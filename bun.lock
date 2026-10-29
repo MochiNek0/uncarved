@@ -6,6 +6,7 @@
       "name": "uncarved-workspace",
       "devDependencies": {
         "@types/bun": "^1.4.4",
+        "@uncarved/plugin-stdio": "workspace:*",
         "@uncarved/provider-anthropic": "workspace:*",
         "@uncarved/provider-openai-compat": "workspace:*",
         "@uncarved/store-jsonl": "workspace:*",
@@ -16,6 +17,13 @@
     "packages/kernel": {
       "name": "uncarved",
       "version": "0.1.0",
+    },
+    "packages/plugin-stdio": {
+      "name": "@uncarved/plugin-stdio",
+      "version": "0.1.0",
+      "peerDependencies": {
+        "uncarved": "workspace:*",
+      },
     },
     "packages/provider-anthropic": {
       "name": "@uncarved/provider-anthropic",
@@ -94,6 +102,8 @@
     "@typescript/typescript-win32-arm64": ["@typescript/typescript-win32-arm64@7.0.2", "", { "os": "win32", "cpu": "arm64" }, "sha512-Gyl1Vy6OsWesLzmq+EP0Fb7b4Nid5232AvcA2SFcdYreldpNtYFFofPjnt62y9hQy7VTaZp65ICJjuAQRaVcIQ=="],
 
     "@typescript/typescript-win32-x64": ["@typescript/typescript-win32-x64@7.0.2", "", { "os": "win32", "cpu": "x64" }, "sha512-0BQ3HkAHHlKLSp1qRvf3SUhGpGsDuhB/jgFw75guyqbxJqEaS0Cw/VFO8i2nHglJUzQCRtMMR/IBAKE3ETMC4g=="],
+
+    "@uncarved/plugin-stdio": ["@uncarved/plugin-stdio@workspace:packages/plugin-stdio"],
 
     "@uncarved/provider-anthropic": ["@uncarved/provider-anthropic@workspace:packages/provider-anthropic"],
 

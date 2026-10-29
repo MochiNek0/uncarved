@@ -1,0 +1,11 @@
+{
+  "name": "@uncarved/plugin-stdio",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "peerDependencies": {
+    "uncarved": "workspace:*"
+  }
+}

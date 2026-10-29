@@ -12,6 +12,7 @@
   "devDependencies": {
     "@types/bun": "^1.4.4",
     "@uncarved/provider-anthropic": "workspace:*",
+    "@uncarved/plugin-stdio": "workspace:*",
     "@uncarved/provider-openai-compat": "workspace:*",
     "@uncarved/store-jsonl": "workspace:*",
     "typescript": "^7.0.2",
