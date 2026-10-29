@@ -1,6 +1,7 @@
 // 插件声明与兼容性检查。对应宪法 4.6、8.2。
 
 import type { HookSpec, Layer } from "./hooks.ts";
+import { checkRemoteHook, isRemote } from "./remote.ts";
 import type { PluginManifestEntry, ResumePolicy, Tool } from "./types.ts";
 
 export const KERNEL_MAJOR = 1;
@@ -53,6 +54,10 @@ export function checkCompat(p: Plugin): void {
   }
   const missing = (p.needs ?? []).filter((n) => !CAPABILITIES.has(n));
   if (missing.length > 0) throw new PluginIncompatible(p.id, `missing capabilities ${missing.join(", ")}`);
+  for (const h of p.hooks ?? []) {
+    const problem = isRemote(h) ? checkRemoteHook(h) : undefined;
+    if (problem) throw new PluginIncompatible(p.id, problem);
+  }
 }
 
 const POLICY_RANK: Record<ResumePolicy, number> = { continue: 0, ask: 1, abort: 2 };

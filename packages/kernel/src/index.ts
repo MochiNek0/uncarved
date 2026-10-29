@@ -5,3 +5,4 @@ export * from "./store.ts";
 export * from "./plugin.ts";
 export * from "./runtime.ts";
 export * from "./trust.ts";
+export * from "./remote.ts";

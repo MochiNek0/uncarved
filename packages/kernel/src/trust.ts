@@ -54,21 +54,50 @@ export function isConfirmed(p: Plugin): boolean {
   return confirmed.has(p);
 }
 
+/** requireTrust 的结果，只能由它创建，只能使用一次 */
+export interface TrustGrant {
+  readonly hash: string;
+  readonly path: string;
+}
+const grants = new WeakSet<TrustGrant>();
+
+export interface TrustOptions {
+  trust: TrustStore;
+  confirm: ConfirmTrust;
+  now?: () => string;
+}
+
+/** 查确认记录，没有就请求确认并保存；拒绝时抛出 UntrustedPlugin。必须在执行任何项目层代码之前调用 */
+export async function requireTrust(
+  request: { path: string; hash: string; files: string[] },
+  opts: TrustOptions,
+): Promise<TrustGrant> {
+  const { path: p, hash } = request;
+  if (!(await opts.trust.has(hash))) {
+    if (!(await opts.confirm(request))) throw new UntrustedPlugin(p, "not confirmed");
+    await opts.trust.add({ hash, path: p, at: (opts.now ?? (() => new Date().toISOString()))() });
+  }
+  const grant: TrustGrant = Object.freeze({ hash, path: p });
+  grants.add(grant);
+  return grant;
+}
+
+/** 凭确认结果把插件标记为项目层，Runtime 只接受这样标记过的项目层插件 */
+export function asProjectPlugin(plugin: Plugin, grant: TrustGrant): Plugin {
+  if (!grants.delete(grant)) throw new UntrustedPlugin(grant.path, "trust grant is not valid or already used");
+  const p: Plugin = { ...plugin, layer: "project" };
+  confirmed.add(p);
+  return p;
+}
+
 /**
  * 加载项目层插件：先对整个目录计算哈希，未确认过的内容先请求确认，通过后才 import。
  * 入口模块的默认导出必须是 Plugin，加载后 layer 固定为 "project"。
  */
-export async function loadProjectPlugin(
-  dir: string,
-  opts: { trust: TrustStore; confirm: ConfirmTrust; entry?: string; now?: () => string },
-): Promise<Plugin> {
+export async function loadProjectPlugin(dir: string, opts: TrustOptions & { entry?: string }): Promise<Plugin> {
   const root = path.resolve(dir);
   const { hash, files } = await hashDir(root);
-
-  if (!(await opts.trust.has(hash))) {
-    if (!(await opts.confirm({ path: root, hash, files }))) throw new UntrustedPlugin(root, "not confirmed");
-    await opts.trust.add({ hash, path: root, at: (opts.now ?? (() => new Date().toISOString()))() });
-  }
+  const grant = await requireTrust({ path: root, hash, files }, opts);
 
   const prev = imported.get(root);
   if (prev !== undefined && prev !== hash) throw new UntrustedPlugin(root, "changed since it was imported; restart to load it");
@@ -76,9 +105,7 @@ export async function loadProjectPlugin(
 
   const mod = (await import(pathToFileURL(path.join(root, opts.entry ?? "index.ts")).href)) as { default?: Plugin };
   if (!mod.default || typeof mod.default.id !== "string") throw new UntrustedPlugin(root, "default export is not a plugin");
-  const plugin: Plugin = { ...mod.default, layer: "project" };
-  confirmed.add(plugin);
-  return plugin;
+  return asProjectPlugin(mod.default, grant);
 }
 
 /**

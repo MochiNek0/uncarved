@@ -1,5 +1,6 @@
 // 扩展点与组合规则。对应宪法第五章。
 
+import { isRemote, toLocalHook, type RemoteHookSpec } from "./remote.ts";
 import type { Awaitable, Event, Message, ModelRequest, ModelResponse, State, ToolCall, ToolOutcome } from "./types.ts";
 
 export interface TransformPayloads {
@@ -53,7 +54,8 @@ interface HookCommon {
   timeoutMs?: number;
 }
 
-export type HookSpec =
+/** 进程内 hook */
+export type LocalHookSpec =
   | {
       [P in TransformPoint]: HookCommon & {
         kind: "transform";
@@ -77,6 +79,8 @@ export type HookSpec =
         fn: (payload: ObservePayloads[P], ctx: HookContext) => Awaitable<void>;
       };
     }[ObservePoint];
+
+export type HookSpec = LocalHookSpec | RemoteHookSpec;
 
 /** 配置层级，后面的覆盖前面的（5.3） */
 export const LAYERS = ["builtin", "distro", "user", "project", "session"] as const;
@@ -112,7 +116,7 @@ interface Registered {
   plugin: string;
   layer: Layer;
   index: number;
-  spec: HookSpec;
+  spec: LocalHookSpec;
 }
 
 type AnyFn = (payload: unknown, ctx: HookContext) => Awaitable<unknown>;
@@ -127,8 +131,9 @@ export class HookBus {
     this.#onError = onError;
   }
 
+  /** 进程外 hook 须先通过 checkRemoteHook（见 checkCompat），这里转成等价的进程内 hook */
   add(plugin: string, layer: Layer, spec: HookSpec): void {
-    this.#hooks.push({ plugin, layer, index: this.#hooks.length, spec });
+    this.#hooks.push({ plugin, layer, index: this.#hooks.length, spec: isRemote(spec) ? toLocalHook(spec) : spec });
   }
 
   /** 某个扩展点上的实际执行顺序（5.3） */
