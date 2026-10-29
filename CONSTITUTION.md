@@ -1,6 +1,6 @@
 # Uncarved 内核宪法
 
-> 版本 0.7 · 草案 · 2026-10-30
+> 版本 0.8 · 草案 · 2026-10-30
 >
 > 未经雕琢的原木。内核只提供循环这块木料，不预设形状，由每个发行版去雕刻。
 
@@ -215,6 +215,12 @@ Provider 把模型请求翻译成某个模型接口的调用，它的实现不�
 
 所有 hook 都必须有超时（默认 30 秒，可配置）。超时按"出错"处理。
 
+hook 通过上下文写日志（`record`/`emit`）的时机：
+
+1. 写入只在 hook 执行期间有效。hook 返回或超时之后再写入，必须被拒绝。
+2. 运行时对外的每次调用（创建会话、发送输入、恢复）必须等到所有未完成的 observe 结束、它们的写入落盘之后才返回，包括写入再触发的 observe。因此这些写入可能排在 `turn.ended` 之后，但一定在调用返回之前。
+3. 结束会话时，`session.end` 的 observe 在写入 `session.ended` **之前**执行并等待完成。`session.ended` 必须是日志的最后一个事件，之后的任何写入都必须被拒绝。
+
 关卡全部弃权（或没有任何关卡）时的结果：
 
 | 扩展点 | 合并结果为 `abstain` | 合并结果为 `ask` |
@@ -226,7 +232,7 @@ Provider 把模型请求翻译成某个模型接口的调用，它的实现不�
 
 | 扩展点 | 种类 | 输入 → 输出 |
 |---|---|---|
-| `session.start` / `session.end` | observe | 会话信息 |
+| `session.start` / `session.end` | observe | 会话信息（`session.end` 在 `session.ended` 之前，见 5.1） |
 | `context.build` | transform | 空请求 → 完整的模型请求（系统提示词就在这里生成） |
 | `context.project` | transform | 事件日志 → 消息列表（压缩、截断策略在这里） |
 | `model.before` | transform | 模型请求 → 模型请求 |
@@ -313,11 +319,7 @@ interface Tool {
 
 ## 第十章 待决问题
 
-| 问题 | 现状 | 见 |
-|---|---|---|
-| observe hook 通过 `record`/`emit` 写入的事件，落盘时机不确定，可能在 `turn.ended` 甚至 `session.ended` 之后。运行时能否在一轮结束前等待未完成的 observe？`session.ended` 之后是否拒绝写入？ | 2026-10-29 实测中 `derived.recorded` 落在 `turn.ended` 之后，`send()` 返回时还读不到 | 5.1、3.2 |
-
-新的问题出现时追加在这里。
+目前没有。新的问题出现时追加在这里。
 
 已决问题（v0.2）：
 
@@ -368,6 +370,16 @@ interface Tool {
 | Provider 出错如何分类？ | 内核导出 `ProviderError`，带 `retryable`、`status`、`retryAfterMs` | 不同作者的 provider 和包装需要共用同一个类型，不能靠解析错误文案 | 4.7 |
 
 受影响的发行版：自己实现 Provider 的发行版，必须读取 `ext` 中自己的分组。内核侧只增加了可选字段和一个导出类型，与现有日志、插件兼容。设计见 `docs/design/provider-contract.md`。
+
+已决问题（v0.8）：
+
+| 问题 | 结论 | 理由 | 见 |
+|---|---|---|---|
+| observe 的写入要不要在 `turn.ended` 之前等完？ | 不在 `turn.ended` 之前等，而在调用返回之前等 | `turn.ended` 本身也会触发 observe，在它之前等不完；调用方关心的是"返回后能读到"。每个 hook 都有超时，等待有上限 | 5.1 |
+| hook 返回后才完成的写入怎么办？ | 拒绝（`HookExpired`） | 否则"所有 hook 已结束"不代表"不会再有插件写入"，上一条无法保证；超时的 hook 尤其如此 | 5.1 |
+| `session.ended` 之后是否拒绝写入？ | 拒绝，由纯核心保证：`ended` 阶段不接受任何事件 | 日志要有明确的结尾；`session.end` 的 observe 改为在 `session.ended` 之前执行，需要收尾写入的插件仍然可以写 | 5.1、3.2 |
+
+受影响的发行版：在 observe 里不 `await` 就调用 `record`/`emit`（hook 返回后才写入）的插件，写入会被拒绝；依赖 `session.end` 收到的状态处于 `ended` 阶段的插件，现在收到的是结束前的状态。这是 hook 接口的不兼容修改，0.x 草案阶段以 0.7 → 0.8 表示。
 
 ---
 
