@@ -295,8 +295,8 @@ describe("关卡与变换", () => {
               fn: (req) => ({
                 ...req,
                 system: [
-                  { text: "now", stability: "volatile", origin },
-                  { text: "identity", stability: "stable", origin },
+                  { text: "now", stability: "volatile", origin, trust: "trusted" },
+                  { text: "identity", stability: "stable", origin, trust: "trusted" },
                 ],
               }),
             },

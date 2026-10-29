@@ -1,19 +1,40 @@
 // 最小示例：一个从 .md 文件加载系统提示词的插件 + 一个只读工具。
 // 运行：bun examples/hello.ts "读一下 CONSTITUTION.md 的第二章，总结成三句话"
 
+import { createHash } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { anthropicProvider } from "@uncarved/provider-anthropic";
 import { openaiCompatProvider } from "@uncarved/provider-openai-compat";
-import { MemoryLogStore, Runtime, type Plugin, type SystemSegment } from "uncarved";
+import { MemoryLogStore, Runtime, type Layer, type Plugin, type SystemSegment } from "uncarved";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = process.cwd();
 
-// 提示词即数据：examples/prompts/*.md 按文件名顺序拼成 stable 段，日期作为 volatile 段放在最后
+// 提示词即数据：发行版自带 examples/prompts/*.md，项目可以在 .uncarved/prompts/*.md 追加。
+// 每段都在 origin.source 中标明配置层、路径和哈希；项目层的片段来自代码仓库，标为 untrusted（7.2）
+const PROMPTS_ID = "example/prompts";
+
+async function promptSegments(root: string, rel: string, layer: Layer): Promise<SystemSegment[]> {
+  const dir = path.join(root, rel);
+  const files = (await readdir(dir).catch(() => [])).filter((f) => f.endsWith(".md")).sort();
+  return Promise.all(
+    files.map(async (f) => {
+      const text = await readFile(path.join(dir, f), "utf8");
+      const hash = createHash("sha256").update(text).digest("hex");
+      return {
+        text,
+        stability: "stable" as const,
+        origin: { by: "plugin" as const, id: PROMPTS_ID, source: { layer, path: `${rel}/${f}`, hash } },
+        trust: layer === "project" ? ("untrusted" as const) : ("trusted" as const),
+      };
+    }),
+  );
+}
+
 const prompts: Plugin = {
-  id: "example/prompts",
+  id: PROMPTS_ID,
   version: "0.1.0",
   kernel: "^1",
   hooks: [
@@ -21,14 +42,15 @@ const prompts: Plugin = {
       kind: "transform",
       point: "context.build",
       fn: async (req) => {
-        const dir = path.join(here, "prompts");
-        const origin = { by: "plugin" as const, id: "example/prompts" };
-        const files = (await readdir(dir)).filter((f) => f.endsWith(".md")).sort();
-        const stable: SystemSegment[] = await Promise.all(
-          files.map(async (f) => ({ text: await readFile(path.join(dir, f), "utf8"), stability: "stable" as const, origin })),
-        );
-        const today = { text: `Today is ${new Date().toISOString().slice(0, 10)}.`, stability: "volatile" as const, origin };
-        return { ...req, system: [...req.system, ...stable, today] };
+        const distro = await promptSegments(here, "prompts", "distro");
+        const project = await promptSegments(root, ".uncarved/prompts", "project");
+        const today: SystemSegment = {
+          text: `Today is ${new Date().toISOString().slice(0, 10)}.`,
+          stability: "volatile",
+          origin: { by: "plugin", id: PROMPTS_ID },
+          trust: "trusted",
+        };
+        return { ...req, system: [...req.system, ...distro, ...project, today] };
       },
     },
   ],

@@ -1,5 +1,7 @@
 // 内核的公共数据格式。对应宪法第三章、第六章。
 
+import type { Layer } from "./hooks.ts";
+
 export type Awaitable<T> = T | Promise<T>;
 
 // ---------- 来源与信任（I-8） ----------
@@ -8,8 +10,17 @@ export type Origin =
   | { by: "user" }
   | { by: "model"; provider: string; model: string }
   | { by: "tool"; name: string }
-  | { by: "plugin"; id: string }
+  | { by: "plugin"; id: string; source?: ContentSource }
   | { by: "runtime" };
+
+/** 插件从配置层加载的内容（例如提示词文件）的出处（7.2） */
+export interface ContentSource {
+  layer: Layer;
+  /** 相对于该配置层根目录的路径 */
+  path: string;
+  /** 内容的 sha256 */
+  hash: string;
+}
 
 export type Trust = "trusted" | "untrusted";
 
@@ -177,6 +188,8 @@ export interface SystemSegment {
   text: string;
   stability: "stable" | "volatile";
   origin: Origin;
+  /** 项目层加载的片段应当为 untrusted（7.2） */
+  trust: Trust;
 }
 
 export interface ToolSpec {

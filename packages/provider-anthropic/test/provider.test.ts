@@ -50,9 +50,9 @@ test("请求翻译：缓存标记打在最后一个 stable 段，空的 system �
     {
       ...base,
       system: [
-        { text: "a", stability: "stable", origin: plugin },
-        { text: "b", stability: "stable", origin: plugin },
-        { text: "c", stability: "volatile", origin: plugin },
+        { text: "a", stability: "stable", origin: plugin, trust: "trusted" },
+        { text: "b", stability: "stable", origin: plugin, trust: "trusted" },
+        { text: "c", stability: "volatile", origin: plugin, trust: "trusted" },
       ],
     },
     { signal: new AbortController().signal },
