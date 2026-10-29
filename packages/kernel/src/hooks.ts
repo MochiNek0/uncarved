@@ -106,6 +106,14 @@ export class HookFailure extends Error {
   }
 }
 
+/** hook 已返回或已超时之后才调用 record/emit（5.1） */
+export class HookExpired extends Error {
+  constructor() {
+    super("hook already returned or timed out; record/emit must be awaited inside the hook");
+    this.name = "HookExpired";
+  }
+}
+
 export interface HookErrorInfo {
   plugin: string;
   point: string;
@@ -126,6 +134,7 @@ const GATE_RANK: Record<GateDecision, number> = { deny: 3, ask: 2, allow: 1, abs
 export class HookBus {
   #hooks: Registered[] = [];
   #onError: (info: HookErrorInfo) => void;
+  #pending = new Set<Promise<void>>();
 
   constructor(onError: (info: HookErrorInfo) => void) {
     this.#onError = onError;
@@ -196,14 +205,26 @@ export class HookBus {
     return best;
   }
 
-  /** 并发执行，不等待，错误只记录 */
+  /** 并发执行，调用方不等待，错误只记录。未完成的 observe 由 idle() 等待 */
   observe<P extends ObservePoint>(point: P, payload: ObservePayloads[P], ctx: HookContextFor): void {
     for (const h of this.ordered(point)) {
       if (h.spec.kind !== "observe") continue;
-      invoke(h.spec.fn as AnyFn, payload, ctx(h.plugin), h.spec.timeoutMs).catch((error) =>
-        this.#onError({ plugin: h.plugin, point, error }),
+      const p = invoke(h.spec.fn as AnyFn, payload, ctx(h.plugin), h.spec.timeoutMs).then(
+        () => {},
+        (error) => this.#onError({ plugin: h.plugin, point, error }),
       );
+      this.#pending.add(p);
+      void p.finally(() => this.#pending.delete(p));
     }
+  }
+
+  get busy(): boolean {
+    return this.#pending.size > 0;
+  }
+
+  /** 等待当前所有 observe 结束（每个都受超时约束） */
+  async idle(): Promise<void> {
+    while (this.#pending.size > 0) await Promise.all(this.#pending);
   }
 }
 
@@ -212,9 +233,14 @@ async function invoke(fn: AnyFn, payload: unknown, ctx: HookContext, timeoutMs =
   const forward = () => ac.abort(ctx.signal.reason);
   ctx.signal.addEventListener("abort", forward, { once: true });
   let timer: ReturnType<typeof setTimeout> | undefined;
+  // hook 返回或超时之后，它的写入一律拒绝：保证"所有 hook 结束"即"不会再有插件写入"
+  let done = false;
+  const live = <A extends unknown[]>(write: (...args: A) => Promise<void>) =>
+    (...args: A) => (done ? Promise.reject(new HookExpired()) : write(...args));
+  const scoped: HookContext = { ...ctx, signal: ac.signal, record: live(ctx.record), emit: live(ctx.emit) };
   try {
     return await Promise.race([
-      Promise.resolve().then(() => fn(payload, { ...ctx, signal: ac.signal })),
+      Promise.resolve().then(() => fn(payload, scoped)),
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
           ac.abort();
@@ -223,6 +249,7 @@ async function invoke(fn: AnyFn, payload: unknown, ctx: HookContext, timeoutMs =
       }),
     ]);
   } finally {
+    done = true;
     clearTimeout(timer);
     ctx.signal.removeEventListener("abort", forward);
   }

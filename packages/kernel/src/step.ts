@@ -38,6 +38,8 @@ export function step(s: State, e: Event): StepResult {
   if (e.seq !== s.lastSeq + 1) {
     throw new InvalidTransition(e.type, s.phase, `expected seq ${s.lastSeq + 1}, got ${e.seq}`);
   }
+  // session.ended 是日志的最后一个事件（5.1）
+  if (s.phase === "ended") throw new InvalidTransition(e.type, s.phase, "session has ended");
   const base: State = { ...s, lastSeq: e.seq };
   const expect = (...phases: Phase[]) => {
     if (!phases.includes(s.phase)) throw new InvalidTransition(e.type, s.phase);
@@ -152,7 +154,7 @@ export function step(s: State, e: Event): StepResult {
     }
 
     case "turn.ended": {
-      if (s.phase === "new" || s.phase === "idle" || s.phase === "ended") {
+      if (s.phase === "new" || s.phase === "idle") {
         throw new InvalidTransition(e.type, s.phase);
       }
       const closed = closeBatch(base);

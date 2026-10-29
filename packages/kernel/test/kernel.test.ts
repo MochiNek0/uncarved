@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
+  HookExpired,
   HookFailure,
+  InvalidTransition,
   MemoryLogStore,
   ModelOutputModified,
   PluginIncompatible,
@@ -789,3 +791,89 @@ class FlakyStore implements LogStore {
     this.crashOn = undefined;
   }
 }
+
+describe("observe 写入的时机（5.1）", () => {
+  test("send() 返回时，observe 的写入已经落盘，包括写入再触发的写入", async () => {
+    const store = new MemoryLogStore();
+    const { provider } = scripted([{ content: [text("a")], stopReason: "end" }]);
+    const meter = plugin("meter", {
+      needs: ["observe:model.after", "observe:event", "log:record", "log:emit"],
+      hooks: [
+        {
+          kind: "observe",
+          point: "model.after",
+          fn: async (res, ctx) => {
+            await new Promise((r) => setTimeout(r, 20));
+            await ctx.record("meter/model", res.model);
+          },
+        },
+        {
+          kind: "observe",
+          point: "event",
+          fn: async (e, ctx) => {
+            if (e.type === "derived.recorded") await ctx.emit("seen", { key: (e.data as { key: string }).key });
+          },
+        },
+      ],
+    });
+    const rt = await Runtime.create({ store, provider, plugins: [meter] });
+    await rt.send(say("hi"));
+
+    expect(rt.state.derived).toEqual({ "meter/model": "scripted-1" });
+    const types = (await readAll(store, rt.state.sessionId)).map((e) => e.type);
+    expect(types.slice(-3)).toEqual(["turn.ended", "derived.recorded", "meter/seen"]);
+  });
+
+  test("hook 返回或超时之后再写入会被拒绝", async () => {
+    const { provider } = scripted([{ content: [text("a")], stopReason: "end" }]);
+    let late: unknown;
+    const p = plugin("p", {
+      needs: ["observe:model.after", "log:record"],
+      hooks: [
+        {
+          kind: "observe",
+          point: "model.after",
+          timeoutMs: 10,
+          fn: async (_res, ctx) => {
+            await new Promise((r) => setTimeout(r, 30));
+            late = await ctx.record("p/late", 1).catch((e: unknown) => e);
+          },
+        },
+      ],
+    });
+    const rt = await Runtime.create({ store: new MemoryLogStore(), provider, plugins: [p] });
+    await rt.send(say("hi"));
+    await new Promise((r) => setTimeout(r, 40));
+
+    expect(late).toBeInstanceOf(HookExpired);
+    expect(rt.state.derived).toEqual({});
+  });
+
+  test("session.end 的 observe 仍可写入，session.ended 是最后一个事件", async () => {
+    const store = new MemoryLogStore();
+    const { provider } = scripted([]);
+    const notices: RuntimeNotice[] = [];
+    const p = plugin("p", {
+      needs: ["observe:session.end", "observe:event", "log:record"],
+      hooks: [
+        { kind: "observe", point: "session.end", fn: (_s, ctx) => ctx.record("p/summary", "done") },
+        {
+          kind: "observe",
+          point: "event",
+          fn: async (e, ctx) => {
+            if (e.type === "session.ended") await ctx.record("p/after", 1);
+          },
+        },
+      ],
+    });
+    const rt = await Runtime.create({ store, provider, plugins: [p] });
+    rt.subscribe((n) => notices.push(n));
+    await rt.close();
+    await new Promise((r) => setTimeout(r, 10));
+
+    const events = await readAll(store, rt.state.sessionId);
+    expect(events.map((e) => e.type)).toEqual(["session.started", "derived.recorded", "session.ended"]);
+    expect(rt.state.derived).toEqual({ "p/summary": "done" });
+    expect(notices.some((n) => n.type === "hook-error" && n.info.error instanceof InvalidTransition)).toBe(true);
+  });
+});

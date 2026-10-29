@@ -132,6 +132,7 @@ export class Runtime {
     const rt = new Runtime(opts, initialState(opts.sessionId ?? newId()));
     await rt.#commit("session.started", { plugins: rt.#manifest, parent }, RUNTIME);
     rt.#hooks.observe("session.start", structuredClone(rt.#state), rt.#hookCtx);
+    await rt.#settle();
     return rt;
   }
 
@@ -178,6 +179,7 @@ export class Runtime {
       await this.#commit("input.received", input, { by: "user" });
       await this.#drive();
     } finally {
+      await this.#settle();
       this.#busy = false;
     }
   }
@@ -223,13 +225,27 @@ export class Runtime {
       }
       await this.#drive();
     } finally {
+      await this.#settle();
       this.#busy = false;
     }
   }
 
+  /**
+   * 结束会话。session.end 的 observe 在 session.ended 之前执行并等待完成，
+   * 因此仍可写入；session.ended 之后日志不再接受任何事件（5.1）
+   */
   async close(): Promise<void> {
-    await this.#commit("session.ended", {}, RUNTIME);
-    this.#hooks.observe("session.end", structuredClone(this.#state), this.#hookCtx);
+    // 插件变化未被接受的会话也可以结束，所以不走 #enter
+    if (this.#busy) throw new RuntimeBusy();
+    this.#busy = true;
+    try {
+      await this.#settle();
+      this.#hooks.observe("session.end", structuredClone(this.#state), this.#hookCtx);
+      await this.#settle();
+      await this.#commit("session.ended", {}, RUNTIME);
+    } finally {
+      this.#busy = false;
+    }
   }
 
   // ---------- 驱动 ----------
@@ -384,6 +400,14 @@ export class Runtime {
     } else {
       for (const c of calls) await run(c);
     }
+  }
+
+  /** 等到没有未完成的 observe，也没有排队中的写入。observe 写入的事件会再触发 observe，所以要循环 */
+  async #settle(): Promise<void> {
+    do {
+      await this.#hooks.idle();
+      await this.#writes;
+    } while (this.#hooks.busy);
   }
 
   // ---------- 写入（单写者队列，I-10） ----------
