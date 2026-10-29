@@ -51,9 +51,19 @@ export interface SessionRef {
   eventId: string;
 }
 
+export interface ChildRef {
+  sessionId: string;
+  seq: number;
+}
+
 export type UserInput =
   | { kind: "message"; content: Block[] }
-  | { kind: "approval"; toolUseId: string; approved: boolean; reason?: string };
+  | { kind: "approval"; toolUseId: string; approved: boolean; reason?: string }
+  /** 对插件清单变化的确认（4.6）。拒绝后只能换回可接受的插件清单 */
+  | { kind: "plugins"; approved: boolean };
+
+/** 恢复会话时插件变化的处理策略，严格程度 abort > ask > continue（4.6） */
+export type ResumePolicy = "continue" | "ask" | "abort";
 
 export type StopReason = "end" | "tool_use" | "max_tokens" | "refusal" | "pause" | "other";
 
@@ -70,7 +80,7 @@ export type Decision = "allow" | "deny" | "ask";
 
 export interface EventDataMap {
   "session.started": { plugins: PluginManifestEntry[]; parent?: SessionRef };
-  "plugins.changed": { plugins: PluginManifestEntry[] };
+  "plugins.changed": { plugins: PluginManifestEntry[]; resolution: ResumePolicy };
   "input.received": UserInput;
   "model.requested": { requestHash: string };
   "model.responded": { content: Block[]; stopReason: StopReason; usage?: Usage };
@@ -87,7 +97,7 @@ export interface EventDataMap {
     toolUseId: string;
     content: Block[];
     isError: boolean;
-    child?: { sessionId: string; seq: number };
+    child?: ChildRef;
   };
   "derived.recorded": { key: string; value: unknown };
   "turn.ended": { reason: TurnEndReason; error?: string };
@@ -132,6 +142,8 @@ export interface PendingCall {
   decision?: Decision;
   reason?: string;
   decidedBy?: string;
+  /** 做出最终决定的事件，子会话以它作为 parent 引用（3.4） */
+  decidedAt?: string;
   result?: ToolResultRecord;
 }
 
@@ -142,7 +154,10 @@ export interface State {
   messages: Message[];
   /** 本轮模型提出的工具调用 */
   batch: PendingCall[];
+  /** 最近一次被接受的插件清单 */
   plugins: PluginManifestEntry[];
+  /** 尚未被接受的插件清单变化；存在时会话暂停（4.6） */
+  held?: { plugins: PluginManifestEntry[]; resolution: "ask" | "abort" };
   parent?: SessionRef;
   ending?: TurnEndReason;
   derived: Record<string, unknown>;
@@ -205,11 +220,15 @@ export interface ToolContext {
   sessionId: string;
   toolUseId: string;
   signal: AbortSignal;
+  /** 启动子会话时作为 parent 记录（3.4） */
+  parent: SessionRef;
 }
 
 export interface ToolResult {
   content: Block[] | string;
   isError?: boolean;
+  /** 工具启动了子会话时，子会话的 ID 和最终 seq（3.4） */
+  child?: ChildRef;
 }
 
 export interface Tool extends ToolSpec {

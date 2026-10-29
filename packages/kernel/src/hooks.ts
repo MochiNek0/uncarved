@@ -37,7 +37,16 @@ export interface GateResult {
 export interface HookContext {
   sessionId: string;
   signal: AbortSignal;
+  /** derived.recorded 累积的派生数据快照 */
+  derived: Readonly<Record<string, unknown>>;
+  /** 把插件产生的派生数据写入日志（derived.recorded），resolve 之后才能使用它（I-5） */
+  record(key: string, value: unknown): Promise<void>;
+  /** 写入插件自定义事件，类型会加上 `<plugin-id>/` 前缀（3.2） */
+  emit(type: string, data: unknown): Promise<void>;
 }
+
+/** 为某个插件生成它的 hook 上下文 */
+export type HookContextFor = (plugin: string) => HookContext;
 
 interface HookCommon {
   order?: number;
@@ -137,12 +146,12 @@ export class HookBus {
   async transform<P extends TransformPoint>(
     point: P,
     value: TransformPayloads[P],
-    ctx: HookContext,
+    ctx: HookContextFor,
   ): Promise<TransformPayloads[P]> {
     for (const h of this.ordered(point)) {
       if (h.spec.kind !== "transform") continue;
       try {
-        const out = await invoke(h.spec.fn as AnyFn, value, ctx, h.spec.timeoutMs);
+        const out = await invoke(h.spec.fn as AnyFn, value, ctx(h.plugin), h.spec.timeoutMs);
         if (out !== undefined) value = out as TransformPayloads[P];
       } catch (error) {
         if (h.spec.optional) {
@@ -159,13 +168,13 @@ export class HookBus {
   async gate<P extends GatePoint>(
     point: P,
     payload: GatePayloads[P],
-    ctx: HookContext,
+    ctx: HookContextFor,
   ): Promise<GateResult & { by?: string }> {
     const hooks = this.ordered(point).filter((h) => h.spec.kind === "gate");
     const results = await Promise.all(
       hooks.map(async (h) => {
         try {
-          const r = (await invoke(h.spec.fn as AnyFn, payload, ctx, h.spec.timeoutMs)) as GateResult;
+          const r = (await invoke(h.spec.fn as AnyFn, payload, ctx(h.plugin), h.spec.timeoutMs)) as GateResult;
           return { ...r, by: h.plugin };
         } catch (error) {
           this.#onError({ plugin: h.plugin, point, error });
@@ -179,10 +188,10 @@ export class HookBus {
   }
 
   /** 并发执行，不等待，错误只记录 */
-  observe<P extends ObservePoint>(point: P, payload: ObservePayloads[P], ctx: HookContext): void {
+  observe<P extends ObservePoint>(point: P, payload: ObservePayloads[P], ctx: HookContextFor): void {
     for (const h of this.ordered(point)) {
       if (h.spec.kind !== "observe") continue;
-      invoke(h.spec.fn as AnyFn, payload, ctx, h.spec.timeoutMs).catch((error) =>
+      invoke(h.spec.fn as AnyFn, payload, ctx(h.plugin), h.spec.timeoutMs).catch((error) =>
         this.#onError({ plugin: h.plugin, point, error }),
       );
     }

@@ -52,11 +52,18 @@ export function step(s: State, e: Event): StepResult {
 
     case "plugins.changed": {
       const d = e.data as EventDataMap["plugins.changed"];
-      return ok({ ...base, plugins: d.plugins });
+      if (d.resolution === "continue") return reopenDecisions({ ...base, plugins: d.plugins, held: undefined });
+      return ok({ ...base, held: { plugins: d.plugins, resolution: d.resolution } });
     }
 
     case "input.received": {
       const d = e.data as EventDataMap["input.received"];
+      if (d.kind === "plugins") {
+        if (s.held?.resolution !== "ask") throw new InvalidTransition(e.type, s.phase, "no plugin change awaiting approval");
+        if (!d.approved) return ok({ ...base, held: { ...s.held, resolution: "abort" } });
+        return reopenDecisions({ ...base, plugins: s.held.plugins, held: undefined });
+      }
+      if (s.held) throw new InvalidTransition(e.type, s.phase, "plugin change not accepted");
       if (d.kind === "message") {
         expect("idle");
         const messages: Message[] = [...s.messages, { role: "user", content: d.content }];
@@ -67,7 +74,13 @@ export function step(s: State, e: Event): StepResult {
       if (!target) throw new InvalidTransition(e.type, s.phase, `no pending approval for ${d.toolUseId}`);
       const batch = s.batch.map((c) =>
         c === target
-          ? { ...c, decision: d.approved ? ("allow" as const) : ("deny" as const), reason: d.reason, decidedBy: "user" }
+          ? {
+              ...c,
+              decision: d.approved ? ("allow" as const) : ("deny" as const),
+              reason: d.reason,
+              decidedBy: "user",
+              decidedAt: e.id,
+            }
           : c,
       );
       return settleDecisions({ ...base, batch });
@@ -106,7 +119,7 @@ export function step(s: State, e: Event): StepResult {
       const d = e.data as EventDataMap["tool.decided"];
       const batch = updateCall(s, e.type, d.toolUseId, (c) => {
         if (c.decision) throw new InvalidTransition(e.type, s.phase, `${d.toolUseId} already decided`);
-        return { ...c, decision: d.decision, input: d.input, reason: d.reason, decidedBy: d.decidedBy };
+        return { ...c, decision: d.decision, input: d.input, reason: d.reason, decidedBy: d.decidedBy, decidedAt: e.id };
       });
       return settleDecisions({ ...base, batch });
     }
@@ -205,6 +218,20 @@ function settleDecisions(s: State): StepResult {
     return ok({ ...s, batch, phase: "tools" }, [{ type: "RunTools", toolUseIds: toRun.map((c) => c.toolUseId) }]);
   }
   return settleResults({ ...s, batch });
+}
+
+/**
+ * 插件清单变化被接受后，尚未执行的工具调用一律从模型给出的原始参数重新决策，
+ * 此前的关卡结果和人工批准都作废（4.6 第 3 款）
+ */
+function reopenDecisions(s: State): StepResult {
+  if (s.phase !== "deciding" && s.phase !== "awaiting") return ok(s);
+  const proposed = new Map<string, unknown>();
+  for (const b of s.messages.at(-1)?.content ?? []) if (b.kind === "tool_use") proposed.set(b.id, b.input);
+  const batch = s.batch.map(
+    (c): PendingCall => ({ toolUseId: c.toolUseId, name: c.name, input: proposed.get(c.toolUseId) }),
+  );
+  return ok({ ...s, phase: "deciding", batch }, [{ type: "DecideTools", toolUseIds: batch.map((c) => c.toolUseId) }]);
 }
 
 function settleResults(s: State): StepResult {

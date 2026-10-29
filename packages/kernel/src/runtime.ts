@@ -5,16 +5,17 @@ import {
   HookBus,
   type GatePayloads,
   type GatePoint,
-  type HookContext,
+  type HookContextFor,
   type HookErrorInfo,
   type TransformPayloads,
   type TransformPoint,
 } from "./hooks.ts";
-import { checkCompat, type Plugin } from "./plugin.ts";
+import { checkCompat, resumePolicy, type Plugin } from "./plugin.ts";
 import { initialState, rebuild, step } from "./step.ts";
 import { readAll, type LogStore } from "./store.ts";
 import type {
   Block,
+  ChildRef,
   CoreEventType,
   Delta,
   Effect,
@@ -54,6 +55,23 @@ export class RuntimeBusy extends Error {
   }
 }
 
+/** 插件清单变化尚未被接受，会话暂停（4.6） */
+export class PluginsHeld extends Error {
+  readonly resolution: "ask" | "abort";
+  constructor(resolution: "ask" | "abort") {
+    super(`plugin change not accepted (${resolution})`);
+    this.name = "PluginsHeld";
+    this.resolution = resolution;
+  }
+}
+
+export class UnresolvedRef extends Error {
+  constructor(detail: string) {
+    super(`unresolved session reference: ${detail}`);
+    this.name = "UnresolvedRef";
+  }
+}
+
 const RUNTIME: Origin = { by: "runtime" };
 
 export class Runtime {
@@ -62,6 +80,7 @@ export class Runtime {
   #provider: Provider;
   #hooks: HookBus;
   #tools = new Map<string, Tool>();
+  #plugins: Plugin[];
   #manifest: PluginManifestEntry[];
   #now: () => string;
   #newId: () => string;
@@ -89,22 +108,39 @@ export class Runtime {
       }
       for (const h of p.hooks ?? []) this.#hooks.add(p.id, p.layer ?? "distro", h);
     }
+    this.#plugins = plugins;
     this.#manifest = plugins.map((p) => ({ id: p.id, version: p.version }));
   }
 
   static async create(opts: RuntimeOptions & { sessionId?: string; parent?: SessionRef }): Promise<Runtime> {
     const newId = opts.newId ?? (() => crypto.randomUUID());
+    const parent = opts.parent;
+    if (parent && !(await resolves(opts.store, parent.sessionId, (e) => e.id === parent.eventId))) {
+      throw new UnresolvedRef(`parent ${parent.sessionId}#${parent.eventId}`);
+    }
     const rt = new Runtime(opts, initialState(opts.sessionId ?? newId()));
-    await rt.#commit("session.started", { plugins: rt.#manifest, parent: opts.parent }, RUNTIME);
-    rt.#hooks.observe("session.start", structuredClone(rt.#state), rt.#ctx());
+    await rt.#commit("session.started", { plugins: rt.#manifest, parent }, RUNTIME);
+    rt.#hooks.observe("session.start", structuredClone(rt.#state), rt.#hookCtx);
     return rt;
   }
 
-  /** 只凭日志重建状态。调用 recover() 才会继续执行未完成的工作 */
+  /**
+   * 只凭日志重建状态。插件清单与日志记录不同时写入 plugins.changed（4.6）。
+   * 调用 recover() 才会继续执行未完成的工作
+   */
   static async resume(opts: RuntimeOptions & { sessionId: string }): Promise<Runtime> {
     const events = await readAll(opts.store, opts.sessionId);
     if (events.length === 0) throw new Error(`session ${opts.sessionId} not found`);
-    return new Runtime(opts, rebuild(opts.sessionId, events));
+    const rt = new Runtime(opts, rebuild(opts.sessionId, events));
+    const s = rt.#state;
+    const recorded = s.held?.plugins ?? s.plugins;
+    if (JSON.stringify(recorded) !== JSON.stringify(rt.#manifest)) {
+      const resolution = resumePolicy(s.plugins, rt.#plugins);
+      await rt.#commit("plugins.changed", { plugins: rt.#manifest, resolution }, RUNTIME);
+      // 接下来该做什么一律由 recover() 根据状态决定
+      rt.#queue.length = 0;
+    }
+    return rt;
   }
 
   get state(): State {
@@ -126,7 +162,7 @@ export class Runtime {
   }
 
   async send(input: UserInput): Promise<void> {
-    this.#enter();
+    this.#enter(input.kind === "plugins");
     try {
       await this.#commit("input.received", input, { by: "user" });
       await this.#drive();
@@ -139,6 +175,7 @@ export class Runtime {
   async recover(): Promise<void> {
     this.#enter();
     try {
+      this.#queue.length = 0;
       const s = this.#state;
       switch (s.phase) {
         case "model":
@@ -181,13 +218,15 @@ export class Runtime {
 
   async close(): Promise<void> {
     await this.#commit("session.ended", {}, RUNTIME);
-    this.#hooks.observe("session.end", structuredClone(this.#state), this.#ctx());
+    this.#hooks.observe("session.end", structuredClone(this.#state), this.#hookCtx);
   }
 
   // ---------- 驱动 ----------
 
-  #enter(): void {
+  #enter(pluginApproval = false): void {
     if (this.#busy) throw new RuntimeBusy();
+    const held = this.#state.held;
+    if (held && !(pluginApproval && held.resolution === "ask")) throw new PluginsHeld(held.resolution);
     this.#busy = true;
     if (this.#abort.signal.aborted) this.#abort = new AbortController();
   }
@@ -229,7 +268,7 @@ export class Runtime {
   }
 
   async #callModel(): Promise<void> {
-    const ctx = this.#ctx();
+    const signal = this.#abort.signal;
     const messages = await this.#transform("context.project", structuredClone(this.#state.messages));
     let request: ModelRequest = {
       system: [],
@@ -248,7 +287,7 @@ export class Runtime {
     await this.#commit("model.requested", { requestHash }, RUNTIME);
 
     const res = await this.#provider.complete(request, {
-      signal: ctx.signal,
+      signal,
       onDelta: (delta) => this.#notify({ type: "delta", delta }),
     });
     await this.#commit(
@@ -256,7 +295,7 @@ export class Runtime {
       { content: res.content, stopReason: res.stopReason, usage: res.usage },
       { by: "model", provider: this.#provider.id, model: res.model },
     );
-    this.#hooks.observe("model.after", structuredClone(res), ctx);
+    this.#hooks.observe("model.after", structuredClone(res), this.#hookCtx);
   }
 
   async #decideTool(call: PendingCall): Promise<void> {
@@ -289,15 +328,23 @@ export class Runtime {
     const run = async (c: PendingCall) => {
       const tool = this.#tools.get(c.name)!;
       const origin: Origin = { by: "tool", name: c.name };
-      const ctx = this.#ctx();
+      const signal = this.#abort.signal;
+      const sessionId = this.#state.sessionId;
       let content: Block[];
       let isError: boolean;
+      let child: ChildRef | undefined;
       try {
-        const r = await tool.execute(c.input, { sessionId: this.#state.sessionId, toolUseId: c.toolUseId, signal: ctx.signal });
+        const r = await tool.execute(c.input, {
+          sessionId,
+          toolUseId: c.toolUseId,
+          signal,
+          parent: { sessionId, eventId: c.decidedAt! },
+        });
         content = typeof r.content === "string" ? [{ kind: "text", text: r.content, origin, trust: "untrusted" }] : r.content;
         isError = r.isError ?? false;
+        child = r.child;
       } catch (err) {
-        if (ctx.signal.aborted) throw err;
+        if (signal.aborted) throw err;
         const text = err instanceof Error ? err.message : String(err);
         content = [{ kind: "text", text, origin, trust: "untrusted" }];
         isError = true;
@@ -307,7 +354,10 @@ export class Runtime {
         content,
         isError,
       });
-      await this.#commit("tool.completed", { toolUseId: c.toolUseId, content: out.content, isError: out.isError }, origin);
+      if (child && !(await resolves(this.#store, child.sessionId, (e) => e.seq === child.seq))) {
+        throw new UnresolvedRef(`child ${child.sessionId}@${child.seq}`);
+      }
+      await this.#commit("tool.completed", { toolUseId: c.toolUseId, content: out.content, isError: out.isError, child }, origin);
     };
 
     // 全部是 safe 的工具才并发，否则按模型给出的顺序依次执行（第六章）
@@ -323,6 +373,10 @@ export class Runtime {
   // ---------- 写入（单写者队列，I-10） ----------
 
   #commit<T extends CoreEventType>(type: T, data: EventDataMap[T], origin: Origin): Promise<void> {
+    return this.#append(type, data, origin);
+  }
+
+  #append(type: string, data: unknown, origin: Origin): Promise<void> {
     const run = async () => {
       const event = {
         v: 1,
@@ -339,7 +393,7 @@ export class Runtime {
       this.#state = next.state;
       this.#queue.push(...next.effects);
       this.#notify({ type: "event", event });
-      this.#hooks.observe("event", structuredClone(event), this.#ctx());
+      this.#hooks.observe("event", structuredClone(event), this.#hookCtx);
     };
     const p = this.#writes.then(run);
     this.#writes = p.catch(() => {});
@@ -348,16 +402,23 @@ export class Runtime {
 
   // ---------- 辅助 ----------
 
-  #ctx(): HookContext {
-    return { sessionId: this.#state.sessionId, signal: this.#abort.signal };
-  }
+  #hookCtx: HookContextFor = (plugin) => {
+    const origin: Origin = { by: "plugin", id: plugin };
+    return {
+      sessionId: this.#state.sessionId,
+      signal: this.#abort.signal,
+      derived: structuredClone(this.#state.derived),
+      record: (key, value) => this.#commit("derived.recorded", { key, value }, origin),
+      emit: (type, data) => this.#append(`${plugin}/${type}`, data, origin),
+    };
+  };
 
   #transform<P extends TransformPoint>(point: P, value: TransformPayloads[P]) {
-    return this.#hooks.transform(point, value, this.#ctx());
+    return this.#hooks.transform(point, value, this.#hookCtx);
   }
 
   #gate<P extends GatePoint>(point: P, payload: GatePayloads[P]) {
-    return this.#hooks.gate(point, payload, this.#ctx());
+    return this.#hooks.gate(point, payload, this.#hookCtx);
   }
 
   #call(toolUseId: string): PendingCall {
@@ -375,6 +436,11 @@ export class Runtime {
       }
     }
   }
+}
+
+async function resolves(store: LogStore, sessionId: string, match: (e: Event) => boolean): Promise<boolean> {
+  for await (const e of store.read(sessionId)) if (match(e)) return true;
+  return false;
 }
 
 function cacheOrderBroken(system: SystemSegment[]): boolean {

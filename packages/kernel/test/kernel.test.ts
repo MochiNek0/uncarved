@@ -3,7 +3,9 @@ import {
   HookFailure,
   MemoryLogStore,
   PluginIncompatible,
+  PluginsHeld,
   Runtime,
+  UnresolvedRef,
   readAll,
   rebuild,
   type Block,
@@ -383,6 +385,224 @@ describe("等待、恢复与兼容", () => {
     await expect(
       Runtime.create({ store: new MemoryLogStore(), provider, plugins: [plugin("future", { kernel: "^2" })] }),
     ).rejects.toBeInstanceOf(PluginIncompatible);
+  });
+});
+
+describe("恢复时插件发生变化（4.6）", () => {
+  /** 建一个停在等待人工审批的会话，返回 sessionId */
+  async function awaitingSession(store: LogStore, plugins: Plugin[]) {
+    const { provider } = scripted([{ content: [toolUse("t1", "echo", { n: 1 })], stopReason: "tool_use" }]);
+    const rt = await Runtime.create({ store, provider, plugins });
+    await rt.send(say("hi"));
+    expect(rt.state.phase).toBe("awaiting");
+    return rt.state.sessionId;
+  }
+  const askGate = { kind: "gate" as const, point: "tool.gate" as const, fn: () => ({ decision: "ask" as const }) };
+
+  test("清单不变时不写事件；小版本升级自动继续", async () => {
+    const store = new MemoryLogStore();
+    const echo = recordingTool("echo");
+    const sessionId = await awaitingSession(store, [plugin("p", { tools: [echo.tool], hooks: [askGate] })]);
+    const { provider } = scripted([]);
+
+    await Runtime.resume({ store, provider, sessionId, plugins: [plugin("p", { tools: [echo.tool], hooks: [askGate] })] });
+    expect(types(await readAll(store, sessionId))).not.toContain("plugins.changed");
+
+    const rt = await Runtime.resume({
+      store,
+      provider,
+      sessionId,
+      plugins: [plugin("p", { version: "1.2.0", tools: [echo.tool], hooks: [askGate] })],
+    });
+    const changed = (await readAll(store, sessionId)).filter((e) => e.type === "plugins.changed");
+    expect(changed.map((e) => e.data)).toEqual([{ plugins: [{ id: "p", version: "1.2.0" }], resolution: "continue" }]);
+    expect(rt.state.held).toBeUndefined();
+  });
+
+  test("主版本、新增、删除都暂停，确认之后才能继续", async () => {
+    const echo = recordingTool("echo");
+    const base = [plugin("p", { tools: [echo.tool], hooks: [askGate] }), plugin("q")];
+    const cases: Plugin[][] = [
+      [plugin("p", { version: "2.0.0", tools: [echo.tool], hooks: [askGate] }), plugin("q")],
+      [...base, plugin("new")],
+      [base[0]!],
+    ];
+    for (const plugins of cases) {
+      const store = new MemoryLogStore();
+      const sessionId = await awaitingSession(store, base);
+      const { provider } = scripted([]);
+      const rt = await Runtime.resume({ store, provider, sessionId, plugins });
+      expect(rt.state.held?.resolution).toBe("ask");
+      await expect(rt.send({ kind: "approval", toolUseId: "t1", approved: true })).rejects.toBeInstanceOf(PluginsHeld);
+      await expect(rt.recover()).rejects.toBeInstanceOf(PluginsHeld);
+
+      await rt.send({ kind: "plugins", approved: true });
+      expect(rt.state.held).toBeUndefined();
+      expect(rt.state.plugins).toEqual(plugins.map((p) => ({ id: p.id, version: p.version })));
+    }
+  });
+
+  test("插件声明的 resume 覆盖默认处理，多个冲突时取最严格", async () => {
+    const echo = recordingTool("echo");
+    const store = new MemoryLogStore();
+    const id = await awaitingSession(store, [plugin("p", { tools: [echo.tool], hooks: [askGate] }), plugin("q")]);
+    const { provider } = scripted([]);
+    const rt = await Runtime.resume({
+      store,
+      provider,
+      sessionId: id,
+      plugins: [
+        plugin("p", { version: "9.0.0", resume: "continue", tools: [echo.tool] }),
+        plugin("q", { version: "1.0.1", resume: "abort" }),
+      ],
+    });
+    expect(rt.state.held?.resolution).toBe("abort");
+    await expect(rt.send({ kind: "plugins", approved: true })).rejects.toBeInstanceOf(PluginsHeld);
+  });
+
+  test("拒绝或 abort 的变化在重启后仍然生效，换回原插件才解除", async () => {
+    const store = new MemoryLogStore();
+    const echo = recordingTool("echo");
+    const original = [plugin("p", { tools: [echo.tool], hooks: [askGate] })];
+    const sessionId = await awaitingSession(store, original);
+    const { provider } = scripted([]);
+    const upgraded = [plugin("p", { version: "2.0.0", tools: [echo.tool], hooks: [askGate] })];
+
+    const rt1 = await Runtime.resume({ store, provider, sessionId, plugins: upgraded });
+    await rt1.send({ kind: "plugins", approved: false });
+    expect(rt1.state.held?.resolution).toBe("abort");
+
+    // 同样的插件再启动一次：清单与日志里最近的记录相同，但变化仍未被接受
+    const rt2 = await Runtime.resume({ store, provider, sessionId, plugins: upgraded });
+    expect(rt2.state.held?.resolution).toBe("abort");
+    await expect(rt2.recover()).rejects.toBeInstanceOf(PluginsHeld);
+
+    const rt3 = await Runtime.resume({ store, provider, sessionId, plugins: original });
+    expect(rt3.state.held).toBeUndefined();
+    expect(rt3.state.phase).toBe("deciding");
+  });
+
+  test("未执行的工具调用重新经过 tool.before 和 tool.gate，此前的人工批准作废（I-7）", async () => {
+    const store = new MemoryLogStore();
+    const echo = recordingTool("echo");
+    const other = recordingTool("other");
+    // 两个调用：t1 先被人工批准，t2 仍在等待，此时进程退出
+    const first = scripted([
+      { content: [toolUse("t1", "echo", { n: 1 }), toolUse("t2", "other", {})], stopReason: "tool_use" },
+    ]);
+    const plugins = [plugin("p", { tools: [echo.tool, other.tool], hooks: [askGate] })];
+    const rt1 = await Runtime.create({ store, provider: first.provider, plugins });
+    await rt1.send(say("hi"));
+    await rt1.send({ kind: "approval", toolUseId: "t1", approved: true });
+    expect(rt1.state.phase).toBe("awaiting");
+
+    // 新版本插件改写参数，并且拒绝 echo
+    const seen: ToolCall[] = [];
+    const v2 = plugin("p", {
+      version: "1.1.0",
+      tools: [echo.tool, other.tool],
+      hooks: [
+        { kind: "transform", point: "tool.before", fn: (c) => ({ ...c, input: { ...(c.input as object), v: 2 } }) },
+        {
+          kind: "gate",
+          point: "tool.gate",
+          fn: (c) => {
+            seen.push(c);
+            return c.name === "echo" ? { decision: "deny", reason: "echo disabled" } : { decision: "allow" };
+          },
+        },
+      ],
+    });
+    const second = scripted([{ content: [text("done")], stopReason: "end" }]);
+    const rt2 = await Runtime.resume({ store, provider: second.provider, sessionId: rt1.state.sessionId, plugins: [v2] });
+    expect(rt2.state.phase).toBe("deciding");
+    await rt2.recover();
+
+    // 关卡看到的是从模型原始参数重新改写的结果，而不是旧插件改写过的
+    expect(seen.map((c) => c.input)).toEqual([{ n: 1, v: 2 }, { v: 2 }]);
+    expect(echo.calls).toHaveLength(0);
+    expect(other.calls).toEqual([{ v: 2 }]);
+    const results = second.requests[0]!.messages.at(-1)!.content;
+    expect(results[0]).toMatchObject({ toolUseId: "t1", isError: true });
+    expect(rt2.state.phase).toBe("idle");
+  });
+});
+
+describe("插件写入日志（I-5）与会话引用（3.4）", () => {
+  test("插件的派生数据先落盘再使用，重建时不需要插件", async () => {
+    const store = new MemoryLogStore();
+    const { provider, requests } = scripted([
+      { content: [text("a")], stopReason: "end" },
+      { content: [text("b")], stopReason: "end" },
+    ]);
+    let summaries = 0;
+    const compactor = plugin("compact", {
+      needs: ["transform:context.project", "log:record", "log:emit"],
+      hooks: [
+        {
+          kind: "transform",
+          point: "context.project",
+          fn: async (messages, ctx) => {
+            let summary = ctx.derived["compact/summary"] as string | undefined;
+            if (summary === undefined) {
+              summary = `summary-${++summaries}`;
+              await ctx.record("compact/summary", summary);
+              await ctx.emit("compacted", { kept: 1 });
+            }
+            return [{ role: "user", content: [{ kind: "text", text: summary, origin: { by: "plugin", id: "compact" }, trust: "trusted" }] }, ...messages.slice(-1)];
+          },
+        },
+      ],
+    });
+    const rt = await Runtime.create({ store, provider, plugins: [compactor] });
+    await rt.send(say("one"));
+    await rt.send(say("two"));
+
+    expect(summaries).toBe(1);
+    expect(requests[1]!.messages[0]!.content[0]).toMatchObject({ text: "summary-1" });
+    const events = await readAll(store, rt.state.sessionId);
+    const custom = events.find((e) => e.type === "compact/compacted")!;
+    expect(custom.origin).toEqual({ by: "plugin", id: "compact" });
+    expect(rebuild(rt.state.sessionId, events).derived).toEqual({ "compact/summary": "summary-1" });
+  });
+
+  test("声明了内核不提供的能力时拒绝加载（8.2）", async () => {
+    const { provider } = scripted([]);
+    await expect(
+      Runtime.create({ store: new MemoryLogStore(), provider, plugins: [plugin("x", { needs: ["gate:teleport"] })] }),
+    ).rejects.toBeInstanceOf(PluginIncompatible);
+  });
+
+  test("子会话双向引用，且引用必须能解析", async () => {
+    const store = new MemoryLogStore();
+    let childSeq = 0;
+    const spawn = recordingTool("spawn", {
+      async execute(_input, ctx) {
+        const { provider } = scripted([{ content: [text("child done")], stopReason: "end" }]);
+        const child = await Runtime.create({ store, provider, parent: ctx.parent });
+        await child.send(say("go"));
+        childSeq = child.state.lastSeq;
+        return { content: "ok", child: { sessionId: child.state.sessionId, seq: child.state.lastSeq } };
+      },
+    });
+    const { provider } = scripted([
+      { content: [toolUse("t1", "spawn", {})], stopReason: "tool_use" },
+      { content: [text("done")], stopReason: "end" },
+    ]);
+    const rt = await Runtime.create({ store, provider, plugins: [plugin("p", { tools: [spawn.tool] })] });
+    await rt.send(say("hi"));
+
+    const events = await readAll(store, rt.state.sessionId);
+    const decided = events.find((e) => e.type === "tool.decided")!;
+    const completed = events.find((e) => e.type === "tool.completed")! as Event<"tool.completed">;
+    const childId = completed.data.child!.sessionId;
+    expect(completed.data.child).toEqual({ sessionId: childId, seq: childSeq });
+    const childStart = (await readAll(store, childId))[0] as Event<"session.started">;
+    expect(childStart.data.parent).toEqual({ sessionId: rt.state.sessionId, eventId: decided.id });
+
+    await expect(
+      Runtime.create({ store, provider, parent: { sessionId: "nope", eventId: "nope" } }),
+    ).rejects.toBeInstanceOf(UnresolvedRef);
   });
 });
 
