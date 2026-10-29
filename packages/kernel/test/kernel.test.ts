@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   HookFailure,
   MemoryLogStore,
+  ModelOutputModified,
   PluginIncompatible,
   PluginsHeld,
   Runtime,
@@ -11,6 +12,7 @@ import {
   type Block,
   type Event,
   type LogStore,
+  type Message,
   type ModelRequest,
   type ModelResponse,
   type Plugin,
@@ -604,6 +606,82 @@ describe("插件写入日志（I-5）与会话引用（3.4）", () => {
     await expect(
       Runtime.create({ store, provider, parent: { sessionId: "nope", eventId: "nope" } }),
     ).rejects.toBeInstanceOf(UnresolvedRef);
+  });
+});
+
+describe("模型输出不可改写（I-6）", () => {
+  const thinking: Block = {
+    kind: "thinking",
+    text: "hmm",
+    origin: MODEL,
+    trust: "trusted",
+    ext: { scripted: { signature: "sig-1" } },
+  };
+
+  /** 第一轮产生模型输出，第二轮让 hook 处理带着这些输出的历史 */
+  async function secondTurnWith(point: "context.project" | "model.before", fn: (m: Message[]) => Message[], optional = false) {
+    const { provider, requests } = scripted([
+      { content: [thinking, text("first")], stopReason: "end" },
+      { content: [text("second")], stopReason: "end" },
+    ]);
+    let active = false;
+    const hook =
+      point === "context.project"
+        ? { kind: "transform" as const, point, optional, fn: (m: Message[]) => (active ? fn(m) : m) }
+        : { kind: "transform" as const, point, optional, fn: (r: ModelRequest) => (active ? { ...r, messages: fn(r.messages) } : r) };
+    const store = new MemoryLogStore();
+    const rt = await Runtime.create({ store, provider, plugins: [plugin("proj", { hooks: [hook] })] });
+    await rt.send(say("one"));
+    active = true;
+    const notices: RuntimeNotice[] = [];
+    rt.subscribe((n) => notices.push(n));
+    const outcome = await rt.send(say("two")).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    return { outcome, requests, notices, events: await readAll(store, rt.state.sessionId) };
+  }
+
+  const editText = (ms: Message[]) =>
+    ms.map((m) => ({ ...m, content: m.content.map((b) => (b.kind === "text" && b.origin.by === "model" ? { ...b, text: "edited" } : b)) }));
+
+  test("省略整块或整条消息、复制时调换键顺序都允许", async () => {
+    const { outcome, requests } = await secondTurnWith("context.project", (ms) =>
+      ms.map((m) => ({
+        ...m,
+        content: m.content
+          .filter((b) => b.kind !== "text" || b.origin.by !== "model")
+          .map((b) => (b.kind === "thinking" ? { ext: b.ext, trust: b.trust, origin: b.origin, text: b.text, kind: b.kind } : b)),
+      })),
+    );
+    expect(outcome).toBeUndefined();
+    expect(requests[1]!.messages[1]!.content).toEqual([thinking]);
+  });
+
+  test("编辑模型文本：本轮失败，归咎于做出修改的插件，请求没有发出", async () => {
+    const { outcome, requests, events } = await secondTurnWith("context.project", editText);
+    expect(outcome).toBeInstanceOf(HookFailure);
+    expect((outcome as HookFailure).plugin).toBe("proj");
+    expect((outcome as HookFailure).cause).toBeInstanceOf(ModelOutputModified);
+    expect(requests).toHaveLength(1);
+    expect(events.at(-1)).toMatchObject({ type: "turn.ended", data: { reason: "error" } });
+  });
+
+  test("改写 ext 中的签名同样算编辑；model.before 也受约束", async () => {
+    const { outcome } = await secondTurnWith("model.before", (ms) =>
+      ms.map((m) => ({
+        ...m,
+        content: m.content.map((b) => (b.kind === "thinking" ? { ...b, ext: { scripted: { signature: "forged" } } } : b)),
+      })),
+    );
+    expect((outcome as HookFailure).cause).toBeInstanceOf(ModelOutputModified);
+  });
+
+  test("optional 的 hook 违反时丢弃它的输出并通知，请求里仍是原文", async () => {
+    const { outcome, requests, notices } = await secondTurnWith("context.project", editText, true);
+    expect(outcome).toBeUndefined();
+    expect(requests[1]!.messages[1]!.content[1]).toMatchObject({ text: "first" });
+    expect(notices.some((n) => n.type === "hook-error" && n.info.error instanceof ModelOutputModified)).toBe(true);
   });
 });
 

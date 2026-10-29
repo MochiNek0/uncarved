@@ -147,12 +147,16 @@ export class HookBus {
     point: P,
     value: TransformPayloads[P],
     ctx: HookContextFor,
+    /** 对每个 hook 的输出做检查，抛错视同该 hook 出错 */
+    check?: (value: TransformPayloads[P]) => void,
   ): Promise<TransformPayloads[P]> {
     for (const h of this.ordered(point)) {
       if (h.spec.kind !== "transform") continue;
       try {
         const out = await invoke(h.spec.fn as AnyFn, value, ctx(h.plugin), h.spec.timeoutMs);
-        if (out !== undefined) value = out as TransformPayloads[P];
+        const next = out === undefined ? value : (out as TransformPayloads[P]);
+        check?.(next);
+        value = next;
       } catch (error) {
         if (h.spec.optional) {
           this.#onError({ plugin: h.plugin, point, error });

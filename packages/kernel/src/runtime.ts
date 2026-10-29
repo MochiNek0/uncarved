@@ -22,6 +22,7 @@ import type {
   Effect,
   Event,
   EventDataMap,
+  Message,
   ModelRequest,
   Origin,
   PendingCall,
@@ -63,6 +64,14 @@ export class PluginsHeld extends Error {
     super(`plugin change not accepted (${resolution})`);
     this.name = "PluginsHeld";
     this.resolution = resolution;
+  }
+}
+
+/** 投影中带模型来源的块与日志中的任何模型块都不一致（I-6） */
+export class ModelOutputModified extends Error {
+  constructor() {
+    super("model output block was modified");
+    this.name = "ModelOutputModified";
   }
 }
 
@@ -271,7 +280,12 @@ export class Runtime {
 
   async #callModel(): Promise<void> {
     const signal = this.#abort.signal;
-    const messages = await this.#transform("context.project", structuredClone(this.#state.messages));
+    // 模型块只能整块省略，不能编辑（I-6）：每个 hook 的输出都要检查
+    const logged = modelBlocks(this.#state.messages);
+    const unmodified = (messages: Message[]) => {
+      for (const b of modelBlocks(messages)) if (!logged.has(b)) throw new ModelOutputModified();
+    };
+    const messages = await this.#transform("context.project", structuredClone(this.#state.messages), unmodified);
     let request: ModelRequest = {
       system: [],
       messages,
@@ -281,9 +295,9 @@ export class Runtime {
         inputSchema: t.inputSchema,
       })),
     };
-    request = await this.#transform("context.build", request);
+    request = await this.#transform("context.build", request, (r) => unmodified(r.messages));
     if (cacheOrderBroken(request.system)) this.#notify({ type: "warning", code: "cache-order" });
-    request = await this.#transform("model.before", request);
+    request = await this.#transform("model.before", request, (r) => unmodified(r.messages));
 
     const requestHash = createHash("sha256").update(JSON.stringify(request)).digest("hex");
     await this.#commit("model.requested", { requestHash }, RUNTIME);
@@ -415,8 +429,12 @@ export class Runtime {
     };
   };
 
-  #transform<P extends TransformPoint>(point: P, value: TransformPayloads[P]) {
-    return this.#hooks.transform(point, value, this.#hookCtx);
+  #transform<P extends TransformPoint>(
+    point: P,
+    value: TransformPayloads[P],
+    check?: (value: TransformPayloads[P]) => void,
+  ) {
+    return this.#hooks.transform(point, value, this.#hookCtx, check);
   }
 
   #gate<P extends GatePoint>(point: P, payload: GatePayloads[P]) {
@@ -443,6 +461,24 @@ export class Runtime {
 async function resolves(store: LogStore, sessionId: string, match: (e: Event) => boolean): Promise<boolean> {
   for await (const e of store.read(sessionId)) if (match(e)) return true;
   return false;
+}
+
+/** 消息中所有模型来源的块，按规范化的 JSON 表示（键排序，忽略键的顺序） */
+function modelBlocks(messages: Message[]): Set<string> {
+  const out = new Set<string>();
+  for (const m of messages) for (const b of m.content) if (b.origin.by === "model") out.add(canonical(b));
+  return out;
+}
+
+function canonical(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(canonical).join(",")}]`;
+  if (v && typeof v === "object") {
+    const keys = Object.keys(v)
+      .filter((k) => (v as Record<string, unknown>)[k] !== undefined)
+      .sort();
+    return `{${keys.map((k) => `${JSON.stringify(k)}:${canonical((v as Record<string, unknown>)[k])}`).join(",")}}`;
+  }
+  return JSON.stringify(v) ?? "null";
 }
 
 function cacheOrderBroken(system: SystemSegment[]): boolean {
