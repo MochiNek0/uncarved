@@ -12,6 +12,7 @@ import {
 } from "./hooks.ts";
 import { checkCompat, resumePolicy, type Plugin } from "./plugin.ts";
 import { initialState, rebuild, step } from "./step.ts";
+import { isConfirmed, UntrustedPlugin } from "./trust.ts";
 import { readAll, type LogStore } from "./store.ts";
 import type {
   Block,
@@ -102,6 +103,7 @@ export class Runtime {
     const plugins = opts.plugins ?? [];
     for (const p of plugins) {
       checkCompat(p);
+      if (p.layer === "project" && !isConfirmed(p)) throw new UntrustedPlugin(p.id, "not loaded via loadProjectPlugin");
       for (const t of p.tools ?? []) {
         if (this.#tools.has(t.name)) throw new Error(`duplicate tool name ${t.name} (plugin ${p.id})`);
         this.#tools.set(t.name, t);

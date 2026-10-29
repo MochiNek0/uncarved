@@ -3,7 +3,7 @@ import { appendFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { readAll, Runtime, type Block, type Event, type Provider, type Tool } from "uncarved";
-import { CorruptLog, JsonlLogStore } from "../src/index.ts";
+import { CorruptLog, JsonlLogStore, JsonlTrustStore } from "../src/index.ts";
 
 let dir: string;
 beforeEach(async () => {
@@ -98,6 +98,20 @@ test("中间某行损坏时报错，不跳过", async () => {
   const err = await readAll(new JsonlLogStore(dir), "s1").catch((e) => e);
   expect(err).toBeInstanceOf(CorruptLog);
   expect(err.line).toBe(2);
+});
+
+test("信任记录跨实例保留，末尾未写完的一行不算确认", async () => {
+  const file = path.join(dir, "trust", "trusted.jsonl");
+  const record = { hash: "h1", path: "/p", at: "2026-01-01T00:00:00.000Z" };
+  await new JsonlTrustStore(file).add(record);
+  await appendFile(file, JSON.stringify({ ...record, hash: "h2" }).slice(0, 15));
+
+  const restarted = new JsonlTrustStore(file);
+  expect(await restarted.has("h1")).toBe(true);
+  expect(await restarted.has("h2")).toBe(false);
+  await restarted.add({ ...record, hash: "h3" });
+  expect(await restarted.has("h3")).toBe(true);
+  expect(await new JsonlTrustStore(path.join(dir, "missing.jsonl")).has("h1")).toBe(false);
 });
 
 test("拒绝会写到目录之外的会话 ID", async () => {

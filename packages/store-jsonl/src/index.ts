@@ -1,4 +1,5 @@
 // 文件日志存储：每个会话一个 .jsonl 文件，一行一个事件。对应宪法 4.2、4.3。
+// 另有信任确认记录的文件存储，对应 7.1。
 //
 // - append 写入后 fsync，resolve 即代表已持久化
 // - 崩溃可能在文件末尾留下不完整的一行。这次写入从未 resolve，所以读取时忽略它，
@@ -7,7 +8,7 @@
 
 import { mkdir, open, readFile } from "node:fs/promises";
 import path from "node:path";
-import type { Event, LogStore } from "uncarved";
+import type { Event, LogStore, TrustRecord, TrustStore } from "uncarved";
 
 export class CorruptLog extends Error {
   readonly sessionId: string;
@@ -73,6 +74,40 @@ export class JsonlLogStore implements LogStore {
       throw new Error(`invalid session id for file storage: ${JSON.stringify(sessionId)}`);
     }
     return path.join(this.dir, `${sessionId}.jsonl`);
+  }
+}
+
+/** 信任确认记录（7.1）：一个 .jsonl 文件，一行一条记录，只追加 */
+export class JsonlTrustStore implements TrustStore {
+  readonly file: string;
+
+  constructor(file: string) {
+    this.file = file;
+  }
+
+  async has(hash: string): Promise<boolean> {
+    let text: string;
+    try {
+      text = await readFile(this.file, "utf8");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw err;
+    }
+    const lines = text.split("\n");
+    lines.pop(); // 未写完的一行从未确认成功，忽略
+    return lines.some((line) => (JSON.parse(line) as TrustRecord).hash === hash);
+  }
+
+  async add(record: TrustRecord): Promise<void> {
+    await mkdir(path.dirname(this.file), { recursive: true });
+    await dropTornTail(this.file);
+    const fh = await open(this.file, "a");
+    try {
+      await fh.writeFile(JSON.stringify(record) + "\n");
+      await fh.sync();
+    } finally {
+      await fh.close();
+    }
   }
 }
 

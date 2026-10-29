@@ -316,12 +316,13 @@ describe("关卡与变换", () => {
       store: new MemoryLogStore(),
       provider,
       plugins: [
-        plugin("project", { layer: "project", hooks: [noop] }),
+        // 项目层插件必须经加载器确认（7.1），这里用会话层验证层级排序
+        plugin("session", { layer: "session", hooks: [noop] }),
         plugin("user", { layer: "user", hooks: [noop] }),
         plugin("early", { layer: "session", hooks: [{ ...noop, order: -1 }] }),
       ],
     });
-    expect(rt.hookOrder("event")).toEqual(["early", "user", "project"]);
+    expect(rt.hookOrder("event")).toEqual(["early", "user", "session"]);
   });
 });
 
