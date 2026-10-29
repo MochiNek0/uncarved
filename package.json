@@ -14,6 +14,7 @@
     "@uncarved/provider-anthropic": "workspace:*",
     "@uncarved/plugin-stdio": "workspace:*",
     "@uncarved/provider-openai-compat": "workspace:*",
+    "@uncarved/provider-openai-responses": "workspace:*",
     "@uncarved/store-jsonl": "workspace:*",
     "typescript": "^7.0.2",
     "uncarved": "workspace:*"

@@ -9,6 +9,7 @@
         "@uncarved/plugin-stdio": "workspace:*",
         "@uncarved/provider-anthropic": "workspace:*",
         "@uncarved/provider-openai-compat": "workspace:*",
+        "@uncarved/provider-openai-responses": "workspace:*",
         "@uncarved/store-jsonl": "workspace:*",
         "typescript": "^7.0.2",
         "uncarved": "workspace:*",
@@ -37,6 +38,13 @@
     },
     "packages/provider-openai-compat": {
       "name": "@uncarved/provider-openai-compat",
+      "version": "0.1.0",
+      "peerDependencies": {
+        "uncarved": "workspace:*",
+      },
+    },
+    "packages/provider-openai-responses": {
+      "name": "@uncarved/provider-openai-responses",
       "version": "0.1.0",
       "peerDependencies": {
         "uncarved": "workspace:*",
@@ -108,6 +116,8 @@
     "@uncarved/provider-anthropic": ["@uncarved/provider-anthropic@workspace:packages/provider-anthropic"],
 
     "@uncarved/provider-openai-compat": ["@uncarved/provider-openai-compat@workspace:packages/provider-openai-compat"],
+
+    "@uncarved/provider-openai-responses": ["@uncarved/provider-openai-responses@workspace:packages/provider-openai-responses"],
 
     "@uncarved/store-jsonl": ["@uncarved/store-jsonl@workspace:packages/store-jsonl"],
 

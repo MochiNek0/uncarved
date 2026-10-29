@@ -7,6 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { anthropicProvider } from "@uncarved/provider-anthropic";
 import { openaiCompatProvider } from "@uncarved/provider-openai-compat";
+import { openaiResponsesProvider } from "@uncarved/provider-openai-responses";
 import { MemoryLogStore, Runtime, type Layer, type Plugin, type SystemSegment } from "uncarved";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -84,14 +85,20 @@ const readFileTool: Plugin = {
   ],
 };
 
-// 设置了 AGNES_API_KEY 就用 Agnes 的免费模型，否则用 Claude
-const provider = process.env.AGNES_API_KEY
-  ? openaiCompatProvider({
-      baseURL: "https://apihub.agnes-ai.com/v1",
-      apiKey: process.env.AGNES_API_KEY,
-      model: process.env.AGNES_MODEL ?? "agnes-3.0-flash",
+// 设置了 OPENAI_API_KEY 就用 OpenAI Responses API；设置了 AGNES_API_KEY 就用 Agnes 的免费模型；否则用 Claude
+const provider = process.env.OPENAI_API_KEY
+  ? openaiResponsesProvider({
+      baseURL: process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1",
+      apiKey: process.env.OPENAI_API_KEY,
+      model: process.env.OPENAI_MODEL ?? "gpt-5",
     })
-  : anthropicProvider();
+  : process.env.AGNES_API_KEY
+    ? openaiCompatProvider({
+        baseURL: "https://apihub.agnes-ai.com/v1",
+        apiKey: process.env.AGNES_API_KEY,
+        model: process.env.AGNES_MODEL ?? "agnes-3.0-flash",
+      })
+    : anthropicProvider();
 
 const rt = await Runtime.create({
   store: new MemoryLogStore(),

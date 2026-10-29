@@ -1,0 +1,204 @@
+import { expect, test } from "bun:test";
+import { MemoryLogStore, Runtime, type Block, type Tool } from "uncarved";
+import { openaiResponsesProvider } from "../src/index.ts";
+
+// 假的服务端：按顺序返回 SSE 事件，并记录请求体
+function fakeServer(responses: object[][]) {
+  const bodies: Record<string, any>[] = [];
+  const fetchFn = (async (_url: string, init: RequestInit) => {
+    bodies.push(JSON.parse(init.body as string));
+    const events = responses.shift() ?? [];
+    const sse = events.map((e) => `event: ${(e as { type: string }).type}\ndata: ${JSON.stringify(e)}\n\n`).join("");
+    // 故意切成小段，验证跨段拼接
+    const bytes = new TextEncoder().encode(sse);
+    const stream = new ReadableStream<Uint8Array>({
+      start(ctrl) {
+        for (let i = 0; i < bytes.length; i += 7) ctrl.enqueue(bytes.slice(i, i + 7));
+        ctrl.close();
+      },
+    });
+    return new Response(stream, { status: 200 });
+  }) as unknown as typeof fetch;
+  return { fetchFn, bodies };
+}
+
+const created = { type: "response.created", response: { model: "fake-1", status: "in_progress" } };
+const completed = (usage?: object) => ({ type: "response.completed", response: { model: "fake-1", status: "completed", usage } });
+const itemDone = (output_index: number, item: object) => ({ type: "response.output_item.done", output_index, item });
+
+const reasoning = {
+  type: "reasoning",
+  id: "rs_1",
+  summary: [{ type: "summary_text", text: "think" }],
+  encrypted_content: "ENC",
+};
+const message = (id: string, text: string) => ({
+  type: "message",
+  id,
+  role: "assistant",
+  status: "completed",
+  content: [{ type: "output_text", text, annotations: [] }],
+});
+const call = { type: "function_call", id: "fc_1", call_id: "call_1", name: "echo", arguments: '{"x": 1}', status: "completed" };
+
+const userSays = (text: string) => ({
+  kind: "message" as const,
+  content: [{ kind: "text" as const, text, origin: { by: "user" as const }, trust: "trusted" as const }],
+});
+
+test("在完整的内核循环里跑通：流式文本、推理、工具调用，输出 item 原样回传", async () => {
+  const { fetchFn, bodies } = fakeServer([
+    [
+      created,
+      { type: "response.reasoning_summary_text.delta", delta: "think" },
+      itemDone(0, reasoning),
+      { type: "response.output_text.delta", delta: "let me " },
+      { type: "response.output_text.delta", delta: "check" },
+      itemDone(1, message("msg_1", "let me check")),
+      { type: "response.function_call_arguments.delta", delta: '{"x"' },
+      itemDone(2, call),
+      completed({ input_tokens: 12, output_tokens: 3, input_tokens_details: { cached_tokens: 8 } }),
+    ],
+    [created, { type: "response.output_text.delta", delta: "done" }, itemDone(0, message("msg_2", "done")), completed()],
+  ]);
+
+  const seen: unknown[] = [];
+  const echo: Tool = {
+    name: "echo",
+    description: "echo",
+    inputSchema: { type: "object" },
+    effect: "read",
+    concurrency: "safe",
+    idempotent: true,
+    async execute(input) {
+      seen.push(input);
+      return { content: "echoed" };
+    },
+  };
+  const prompt = {
+    id: "prompt",
+    version: "1",
+    kernel: "^1",
+    hooks: [
+      {
+        kind: "transform" as const,
+        point: "context.build" as const,
+        fn: (r: any) => ({
+          ...r,
+          system: [{ text: "be brief", stability: "stable", origin: { by: "plugin", id: "prompt" }, trust: "trusted" }],
+        }),
+      },
+    ],
+  };
+
+  const rt = await Runtime.create({
+    store: new MemoryLogStore(),
+    provider: openaiResponsesProvider({ baseURL: "https://example.test/v1/", model: "fake-1", apiKey: "k", fetch: fetchFn }),
+    plugins: [{ id: "p", version: "1", kernel: "^1", tools: [echo] }, prompt],
+  });
+  const deltas: string[] = [];
+  rt.subscribe((n) => n.type === "delta" && deltas.push(`${n.delta.kind}:${n.delta.text}`));
+  await rt.send(userSays("hi"));
+
+  expect(deltas).toEqual(["thinking:think", "text:let me ", "text:check", "text:done"]);
+  expect(seen).toEqual([{ x: 1 }]);
+  const first = rt.state.messages[1]!.content;
+  expect(first.map((b) => b.kind)).toEqual(["thinking", "text", "tool_use"]);
+  expect(first[0]).toMatchObject({ text: "think", origin: { provider: "openai-responses", model: "fake-1" } });
+  expect(first[2]).toMatchObject({ id: "call_1", name: "echo", input: { x: 1 } });
+
+  expect(bodies[0]).toMatchObject({
+    model: "fake-1",
+    stream: true,
+    store: false,
+    include: ["reasoning.encrypted_content"],
+    instructions: "be brief",
+    tools: [{ type: "function", name: "echo", description: "echo", parameters: { type: "object" }, strict: false }],
+  });
+  // 无状态：去掉 id，其余字段（包括加密推理、原始参数字符串）原样回传
+  const { id: _r, ...reasoningNoId } = reasoning;
+  const { id: _m, ...messageNoId } = message("msg_1", "let me check");
+  const { id: _c, ...callNoId } = call;
+  expect(bodies[1]!.input).toEqual([
+    { type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] },
+    reasoningNoId,
+    messageNoId,
+    callNoId,
+    { type: "function_call_output", call_id: "call_1", output: "echoed" },
+  ]);
+  expect(rt.state.messages.at(-1)!.content[0]).toMatchObject({ kind: "text", text: "done" });
+});
+
+test("用量、截断与拒绝映射到内核的停止原因", async () => {
+  const complete = async (events: object[]) => {
+    const { fetchFn } = fakeServer([events]);
+    const provider = openaiResponsesProvider({ baseURL: "https://example.test/v1", model: "m", fetch: fetchFn });
+    return provider.complete({ system: [], tools: [], messages: [] }, { signal: new AbortController().signal });
+  };
+
+  const ok = await complete([itemDone(0, message("m1", "hi")), completed({ input_tokens: 5, output_tokens: 2, input_tokens_details: { cached_tokens: 4 } })]);
+  expect(ok.stopReason).toBe("end");
+  expect(ok.usage).toEqual({ inputTokens: 5, outputTokens: 2, cacheReadTokens: 4 });
+
+  const cut = await complete([
+    itemDone(0, message("m1", "partial")),
+    { type: "response.incomplete", response: { status: "incomplete", incomplete_details: { reason: "max_output_tokens" } } },
+  ]);
+  expect(cut.stopReason).toBe("max_tokens");
+
+  const refused = await complete([
+    itemDone(0, { type: "message", id: "m1", role: "assistant", content: [{ type: "refusal", refusal: "no" }] }),
+    completed(),
+  ]);
+  expect(refused.stopReason).toBe("refusal");
+  expect(refused.content[0]).toMatchObject({ kind: "text", text: "no" });
+
+  // 内核不认识的 item 作为 opaque 块原样保留
+  const builtin = await complete([itemDone(0, { type: "web_search_call", id: "ws_1", status: "completed" }), completed()]);
+  expect(builtin.content[0]).toMatchObject({ kind: "opaque", ext: { "openai-responses": { item: { type: "web_search_call" } } } });
+});
+
+test("失败事件与 HTTP 错误会让调用失败，并带上服务端的信息", async () => {
+  const { fetchFn } = fakeServer([[{ type: "response.failed", response: { status: "failed", error: { message: "overloaded" } } }]]);
+  const provider = openaiResponsesProvider({ baseURL: "https://example.test/v1", model: "m", fetch: fetchFn });
+  const req = { system: [], tools: [], messages: [] };
+  await expect(provider.complete(req, { signal: new AbortController().signal })).rejects.toThrow("overloaded");
+
+  const http = (async () => new Response('{"error":"bad key"}', { status: 401 })) as unknown as typeof fetch;
+  await expect(
+    openaiResponsesProvider({ baseURL: "https://example.test/v1", model: "m", fetch: http }).complete(req, {
+      signal: new AbortController().signal,
+    }),
+  ).rejects.toThrow("HTTP 401");
+});
+
+test("来自其他 provider 的历史：文本和工具调用按本格式重建，无法表达的块省略", async () => {
+  const { fetchFn, bodies } = fakeServer([[itemDone(0, message("m1", "ok")), completed()]]);
+  const other = { by: "model" as const, provider: "anthropic", model: "claude" };
+  const history: Block[] = [
+    { kind: "thinking", text: "hidden", origin: other, trust: "trusted", ext: { anthropic: { signature: "s" } } },
+    { kind: "text", text: "calling", origin: other, trust: "trusted" },
+    { kind: "tool_use", id: "toolu_1", name: "echo", input: { x: 1 }, origin: other, trust: "trusted" },
+  ];
+  const provider = openaiResponsesProvider({ baseURL: "https://example.test/v1", model: "m", fetch: fetchFn, store: true });
+  await provider.complete(
+    {
+      system: [],
+      tools: [],
+      messages: [
+        { role: "assistant", content: history },
+        {
+          role: "user",
+          content: [{ kind: "tool_result", toolUseId: "toolu_1", content: [], isError: true, origin: { by: "runtime" }, trust: "trusted" }],
+        },
+      ],
+    },
+    { signal: new AbortController().signal },
+  );
+  expect(bodies[0]).not.toHaveProperty("include");
+  expect(bodies[0]!.input).toEqual([
+    { type: "message", role: "assistant", content: [{ type: "output_text", text: "calling" }] },
+    { type: "function_call", call_id: "toolu_1", name: "echo", arguments: '{"x":1}' },
+    { type: "function_call_output", call_id: "toolu_1", output: "error" },
+  ]);
+});
