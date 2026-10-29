@@ -1,0 +1,9 @@
+{
+  "name": "uncarved",
+  "version": "0.1.0",
+  "description": "A minimal, fully customizable agent harness kernel",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}

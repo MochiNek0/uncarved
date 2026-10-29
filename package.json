@@ -1,0 +1,19 @@
+{
+  "name": "uncarved-workspace",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.4",
+    "@uncarved/provider-anthropic": "workspace:*",
+    "@uncarved/provider-openai-compat": "workspace:*",
+    "typescript": "^7.0.2",
+    "uncarved": "workspace:*"
+  }
+}

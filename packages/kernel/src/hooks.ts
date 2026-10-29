@@ -1,0 +1,211 @@
+// 扩展点与组合规则。对应宪法第五章。
+
+import type { Awaitable, Event, Message, ModelRequest, ModelResponse, State, ToolCall, ToolOutcome } from "./types.ts";
+
+export interface TransformPayloads {
+  "context.project": Message[];
+  "context.build": ModelRequest;
+  "model.before": ModelRequest;
+  "tool.before": ToolCall;
+  "tool.after": ToolOutcome;
+}
+
+export interface GatePayloads {
+  "tool.gate": ToolCall;
+  "turn.continue": State;
+}
+
+export interface ObservePayloads {
+  "session.start": State;
+  "session.end": State;
+  "model.after": ModelResponse;
+  event: Event;
+}
+
+export type TransformPoint = keyof TransformPayloads;
+export type GatePoint = keyof GatePayloads;
+export type ObservePoint = keyof ObservePayloads;
+
+export type GateDecision = "deny" | "ask" | "allow" | "abstain";
+
+export interface GateResult {
+  decision: GateDecision;
+  /** 拒绝时交给模型看的说明，由插件提供（I-1） */
+  reason?: string;
+}
+
+export interface HookContext {
+  sessionId: string;
+  signal: AbortSignal;
+}
+
+interface HookCommon {
+  order?: number;
+  timeoutMs?: number;
+}
+
+export type HookSpec =
+  | {
+      [P in TransformPoint]: HookCommon & {
+        kind: "transform";
+        point: P;
+        /** 出错或超时时跳过，而不是让本轮失败 */
+        optional?: boolean;
+        fn: (value: TransformPayloads[P], ctx: HookContext) => Awaitable<TransformPayloads[P] | void>;
+      };
+    }[TransformPoint]
+  | {
+      [P in GatePoint]: HookCommon & {
+        kind: "gate";
+        point: P;
+        fn: (payload: GatePayloads[P], ctx: HookContext) => Awaitable<GateResult>;
+      };
+    }[GatePoint]
+  | {
+      [P in ObservePoint]: HookCommon & {
+        kind: "observe";
+        point: P;
+        fn: (payload: ObservePayloads[P], ctx: HookContext) => Awaitable<void>;
+      };
+    }[ObservePoint];
+
+/** 配置层级，后面的覆盖前面的（5.3） */
+export const LAYERS = ["builtin", "distro", "user", "project", "session"] as const;
+export type Layer = (typeof LAYERS)[number];
+
+export const DEFAULT_HOOK_TIMEOUT_MS = 30_000;
+
+export class HookTimeout extends Error {
+  constructor() {
+    super("hook timed out");
+    this.name = "HookTimeout";
+  }
+}
+
+export class HookFailure extends Error {
+  readonly plugin: string;
+  readonly point: string;
+  constructor(plugin: string, point: string, cause: unknown) {
+    super(`hook ${plugin} at ${point} failed: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+    this.name = "HookFailure";
+    this.plugin = plugin;
+    this.point = point;
+  }
+}
+
+export interface HookErrorInfo {
+  plugin: string;
+  point: string;
+  error: unknown;
+}
+
+interface Registered {
+  plugin: string;
+  layer: Layer;
+  index: number;
+  spec: HookSpec;
+}
+
+type AnyFn = (payload: unknown, ctx: HookContext) => Awaitable<unknown>;
+
+const GATE_RANK: Record<GateDecision, number> = { deny: 3, ask: 2, allow: 1, abstain: 0 };
+
+export class HookBus {
+  #hooks: Registered[] = [];
+  #onError: (info: HookErrorInfo) => void;
+
+  constructor(onError: (info: HookErrorInfo) => void) {
+    this.#onError = onError;
+  }
+
+  add(plugin: string, layer: Layer, spec: HookSpec): void {
+    this.#hooks.push({ plugin, layer, index: this.#hooks.length, spec });
+  }
+
+  /** 某个扩展点上的实际执行顺序（5.3） */
+  ordered(point: string): Registered[] {
+    return this.#hooks
+      .filter((h) => h.spec.point === point)
+      .sort(
+        (a, b) =>
+          (a.spec.order ?? 0) - (b.spec.order ?? 0) ||
+          LAYERS.indexOf(a.layer) - LAYERS.indexOf(b.layer) ||
+          a.index - b.index,
+      );
+  }
+
+  async transform<P extends TransformPoint>(
+    point: P,
+    value: TransformPayloads[P],
+    ctx: HookContext,
+  ): Promise<TransformPayloads[P]> {
+    for (const h of this.ordered(point)) {
+      if (h.spec.kind !== "transform") continue;
+      try {
+        const out = await invoke(h.spec.fn as AnyFn, value, ctx, h.spec.timeoutMs);
+        if (out !== undefined) value = out as TransformPayloads[P];
+      } catch (error) {
+        if (h.spec.optional) {
+          this.#onError({ plugin: h.plugin, point, error });
+          continue;
+        }
+        throw new HookFailure(h.plugin, point, error);
+      }
+    }
+    return value;
+  }
+
+  /** 全部执行后合并：deny > ask > allow > abstain；出错或超时视为 deny */
+  async gate<P extends GatePoint>(
+    point: P,
+    payload: GatePayloads[P],
+    ctx: HookContext,
+  ): Promise<GateResult & { by?: string }> {
+    const hooks = this.ordered(point).filter((h) => h.spec.kind === "gate");
+    const results = await Promise.all(
+      hooks.map(async (h) => {
+        try {
+          const r = (await invoke(h.spec.fn as AnyFn, payload, ctx, h.spec.timeoutMs)) as GateResult;
+          return { ...r, by: h.plugin };
+        } catch (error) {
+          this.#onError({ plugin: h.plugin, point, error });
+          return { decision: "deny" as const, by: h.plugin };
+        }
+      }),
+    );
+    let best: GateResult & { by?: string } = { decision: "abstain" };
+    for (const r of results) if (GATE_RANK[r.decision] > GATE_RANK[best.decision]) best = r;
+    return best;
+  }
+
+  /** 并发执行，不等待，错误只记录 */
+  observe<P extends ObservePoint>(point: P, payload: ObservePayloads[P], ctx: HookContext): void {
+    for (const h of this.ordered(point)) {
+      if (h.spec.kind !== "observe") continue;
+      invoke(h.spec.fn as AnyFn, payload, ctx, h.spec.timeoutMs).catch((error) =>
+        this.#onError({ plugin: h.plugin, point, error }),
+      );
+    }
+  }
+}
+
+async function invoke(fn: AnyFn, payload: unknown, ctx: HookContext, timeoutMs = DEFAULT_HOOK_TIMEOUT_MS) {
+  const ac = new AbortController();
+  const forward = () => ac.abort(ctx.signal.reason);
+  ctx.signal.addEventListener("abort", forward, { once: true });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(() => fn(payload, { ...ctx, signal: ac.signal })),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          ac.abort();
+          reject(new HookTimeout());
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+    ctx.signal.removeEventListener("abort", forward);
+  }
+}
