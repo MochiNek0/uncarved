@@ -8,6 +8,7 @@
         "@types/bun": "^1.4.4",
         "@uncarved/provider-anthropic": "workspace:*",
         "@uncarved/provider-openai-compat": "workspace:*",
+        "@uncarved/store-jsonl": "workspace:*",
         "typescript": "^7.0.2",
         "uncarved": "workspace:*",
       },
@@ -28,6 +29,13 @@
     },
     "packages/provider-openai-compat": {
       "name": "@uncarved/provider-openai-compat",
+      "version": "0.1.0",
+      "peerDependencies": {
+        "uncarved": "workspace:*",
+      },
+    },
+    "packages/store-jsonl": {
+      "name": "@uncarved/store-jsonl",
       "version": "0.1.0",
       "peerDependencies": {
         "uncarved": "workspace:*",
@@ -90,6 +98,8 @@
     "@uncarved/provider-anthropic": ["@uncarved/provider-anthropic@workspace:packages/provider-anthropic"],
 
     "@uncarved/provider-openai-compat": ["@uncarved/provider-openai-compat@workspace:packages/provider-openai-compat"],
+
+    "@uncarved/store-jsonl": ["@uncarved/store-jsonl@workspace:packages/store-jsonl"],
 
     "bun-types": ["bun-types@1.4.4", "", { "dependencies": { "@types/node": "*", "undici-types": "*" } }, "sha512-yjrJh5oGX7mMPKGd19YXyIjmEuj4G4zNC30bs7PM9Az7NQ3ndF3j6hbeRdvJTRQEhJ/FYQwW0a2moweEi2hMxQ=="],
 
