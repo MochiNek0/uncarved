@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { MemoryLogStore, ProviderError, Runtime, type Tool } from "uncarved";
+import { MemoryLogStore, ProviderError, Runtime, type Block, type Tool } from "uncarved";
 import { openaiCompatProvider, PROVIDER_ID } from "../src/index.ts";
 
 // 假的服务端：按顺序返回 SSE 响应，并记录请求体
@@ -123,4 +123,31 @@ test("ext 与构造参数：body、headers 按 默认值 < ext 合并，保留�
   await expect(
     provider.complete({ system: [], tools: [], messages: [], ext: { [PROVIDER_ID]: { body: { stream: false } } } }, { signal }),
   ).rejects.toThrow('must not set "stream"');
+});
+
+test("错误的工具结果加上 [error] 前缀，这个格式没有 is_error 字段", async () => {
+  const { fetchFn, bodies } = fakeServer([[chunk({ content: "ok" }, "stop")]]);
+  const provider = openaiCompatProvider({ baseURL: "https://example.test/v1", model: "m", fetch: fetchFn });
+  const origin = { by: "plugin" as const, id: "policy" };
+  const result = (toolUseId: string, text: string | undefined, isError: boolean): Block => ({
+    kind: "tool_result",
+    toolUseId,
+    content: text === undefined ? [] : [{ kind: "text", text, origin, trust: "trusted" }],
+    isError,
+    origin,
+    trust: "trusted",
+  });
+  await provider.complete(
+    {
+      system: [],
+      tools: [],
+      messages: [{ role: "user", content: [result("c1", "denied by policy", true), result("c2", undefined, true), result("c3", "fine", false)] }],
+    },
+    { signal: new AbortController().signal },
+  );
+  expect(bodies[0]!.messages).toEqual([
+    { role: "tool", tool_call_id: "c1", content: "[error] denied by policy" },
+    { role: "tool", tool_call_id: "c2", content: "error" },
+    { role: "tool", tool_call_id: "c3", content: "fine" },
+  ]);
 });

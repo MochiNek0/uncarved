@@ -264,3 +264,25 @@ test("来自其他 provider 的历史：文本和工具调用按本格式重建�
     { type: "function_call_output", call_id: "toolu_1", output: "error" },
   ]);
 });
+
+test("错误的工具结果加上 [error] 前缀，这个格式没有 is_error 字段", async () => {
+  const { fetchFn, bodies } = fakeServer([[itemDone(0, message("m1", "ok")), completed()]]);
+  const provider = openaiResponsesProvider({ baseURL: "https://example.test/v1", model: "m", fetch: fetchFn });
+  const origin = { by: "plugin" as const, id: "policy" };
+  const result = (toolUseId: string, text: string, isError: boolean): Block => ({
+    kind: "tool_result",
+    toolUseId,
+    content: [{ kind: "text", text, origin, trust: "trusted" }],
+    isError,
+    origin,
+    trust: "trusted",
+  });
+  await provider.complete(
+    { system: [], tools: [], messages: [{ role: "user", content: [result("c1", "denied by policy", true), result("c2", "fine", false)] }] },
+    { signal: new AbortController().signal },
+  );
+  expect(bodies[0]!.input).toEqual([
+    { type: "function_call_output", call_id: "c1", output: "[error] denied by policy" },
+    { type: "function_call_output", call_id: "c2", output: "fine" },
+  ]);
+});

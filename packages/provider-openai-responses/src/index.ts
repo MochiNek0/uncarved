@@ -275,8 +275,8 @@ function fromUser(m: Message): Item[] {
   for (const b of m.content) {
     if (b.kind === "tool_result") {
       const body = b.content.flatMap((c) => (c.kind === "text" ? [c.text] : [])).join("\n");
-      // 这个格式没有 is_error 字段；空的错误结果给一个最小占位
-      out.push({ type: "function_call_output", call_id: b.toolUseId, output: body || (b.isError ? "error" : "") });
+      // 这个格式没有 is_error 字段，错误结果加前缀，否则模型会把拒绝理由当成正常输出；空的错误结果给一个最小占位
+      out.push({ type: "function_call_output", call_id: b.toolUseId, output: b.isError ? errorText(body) : body });
     } else if (b.kind === "text") {
       texts.push({ type: "input_text", text: b.text });
     }
@@ -315,4 +315,8 @@ async function* readSSE(body: ReadableStream<Uint8Array>): AsyncGenerator<Stream
       yield JSON.parse(data) as StreamEvent;
     }
   }
+}
+
+function errorText(body: string): string {
+  return body ? `[error] ${body}` : "error";
 }
