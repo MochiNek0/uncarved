@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
-import { MemoryLogStore, Runtime, type Tool } from "uncarved";
-import { openaiCompatProvider } from "../src/index.ts";
+import { MemoryLogStore, ProviderError, Runtime, type Tool } from "uncarved";
+import { openaiCompatProvider, PROVIDER_ID } from "../src/index.ts";
 
 // 假的服务端：按顺序返回 SSE 响应，并记录请求体
 function fakeServer(responses: string[][]) {
@@ -79,10 +79,48 @@ test("在完整的内核循环里跑通：流式文本、分段的工具参数�
   ]);
 });
 
-test("HTTP 错误会让本轮失败，并带上服务端返回的信息", async () => {
-  const fetchFn = (async () => new Response('{"error":"Token not provided"}', { status: 401 })) as unknown as typeof fetch;
-  const provider = openaiCompatProvider({ baseURL: "https://example.test/v1", model: "m", fetch: fetchFn });
+test("HTTP 错误会让本轮失败，并带上服务端返回的信息和能否重试（4.7）", async () => {
+  const req = { system: [], tools: [], messages: [] };
+  const signal = new AbortController().signal;
+  const denied = (async () => new Response('{"error":"Token not provided"}', { status: 401 })) as unknown as typeof fetch;
+  const err = await openaiCompatProvider({ baseURL: "https://example.test/v1", model: "m", fetch: denied })
+    .complete(req, { signal })
+    .catch((e) => e);
+  expect(err).toBeInstanceOf(ProviderError);
+  expect(err).toMatchObject({ retryable: false, status: 401, message: expect.stringContaining("Token not provided") });
+
+  const busy = (async () => new Response("busy", { status: 503 })) as unknown as typeof fetch;
+  const err2 = await openaiCompatProvider({ baseURL: "https://example.test/v1", model: "m", fetch: busy })
+    .complete(req, { signal })
+    .catch((e) => e);
+  expect(err2).toMatchObject({ retryable: true, status: 503 });
+});
+
+test("ext 与构造参数：body、headers 按 默认值 < ext 合并，保留字段不能覆盖（4.7）", async () => {
+  const { fetchFn, bodies } = fakeServer([[chunk({ content: "ok" }, "stop")]]);
+  const headers: unknown[] = [];
+  const spy = ((url: string, init: RequestInit) => {
+    headers.push(init.headers);
+    return fetchFn(url, init);
+  }) as unknown as typeof fetch;
+  const provider = openaiCompatProvider({
+    baseURL: "https://example.test/v1",
+    model: "m",
+    apiKey: "k",
+    fetch: spy,
+    extraBody: { temperature: 1 },
+    headers: { authorization: "Token custom" },
+  });
+  const signal = new AbortController().signal;
+  await provider.complete(
+    { system: [], tools: [], messages: [], ext: { [PROVIDER_ID]: { body: { temperature: 0, enable_thinking: false } } } },
+    { signal },
+  );
+  expect(bodies[0]).toMatchObject({ model: "m", temperature: 0, enable_thinking: false, stream: true });
+  // 构造参数中的 headers 可以替换默认的认证方式
+  expect(headers[0]).toMatchObject({ authorization: "Token custom" });
+
   await expect(
-    provider.complete({ system: [], tools: [], messages: [] }, { signal: new AbortController().signal }),
-  ).rejects.toThrow("HTTP 401");
+    provider.complete({ system: [], tools: [], messages: [], ext: { [PROVIDER_ID]: { body: { stream: false } } } }, { signal }),
+  ).rejects.toThrow('must not set "stream"');
 });

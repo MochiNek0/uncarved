@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
-import { MemoryLogStore, Runtime, type Block, type Tool } from "uncarved";
-import { openaiResponsesProvider } from "../src/index.ts";
+import { MemoryLogStore, ProviderError, Runtime, type Block, type Tool } from "uncarved";
+import { openaiResponsesProvider, PROVIDER_ID } from "../src/index.ts";
 
 // 假的服务端：按顺序返回 SSE 事件，并记录请求体
 function fakeServer(responses: object[][]) {
@@ -115,15 +115,15 @@ test("在完整的内核循环里跑通：流式文本、推理、工具调用�
     instructions: "be brief",
     tools: [{ type: "function", name: "echo", description: "echo", parameters: { type: "object" }, strict: false }],
   });
-  // 无状态：去掉 id，其余字段（包括加密推理、原始参数字符串）原样回传
+  // 无状态：去掉 id，其余字段（包括加密推理、原始参数字符串）原样回传；
+  // function_call 保留 id，部分兼容服务端要求必填
   const { id: _r, ...reasoningNoId } = reasoning;
   const { id: _m, ...messageNoId } = message("msg_1", "let me check");
-  const { id: _c, ...callNoId } = call;
   expect(bodies[1]!.input).toEqual([
     { type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] },
     reasoningNoId,
     messageNoId,
-    callNoId,
+    call,
     { type: "function_call_output", call_id: "call_1", output: "echoed" },
   ]);
   expect(rt.state.messages.at(-1)!.content[0]).toMatchObject({ kind: "text", text: "done" });
@@ -158,18 +158,80 @@ test("用量、截断与拒绝映射到内核的停止原因", async () => {
   expect(builtin.content[0]).toMatchObject({ kind: "opaque", ext: { "openai-responses": { item: { type: "web_search_call" } } } });
 });
 
-test("失败事件与 HTTP 错误会让调用失败，并带上服务端的信息", async () => {
-  const { fetchFn } = fakeServer([[{ type: "response.failed", response: { status: "failed", error: { message: "overloaded" } } }]]);
+test("失败事件与 HTTP 错误会让调用失败，并带上服务端的信息和能否重试（4.7）", async () => {
+  const { fetchFn } = fakeServer([
+    [{ type: "response.failed", response: { status: "failed", error: { code: "server_error", message: "overloaded" } } }],
+  ]);
   const provider = openaiResponsesProvider({ baseURL: "https://example.test/v1", model: "m", fetch: fetchFn });
   const req = { system: [], tools: [], messages: [] };
-  await expect(provider.complete(req, { signal: new AbortController().signal })).rejects.toThrow("overloaded");
+  const failed = await provider.complete(req, { signal: new AbortController().signal }).catch((e) => e);
+  expect(failed).toBeInstanceOf(ProviderError);
+  expect(failed).toMatchObject({ retryable: true, message: expect.stringContaining("overloaded") });
 
   const http = (async () => new Response('{"error":"bad key"}', { status: 401 })) as unknown as typeof fetch;
+  const denied = await openaiResponsesProvider({ baseURL: "https://example.test/v1", model: "m", fetch: http })
+    .complete(req, { signal: new AbortController().signal })
+    .catch((e) => e);
+  expect(denied).toBeInstanceOf(ProviderError);
+  expect(denied).toMatchObject({ retryable: false, status: 401, message: expect.stringContaining("HTTP 401") });
+});
+
+test("ext 与构造参数：body、headers 按 默认值 < ext 合并，保留字段不能覆盖（4.7）", async () => {
+  const seen: RequestInit[] = [];
+  const fetchFn = (async (url: string, init: RequestInit) => {
+    seen.push(init);
+    const { fetchFn } = fakeServer([[itemDone(0, message("m1", "ok")), completed()]]);
+    return fetchFn(url, init);
+  }) as unknown as typeof fetch;
+  const provider = openaiResponsesProvider({
+    baseURL: "https://example.test/v1",
+    model: "m",
+    fetch: fetchFn,
+    extraBody: { temperature: 1, top_p: 0.5 },
+    headers: { "x-a": "default", "x-b": "default" },
+  });
+  const signal = new AbortController().signal;
+  await provider.complete(
+    {
+      system: [],
+      tools: [],
+      messages: [],
+      ext: { [PROVIDER_ID]: { body: { temperature: 0, model: "m-mini" }, headers: { "x-b": "ext" } }, other: { body: { x: 1 } } },
+    },
+    { signal },
+  );
+  expect(JSON.parse(seen[0]!.body as string)).toMatchObject({ model: "m-mini", temperature: 0, top_p: 0.5 });
+  expect(JSON.parse(seen[0]!.body as string)).not.toHaveProperty("x");
+  expect(seen[0]!.headers).toMatchObject({ "x-a": "default", "x-b": "ext" });
+
   await expect(
-    openaiResponsesProvider({ baseURL: "https://example.test/v1", model: "m", fetch: http }).complete(req, {
-      signal: new AbortController().signal,
-    }),
-  ).rejects.toThrow("HTTP 401");
+    provider.complete({ system: [], tools: [], messages: [], ext: { [PROVIDER_ID]: { body: { input: [] } } } }, { signal }),
+  ).rejects.toThrow('must not set "input"');
+  expect(seen).toHaveLength(1);
+});
+
+test("网络错误可以重试，取消照原样抛出；Retry-After 换算成毫秒", async () => {
+  const req = { system: [], tools: [], messages: [] };
+  const offline = (async () => {
+    throw new TypeError("fetch failed");
+  }) as unknown as typeof fetch;
+  const err = await openaiResponsesProvider({ baseURL: "https://example.test/v1", model: "m", fetch: offline })
+    .complete(req, { signal: new AbortController().signal })
+    .catch((e) => e);
+  expect(err).toMatchObject({ name: "ProviderError", retryable: true });
+
+  const ac = new AbortController();
+  ac.abort(new Error("stop"));
+  const aborted = await openaiResponsesProvider({ baseURL: "https://example.test/v1", model: "m", fetch: offline })
+    .complete(req, { signal: ac.signal })
+    .catch((e) => e);
+  expect(aborted).not.toBeInstanceOf(ProviderError);
+
+  const limited = (async () => new Response("slow down", { status: 429, headers: { "retry-after": "3" } })) as unknown as typeof fetch;
+  const r = await openaiResponsesProvider({ baseURL: "https://example.test/v1", model: "m", fetch: limited })
+    .complete(req, { signal: new AbortController().signal })
+    .catch((e) => e);
+  expect(r).toMatchObject({ retryable: true, status: 429, retryAfterMs: 3000 });
 });
 
 test("来自其他 provider 的历史：文本和工具调用按本格式重建，无法表达的块省略", async () => {

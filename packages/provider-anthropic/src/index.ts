@@ -1,7 +1,7 @@
 // Anthropic provider：把内核的 ModelRequest 翻译成 Claude Messages API 请求。
 
 import Anthropic from "@anthropic-ai/sdk";
-import type { Block, Message, Origin, Provider, StopReason, SystemSegment } from "uncarved";
+import { ProviderError, type Block, type Message, type Origin, type Provider, type StopReason, type SystemSegment } from "uncarved";
 
 type ContentBlock = Anthropic.Beta.BetaContentBlock;
 type ContentBlockParam = Anthropic.Beta.BetaContentBlockParam;
@@ -10,6 +10,17 @@ type TextBlockParam = Anthropic.Beta.BetaTextBlockParam;
 type ToolResultBlockParam = Anthropic.Beta.BetaToolResultBlockParam;
 
 export const PROVIDER_ID = "anthropic";
+
+/** ModelRequest.ext[PROVIDER_ID] 的格式（4.7） */
+export interface AnthropicExt {
+  /** 合并进请求参数 */
+  body?: Record<string, unknown>;
+  /** 合并进请求头 */
+  headers?: Record<string, string>;
+}
+
+// 由 ModelRequest 生成的字段，不能通过 extraBody / ext 覆盖
+const RESERVED = ["messages", "system", "tools", "stream"];
 
 export interface AnthropicProviderOptions {
   client?: Anthropic;
@@ -23,6 +34,10 @@ export interface AnthropicProviderOptions {
   thinkingDisplay?: "summarized" | "omitted";
   /** 模型因安全策略拒绝时，由服务端自动换模型重试。默认开启 */
   fallbacks?: boolean;
+  /** 每次请求都合并进请求参数，ext 中的 body 覆盖它 */
+  extraBody?: Record<string, unknown>;
+  /** 每次请求都合并进请求头，ext 中的 headers 覆盖它 */
+  headers?: Record<string, string>;
 }
 
 export function anthropicProvider(opts: AnthropicProviderOptions = {}): Provider {
@@ -32,6 +47,11 @@ export function anthropicProvider(opts: AnthropicProviderOptions = {}): Provider
   return {
     id: PROVIDER_ID,
     async complete(req, { signal, onDelta }) {
+      const ext = (req.ext?.[PROVIDER_ID] ?? {}) as AnthropicExt;
+      const extra = { ...opts.extraBody, ...ext.body };
+      const reserved = RESERVED.find((k) => k in extra);
+      if (reserved) throw new Error(`${PROVIDER_ID}: extra body must not set "${reserved}"`);
+
       const stream = client.beta.messages.stream(
         {
           model,
@@ -43,6 +63,7 @@ export function anthropicProvider(opts: AnthropicProviderOptions = {}): Provider
             : { betas: ["server-side-fallback-2026-07-01"], fallbacks: "default" as const }),
           // 自动在最后一个可缓存的块上打缓存标记，覆盖整段历史
           cache_control: { type: "ephemeral" },
+          ...extra,
           ...(req.system.length > 0 ? { system: toSystem(req.system) } : {}),
           ...(req.tools.length > 0
             ? {
@@ -55,21 +76,28 @@ export function anthropicProvider(opts: AnthropicProviderOptions = {}): Provider
             : {}),
           messages: req.messages.map(toParam),
         },
-        { signal },
+        { signal, headers: { ...opts.headers, ...ext.headers } },
       );
 
-      for await (const ev of stream) {
-        if (ev.type !== "content_block_delta") continue;
-        if (ev.delta.type === "text_delta") onDelta?.({ kind: "text", text: ev.delta.text });
-        else if (ev.delta.type === "thinking_delta") onDelta?.({ kind: "thinking", text: ev.delta.thinking });
+      let msg: Anthropic.Beta.BetaMessage;
+      try {
+        for await (const ev of stream) {
+          if (ev.type !== "content_block_delta") continue;
+          if (ev.delta.type === "text_delta") onDelta?.({ kind: "text", text: ev.delta.text });
+          else if (ev.delta.type === "thinking_delta") onDelta?.({ kind: "thinking", text: ev.delta.thinking });
+        }
+        msg = await stream.finalMessage();
+      } catch (err) {
+        throw toProviderError(err, signal);
       }
 
-      const msg = await stream.finalMessage();
       const origin: Origin = { by: "model", provider: PROVIDER_ID, model: msg.model };
+      const content = msg.content.map((b) => fromBlock(b, origin));
       return {
+        provider: PROVIDER_ID,
         model: msg.model,
-        content: msg.content.map((b) => fromBlock(b, origin)),
-        stopReason: toStopReason(msg.stop_reason),
+        content,
+        stopReason: toStopReason(msg.stop_reason, content.some((b) => b.kind === "tool_use")),
         usage: {
           inputTokens: msg.usage.input_tokens,
           outputTokens: msg.usage.output_tokens,
@@ -79,6 +107,20 @@ export function anthropicProvider(opts: AnthropicProviderOptions = {}): Provider
       };
     },
   };
+}
+
+/** SDK 的错误转成 ProviderError；取消和非 SDK 错误照原样抛出 */
+function toProviderError(err: unknown, signal: AbortSignal): unknown {
+  if (signal.aborted || !(err instanceof Anthropic.APIError) || err instanceof Anthropic.APIUserAbortError) return err;
+  const status = err.status;
+  const retryAfter = Number(err.headers?.get("retry-after"));
+  return new ProviderError(`${PROVIDER_ID} ${status === undefined ? "request failed" : `HTTP ${status}`}: ${err.message}`, {
+    // 没有状态码的是连接错误
+    retryable: status === undefined || status === 408 || status === 429 || status >= 500,
+    status,
+    retryAfterMs: Number.isFinite(retryAfter) ? retryAfter * 1000 : undefined,
+    cause: err,
+  });
 }
 
 /** 缓存标记打在最后一个 stable 段上 */
@@ -141,7 +183,9 @@ function toBlockParam(b: Block): ContentBlockParam[] {
   }
 }
 
-function toStopReason(r: string | null): StopReason {
+function toStopReason(r: string | null | undefined, hasToolUse: boolean): StopReason {
+  // 部分兼容服务端的流里没有 message_delta，拿不到 stop_reason（SDK 拼出的消息里没有这个字段）
+  if (r == null && hasToolUse) return "tool_use";
   switch (r) {
     case "end_turn":
     case "stop_sequence":

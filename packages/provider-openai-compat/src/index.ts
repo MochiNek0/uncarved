@@ -1,8 +1,19 @@
 // OpenAI 兼容格式（/chat/completions）的 provider，零依赖，基于 fetch + SSE。
 
-import type { Block, Message, ModelRequest, Origin, Provider, StopReason } from "uncarved";
+import { ProviderError, type Block, type Message, type ModelRequest, type Origin, type Provider, type StopReason } from "uncarved";
 
 export const PROVIDER_ID = "openai-compat";
+
+/** ModelRequest.ext[PROVIDER_ID] 的格式（4.7） */
+export interface OpenAICompatExt {
+  /** 合并进请求体 */
+  body?: Record<string, unknown>;
+  /** 合并进请求头 */
+  headers?: Record<string, string>;
+}
+
+// 由 ModelRequest 生成、或决定如何解析响应的字段，不能通过 extraBody / ext 覆盖
+const RESERVED = ["messages", "tools", "stream", "stream_options"];
 
 export interface OpenAICompatOptions {
   /** 例如 https://api.openai.com/v1 */
@@ -10,6 +21,10 @@ export interface OpenAICompatOptions {
   apiKey?: string;
   model: string;
   maxTokens?: number;
+  /** 每次请求都合并进请求体，ext 中的 body 覆盖它 */
+  extraBody?: Record<string, unknown>;
+  /** 每次请求都合并进请求头，ext 中的 headers 覆盖它 */
+  headers?: Record<string, string>;
   /** 可替换，便于测试 */
   fetch?: typeof fetch;
 }
@@ -41,18 +56,26 @@ export function openaiCompatProvider(opts: OpenAICompatOptions): Provider {
   return {
     id: PROVIDER_ID,
     async complete(req, { signal, onDelta }) {
-      const res = await doFetch(url, {
+      const ext = (req.ext?.[PROVIDER_ID] ?? {}) as OpenAICompatExt;
+      const extra = { ...opts.extraBody, ...ext.body };
+      const reserved = RESERVED.find((k) => k in extra);
+      if (reserved) throw new Error(`${PROVIDER_ID}: extra body must not set "${reserved}"`);
+
+      const res = await send(doFetch, url, signal, {
         method: "POST",
         signal,
         headers: {
           "content-type": "application/json",
           ...(opts.apiKey ? { authorization: `Bearer ${opts.apiKey}` } : {}),
+          ...opts.headers,
+          ...ext.headers,
         },
         body: JSON.stringify({
           model: opts.model,
           stream: true,
           stream_options: { include_usage: true },
           ...(opts.maxTokens ? { max_tokens: opts.maxTokens } : {}),
+          ...extra,
           messages: toMessages(req),
           ...(req.tools.length > 0
             ? {
@@ -64,11 +87,8 @@ export function openaiCompatProvider(opts: OpenAICompatOptions): Provider {
             : {}),
         }),
       });
-      if (!res.ok || !res.body) {
-        throw new Error(`${PROVIDER_ID} HTTP ${res.status}: ${(await res.text()).slice(0, 500)}`);
-      }
 
-      let model = opts.model;
+      let model = (extra.model as string | undefined) ?? opts.model;
       let text = "";
       let reasoning = "";
       let finish: string | null = null;
@@ -116,6 +136,7 @@ export function openaiCompatProvider(opts: OpenAICompatOptions): Provider {
       }
 
       return {
+        provider: PROVIDER_ID,
         model,
         content,
         stopReason: toStopReason(finish, calls.length > 0),
@@ -123,6 +144,36 @@ export function openaiCompatProvider(opts: OpenAICompatOptions): Provider {
       };
     },
   };
+}
+
+/** 发送请求；网络错误和 HTTP 错误都转成 ProviderError，取消照原样抛出 */
+async function send(doFetch: typeof fetch, url: string, signal: AbortSignal, init: RequestInit): Promise<Response & { body: ReadableStream<Uint8Array> }> {
+  let res: Response;
+  try {
+    res = await doFetch(url, init);
+  } catch (err) {
+    if (signal.aborted) throw err;
+    throw new ProviderError(`${PROVIDER_ID} request failed: ${err instanceof Error ? err.message : String(err)}`, {
+      retryable: true,
+      cause: err,
+    });
+  }
+  if (res.ok && res.body) return res as Response & { body: ReadableStream<Uint8Array> };
+  const status = res.status;
+  throw new ProviderError(`${PROVIDER_ID} HTTP ${status}: ${(await res.text()).slice(0, 500)}`, {
+    retryable: status === 408 || status === 429 || status >= 500,
+    status,
+    retryAfterMs: retryAfter(res.headers.get("retry-after")),
+  });
+}
+
+/** Retry-After 可以是秒数，也可以是 HTTP 日期 */
+function retryAfter(v: string | null): number | undefined {
+  if (!v) return undefined;
+  const seconds = Number(v);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  const at = Date.parse(v);
+  return Number.isNaN(at) ? undefined : Math.max(0, at - Date.now());
 }
 
 function toMessages(req: ModelRequest): ChatMessage[] {

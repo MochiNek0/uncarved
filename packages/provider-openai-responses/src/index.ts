@@ -4,9 +4,20 @@
 // - 模型输出的每个 item 原样存进块的 ext，回传时原样发回（I-6），
 //   推理模型的 encrypted_content 因此能跨轮保留
 
-import type { Block, Message, ModelRequest, Origin, Provider, StopReason, Usage } from "uncarved";
+import { ProviderError, type Block, type Message, type ModelRequest, type Origin, type Provider, type StopReason, type Usage } from "uncarved";
 
 export const PROVIDER_ID = "openai-responses";
+
+/** ModelRequest.ext[PROVIDER_ID] 的格式（4.7） */
+export interface OpenAIResponsesExt {
+  /** 合并进请求体 */
+  body?: Record<string, unknown>;
+  /** 合并进请求头 */
+  headers?: Record<string, string>;
+}
+
+// 由 ModelRequest 生成、或决定如何回传历史和解析响应的字段，不能通过 extraBody / ext 覆盖
+const RESERVED = ["input", "instructions", "tools", "stream", "store", "include"];
 
 export interface OpenAIResponsesOptions {
   /** 例如 https://api.openai.com/v1 */
@@ -17,6 +28,10 @@ export interface OpenAIResponsesOptions {
   reasoning?: { effort?: "minimal" | "low" | "medium" | "high"; summary?: "auto" | "concise" | "detailed" };
   /** 默认 false。为 true 时服务端保存响应，回传的 item 保留 id */
   store?: boolean;
+  /** 每次请求都合并进请求体，ext 中的 body 覆盖它 */
+  extraBody?: Record<string, unknown>;
+  /** 每次请求都合并进请求头，ext 中的 headers 覆盖它 */
+  headers?: Record<string, string>;
   /** 可替换，便于测试 */
   fetch?: typeof fetch;
 }
@@ -38,7 +53,7 @@ interface StreamEvent {
     status?: string;
     output?: Item[];
     incomplete_details?: { reason?: string } | null;
-    error?: { message?: string } | null;
+    error?: { code?: string; message?: string } | null;
     usage?: {
       input_tokens?: number;
       output_tokens?: number;
@@ -56,13 +71,20 @@ export function openaiResponsesProvider(opts: OpenAIResponsesOptions): Provider 
   return {
     id: PROVIDER_ID,
     async complete(req, { signal, onDelta }) {
+      const ext = (req.ext?.[PROVIDER_ID] ?? {}) as OpenAIResponsesExt;
+      const extra = { ...opts.extraBody, ...ext.body };
+      const reserved = RESERVED.find((k) => k in extra);
+      if (reserved) throw new Error(`${PROVIDER_ID}: extra body must not set "${reserved}"`);
+
       const instructions = req.system.map((s) => s.text).join("\n\n");
-      const res = await doFetch(url, {
+      const res = await send(doFetch, url, signal, {
         method: "POST",
         signal,
         headers: {
           "content-type": "application/json",
           ...(opts.apiKey ? { authorization: `Bearer ${opts.apiKey}` } : {}),
+          ...opts.headers,
+          ...ext.headers,
         },
         body: JSON.stringify({
           model: opts.model,
@@ -73,6 +95,7 @@ export function openaiResponsesProvider(opts: OpenAIResponsesOptions): Provider 
           ...(instructions ? { instructions } : {}),
           ...(opts.maxTokens ? { max_output_tokens: opts.maxTokens } : {}),
           ...(opts.reasoning ? { reasoning: opts.reasoning } : {}),
+          ...extra,
           input: toInput(req, store),
           ...(req.tools.length > 0
             ? {
@@ -88,11 +111,8 @@ export function openaiResponsesProvider(opts: OpenAIResponsesOptions): Provider 
             : {}),
         }),
       });
-      if (!res.ok || !res.body) {
-        throw new Error(`${PROVIDER_ID} HTTP ${res.status}: ${(await res.text()).slice(0, 500)}`);
-      }
 
-      let model = opts.model;
+      let model = (extra.model as string | undefined) ?? opts.model;
       const done: Item[] = [];
       let final: StreamEvent["response"];
 
@@ -114,13 +134,18 @@ export function openaiResponsesProvider(opts: OpenAIResponsesOptions): Provider 
           case "response.incomplete":
             final = ev.response;
             break;
-          case "response.failed":
-            throw new Error(`${PROVIDER_ID} response failed: ${ev.response?.error?.message ?? "unknown error"}`);
+          case "response.failed": {
+            const code = ev.response?.error?.code;
+            throw new ProviderError(`${PROVIDER_ID} response failed: ${ev.response?.error?.message ?? "unknown error"}`, {
+              retryable: code === "server_error" || code === "rate_limit_exceeded",
+            });
+          }
           case "error":
-            throw new Error(`${PROVIDER_ID} stream error: ${ev.message ?? "unknown error"}`);
+            throw new ProviderError(`${PROVIDER_ID} stream error: ${ev.message ?? "unknown error"}`, { retryable: false });
         }
       }
-      if (!final) throw new Error(`${PROVIDER_ID} stream ended without a final response`);
+      // 没有收到最终响应就断开，多半是连接中断
+      if (!final) throw new ProviderError(`${PROVIDER_ID} stream ended without a final response`, { retryable: true });
       if (final.model) model = final.model;
 
       const items = done.filter(Boolean);
@@ -131,9 +156,39 @@ export function openaiResponsesProvider(opts: OpenAIResponsesOptions): Provider 
         ? { inputTokens: u.input_tokens, outputTokens: u.output_tokens, cacheReadTokens: u.input_tokens_details?.cached_tokens }
         : undefined;
 
-      return { model, content, stopReason: toStopReason(final, content), usage };
+      return { provider: PROVIDER_ID, model, content, stopReason: toStopReason(final, content), usage };
     },
   };
+}
+
+/** 发送请求；网络错误和 HTTP 错误都转成 ProviderError，取消照原样抛出 */
+async function send(doFetch: typeof fetch, url: string, signal: AbortSignal, init: RequestInit): Promise<Response & { body: ReadableStream<Uint8Array> }> {
+  let res: Response;
+  try {
+    res = await doFetch(url, init);
+  } catch (err) {
+    if (signal.aborted) throw err;
+    throw new ProviderError(`${PROVIDER_ID} request failed: ${err instanceof Error ? err.message : String(err)}`, {
+      retryable: true,
+      cause: err,
+    });
+  }
+  if (res.ok && res.body) return res as Response & { body: ReadableStream<Uint8Array> };
+  const status = res.status;
+  throw new ProviderError(`${PROVIDER_ID} HTTP ${status}: ${(await res.text()).slice(0, 500)}`, {
+    retryable: status === 408 || status === 429 || status >= 500,
+    status,
+    retryAfterMs: retryAfter(res.headers.get("retry-after")),
+  });
+}
+
+/** Retry-After 可以是秒数，也可以是 HTTP 日期 */
+function retryAfter(v: string | null): number | undefined {
+  if (!v) return undefined;
+  const seconds = Number(v);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  const at = Date.parse(v);
+  return Number.isNaN(at) ? undefined : Math.max(0, at - Date.now());
 }
 
 // ---------- 输出 item → 内容块 ----------
@@ -193,8 +248,9 @@ function fromAssistant(m: Message, store: boolean): Item[] {
   for (const b of m.content) {
     const item = ownItem(b);
     if (item) {
-      // 不在服务端保存时，id 指向的 item 并不存在，只发内容
-      if (store) {
+      // 不在服务端保存时，id 指向的 item 并不存在，只发内容。
+      // function_call 例外：它的 id 只是 item 自身的标识（规范中可选），部分兼容服务端要求必填
+      if (store || item.type === "function_call") {
         out.push(item);
       } else {
         const { id: _id, ...rest } = item;

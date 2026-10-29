@@ -1,27 +1,29 @@
 import { expect, test } from "bun:test";
-import type Anthropic from "@anthropic-ai/sdk";
-import type { Block, ModelRequest } from "uncarved";
-import { anthropicProvider } from "../src/index.ts";
+import Anthropic from "@anthropic-ai/sdk";
+import { ProviderError, type Block, type ModelRequest } from "uncarved";
+import { anthropicProvider, PROVIDER_ID } from "../src/index.ts";
 
-// 假的 SDK client：记录请求参数，按脚本回放流式事件和最终消息
-function fakeClient(final: Record<string, unknown>, events: unknown[] = []) {
+// 假的 SDK client：记录请求参数，按脚本回放流式事件和最终消息；final 是函数时可以抛错
+function fakeClient(final: Record<string, unknown> | (() => never), events: unknown[] = []) {
   const calls: Record<string, unknown>[] = [];
+  const options: Record<string, unknown>[] = [];
   const client = {
     beta: {
       messages: {
-        stream(params: Record<string, unknown>) {
+        stream(params: Record<string, unknown>, opts: Record<string, unknown>) {
           calls.push(params);
+          options.push(opts);
           return {
             async *[Symbol.asyncIterator]() {
               yield* events;
             },
-            finalMessage: async () => final,
+            finalMessage: async () => (typeof final === "function" ? final() : final),
           };
         },
       },
     },
   } as unknown as Anthropic;
-  return { client, calls };
+  return { client, calls, options };
 }
 
 const user = { by: "user" as const };
@@ -143,4 +145,47 @@ test("没有原始数据的思考块和空的错误结果", async () => {
   const sent = calls[0]!.messages as Array<{ content: unknown[] }>;
   expect(sent[0]!.content).toEqual([]);
   expect(sent[1]!.content).toEqual([{ type: "tool_result", tool_use_id: "t", is_error: true }]);
+});
+
+const hi: ModelRequest = {
+  system: [],
+  tools: [],
+  messages: [{ role: "user", content: [{ kind: "text", text: "hi", origin: user, trust: "trusted" }] }],
+};
+
+test("流里拿不到 stop_reason 但有 tool_use 时，按 tool_use 处理", async () => {
+  const toolOnly = { model: "m", content: [{ type: "tool_use", id: "tu1", name: "echo", input: {} }], usage: { input_tokens: 1, output_tokens: 1 } };
+  // SDK 拼出的消息里没有 stop_reason 字段，或者为 null
+  for (const final of [toolOnly, { ...toolOnly, stop_reason: null }]) {
+    const res = await anthropicProvider({ client: fakeClient(final).client }).complete(hi, { signal: new AbortController().signal });
+    expect(res.stopReason).toBe("tool_use");
+    expect(res.provider).toBe(PROVIDER_ID);
+  }
+});
+
+test("ext 与构造参数：body、headers 按 默认值 < ext 合并，保留字段不能覆盖（4.7）", async () => {
+  const { client, calls, options } = fakeClient({ model: "m", content: [], stop_reason: "end_turn", usage: { input_tokens: 1, output_tokens: 1 } });
+  const provider = anthropicProvider({ client, extraBody: { temperature: 1 }, headers: { "x-a": "default" } });
+  const signal = new AbortController().signal;
+  await provider.complete({ ...hi, ext: { [PROVIDER_ID]: { body: { temperature: 0, model: "claude-haiku-5-5" }, headers: { "x-b": "ext" } } } }, { signal });
+  expect(calls[0]).toMatchObject({ model: "claude-haiku-5-5", temperature: 0 });
+  expect(options[0]).toMatchObject({ signal, headers: { "x-a": "default", "x-b": "ext" } });
+
+  await expect(provider.complete({ ...hi, ext: { [PROVIDER_ID]: { body: { messages: [] } } } }, { signal })).rejects.toThrow(
+    'must not set "messages"',
+  );
+  expect(calls).toHaveLength(1);
+});
+
+test("SDK 的错误转成 ProviderError；取消照原样抛出", async () => {
+  const signal = new AbortController().signal;
+  const fail = (err: unknown) => anthropicProvider({ client: fakeClient(() => { throw err; }).client }).complete(hi, { signal }).catch((e) => e);
+
+  const limited = await fail(new Anthropic.APIError(429, {}, "rate limited", new Headers({ "retry-after": "2" })));
+  expect(limited).toBeInstanceOf(ProviderError);
+  expect(limited).toMatchObject({ retryable: true, status: 429, retryAfterMs: 2000 });
+
+  expect(await fail(new Anthropic.APIError(400, {}, "bad", new Headers()))).toMatchObject({ retryable: false, status: 400 });
+  expect(await fail(new Anthropic.APIConnectionError({ message: "reset" }))).toMatchObject({ retryable: true, status: undefined });
+  expect(await fail(new Anthropic.APIUserAbortError())).not.toBeInstanceOf(ProviderError);
 });
