@@ -5,6 +5,7 @@ import {
   ModelOutputModified,
   PluginIncompatible,
   PluginsHeld,
+  ProviderError,
   Runtime,
   UnresolvedRef,
   readAll,
@@ -682,6 +683,86 @@ describe("模型输出不可改写（I-6）", () => {
     expect(outcome).toBeUndefined();
     expect(requests[1]!.messages[1]!.content[1]).toMatchObject({ text: "first" });
     expect(notices.some((n) => n.type === "hook-error" && n.info.error instanceof ModelOutputModified)).toBe(true);
+  });
+});
+
+describe("Provider 契约（4.7）", () => {
+  // 包装 Provider：按 ext.router 选择被包装者，遇到可重试的错误再调一次
+  function router(inner: Record<string, Provider>): Provider {
+    return {
+      id: "router",
+      async complete(req, opts) {
+        const use = (req.ext?.router as { use?: string } | undefined)?.use ?? "a";
+        for (let attempt = 0; ; attempt++) {
+          try {
+            const res = await inner[use]!.complete(req, opts);
+            return { ...res, provider: res.provider ?? inner[use]!.id };
+          } catch (err) {
+            if (!(err instanceof ProviderError && err.retryable) || attempt >= 1) throw err;
+          }
+        }
+      },
+    };
+  }
+
+  test("model.before 在 ext 中给出意图，包装 Provider 执行；日志记录实际回复的 provider", async () => {
+    const store = new MemoryLogStore();
+    const a = scripted([{ content: [text("from a")], stopReason: "end" }]);
+    let failures = 1;
+    const seen: unknown[] = [];
+    const b: Provider = {
+      id: "b",
+      async complete(req) {
+        seen.push(req.ext);
+        if (failures-- > 0) throw new ProviderError("busy", { retryable: true, status: 429 });
+        return { model: "b-1", content: [text("from b")], stopReason: "end" };
+      },
+    };
+    const route = plugin("route", {
+      hooks: [
+        {
+          kind: "transform",
+          point: "model.before",
+          fn: (req) => ({ ...req, ext: { ...req.ext, router: { use: "b" }, b: { body: { temperature: 0 } } } }),
+        },
+      ],
+    });
+    const rt = await Runtime.create({ store, provider: router({ a: a.provider, b }), plugins: [route], ...deterministic() });
+
+    await rt.send(say("hi"));
+
+    expect(a.requests).toHaveLength(0);
+    // 重试了一次；ext 原样传给被包装者
+    expect(seen).toEqual([
+      { router: { use: "b" }, b: { body: { temperature: 0 } } },
+      { router: { use: "b" }, b: { body: { temperature: 0 } } },
+    ]);
+    const responded = (await readAll(store, rt.state.sessionId)).filter((e) => e.type === "model.responded");
+    expect(responded).toHaveLength(1);
+    expect(responded[0]!.origin).toEqual({ by: "model", provider: "b", model: "b-1" });
+  });
+
+  test("没有标明 provider 时退回 Provider.id；不可重试的错误让本轮失败", async () => {
+    const store = new MemoryLogStore();
+    const { provider } = scripted([{ content: [text("ok")], stopReason: "end" }]);
+    const rt = await Runtime.create({ store, provider, ...deterministic() });
+    await rt.send(say("hi"));
+    const responded = (await readAll(store, rt.state.sessionId)).find((e) => e.type === "model.responded");
+    expect(responded!.origin).toMatchObject({ provider: "scripted" });
+
+    const broken: Provider = {
+      id: "broken",
+      async complete() {
+        throw new ProviderError("bad key", { retryable: false, status: 401 });
+      },
+    };
+    const store2 = new MemoryLogStore();
+    const rt2 = await Runtime.create({ store: store2, provider: router({ a: broken }), ...deterministic() });
+    const err = await rt2.send(say("hi")).catch((e) => e);
+    expect(err).toBeInstanceOf(ProviderError);
+    expect(err).toMatchObject({ retryable: false, status: 401 });
+    const ended = (await readAll(store2, rt2.state.sessionId)).at(-1)!;
+    expect(ended).toMatchObject({ type: "turn.ended", data: { reason: "error", error: "bad key" } });
   });
 });
 

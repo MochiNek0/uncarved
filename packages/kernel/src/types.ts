@@ -202,11 +202,13 @@ export interface ModelRequest {
   system: SystemSegment[];
   messages: Message[];
   tools: ToolSpec[];
-  /** 给 provider 的私有参数，内核只透传 */
+  /** 按 providerId 分组，ext[providerId] 由该 provider 解释，内核只透传（4.7） */
   ext?: Record<string, unknown>;
 }
 
 export interface ModelResponse {
+  /** 实际产生回复的 provider。包装 Provider 必须把被包装者的值传上来；缺省为 Provider.id（4.7） */
+  provider?: string;
   /** 实际产生回复的模型 */
   model: string;
   content: Block[];
@@ -219,6 +221,11 @@ export interface Delta {
   text: string;
 }
 
+/**
+ * 把模型请求翻译成某个模型接口的调用，实现不属于内核（4.7）。
+ * 可以包装另一个 Provider 来做路由、重试、限流：包装者必须转发 signal、原样传递 ext；
+ * 调用失败时应当抛出 ProviderError
+ */
 export interface Provider {
   id: string;
   complete(

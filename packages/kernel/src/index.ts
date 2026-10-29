@@ -6,3 +6,4 @@ export * from "./plugin.ts";
 export * from "./runtime.ts";
 export * from "./trust.ts";
 export * from "./remote.ts";
+export * from "./provider.ts";

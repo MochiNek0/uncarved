@@ -309,7 +309,7 @@ export class Runtime {
     await this.#commit(
       "model.responded",
       { content: res.content, stopReason: res.stopReason, usage: res.usage },
-      { by: "model", provider: this.#provider.id, model: res.model },
+      { by: "model", provider: res.provider ?? this.#provider.id, model: res.model },
     );
     this.#hooks.observe("model.after", structuredClone(res), this.#hookCtx);
   }
