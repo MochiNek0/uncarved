@@ -3,7 +3,7 @@ import { appendFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { readAll, Runtime, type Block, type Event, type Provider, type Tool } from "uncarved";
-import { CorruptLog, JsonlLogStore, JsonlTrustStore } from "../src/index.ts";
+import { ConcurrentWrite, CorruptLog, JsonlLogStore, JsonlTrustStore } from "../src/index.ts";
 
 let dir: string;
 beforeEach(async () => {
@@ -119,4 +119,49 @@ test("拒绝会写到目录之外的会话 ID", async () => {
   for (const id of ["../evil", "a/b", "a\\b", "..", ""]) {
     await expect(store.append(id, [ev(1)])).rejects.toThrow("invalid session id");
   }
+});
+
+test("同一会话有另一个写入者时拒绝写入，不把日志写坏", async () => {
+  const a = new JsonlLogStore(dir);
+  const b = new JsonlLogStore(dir);
+  await a.append("s1", [ev(1)]);
+  // b 读到 seq 1 之后，a 又写了 seq 2：b 按旧状态写 seq 2 会被拒绝
+  await a.append("s1", [ev(2)]);
+  await expect(b.append("s1", [ev(2)])).rejects.toBeInstanceOf(ConcurrentWrite);
+  // b 接着写对了 seq 之后，a 再按自己的状态写也会被拒绝
+  await b.append("s1", [ev(3)]);
+  await expect(a.append("s1", [ev(3)])).rejects.toBeInstanceOf(ConcurrentWrite);
+  expect((await readAll(a, "s1")).map((e) => e.seq)).toEqual([1, 2, 3]);
+});
+
+test("每次追加持有锁：别人持锁时等待，持锁进程已退出时接管，写完释放", async () => {
+  const store = new JsonlLogStore(dir);
+  const lock = path.join(dir, "s1.jsonl.lock");
+
+  // 活着的进程（父进程）持有锁：等它释放后才写入
+  await writeFile(lock, String(process.ppid));
+  setTimeout(() => void rm(lock, { force: true }), 200);
+  const t0 = Date.now();
+  await store.append("s1", [ev(1)]);
+  expect(Date.now() - t0).toBeGreaterThanOrEqual(150);
+
+  // 已退出的进程留下的锁：直接接管
+  const dead = Bun.spawn(["bun", "--version"], { stdout: "ignore" });
+  await dead.exited;
+  await writeFile(lock, String(dead.pid));
+  await store.append("s1", [ev(2)]);
+
+  expect((await readAll(store, "s1")).map((e) => e.seq)).toEqual([1, 2]);
+  expect(await Bun.file(lock).exists()).toBe(false);
+});
+
+test("两个实例同时追加同一个 seq：只有一个成功，日志保持合法", async () => {
+  const a = new JsonlLogStore(dir);
+  const b = new JsonlLogStore(dir);
+  await a.append("s1", [ev(1)]);
+  await readAll(b, "s1");
+  const results = await Promise.allSettled([a.append("s1", [ev(2)]), b.append("s1", [ev(2)])]);
+  expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+  expect((results.find((r) => r.status === "rejected") as PromiseRejectedResult).reason).toBeInstanceOf(ConcurrentWrite);
+  expect((await readAll(a, "s1")).map((e) => e.seq)).toEqual([1, 2]);
 });
