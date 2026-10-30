@@ -32,12 +32,15 @@ import type {
   State,
   SystemSegment,
   Tool,
+  ToolInfo,
   UserInput,
 } from "./types.ts";
 
 export type RuntimeNotice =
   | { type: "event"; event: Event }
   | { type: "delta"; delta: Delta }
+  /** 工具通过 ctx.progress 推送的进度，不记入日志 */
+  | { type: "tool-progress"; toolUseId: string; name: string; update: unknown }
   | { type: "awaiting"; toolUseIds: string[] }
   | { type: "warning"; code: "cache-order" }
   | { type: "hook-error"; info: HookErrorInfo };
@@ -75,6 +78,22 @@ export class ModelOutputModified extends Error {
   }
 }
 
+/** 本实例已经 detach，要继续这个会话请用 Runtime.resume（4.2） */
+export class SessionDetached extends Error {
+  constructor() {
+    super("runtime has detached from the session; use Runtime.resume to continue it");
+    this.name = "SessionDetached";
+  }
+}
+
+/** tool.before 只能修改参数，不能修改 toolUseId 和 name（4.4） */
+export class ToolCallModified extends Error {
+  constructor(field: string) {
+    super(`tool.before must not change ${field}`);
+    this.name = "ToolCallModified";
+  }
+}
+
 export class UnresolvedRef extends Error {
   constructor(detail: string) {
     super(`unresolved session reference: ${detail}`);
@@ -83,6 +102,7 @@ export class UnresolvedRef extends Error {
 }
 
 const RUNTIME: Origin = { by: "runtime" };
+const HOST: Origin = { by: "host" };
 
 export class Runtime {
   #state: State;
@@ -100,6 +120,7 @@ export class Runtime {
   #listeners = new Set<(n: RuntimeNotice) => void>();
   #abort = new AbortController();
   #busy = false;
+  #detached = false;
 
   private constructor(opts: RuntimeOptions, state: State) {
     this.#state = state;
@@ -236,21 +257,51 @@ export class Runtime {
    */
   async close(): Promise<void> {
     // 插件变化未被接受的会话也可以结束，所以不走 #enter
-    if (this.#busy) throw new RuntimeBusy();
-    this.#busy = true;
-    try {
-      await this.#settle();
+    await this.#exclusive(async () => {
       this.#hooks.observe("session.end", structuredClone(this.#state), this.#hookCtx);
       await this.#settle();
       await this.#commit("session.ended", {}, RUNTIME);
-    } finally {
-      this.#busy = false;
-    }
+    });
+  }
+
+  /**
+   * 宿主进程离开会话，会话保持可恢复：写入 session.detached，等它触发的 observe 及其写入完成。
+   * 之后本实例不再可用（4.2）
+   */
+  async detach(): Promise<void> {
+    await this.#exclusive(() => this.#commit("session.detached", {}, RUNTIME));
+    this.#detached = true;
+  }
+
+  /** 宿主写入派生数据（derived.recorded），插件可以从 ctx.derived 读到，恢复后仍在（4.8） */
+  async record(key: string, value: unknown): Promise<void> {
+    await this.#exclusive(() => this.#commit("derived.recorded", { key, value }, HOST));
+  }
+
+  /** 宿主写入自定义事件，类型必须带命名空间 `<ns>/<type>`（3.2、4.8） */
+  async emit(type: string, data: unknown): Promise<void> {
+    if (!/^[^/]+\/./.test(type)) throw new Error(`host event type must be namespaced "<ns>/<type>": ${JSON.stringify(type)}`);
+    await this.#exclusive(() => this.#append(type, data, HOST));
   }
 
   // ---------- 驱动 ----------
 
+  /** 不驱动循环的对外调用：独占运行时，返回前等 observe 完成（5.1） */
+  async #exclusive(fn: () => Promise<void>): Promise<void> {
+    if (this.#detached) throw new SessionDetached();
+    if (this.#busy) throw new RuntimeBusy();
+    this.#busy = true;
+    try {
+      await this.#settle();
+      await fn();
+    } finally {
+      await this.#settle();
+      this.#busy = false;
+    }
+  }
+
   #enter(pluginApproval = false): void {
+    if (this.#detached) throw new SessionDetached();
     if (this.#busy) throw new RuntimeBusy();
     const held = this.#state.held;
     if (held && !(pluginApproval && held.resolution === "ask")) throw new PluginsHeld(held.resolution);
@@ -265,8 +316,10 @@ export class Runtime {
       this.#queue.length = 0;
       const phase = this.#state.phase;
       if (phase !== "new" && phase !== "idle" && phase !== "ended") {
-        const error = err instanceof Error ? err.message : String(err);
-        await this.#commit("turn.ended", { reason: "error", error }, RUNTIME);
+        const aborted = this.#abort.signal.aborted;
+        const cause = aborted ? this.#abort.signal.reason : err;
+        const error = cause instanceof Error ? cause.message : cause === undefined ? undefined : String(cause);
+        await this.#commit("turn.ended", { reason: aborted ? "aborted" : "error", error }, RUNTIME);
       }
       throw err;
     }
@@ -337,12 +390,20 @@ export class Runtime {
       return;
     }
     // tool.before 必须在 tool.gate 之前：关卡审的是最终参数（4.4）
-    const final = await this.#transform("tool.before", {
+    const final = await this.#transform(
+      "tool.before",
+      { toolUseId: call.toolUseId, name: call.name, input: structuredClone(call.input) },
+      (out) => {
+        if (out.toolUseId !== call.toolUseId) throw new ToolCallModified("toolUseId");
+        if (out.name !== call.name) throw new ToolCallModified("name");
+      },
+    );
+    const g = await this.#gate("tool.gate", {
       toolUseId: call.toolUseId,
       name: call.name,
-      input: structuredClone(call.input),
+      input: structuredClone(final.input),
+      tool: toolInfo(this.#tools.get(call.name)!),
     });
-    const g = await this.#gate("tool.gate", final);
     await this.#commit(
       "tool.decided",
       {
@@ -371,6 +432,7 @@ export class Runtime {
           toolUseId: c.toolUseId,
           signal,
           parent: { sessionId, eventId: c.decidedAt! },
+          progress: (update) => this.#notify({ type: "tool-progress", toolUseId: c.toolUseId, name: c.name, update }),
         });
         content = typeof r.content === "string" ? [{ kind: "text", text: r.content, origin, trust: "untrusted" }] : r.content;
         isError = r.isError ?? false;
@@ -480,6 +542,12 @@ export class Runtime {
       }
     }
   }
+}
+
+/** 工具的声明部分，深拷贝，插件改了也不影响执行 */
+function toolInfo(t: Tool): ToolInfo {
+  const { name, description, inputSchema, effect, concurrency, idempotent } = t;
+  return structuredClone({ name, description, inputSchema, effect, concurrency, idempotent });
 }
 
 async function resolves(store: LogStore, sessionId: string, match: (e: Event) => boolean): Promise<boolean> {

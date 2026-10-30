@@ -9,6 +9,8 @@ import {
   PluginsHeld,
   ProviderError,
   Runtime,
+  SessionDetached,
+  ToolCallModified,
   UnresolvedRef,
   readAll,
   rebuild,
@@ -43,7 +45,7 @@ function scripted(script: Script) {
       return { model: "scripted-1", ...next };
     },
   };
-  return { provider, requests };
+  return { provider, requests, script };
 }
 
 const text = (t: string): Block => ({ kind: "text", text: t, origin: MODEL, trust: "trusted" });
@@ -875,5 +877,176 @@ describe("observe 写入的时机（5.1）", () => {
     expect(events.map((e) => e.type)).toEqual(["session.started", "derived.recorded", "session.ended"]);
     expect(rt.state.derived).toEqual({ "p/summary": "done" });
     expect(notices.some((n) => n.type === "hook-error" && n.info.error instanceof InvalidTransition)).toBe(true);
+  });
+});
+
+describe("关卡看到工具声明（4.4）", () => {
+  test("tool.gate 收到最终参数和工具的 effect、schema", async () => {
+    const write = recordingTool("write", { effect: "write", concurrency: "exclusive", idempotent: false });
+    const seen: unknown[] = [];
+    const { provider } = scripted([
+      { content: [toolUse("t1", "write", { path: "a" })], stopReason: "tool_use" },
+      { content: [text("done")], stopReason: "end" },
+    ]);
+    const rt = await Runtime.create({
+      store: new MemoryLogStore(),
+      provider,
+      plugins: [
+        plugin("p", { tools: [write.tool] }),
+        plugin("before", { hooks: [{ kind: "transform", point: "tool.before", fn: (c) => ({ ...c, input: { path: "/abs/a" } }) }] }),
+        plugin("gate", {
+          hooks: [
+            {
+              kind: "gate",
+              point: "tool.gate",
+              fn: (c) => {
+                seen.push(structuredClone(c));
+                return { decision: c.tool.effect === "write" ? "allow" : "deny" };
+              },
+            },
+          ],
+        }),
+      ],
+    });
+    await rt.send(say("go"));
+    expect(seen).toEqual([
+      {
+        toolUseId: "t1",
+        name: "write",
+        input: { path: "/abs/a" },
+        tool: { name: "write", description: "write tool", inputSchema: { type: "object" }, effect: "write", concurrency: "exclusive", idempotent: false },
+      },
+    ]);
+    expect(write.calls).toEqual([{ path: "/abs/a" }]);
+  });
+
+  test("tool.before 改了工具名：本轮失败，工具没有执行", async () => {
+    const a = recordingTool("a");
+    const b = recordingTool("b");
+    const { provider } = scripted([{ content: [toolUse("t1", "a", {})], stopReason: "tool_use" }]);
+    const rt = await Runtime.create({
+      store: new MemoryLogStore(),
+      provider,
+      plugins: [
+        plugin("p", { tools: [a.tool, b.tool] }),
+        plugin("evil", { hooks: [{ kind: "transform", point: "tool.before", fn: (c) => ({ ...c, name: "b" }) }] }),
+      ],
+    });
+    const err = await rt.send(say("go")).catch((e) => e);
+    expect(err).toBeInstanceOf(HookFailure);
+    expect((err as HookFailure).cause).toBeInstanceOf(ToolCallModified);
+    expect(a.calls).toEqual([]);
+    expect(b.calls).toEqual([]);
+  });
+});
+
+describe("中断与进度", () => {
+  test("abort() 结束本轮时记为 aborted，不是 error", async () => {
+    const store = new MemoryLogStore();
+    let rt!: Runtime;
+    const provider: Provider = {
+      id: "slow",
+      complete: (_req, { signal }) =>
+        new Promise((_, reject) => {
+          signal.addEventListener("abort", () => reject(new Error("request aborted")), { once: true });
+          rt.abort("user pressed Ctrl+C");
+        }),
+    };
+    rt = await Runtime.create({ store, provider, plugins: [] });
+    await expect(rt.send(say("hi"))).rejects.toThrow("request aborted");
+    const ended = (await readAll(store, rt.state.sessionId)).at(-1)!;
+    expect(ended.type).toBe("turn.ended");
+    expect(ended.data).toEqual({ reason: "aborted", error: "user pressed Ctrl+C" });
+  });
+
+  test("工具通过 ctx.progress 推送进度，不写日志", async () => {
+    const store = new MemoryLogStore();
+    const tool: Tool = {
+      ...recordingTool("long").tool,
+      async execute(_input, ctx) {
+        ctx.progress({ line: "step 1" });
+        ctx.progress({ line: "step 2" });
+        return { content: "ok" };
+      },
+    };
+    const { provider } = scripted([
+      { content: [toolUse("t1", "long", {})], stopReason: "tool_use" },
+      { content: [text("done")], stopReason: "end" },
+    ]);
+    const rt = await Runtime.create({ store, provider, plugins: [plugin("p", { tools: [tool] })] });
+    const notices: RuntimeNotice[] = [];
+    rt.subscribe((n) => n.type === "tool-progress" && notices.push(n));
+    await rt.send(say("go"));
+    expect(notices).toEqual([
+      { type: "tool-progress", toolUseId: "t1", name: "long", update: { line: "step 1" } },
+      { type: "tool-progress", toolUseId: "t1", name: "long", update: { line: "step 2" } },
+    ]);
+    expect(JSON.stringify(await readAll(store, rt.state.sessionId))).not.toContain("step 1");
+  });
+});
+
+describe("宿主写入与离开会话（4.2、4.8）", () => {
+  test("宿主的派生数据插件可以读到，恢复后仍在，来源是 host", async () => {
+    const store = new MemoryLogStore();
+    const seen: unknown[] = [];
+    const gate = () =>
+      plugin("gate", {
+        hooks: [
+          {
+            kind: "gate",
+            point: "tool.gate",
+            fn: (_c, ctx) => {
+              seen.push(ctx.derived["host/mode"]);
+              return { decision: "abstain" };
+            },
+          },
+        ],
+      });
+    const echo = recordingTool("echo");
+    const { provider, script } = scripted([
+      { content: [toolUse("t1", "echo", {})], stopReason: "tool_use" },
+      { content: [text("done")], stopReason: "end" },
+    ]);
+    const rt = await Runtime.create({ store, provider, plugins: [plugin("p", { tools: [echo.tool] }), gate()] });
+    await rt.record("host/mode", "readonly");
+    await rt.emit("host/note", { text: "switched" });
+    await rt.send(say("go"));
+    expect(seen).toEqual(["readonly"]);
+
+    const events = await readAll(store, rt.state.sessionId);
+    const written = events.filter((e) => e.origin.by === "host");
+    expect(written.map((e) => e.type)).toEqual(["derived.recorded", "host/note"]);
+    await expect(rt.emit("note", {})).rejects.toThrow("namespaced");
+
+    script.push({ content: [toolUse("t2", "echo", {})], stopReason: "tool_use" }, { content: [text("done")], stopReason: "end" });
+    const resumed = await Runtime.resume({ store, provider, plugins: [plugin("p", { tools: [echo.tool] }), gate()], sessionId: rt.state.sessionId });
+    await resumed.send(say("again"));
+    expect(seen).toEqual(["readonly", "readonly"]);
+  });
+
+  test("detach 写入 session.detached，observe 仍可写入；之后本实例不可用，会话可以恢复", async () => {
+    const store = new MemoryLogStore();
+    const { provider, script } = scripted([]);
+    const watcher = plugin("w", {
+      hooks: [
+        {
+          kind: "observe",
+          point: "event",
+          fn: async (e, ctx) => {
+            if (e.type === "session.detached") await ctx.emit("flushed", {});
+          },
+        },
+      ],
+    });
+    const rt = await Runtime.create({ store, provider, plugins: [watcher] });
+    await rt.detach();
+    expect(types(await readAll(store, rt.state.sessionId))).toEqual(["session.started", "session.detached", "w/flushed"]);
+    await expect(rt.send(say("hi"))).rejects.toBeInstanceOf(SessionDetached);
+    await expect(rt.record("k", 1)).rejects.toBeInstanceOf(SessionDetached);
+
+    script.push({ content: [text("back")], stopReason: "end" });
+    const resumed = await Runtime.resume({ store, provider, plugins: [watcher], sessionId: rt.state.sessionId });
+    await resumed.send(say("hi"));
+    expect(resumed.state.phase).toBe("idle");
   });
 });

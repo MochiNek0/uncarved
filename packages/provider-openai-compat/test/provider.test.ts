@@ -57,7 +57,7 @@ test("在完整的内核循环里跑通：流式文本、分段的工具参数�
     plugins: [{ id: "p", version: "1", kernel: "^1", tools: [echo] }],
   });
   const deltas: string[] = [];
-  rt.subscribe((n) => n.type === "delta" && deltas.push(n.delta.text));
+  rt.subscribe((n) => n.type === "delta" && n.delta.kind !== "reset" && deltas.push(n.delta.text));
 
   await rt.send({ kind: "message", content: [{ kind: "text", text: "hi", origin: { by: "user" }, trust: "trusted" }] });
 

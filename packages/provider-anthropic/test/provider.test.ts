@@ -84,7 +84,7 @@ test("模型输出的块原样回传，包括思考块的签名（I-6）", async
 
   const res = await provider.complete(
     { system: [], tools: [], messages: [{ role: "user", content: [{ kind: "text", text: "hi", origin: user, trust: "trusted" }] }] },
-    { signal: new AbortController().signal, onDelta: (d) => deltas.push(d.text) },
+    { signal: new AbortController().signal, onDelta: (d) => d.kind !== "reset" && deltas.push(d.text) },
   );
 
   expect(deltas).toEqual(["he"]);

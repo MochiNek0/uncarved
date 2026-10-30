@@ -97,7 +97,7 @@ test("在完整的内核循环里跑通：流式文本、推理、工具调用�
     plugins: [{ id: "p", version: "1", kernel: "^1", tools: [echo] }, prompt],
   });
   const deltas: string[] = [];
-  rt.subscribe((n) => n.type === "delta" && deltas.push(`${n.delta.kind}:${n.delta.text}`));
+  rt.subscribe((n) => n.type === "delta" && n.delta.kind !== "reset" && deltas.push(`${n.delta.kind}:${n.delta.text}`));
   await rt.send(userSays("hi"));
 
   expect(deltas).toEqual(["thinking:think", "text:let me ", "text:check", "text:done"]);

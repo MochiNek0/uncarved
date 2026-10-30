@@ -11,7 +11,9 @@ export type Origin =
   | { by: "model"; provider: string; model: string }
   | { by: "tool"; name: string }
   | { by: "plugin"; id: string; source?: ContentSource }
-  | { by: "runtime" };
+  | { by: "runtime" }
+  /** 宿主程序（发行版的 CLI、服务端等）通过 Runtime.record / Runtime.emit 写入（4.8） */
+  | { by: "host" };
 
 /** 插件从配置层加载的内容（例如提示词文件）的出处（7.2） */
 export interface ContentSource {
@@ -78,7 +80,8 @@ export type ResumePolicy = "continue" | "ask" | "abort";
 
 export type StopReason = "end" | "tool_use" | "max_tokens" | "refusal" | "pause" | "other";
 
-export type TurnEndReason = "end" | "max_tokens" | "refusal" | "stopped" | "error";
+/** aborted：被 Runtime.abort() 中断（4.4） */
+export type TurnEndReason = "end" | "max_tokens" | "refusal" | "stopped" | "aborted" | "error";
 
 export interface Usage {
   inputTokens?: number;
@@ -112,6 +115,8 @@ export interface EventDataMap {
   };
   "derived.recorded": { key: string; value: unknown };
   "turn.ended": { reason: TurnEndReason; error?: string };
+  /** 宿主进程离开会话，会话仍可恢复（4.2） */
+  "session.detached": Record<string, never>;
   "session.ended": Record<string, never>;
 }
 
@@ -216,10 +221,11 @@ export interface ModelResponse {
   usage?: Usage;
 }
 
-export interface Delta {
-  kind: "text" | "thinking";
-  text: string;
-}
+/**
+ * 流式增量，只推送给订阅者，不记入日志（3.2）。
+ * reset：此前推送的本次模型调用的增量全部作废，例如包装 Provider 重试或切换之前（4.7）
+ */
+export type Delta = { kind: "text" | "thinking"; text: string } | { kind: "reset" };
 
 /**
  * 把模型请求翻译成某个模型接口的调用，实现不属于内核（4.7）。
@@ -242,6 +248,8 @@ export interface ToolContext {
   signal: AbortSignal;
   /** 启动子会话时作为 parent 记录（3.4） */
   parent: SessionRef;
+  /** 推送执行进度给订阅者，不记入日志，格式由工具和宿主约定（第六章） */
+  progress(update: unknown): void;
 }
 
 export interface ToolResult {
@@ -251,10 +259,14 @@ export interface ToolResult {
   child?: ChildRef;
 }
 
-export interface Tool extends ToolSpec {
+/** 工具的声明部分，交给关卡判断（4.4） */
+export interface ToolInfo extends ToolSpec {
   effect: "read" | "write" | "external";
   concurrency: "safe" | "exclusive";
   idempotent: boolean;
+}
+
+export interface Tool extends ToolInfo {
   execute(input: unknown, ctx: ToolContext): Promise<ToolResult>;
 }
 
@@ -262,6 +274,11 @@ export interface ToolCall {
   toolUseId: string;
   name: string;
   input: unknown;
+}
+
+/** tool.gate 的输入：最终参数，加上被调用工具的声明 */
+export interface GatedToolCall extends ToolCall {
+  tool: ToolInfo;
 }
 
 export interface ToolOutcome {

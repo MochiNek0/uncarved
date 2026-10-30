@@ -28,7 +28,7 @@ const POINTS: Record<ExtensionPoint, { kind: RemoteHookSpec["kind"]; reads: stri
   "model.before": { kind: "transform", reads: ["system", "messages", "tools", "ext"], writes: ["system", "messages", "tools", "ext"] },
   "tool.before": { kind: "transform", reads: ["toolUseId", "name", "input"], writes: ["input"] },
   "tool.after": { kind: "transform", reads: ["call", "content", "isError"], writes: ["content", "isError"] },
-  "tool.gate": { kind: "gate", reads: ["toolUseId", "name", "input"], writes: [] },
+  "tool.gate": { kind: "gate", reads: ["toolUseId", "name", "input", "tool"], writes: [] },
   "turn.continue": { kind: "gate", reads: ["phase", "messages"], writes: [] },
   "model.after": { kind: "observe", reads: ["model", "content", "stopReason", "usage"], writes: [] },
   event: { kind: "observe", reads: ["id", "type", "seq", "at", "data", "origin"], writes: [] },

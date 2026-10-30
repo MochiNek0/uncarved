@@ -1,7 +1,7 @@
 // 扩展点与组合规则。对应宪法第五章。
 
 import { isRemote, toLocalHook, type RemoteHookSpec } from "./remote.ts";
-import type { Awaitable, Event, Message, ModelRequest, ModelResponse, State, ToolCall, ToolOutcome } from "./types.ts";
+import type { Awaitable, Event, GatedToolCall, Message, ModelRequest, ModelResponse, State, ToolCall, ToolOutcome } from "./types.ts";
 
 export interface TransformPayloads {
   "context.project": Message[];
@@ -12,7 +12,8 @@ export interface TransformPayloads {
 }
 
 export interface GatePayloads {
-  "tool.gate": ToolCall;
+  /** 最终参数和被调用工具的声明（effect、schema 等），供权限插件判断（4.4） */
+  "tool.gate": GatedToolCall;
   "turn.continue": State;
 }
 

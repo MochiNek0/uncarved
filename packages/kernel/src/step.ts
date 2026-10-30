@@ -161,6 +161,10 @@ export function step(s: State, e: Event): StepResult {
       return ok({ ...closed, phase: "idle", ending: undefined });
     }
 
+    case "session.detached":
+      // 只是记录宿主进程离开，状态不变；恢复后照常继续（4.2）
+      return ok(base);
+
     case "session.ended":
       return ok({ ...base, phase: "ended" });
 
