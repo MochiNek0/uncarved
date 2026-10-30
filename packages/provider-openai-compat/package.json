@@ -1,11 +1,33 @@
 {
   "name": "@uncarved/provider-openai-compat",
   "version": "0.1.0",
+  "description": "OpenAI-compatible Chat Completions provider for uncarved",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MochiNek0/uncarved.git",
+    "directory": "packages/provider-openai-compat"
+  },
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "bun": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepublishOnly": "bun run build"
   },
   "peerDependencies": {
-    "uncarved": "workspace:*"
+    "uncarved": "workspace:^"
   }
 }

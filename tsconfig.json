@@ -11,7 +11,8 @@
     "verbatimModuleSyntax": true,
     "erasableSyntaxOnly": true,
     "skipLibCheck": true,
-    "types": ["bun"]
+    "types": ["bun"],
+    "customConditions": ["bun"]
   },
   "include": ["packages/*/src", "packages/*/test", "apps/*/src", "apps/*/test", "examples"]
 }

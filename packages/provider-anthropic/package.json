@@ -1,12 +1,34 @@
 {
   "name": "@uncarved/provider-anthropic",
   "version": "0.1.0",
+  "description": "Anthropic Claude Messages API provider for uncarved",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MochiNek0/uncarved.git",
+    "directory": "packages/provider-anthropic"
+  },
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "bun": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepublishOnly": "bun run build"
   },
   "peerDependencies": {
-    "uncarved": "workspace:*"
+    "uncarved": "workspace:^"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^1.3.0"
