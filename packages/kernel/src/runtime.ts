@@ -42,7 +42,8 @@ export type RuntimeNotice =
   /** 工具通过 ctx.progress 推送的进度，不记入日志 */
   | { type: "tool-progress"; toolUseId: string; name: string; update: unknown }
   | { type: "awaiting"; toolUseIds: string[] }
-  | { type: "warning"; code: "cache-order" }
+  /** event-loop：event observe 引发的写入超过上限（链太深或总数太多），之后的事件不再分发给 event observe */
+  | { type: "warning"; code: "cache-order" | "event-loop" }
   | { type: "hook-error"; info: HookErrorInfo };
 
 export interface RuntimeOptions {
@@ -101,6 +102,14 @@ export class UnresolvedRef extends Error {
   }
 }
 
+/** event observe 写入链的最大层数 */
+const MAX_EVENT_DEPTH = 16;
+/**
+ * 一次对外调用中，由 event observe 写入、还会再分发给 event observe 的事件总数上限。
+ * 只限层数不够：两个插件互相回应时，事件数随层数指数增长
+ */
+const MAX_CASCADE_EVENTS = 256;
+
 const RUNTIME: Origin = { by: "runtime" };
 const HOST: Origin = { by: "host" };
 
@@ -121,6 +130,9 @@ export class Runtime {
   #abort = new AbortController();
   #busy = false;
   #detached = false;
+  /** 本次对外调用中 event observe 已写入的事件数，以及是否已经警告过 */
+  #cascade = 0;
+  #cascadeWarned = false;
 
   private constructor(opts: RuntimeOptions, state: State) {
     this.#state = state;
@@ -149,6 +161,10 @@ export class Runtime {
     const parent = opts.parent;
     if (parent && !(await resolves(opts.store, parent.sessionId, (e) => e.id === parent.eventId))) {
       throw new UnresolvedRef(`parent ${parent.sessionId}#${parent.eventId}`);
+    }
+    // 已有日志的会话再写一条 session.started 会让它无法重建，继续已有会话要用 resume
+    if (opts.sessionId && (await resolves(opts.store, opts.sessionId, () => true))) {
+      throw new Error(`session ${opts.sessionId} already exists; use Runtime.resume`);
     }
     const rt = new Runtime(opts, initialState(opts.sessionId ?? newId()));
     await rt.#commit("session.started", { plugins: rt.#manifest, parent }, RUNTIME);
@@ -291,6 +307,8 @@ export class Runtime {
     if (this.#detached) throw new SessionDetached();
     if (this.#busy) throw new RuntimeBusy();
     this.#busy = true;
+    this.#cascade = 0;
+    this.#cascadeWarned = false;
     try {
       await this.#settle();
       await fn();
@@ -306,12 +324,18 @@ export class Runtime {
     const held = this.#state.held;
     if (held && !(pluginApproval && held.resolution === "ask")) throw new PluginsHeld(held.resolution);
     this.#busy = true;
+    this.#cascade = 0;
+    this.#cascadeWarned = false;
     if (this.#abort.signal.aborted) this.#abort = new AbortController();
   }
 
   async #drive(): Promise<void> {
     try {
-      while (this.#queue.length > 0) await this.#execute(this.#queue.shift()!);
+      while (this.#queue.length > 0) {
+        // 中断后不再开始任何 Effect，即使上一步（例如关卡）没有理会 signal（4.4）
+        this.#abort.signal.throwIfAborted();
+        await this.#execute(this.#queue.shift()!);
+      }
     } catch (err) {
       this.#queue.length = 0;
       const phase = this.#state.phase;
@@ -319,7 +343,12 @@ export class Runtime {
         const aborted = this.#abort.signal.aborted;
         const cause = aborted ? this.#abort.signal.reason : err;
         const error = cause instanceof Error ? cause.message : cause === undefined ? undefined : String(cause);
-        await this.#commit("turn.ended", { reason: aborted ? "aborted" : "error", error }, RUNTIME);
+        try {
+          await this.#commit("turn.ended", { reason: aborted ? "aborted" : "error", error }, RUNTIME);
+        } catch {
+          // 存储本身坏了时这次写入也会失败：抛出最初的错误，它才说明发生了什么。
+          // 状态停在原阶段，之后可以用 recover() 继续
+        }
       }
       throw err;
     }
@@ -352,16 +381,31 @@ export class Runtime {
     // 模型块只能整块省略，不能编辑（I-6）：每个 hook 的输出都要检查
     const logged = modelBlocks(this.#state.messages);
     const unmodified = (messages: Message[]) => {
-      for (const b of modelBlocks(messages)) if (!logged.has(b)) throw new ModelOutputModified();
+      // 投影里的模型块必须是日志中模型块的子序列：不能编辑、复制、调换顺序，也不能挪出 assistant 消息。
+      // assistant 消息里只能有模型块，否则把模型块改个来源就能绕过检查
+      let next = 0;
+      for (const m of messages) {
+        for (const b of m.content) {
+          if (b.origin.by !== "model") {
+            if (m.role === "assistant") throw new ModelOutputModified();
+            continue;
+          }
+          if (m.role !== "assistant") throw new ModelOutputModified();
+          const at = logged.indexOf(canonical(b), next);
+          if (at < 0) throw new ModelOutputModified();
+          next = at + 1;
+        }
+      }
     };
     const messages = await this.#transform("context.project", structuredClone(this.#state.messages), unmodified);
     let request: ModelRequest = {
       system: [],
       messages,
+      // 拷贝 schema：hook 改了请求里的 schema 不能影响工具本身（关卡按它校验参数）
       tools: [...this.#tools.values()].map((t) => ({
         name: t.name,
         description: t.description,
-        inputSchema: t.inputSchema,
+        inputSchema: structuredClone(t.inputSchema),
       })),
     };
     request = await this.#transform("context.build", request, (r) => unmodified(r.messages));
@@ -422,12 +466,15 @@ export class Runtime {
       const tool = this.#tools.get(c.name)!;
       const origin: Origin = { by: "tool", name: c.name };
       const signal = this.#abort.signal;
+      // 依次执行时，前一个工具执行期间被中断，后面的不再启动
+      signal.throwIfAborted();
       const sessionId = this.#state.sessionId;
       let content: Block[];
       let isError: boolean;
       let child: ChildRef | undefined;
       try {
-        const r = await tool.execute(c.input, {
+        // 工具拿到的是拷贝，修改参数不会改到状态里的调用记录
+        const r = await tool.execute(structuredClone(c.input), {
           sessionId,
           toolUseId: c.toolUseId,
           signal,
@@ -444,7 +491,7 @@ export class Runtime {
         isError = true;
       }
       const out = await this.#transform("tool.after", {
-        call: { toolUseId: c.toolUseId, name: c.name, input: c.input },
+        call: { toolUseId: c.toolUseId, name: c.name, input: structuredClone(c.input) },
         content,
         isError,
       });
@@ -474,11 +521,12 @@ export class Runtime {
 
   // ---------- 写入（单写者队列，I-10） ----------
 
-  #commit<T extends CoreEventType>(type: T, data: EventDataMap[T], origin: Origin): Promise<void> {
-    return this.#append(type, data, origin);
+  #commit<T extends CoreEventType>(type: T, data: EventDataMap[T], origin: Origin, depth = 0): Promise<void> {
+    return this.#append(type, data, origin, depth);
   }
 
-  #append(type: string, data: unknown, origin: Origin): Promise<void> {
+  /** depth：这个事件是 event observe 写入链上的第几层，0 表示不是由 event observe 写入的 */
+  #append(type: string, data: unknown, origin: Origin, depth = 0): Promise<void> {
     const run = async () => {
       const event = {
         v: 1,
@@ -494,8 +542,17 @@ export class Runtime {
       await this.#store.append(this.#state.sessionId, [event]);
       this.#state = next.state;
       this.#queue.push(...next.effects);
-      this.#notify({ type: "event", event });
-      this.#hooks.observe("event", structuredClone(event), this.#hookCtx);
+      // 事件的 data 被状态引用着，订阅者拿到的是拷贝
+      this.#notify({ type: "event", event: structuredClone(event) });
+      // event observe 的写入会再触发 event observe。链条过长（例如插件对每个事件都写一条）时不再分发，
+      // 否则 #settle 永远等不完
+      if (depth > 0) this.#cascade++;
+      if (depth < MAX_EVENT_DEPTH && this.#cascade <= MAX_CASCADE_EVENTS) {
+        this.#hooks.observe("event", structuredClone(event), this.#ctxAt(depth + 1));
+      } else if (!this.#cascadeWarned) {
+        this.#cascadeWarned = true;
+        this.#notify({ type: "warning", code: "event-loop" });
+      }
     };
     const p = this.#writes.then(run);
     this.#writes = p.catch(() => {});
@@ -504,16 +561,21 @@ export class Runtime {
 
   // ---------- 辅助 ----------
 
-  #hookCtx: HookContextFor = (plugin) => {
-    const origin: Origin = { by: "plugin", id: plugin };
-    return {
-      sessionId: this.#state.sessionId,
-      signal: this.#abort.signal,
-      derived: structuredClone(this.#state.derived),
-      record: (key, value) => this.#commit("derived.recorded", { key, value }, origin),
-      emit: (type, data) => this.#append(`${plugin}/${type}`, data, origin),
+  #hookCtx: HookContextFor = (plugin) => this.#ctxAt(0)(plugin);
+
+  /** hook 上下文，写入的事件记为第 depth 层（见 #append） */
+  #ctxAt(depth: number): HookContextFor {
+    return (plugin) => {
+      const origin: Origin = { by: "plugin", id: plugin };
+      return {
+        sessionId: this.#state.sessionId,
+        signal: this.#abort.signal,
+        derived: structuredClone(this.#state.derived),
+        record: (key, value) => this.#commit("derived.recorded", { key, value }, origin, depth),
+        emit: (type, data) => this.#append(`${plugin}/${type}`, data, origin, depth),
+      };
     };
-  };
+  }
 
   #transform<P extends TransformPoint>(
     point: P,
@@ -555,10 +617,10 @@ async function resolves(store: LogStore, sessionId: string, match: (e: Event) =>
   return false;
 }
 
-/** 消息中所有模型来源的块，按规范化的 JSON 表示（键排序，忽略键的顺序） */
-function modelBlocks(messages: Message[]): Set<string> {
-  const out = new Set<string>();
-  for (const m of messages) for (const b of m.content) if (b.origin.by === "model") out.add(canonical(b));
+/** 消息中所有模型来源的块，按出现顺序，规范化的 JSON 表示（键排序，忽略键的顺序） */
+function modelBlocks(messages: Message[]): string[] {
+  const out: string[] = [];
+  for (const m of messages) for (const b of m.content) if (b.origin.by === "model") out.push(canonical(b));
   return out;
 }
 

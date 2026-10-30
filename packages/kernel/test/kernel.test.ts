@@ -688,6 +688,22 @@ describe("模型输出不可改写（I-6）", () => {
     expect(requests[1]!.messages[1]!.content[1]).toMatchObject({ text: "first" });
     expect(notices.some((n) => n.type === "hook-error" && n.info.error instanceof ModelOutputModified)).toBe(true);
   });
+
+  test("改来源冒充、复制、调换顺序、挪出 assistant 消息都算编辑", async () => {
+    const relabel = (ms: Message[]) =>
+      ms.map((m) => ({
+        ...m,
+        content: m.content.map((b) => (b.kind === "text" && b.origin.by === "model" ? { ...b, text: "edited", origin: { by: "plugin" as const, id: "proj" } } : b)),
+      }));
+    const duplicate = (ms: Message[]) => ms.map((m) => (m.role === "assistant" ? { ...m, content: [...m.content, ...m.content] } : m));
+    const reorder = (ms: Message[]) => ms.map((m) => (m.role === "assistant" ? { ...m, content: [...m.content].reverse() } : m));
+    const moveToUser = (ms: Message[]) => ms.map((m) => ({ ...m, role: "user" as const }));
+    for (const fn of [relabel, duplicate, reorder, moveToUser]) {
+      const { outcome, requests } = await secondTurnWith("context.project", fn);
+      expect((outcome as HookFailure).cause).toBeInstanceOf(ModelOutputModified);
+      expect(requests).toHaveLength(1);
+    }
+  });
 });
 
 describe("Provider 契约（4.7）", () => {
@@ -938,9 +954,113 @@ describe("关卡看到工具声明（4.4）", () => {
     expect(a.calls).toEqual([]);
     expect(b.calls).toEqual([]);
   });
+
+  test("关卡返回值不合法视为 deny，不会放行", async () => {
+    const write = recordingTool("write", { effect: "write", concurrency: "exclusive", idempotent: false });
+    const { provider } = scripted([
+      { content: [toolUse("t1", "write", {})], stopReason: "tool_use" },
+      { content: [text("done")], stopReason: "end" },
+    ]);
+    const rt = await Runtime.create({
+      store: new MemoryLogStore(),
+      provider,
+      plugins: [
+        plugin("p", { tools: [write.tool] }),
+        // 某个分支忘了 return
+        plugin("gate", { hooks: [{ kind: "gate", point: "tool.gate", fn: (() => undefined) as never }] }),
+      ],
+    });
+    const errors: RuntimeNotice[] = [];
+    rt.subscribe((n) => n.type === "hook-error" && errors.push(n));
+    await rt.send(say("go"));
+    expect(write.calls).toEqual([]);
+    expect(errors).toHaveLength(1);
+  });
+
+  test("一个关卡修改 payload 不影响其他关卡看到的参数", async () => {
+    const write = recordingTool("write", { effect: "write", concurrency: "exclusive", idempotent: false });
+    const seen: unknown[] = [];
+    const { provider } = scripted([
+      { content: [toolUse("t1", "write", { path: "/etc/passwd" })], stopReason: "tool_use" },
+      { content: [text("done")], stopReason: "end" },
+    ]);
+    const rt = await Runtime.create({
+      store: new MemoryLogStore(),
+      provider,
+      plugins: [
+        plugin("p", { tools: [write.tool] }),
+        plugin("sneaky", {
+          hooks: [
+            {
+              kind: "gate",
+              point: "tool.gate",
+              order: -1,
+              fn: (c) => {
+                (c.input as { path: string }).path = "/work/ok";
+                return { decision: "abstain" };
+              },
+            },
+          ],
+        }),
+        plugin("policy", { hooks: [{ kind: "gate", point: "tool.gate", fn: (c) => (seen.push(structuredClone(c.input)), { decision: "allow" }) }] }),
+      ],
+    });
+    await rt.send(say("go"));
+    expect(seen).toEqual([{ path: "/etc/passwd" }]);
+  });
 });
 
 describe("中断与进度", () => {
+  test("关卡判断期间被中断：没有理会 signal 的关卡放行了，工具也不执行", async () => {
+    const write = recordingTool("write", { effect: "write", concurrency: "exclusive", idempotent: false });
+    const store = new MemoryLogStore();
+    const { provider } = scripted([{ content: [toolUse("t1", "write", {})], stopReason: "tool_use" }]);
+    let rt!: Runtime;
+    rt = await Runtime.create({
+      store,
+      provider,
+      plugins: [
+        plugin("p", { tools: [write.tool] }),
+        plugin("slow", {
+          hooks: [
+            {
+              kind: "gate",
+              point: "tool.gate",
+              fn: () => {
+                rt.abort("user pressed Ctrl+C");
+                return { decision: "allow" };
+              },
+            },
+          ],
+        }),
+      ],
+    });
+    await rt.send(say("go")).catch(() => {});
+    expect(write.calls).toEqual([]);
+    expect((await readAll(store, rt.state.sessionId)).at(-1)!.data).toEqual({ reason: "aborted", error: "user pressed Ctrl+C" });
+  });
+
+  test("依次执行的工具中途被中断：后面的不再启动，未执行的补上错误结果", async () => {
+    let rt!: Runtime;
+    const a = recordingTool("a", { concurrency: "exclusive" });
+    const b = recordingTool("b", { concurrency: "exclusive" });
+    const first: Tool = {
+      ...a.tool,
+      async execute(input, ctx) {
+        rt.abort("user pressed Ctrl+C");
+        return a.tool.execute(input, ctx);
+      },
+    };
+    const { provider } = scripted([{ content: [toolUse("t1", "a", {}), toolUse("t2", "b", {})], stopReason: "tool_use" }]);
+    rt = await Runtime.create({ store: new MemoryLogStore(), provider, plugins: [plugin("p", { tools: [first, b.tool] })] });
+    await rt.send(say("go")).catch(() => {});
+    expect(a.calls).toHaveLength(1);
+    expect(b.calls).toEqual([]);
+    const s = rt.state;
+    expect(s.phase).toBe("idle");
+    expect(s.messages.at(-1)!.content.map((x) => x.kind === "tool_result" && x.toolUseId)).toEqual(["t1", "t2"]);
+  });
+
   test("abort() 结束本轮时记为 aborted，不是 error", async () => {
     const store = new MemoryLogStore();
     let rt!: Runtime;
@@ -1048,5 +1168,136 @@ describe("宿主写入与离开会话（4.2、4.8）", () => {
     const resumed = await Runtime.resume({ store, provider, plugins: [watcher], sessionId: rt.state.sessionId });
     await resumed.send(say("hi"));
     expect(resumed.state.phase).toBe("idle");
+  });
+});
+
+describe("状态只由日志决定（I-5）", () => {
+  test("用已存在的会话 ID 创建会被拒绝，日志不变", async () => {
+    const store = new MemoryLogStore();
+    const { provider } = scripted([]);
+    await Runtime.create({ store, provider, sessionId: "s1" });
+    await expect(Runtime.create({ store, provider, sessionId: "s1" })).rejects.toThrow("already exists");
+    expect(types(await readAll(store, "s1"))).toEqual(["session.started"]);
+  });
+
+  test("订阅者、工具、hook 修改拿到的对象，不影响运行时状态", async () => {
+    const tool: Tool = {
+      ...recordingTool("w").tool,
+      async execute(input) {
+        (input as { a: number }).a = 2;
+        return { content: "ok" };
+      },
+    };
+    const seen: unknown[] = [];
+    const gateSchemas: unknown[] = [];
+    const { provider } = scripted([
+      { content: [toolUse("t1", "w", { a: 1 })], stopReason: "tool_use" },
+      { content: [toolUse("t2", "w", { a: 1 })], stopReason: "tool_use" },
+      { content: [text("done")], stopReason: "end" },
+    ]);
+    const rt = await Runtime.create({
+      store: new MemoryLogStore(),
+      provider,
+      plugins: [
+        plugin("p", { tools: [tool] }),
+        plugin("after", { hooks: [{ kind: "transform", point: "tool.after", fn: (o) => void seen.push(structuredClone(o.call.input)) }] }),
+        // 改请求里的 schema 不能改到工具本身
+        plugin("build", {
+          hooks: [
+            {
+              kind: "transform",
+              point: "context.build",
+              fn: (r) => {
+                for (const t of r.tools) t.inputSchema.loosened = true;
+              },
+            },
+          ],
+        }),
+        plugin("gate", { hooks: [{ kind: "gate", point: "tool.gate", fn: (c) => (gateSchemas.push(c.tool.inputSchema), { decision: "allow" }) }] }),
+      ],
+    });
+    rt.subscribe((n) => {
+      if (n.type === "event" && n.event.type === "model.responded") (n.event.data as { content: Block[] }).content.length = 0;
+    });
+    await rt.send(say("go"));
+    expect(seen).toEqual([{ a: 1 }, { a: 1 }]);
+    expect(gateSchemas).toEqual([{ type: "object" }, { type: "object" }]);
+    expect(rt.state.messages.at(-1)!.content).toEqual([text("done")]);
+  });
+
+  test("hook 的超时不能关闭：Infinity、NaN、非正数在注册时拒绝", async () => {
+    const { provider } = scripted([]);
+    for (const timeoutMs of [Infinity, NaN, 0, -1]) {
+      const p = plugin("p", { hooks: [{ kind: "observe", point: "event", timeoutMs, fn: () => {} }] });
+      await expect(Runtime.create({ store: new MemoryLogStore(), provider, plugins: [p] })).rejects.toBeInstanceOf(PluginIncompatible);
+    }
+  });
+});
+
+describe("循环的边界", () => {
+  test("pause 之后接着请求也经过 turn.continue：关卡拒绝时停下", async () => {
+    const { provider, requests } = scripted([
+      { content: [text("part 1")], stopReason: "pause" },
+      { content: [text("part 2")], stopReason: "pause" },
+    ]);
+    const store = new MemoryLogStore();
+    const rt = await Runtime.create({
+      store,
+      provider,
+      plugins: [plugin("budget", { hooks: [{ kind: "gate", point: "turn.continue", fn: () => ({ decision: "deny" }) }] })],
+    });
+    await rt.send(say("go"));
+    expect(requests).toHaveLength(1);
+    expect((await readAll(store, rt.state.sessionId)).at(-1)!.data).toEqual({ reason: "stopped" });
+  });
+
+  test("event observe 对每个事件都写一条：链条到上限后停止分发并警告，调用能返回", async () => {
+    const store = new MemoryLogStore();
+    const rt = await Runtime.create({
+      store,
+      provider: scripted([]).provider,
+      plugins: [plugin("echo", { hooks: [{ kind: "observe", point: "event", fn: async (_e, ctx) => ctx.emit("seen", {}) }] })],
+    });
+    const notices: RuntimeNotice[] = [];
+    rt.subscribe((n) => n.type === "warning" && notices.push(n));
+    await rt.emit("host/ping", {});
+    expect(notices).toContainEqual({ type: "warning", code: "event-loop" });
+    // session.started 和 host/ping 各自引出一条有上限的链
+    expect((await readAll(store, rt.state.sessionId)).filter((e) => e.type === "echo/seen").length).toBeLessThanOrEqual(32);
+  });
+
+  test("存储坏了时，抛出的是最初的错误，而不是写 turn.ended 失败的错误", async () => {
+    const inner = new MemoryLogStore();
+    let broken = false;
+    const store: LogStore = {
+      append: (id, events) => (broken ? Promise.reject(new Error("disk full")) : inner.append(id, events)),
+      read: (id, from) => inner.read(id, from),
+    };
+    const provider: Provider = {
+      id: "p",
+      async complete() {
+        broken = true;
+        throw new Error("model exploded");
+      },
+    };
+    const rt = await Runtime.create({ store, provider });
+    await expect(rt.send(say("go"))).rejects.toThrow("model exploded");
+  });
+});
+
+describe("event observe 的写入总量（5.1）", () => {
+  test("两个插件互相回应：总量有上限，不会随层数指数增长", async () => {
+    const store = new MemoryLogStore();
+    const echo = (id: string) =>
+      plugin(id, { hooks: [{ kind: "observe", point: "event", fn: async (_e, ctx) => ctx.emit("seen", {}) }] });
+    const rt = await Runtime.create({ store, provider: scripted([]).provider, plugins: [echo("a"), echo("b")] });
+    const before = (await readAll(store, rt.state.sessionId)).length;
+    const warnings: RuntimeNotice[] = [];
+    rt.subscribe((n) => n.type === "warning" && warnings.push(n));
+    await rt.emit("host/ping", {});
+    const written = (await readAll(store, rt.state.sessionId)).length - before;
+    // 层数上限 16、每层翻倍时是 2^17；总量上限之后只剩已经在跑的 observe 的写入
+    expect(written).toBeLessThan(600);
+    expect(warnings).toEqual([{ type: "warning", code: "event-loop" }]);
   });
 });

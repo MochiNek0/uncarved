@@ -101,7 +101,8 @@ export function step(s: State, e: Event): StepResult {
         b.kind === "tool_use" ? [{ toolUseId: b.id, name: b.name, input: b.input }] : [],
       );
 
-      if (d.stopReason === "pause") return ok(next, [{ type: "CallModel" }]);
+      // 暂停后接着请求也要经过 turn.continue，否则一直暂停的模型会绕过步数上限
+      if (d.stopReason === "pause") return ok({ ...next, phase: "continuing" }, [{ type: "DecideContinue" }]);
 
       if (d.stopReason === "tool_use" && calls.length > 0) {
         return ok({ ...next, phase: "deciding", batch: calls }, [

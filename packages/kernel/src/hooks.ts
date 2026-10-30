@@ -88,6 +88,7 @@ export const LAYERS = ["builtin", "distro", "user", "project", "session"] as con
 export type Layer = (typeof LAYERS)[number];
 
 export const DEFAULT_HOOK_TIMEOUT_MS = 30_000;
+const MAX_TIMER_MS = 2 ** 31 - 1;
 
 export class HookTimeout extends Error {
   constructor() {
@@ -183,7 +184,7 @@ export class HookBus {
     return value;
   }
 
-  /** 全部执行后合并：deny > ask > allow > abstain；出错或超时视为 deny */
+  /** 全部执行后合并：deny > ask > allow > abstain；出错、超时或返回值不合法视为 deny */
   async gate<P extends GatePoint>(
     point: P,
     payload: GatePayloads[P],
@@ -193,7 +194,9 @@ export class HookBus {
     const results = await Promise.all(
       hooks.map(async (h) => {
         try {
-          const r = (await invoke(h.spec.fn as AnyFn, payload, ctx(h.plugin), h.spec.timeoutMs)) as GateResult;
+          // 每个 gate 一份拷贝：并发执行时，一个 gate 改了 payload 不能影响其他 gate 看到的内容
+          const r = (await invoke(h.spec.fn as AnyFn, structuredClone(payload), ctx(h.plugin), h.spec.timeoutMs)) as GateResult;
+          if (!r || !Object.hasOwn(GATE_RANK, r.decision)) throw new Error(`invalid gate result ${JSON.stringify(r)}`);
           return { ...r, by: h.plugin };
         } catch (error) {
           this.#onError({ plugin: h.plugin, point, error });
@@ -243,10 +246,11 @@ async function invoke(fn: AnyFn, payload: unknown, ctx: HookContext, timeoutMs =
     return await Promise.race([
       Promise.resolve().then(() => fn(payload, scoped)),
       new Promise<never>((_, reject) => {
+        // setTimeout 超过 2^31-1 毫秒会当成 1 毫秒，截到上限
         timer = setTimeout(() => {
           ac.abort();
           reject(new HookTimeout());
-        }, timeoutMs);
+        }, Math.min(timeoutMs, MAX_TIMER_MS));
       }),
     ]);
   } finally {

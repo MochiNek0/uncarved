@@ -4,9 +4,10 @@
 // 项目层插件只能经 loadProjectPlugin 加载，Runtime 拒绝其他途径注册的项目层插件。
 
 import { createHash } from "node:crypto";
-import { readdir, readFile } from "node:fs/promises";
+import { readdir, readFile, realpath } from "node:fs/promises";
+import { createRequire, isBuiltin } from "node:module";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { Plugin } from "./plugin.ts";
 
 export interface TrustRecord {
@@ -97,6 +98,7 @@ export function asProjectPlugin(plugin: Plugin, grant: TrustGrant): Plugin {
 export async function loadProjectPlugin(dir: string, opts: TrustOptions & { entry?: string }): Promise<Plugin> {
   const root = path.resolve(dir);
   const { hash, files } = await hashDir(root);
+  await checkImports(root, files);
   const grant = await requireTrust({ path: root, hash, files }, opts);
 
   const prev = imported.get(root);
@@ -106,6 +108,56 @@ export async function loadProjectPlugin(dir: string, opts: TrustOptions & { entr
   const mod = (await import(pathToFileURL(path.join(root, opts.entry ?? "index.ts")).href)) as { default?: Plugin };
   if (!mod.default || typeof mod.default.id !== "string") throw new UntrustedPlugin(root, "default export is not a plugin");
   return asProjectPlugin(mod.default, grant);
+}
+
+const CODE_FILE = /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
+/** import/export ... from "x"、import "x"、import("x")、require("x") 里的模块名 */
+const SPECIFIER = /\b(?:from|import|require)\s*\(?\s*(["'`])([^"'`]*)\1/g;
+/** import( / require( 后面不是字符串字面量：模块名在运行时才确定 */
+const COMPUTED = /\b(?:import|require)\s*\(\s*(?!["'`][^"'`$]*["'`]\s*\))/;
+/** 只导入类型的语句，编译后不存在，不加载任何代码 */
+const TYPE_ONLY = /\b(?:import|export)\s+type\s+[^;]*?\bfrom\s*(["'`])[^"'`]*\1/gs;
+/** 内核自己的包目录：插件从这里导入的是宿主已经在运行的代码 */
+const KERNEL_DIR = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+
+/**
+ * 哈希只覆盖插件目录，所以插件代码不能加载目录之外的文件，否则那些文件变了也不会重新确认（7.1）。
+ * 每个模块名都解析成文件：必须在插件目录内（包括插件自带的 node_modules），或者是内核自身、Node 内置模块。
+ * 无法静态确定的动态 import 一律拒绝。
+ *
+ * 这只能防住正常写法的 import：插件是任意代码，可以在运行时读文件再 eval，那属于用户确认过的代码自己的行为
+ */
+async function checkImports(root: string, files: string[]): Promise<void> {
+  const within = (dir: string, target: string) => {
+    const out = path.relative(dir, target);
+    return out !== ".." && !out.startsWith(`..${path.sep}`) && !path.isAbsolute(out);
+  };
+  const kernelDir = await realpath(KERNEL_DIR);
+  const realRoot = await realpath(root);
+  for (const rel of files) {
+    if (!CODE_FILE.test(rel)) continue;
+    const file = path.join(root, rel);
+    const code = (await readFile(file, "utf8")).replace(TYPE_ONLY, "");
+    if (COMPUTED.test(code)) throw new UntrustedPlugin(root, `${rel}: dynamic import with a computed specifier is not allowed`);
+    for (const [, , spec] of code.matchAll(SPECIFIER)) {
+      if (isBuiltin(spec!)) continue;
+      let target: string;
+      if (spec!.startsWith("file:")) target = fileURLToPath(spec!);
+      else if (spec!.startsWith(".") || path.isAbsolute(spec!)) target = path.resolve(path.dirname(file), spec!);
+      else {
+        // 包名按 Node 的规则解析（会解析符号链接），看它最终落在哪里
+        try {
+          target = createRequire(file).resolve(spec!);
+        } catch {
+          throw new UntrustedPlugin(root, `${rel}: cannot resolve ${JSON.stringify(spec)}`);
+        }
+        if (within(kernelDir, target)) continue;
+      }
+      if (!within(root, target) && !within(realRoot, target)) {
+        throw new UntrustedPlugin(root, `${rel}: imports ${JSON.stringify(spec)} from outside the plugin directory`);
+      }
+    }
+  }
 }
 
 /**

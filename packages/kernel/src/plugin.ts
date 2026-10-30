@@ -55,9 +55,15 @@ export function checkCompat(p: Plugin): void {
   const missing = (p.needs ?? []).filter((n) => !CAPABILITIES.has(n));
   if (missing.length > 0) throw new PluginIncompatible(p.id, `missing capabilities ${missing.join(", ")}`);
   for (const h of p.hooks ?? []) {
-    const problem = isRemote(h) ? checkRemoteHook(h) : undefined;
+    const problem = isRemote(h) ? checkRemoteHook(h) : checkTimeout(h.point, h.timeoutMs);
     if (problem) throw new PluginIncompatible(p.id, problem);
   }
+}
+
+/** 所有 hook 都必须有超时，不能关闭（5.1）：Infinity、NaN、非正数一律拒绝 */
+function checkTimeout(point: string, timeoutMs: number | undefined): string | undefined {
+  if (timeoutMs === undefined || (Number.isFinite(timeoutMs) && timeoutMs > 0)) return undefined;
+  return `${point}: timeoutMs must be a positive finite number`;
 }
 
 const POLICY_RANK: Record<ResumePolicy, number> = { continue: 0, ask: 1, abort: 2 };

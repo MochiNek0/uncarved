@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   MemoryLogStore,
   MemoryTrustStore,
@@ -108,4 +109,68 @@ test("绕过加载器、直接注册的项目层插件被拒绝", async () => {
   await expect(
     Runtime.create({ store: new MemoryLogStore(), provider, plugins: [{ ...loaded }] }),
   ).rejects.toBeInstanceOf(UntrustedPlugin);
+});
+
+test("插件代码不能加载目录之外的文件：那些文件不在哈希里，变了也不会重新确认", async () => {
+  await writeFile(path.join(dir, "helper.ts"), "export const v = 1;");
+  const cases = [
+    `import { v } from "../../helper.ts";`,
+    `export * from "../../helper.ts";`,
+    `import "../../helper.ts";`,
+    `const m = await import("../../helper.ts");`,
+    `const name = "../../helper.ts"; await import(name);`,
+    `import x from ${JSON.stringify(pathToFileURL(path.join(dir, "helper.ts")).href)};`,
+  ];
+  for (const [i, code] of cases.entries()) {
+    const root = await writePlugin(`escape${i}`);
+    await writeFile(path.join(root, "lib", "util.ts"), code);
+    const { confirm, asked } = recordingConfirm(true);
+    const err = await loadProjectPlugin(root, { trust: new MemoryTrustStore(), confirm }).catch((e) => e);
+    expect(err).toBeInstanceOf(UntrustedPlugin);
+    // 在询问用户、执行代码之前就拒绝
+    expect(asked).toEqual([]);
+  }
+  expect(globalThis.__uncarvedTrustRuns).toBe(0);
+
+  // 目录之内的相对路径、包名都可以
+  const root = await writePlugin("inside");
+  await writeFile(path.join(root, "lib", "util.ts"), `import { x } from "./other.ts"; import path from "node:path"; export const y = "../not-an-import";`);
+  await loadProjectPlugin(root, { trust: new MemoryTrustStore(), confirm: async () => true });
+});
+
+test("包名也解析成文件：必须在插件目录内、内核自身或 Node 内置模块；只导入类型的语句不算", async () => {
+  // 插件目录之外的包
+  await mkdir(path.join(dir, "node_modules", "evil"), { recursive: true });
+  await writeFile(path.join(dir, "node_modules", "evil", "package.json"), `{ "name": "evil", "main": "index.js" }`);
+  await writeFile(path.join(dir, "node_modules", "evil", "index.js"), "export const x = 1;");
+  for (const code of [`import { x } from "evil";`, `import { y } from "does-not-exist";`]) {
+    const root = await writePlugin(`bare${code.length}`);
+    await writeFile(path.join(root, "lib", "util.ts"), code);
+    const err = await loadProjectPlugin(root, { trust: new MemoryTrustStore(), confirm: async () => true }).catch((e) => e);
+    expect(err).toBeInstanceOf(UntrustedPlugin);
+  }
+
+  // 插件自带的包、内置模块、只导入类型
+  const root = await writePlugin("vendored");
+  await mkdir(path.join(root, "node_modules", "ok"), { recursive: true });
+  await writeFile(path.join(root, "node_modules", "ok", "package.json"), `{ "name": "ok", "main": "index.js" }`);
+  await writeFile(path.join(root, "node_modules", "ok", "index.js"), "export const z = 1;");
+  await writeFile(
+    path.join(root, "lib", "util.ts"),
+    `import { z } from "ok";\nimport path from "node:path";\nimport fs from "fs";\nimport type {\n  Plugin,\n} from "evil";\nexport type { Tool } from "does-not-exist";`,
+  );
+  await loadProjectPlugin(root, { trust: new MemoryTrustStore(), confirm: async () => true });
+});
+
+test("从内核自身导入是允许的：那是宿主已经在运行的代码", async () => {
+  // 放在仓库里，"uncarved" 才能按工作区解析到内核
+  const root = path.join(import.meta.dir, `.tmp-plugin-${process.pid}`);
+  try {
+    await mkdir(root, { recursive: true });
+    await writeFile(path.join(root, "index.ts"), `import { KERNEL_MAJOR } from "uncarved";\nexport default { id: "k", version: "1.0.0", kernel: "^" + KERNEL_MAJOR };`);
+    const loaded = await loadProjectPlugin(root, { trust: new MemoryTrustStore(), confirm: async () => true });
+    expect(loaded.kernel).toBe("^1");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
