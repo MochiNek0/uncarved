@@ -21,8 +21,13 @@ import {
 export interface SpawnOptions {
   command: string;
   args?: string[];
-  /** 追加到当前进程环境变量之上 */
+  /** 追加到当前进程环境变量之上；inheritEnv 为 false 时就是插件的全部环境变量 */
   env?: Record<string, string>;
+  /**
+   * 默认 true：插件继承宿主的全部环境变量，包括 API key 之类的密钥。
+   * false 时只传 env 里的变量，需要的 PATH 等要自己放进 env
+   */
+  inheritEnv?: boolean;
   cwd?: string;
   /** 默认 "distro"。"project" 时必须提供 trust，启动前先确认（7.1） */
   layer?: Layer;
@@ -72,9 +77,11 @@ export async function spawnPlugin(opts: SpawnOptions): Promise<StdioPlugin> {
 
   const child = spawn(opts.command, opts.args ?? [], {
     cwd: opts.cwd,
-    env: mergeEnv(opts.env),
+    env: opts.inheritEnv === false ? { ...opts.env } : mergeEnv(opts.env),
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
+    // POSIX 上让插件自成一个进程组，结束时连同它启动的子进程一起结束（见 terminate）
+    detached: process.platform !== "win32",
   });
   const conn = new Connection(child, opts.maxMessageBytes ?? DEFAULT_MAX_MESSAGE_BYTES, opts.onStderr);
 
@@ -125,22 +132,41 @@ function mergeEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
   return { ...env, ...extra };
 }
 
-/** 先 SIGTERM，宽限期后还没退出就 SIGKILL：插件可能忽略 SIGTERM（Windows 上 kill 本来就是直接结束） */
+/**
+ * 先 SIGTERM，宽限期后还没退出就 SIGKILL：插件可能忽略 SIGTERM（Windows 上本来就是直接结束）。
+ * 信号发给整个进程树：插件经 sh -c、npx 这类包装命令启动时，只结束直接子进程会留下真正的插件进程
+ */
 function terminate(child: ChildProcess): void {
-  child.kill();
+  killTree(child, "SIGTERM");
   setTimeout(() => {
-    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    if (child.exitCode === null && child.signalCode === null) killTree(child, "SIGKILL");
   }, SHUTDOWN_GRACE_MS).unref();
 }
 
-/** 启动规格（命令、参数、按键排序的环境变量、工作目录）与插件目录内容一起计算哈希 */
+function killTree(child: ChildProcess, signal: NodeJS.Signals): void {
+  if (child.pid === undefined) return;
+  if (process.platform === "win32") {
+    // taskkill /T 按父子关系结束整棵树，必须在直接子进程退出之前执行
+    spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true }).on("error", () => child.kill());
+    return;
+  }
+  try {
+    // 负的 pid 表示进程组（spawn 时 detached，插件是组长）
+    process.kill(-child.pid, signal);
+  } catch {
+    child.kill(signal);
+  }
+}
+
+/** 启动规格（命令、参数、按键排序的环境变量、是否继承宿主环境变量、工作目录）与插件目录内容一起计算哈希 */
 async function describeForTrust(opts: SpawnOptions, dir: string) {
   const root = path.resolve(dir);
   const content = await hashDir(root);
   const env = Object.fromEntries(Object.entries(opts.env ?? {}).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
   // 工作目录决定命令和参数里的相对路径指向哪里
   const cwd = path.resolve(opts.cwd ?? process.cwd());
-  const spec = JSON.stringify({ command: opts.command, args: opts.args ?? [], env, cwd });
+  // 继承宿主环境变量意味着插件能拿到宿主的密钥，确认的内容要包括这一点
+  const spec = JSON.stringify({ command: opts.command, args: opts.args ?? [], env, inheritEnv: opts.inheritEnv !== false, cwd });
   const hash = createHash("sha256").update(spec).update("\0").update(content.hash).digest("hex");
   return { path: root, hash, files: content.files };
 }
@@ -322,6 +348,8 @@ class Connection {
   }
 
   #receive(line: string): void {
+    // 空行（例如插件多输出了一个换行）不是消息，也不说明流坏了
+    if (!line.trim()) return;
     let parsed: unknown;
     try {
       parsed = JSON.parse(line);

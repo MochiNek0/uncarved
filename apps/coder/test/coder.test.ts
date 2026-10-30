@@ -9,7 +9,7 @@ import {
   Runtime,
   type Block,
   type Delta,
-  type Event,
+  type LogEvent,
   type EventDataMap,
   type LogStore,
   type ModelRequest,
@@ -73,7 +73,7 @@ async function setup(script: Step[], extra: Partial<CoderOptions> = {}) {
 }
 
 const events = async (store: LogStore, id: string, type: string) =>
-  (await readAll(store, id)).filter((e) => e.type === type) as Event[];
+  (await readAll(store, id)).filter((e) => e.type === type) as LogEvent[];
 
 const ctx = (progress: unknown[] = []): ToolContext => ({
   sessionId: "s",

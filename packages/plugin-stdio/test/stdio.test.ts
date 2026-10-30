@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -166,6 +166,34 @@ test("插件输出不是对象的 JSON：结束插件进程，宿主不受影响
   expect((await p.exited).code).not.toBe(0);
 });
 
+test("插件输出空行：忽略，不结束插件进程", async () => {
+  const p = await start({ hooks: [hook("blank-lines", "transform", "context.build")] });
+  const { provider, requests } = scripted([{ content: [text("ok")], stopReason: "end" }]);
+  const rt = await Runtime.create({ store: new MemoryLogStore(), provider, plugins: [p] });
+  await rt.send(say("hi"));
+  expect(requests).toHaveLength(1);
+});
+
+test("结束插件进程时连同它启动的子进程一起结束（经包装命令启动的情况）", async () => {
+  const pidFile = path.join(dir, "grandchild.pid");
+  const p = await start({ hooks: [hook("garbage", "transform", "context.build")] }, { env: { FIXTURE_GRANDCHILD: pidFile } });
+  const grandchild = Number(await readFile(pidFile, "utf8"));
+  const alive = () => {
+    try {
+      process.kill(grandchild, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  expect(alive()).toBe(true);
+  const rt = await Runtime.create({ store: new MemoryLogStore(), provider: scripted([]).provider, plugins: [p] });
+  await rt.send(say("hi")).catch(() => {});
+  await p.exited;
+  for (let i = 0; i < 50 && alive(); i++) await Bun.sleep(100);
+  expect(alive()).toBe(false);
+});
+
 test("单条消息超过上限：结束插件进程，宿主不会无限缓存", async () => {
   const p = await start({ hooks: [hook("flood", "transform", "context.build")] }, { maxMessageBytes: 1024 });
   const rt = await Runtime.create({ store: new MemoryLogStore(), provider: scripted([]).provider, plugins: [p] });
@@ -199,6 +227,26 @@ test.if(process.platform === "win32")("Windows：env 覆盖大小写不同的同
   const rt = await Runtime.create({ store: new MemoryLogStore(), provider, plugins: [p] });
   await rt.send(say("hi"));
   expect(requests[0]!.system.at(-1)!.text).toBe("from-override");
+});
+
+test("inheritEnv: false：宿主的环境变量（比如密钥）不会传给插件", async () => {
+  process.env.UNCARVED_TEST_SECRET = "leaked";
+  try {
+    const seen = [];
+    for (const inheritEnv of [true, false]) {
+      const p = await start({ hooks: [hook("env", "transform", "context.build", { reads: ["system"], writes: ["system"] })] }, {
+        inheritEnv,
+        env: { FIXTURE_ENV_NAME: "UNCARVED_TEST_SECRET" },
+      });
+      const { provider, requests } = scripted([{ content: [text("ok")], stopReason: "end" }]);
+      const rt = await Runtime.create({ store: new MemoryLogStore(), provider, plugins: [p] });
+      await rt.send(say("hi"));
+      seen.push(requests[0]!.system.at(-1)!.text);
+    }
+    expect(seen).toEqual(["leaked", ""]);
+  } finally {
+    delete process.env.UNCARVED_TEST_SECRET;
+  }
 });
 
 test("最后一条消息没有换行：stdout 关闭时仍然处理", async () => {

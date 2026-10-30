@@ -21,7 +21,7 @@ import type {
   CoreEventType,
   Delta,
   Effect,
-  Event,
+  LogEvent,
   EventDataMap,
   Message,
   ModelRequest,
@@ -38,7 +38,7 @@ import type {
 } from "./types.ts";
 
 export type RuntimeNotice =
-  | { type: "event"; event: Event }
+  | { type: "event"; event: LogEvent }
   | { type: "delta"; delta: Delta }
   /** 工具通过 ctx.progress 推送的进度，不记入日志 */
   | { type: "tool-progress"; toolUseId: string; name: string; update: unknown }
@@ -111,6 +111,8 @@ const MAX_EVENT_DEPTH = 16;
  */
 const MAX_CASCADE_EVENTS = 256;
 
+/** 中断后等 provider 自己结束的时间，超过就不再等它 */
+const ABORT_GRACE_MS = 1_000;
 const RUNTIME: Origin = { by: "runtime" };
 const HOST: Origin = { by: "host" };
 
@@ -225,7 +227,9 @@ export class Runtime {
     this.#enter(input.kind === "plugins");
     try {
       await this.#commit("input.received", input, { by: "user" });
-      await this.#drive();
+      // 插件变化的批准只记录结果，接下来做什么一律由 recover() 根据状态决定，与 resume() 一致（4.6）
+      if (input.kind === "plugins") this.#queue.length = 0;
+      else await this.#drive();
     } finally {
       await this.#settle();
       this.#busy = false;
@@ -433,10 +437,15 @@ export class Runtime {
     const requestHash = createHash("sha256").update(JSON.stringify(request)).digest("hex");
     await this.#commit("model.requested", { requestHash }, RUNTIME);
 
-    const res = await this.#provider.complete(request, {
+    // 不理会 signal 的 provider 不能让中断一直等下去（I-9）：模型调用没有副作用，宽限期过后直接放弃，迟到的结果丢弃。
+    // 工具不这样处理：工具可能还在改动外部状态，提前结束会让下一轮和它同时运行
+    const res = await abortable(
+      this.#provider.complete(request, {
+        signal,
+        onDelta: (delta) => this.#notify({ type: "delta", delta }),
+      }),
       signal,
-      onDelta: (delta) => this.#notify({ type: "delta", delta }),
-    });
+    );
     // I-6 的检查靠 origin 认出模型块，来源不对的块写进日志后就再也认不出来了（I-8）
     if (res.content.some((b) => b.origin?.by !== "model")) {
       throw new ProviderError(`provider ${res.provider ?? this.#provider.id} returned a block not attributed to the model`, {
@@ -562,7 +571,7 @@ export class Runtime {
         type,
         data,
         origin,
-      } as Event;
+      } as LogEvent;
       // 先校验状态转换，再落盘，落盘成功后才更新状态、交出 Effect
       const next = step(this.#state, event);
       await this.#store.append(this.#state.sessionId, [event]);
@@ -642,7 +651,26 @@ function toolInfo(t: Tool): ToolInfo {
   return structuredClone({ name, description, inputSchema, effect, concurrency, idempotent });
 }
 
-async function resolves(store: LogStore, sessionId: string, match: (e: Event) => boolean): Promise<boolean> {
+/**
+ * 中断后 p 在宽限期内结束的，照常返回它的结果或错误；超过宽限期就以 signal.reason 拒绝，不再等 p，
+ * p 之后的结果或错误被丢弃
+ */
+function abortable<T>(p: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const onAbort = () => {
+      timer = setTimeout(() => reject(signal.reason), ABORT_GRACE_MS);
+    };
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+    p.then(resolve, reject).finally(() => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+    });
+  });
+}
+
+async function resolves(store: LogStore, sessionId: string, match: (e: LogEvent) => boolean): Promise<boolean> {
   for await (const e of store.read(sessionId)) if (match(e)) return true;
   return false;
 }

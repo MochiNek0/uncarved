@@ -1,7 +1,7 @@
 // 扩展点与组合规则。对应宪法第五章。
 
 import { isRemote, toLocalHook, type RemoteHookSpec } from "./remote.ts";
-import type { Awaitable, Event, GatedToolCall, Message, ModelRequest, ModelResponse, State, ToolCall, ToolOutcome } from "./types.ts";
+import type { Awaitable, LogEvent, GatedToolCall, Message, ModelRequest, ModelResponse, State, ToolCall, ToolOutcome } from "./types.ts";
 
 export interface TransformPayloads {
   "context.project": Message[];
@@ -21,7 +21,7 @@ export interface ObservePayloads {
   "session.start": State;
   "session.end": State;
   "model.after": ModelResponse;
-  event: Event;
+  event: LogEvent;
 }
 
 export type TransformPoint = keyof TransformPayloads;

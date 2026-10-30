@@ -89,7 +89,8 @@ test("模型输出的块原样回传，包括思考块的签名（I-6）", async
 
   expect(deltas).toEqual(["he"]);
   expect(res.stopReason).toBe("tool_use");
-  expect(res.usage).toMatchObject({ inputTokens: 10, outputTokens: 5, cacheReadTokens: 3 });
+  // inputTokens 是输入总量：API 的 input_tokens 加上缓存部分
+  expect(res.usage).toMatchObject({ inputTokens: 13, outputTokens: 5, cacheReadTokens: 3 });
   expect(res.content.map((b) => b.kind)).toEqual(["thinking", "opaque", "tool_use"]);
 
   // 第二轮：把回复和工具结果发回去
@@ -194,6 +195,31 @@ test("SDK 的错误转成 ProviderError；取消照原样抛出", async () => {
   expect(await fail(new Anthropic.APIError(400, {}, "bad", new Headers()))).toMatchObject({ retryable: false, status: 400 });
   expect(await fail(new Anthropic.APIConnectionError({ message: "reset" }))).toMatchObject({ retryable: true, status: undefined });
   expect(await fail(new Anthropic.APIUserAbortError())).not.toBeInstanceOf(ProviderError);
+});
+
+test("其他 provider 的工具调用参数不是对象（解析失败的原始字符串）：包成对象发送，API 只接受对象", async () => {
+  const { client, calls } = fakeClient({ model: "m", content: [], stop_reason: "end_turn", usage: { input_tokens: 0, output_tokens: 0 } });
+  const other = { by: "model" as const, provider: "openai-compat", model: "x" };
+  await anthropicProvider({ client }).complete(
+    {
+      system: [],
+      tools: [],
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            { kind: "tool_use", id: "a", name: "echo", input: '{"x": ', origin: other, trust: "trusted" },
+            { kind: "tool_use", id: "b", name: "echo", input: { x: 1 }, origin: other, trust: "trusted" },
+          ],
+        },
+      ],
+    },
+    { signal: new AbortController().signal },
+  );
+  expect((calls[0]!.messages as Array<{ content: unknown }>)[0]!.content).toEqual([
+    { type: "tool_use", id: "a", name: "echo", input: { raw_arguments: '{"x": ' } },
+    { type: "tool_use", id: "b", name: "echo", input: { x: 1 } },
+  ]);
 });
 
 test("空的 text 块不发送；没有内容的消息整条省略", async () => {

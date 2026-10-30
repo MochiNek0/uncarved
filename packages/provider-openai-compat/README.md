@@ -28,7 +28,7 @@ const provider = openaiCompatProvider({
 | `baseURL` | 必填，例如 `https://api.deepseek.com/v1` |
 | `model` | 必填 |
 | `apiKey` | |
-| `maxTokens` | |
+| `maxTokens` | 作为 `max_tokens` 发送，不设时不发。OpenAI 的推理模型（o 系列、gpt-5 等）不接受 `max_tokens`，请不设 `maxTokens`，改用 `extraBody: { max_completion_tokens: ... }` |
 | `extraBody` / `headers` | 每次请求合并进请求体 / 请求头 |
 | `fetch` | 替换 `fetch` 实现，便于测试或走代理 |
 

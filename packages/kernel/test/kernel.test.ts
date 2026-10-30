@@ -20,7 +20,7 @@ import {
   rebuild,
   step,
   type Block,
-  type Event,
+  type LogEvent,
   type LogStore,
   type Message,
   type ModelRequest,
@@ -96,7 +96,7 @@ function deterministic() {
   return { now: () => "2026-01-01T00:00:00.000Z", newId: () => `id-${++n}` };
 }
 
-const types = (events: Event[]) => events.map((e) => e.type);
+const types = (events: LogEvent[]) => events.map((e) => e.type);
 
 // ---------- 测试 ----------
 
@@ -603,9 +603,13 @@ describe("恢复时插件发生变化（4.6）", () => {
       await expect(rt.send({ kind: "approval", toolUseId: "t1", approved: true })).rejects.toBeInstanceOf(PluginsHeld);
       await expect(rt.recover()).rejects.toBeInstanceOf(PluginsHeld);
 
+      // 批准只记录结果：待决的调用回到 deciding，由 recover() 重新走关卡
       await rt.send({ kind: "plugins", approved: true });
       expect(rt.state.held).toBeUndefined();
       expect(rt.state.plugins).toEqual(plugins.map((p) => ({ id: p.id, version: p.version })));
+      expect(rt.state.phase).toBe("deciding");
+      await rt.recover();
+      expect(rt.state.phase).toBe("awaiting");
     }
   });
 
@@ -768,10 +772,10 @@ describe("插件写入日志（I-5）与会话引用（3.4）", () => {
 
     const events = await readAll(store, rt.state.sessionId);
     const decided = events.find((e) => e.type === "tool.decided")!;
-    const completed = events.find((e) => e.type === "tool.completed")! as Event<"tool.completed">;
+    const completed = events.find((e) => e.type === "tool.completed")! as LogEvent<"tool.completed">;
     const childId = completed.data.child!.sessionId;
     expect(completed.data.child).toEqual({ sessionId: childId, seq: childSeq });
-    const childStart = (await readAll(store, childId))[0] as Event<"session.started">;
+    const childStart = (await readAll(store, childId))[0] as LogEvent<"session.started">;
     expect(childStart.data.parent).toEqual({ sessionId: rt.state.sessionId, eventId: decided.id });
 
     await expect(
@@ -974,7 +978,7 @@ class FlakyStore implements LogStore {
   #crashed = false;
   crashOn?: string;
 
-  async append(sessionId: string, events: Event[]): Promise<void> {
+  async append(sessionId: string, events: LogEvent[]): Promise<void> {
     if (this.#crashed || events.some((e) => e.type === this.crashOn)) {
       this.#crashed = true;
       throw new Error("disk gone");
@@ -1345,6 +1349,29 @@ describe("中断与进度", () => {
     expect(ended.data).toEqual({ reason: "aborted", error: "user pressed Ctrl+C" });
   });
 
+  test("provider 不理会中断信号：宽限期过后不再等它，本轮记为 aborted", async () => {
+    const store = new MemoryLogStore();
+    let rt!: Runtime;
+    let late!: (r: ModelResponse) => void;
+    const provider: Provider = {
+      id: "stuck",
+      complete: () =>
+        new Promise((resolve) => {
+          late = resolve;
+          rt.abort("user pressed Ctrl+C");
+        }),
+    };
+    rt = await Runtime.create({ store, provider, plugins: [] });
+    await expect(rt.send(say("hi"))).rejects.toBe("user pressed Ctrl+C");
+    expect(rt.state.phase).toBe("idle");
+    // 迟到的响应被丢弃，不写进日志
+    late({ model: "m", content: [text("late")], stopReason: "end" });
+    await Bun.sleep(0);
+    const events = await readAll(store, rt.state.sessionId);
+    expect(events.at(-1)!.data).toEqual({ reason: "aborted", error: "user pressed Ctrl+C" });
+    expect(types(events)).not.toContain("model.responded");
+  });
+
   test("工具通过 ctx.progress 推送进度，不写日志", async () => {
     const store = new MemoryLogStore();
     const tool: Tool = {
@@ -1712,7 +1739,7 @@ describe("边界情况", () => {
 
   test("tool.interrupted 只能用于已允许、还没有结果的调用", () => {
     const at = "2026-01-01T00:00:00.000Z";
-    const events: Event[] = [
+    const events: LogEvent[] = [
       { v: 1, id: "e1", seq: 1, at, type: "session.started", data: { plugins: [] }, origin: { by: "runtime" } },
       { v: 1, id: "e2", seq: 2, at, type: "input.received", data: say("hi"), origin: { by: "user" } },
       { v: 1, id: "e3", seq: 3, at, type: "model.requested", data: { requestHash: "h" }, origin: { by: "runtime" } },
@@ -1730,7 +1757,7 @@ describe("边界情况", () => {
       { v: 1, id: "e7", seq: 7, at, type: "tool.completed", data: { toolUseId: "t1", content: [], isError: false }, origin: { by: "tool", name: "echo" } },
     ];
     const s = rebuild("s", events);
-    const interrupt = (toolUseId: string): Event => ({
+    const interrupt = (toolUseId: string): LogEvent => ({
       v: 1,
       id: "e8",
       seq: 8,

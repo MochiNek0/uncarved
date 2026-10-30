@@ -1,6 +1,7 @@
 // 测试用的进程外插件。清单来自环境变量 FIXTURE_MANIFEST，hook 的行为由 hook 名决定。
 // 设置 FIXTURE_MARK 时，启动后立即写入该文件，用来证明进程是否被启动过。
 
+import { spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
@@ -14,6 +15,16 @@ interface Msg {
 
 const manifest = JSON.parse(process.env.FIXTURE_MANIFEST!);
 if (process.env.FIXTURE_MARK) writeFileSync(process.env.FIXTURE_MARK, "started");
+// 设置 FIXTURE_GRANDCHILD 时，启动一个一直运行的子进程，把它的 pid 写进该文件：模拟经包装命令启动的插件
+if (process.env.FIXTURE_GRANDCHILD) {
+  // Windows 上 Bun 启动的子进程会随父进程一起结束，真正的包装命令（npx、cmd）不会：detached 绕开这一点。
+  // POSIX 上不能 detached，否则它自成一个进程组，不再属于插件的进程组
+  const grandchild = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    stdio: "ignore",
+    detached: process.platform === "win32",
+  });
+  writeFileSync(process.env.FIXTURE_GRANDCHILD, String(grandchild.pid));
+}
 // 不肯退出的插件：忽略 SIGTERM，不回复 shutdown，stdin 关闭后也不退出
 const stubborn = process.env.FIXTURE_STUBBORN === "1";
 if (stubborn) {
@@ -49,7 +60,7 @@ async function handle(msg: Msg): Promise<unknown> {
           };
         case "env":
           return {
-            system: [...payload.system, { text: process.env.PATH ?? "", stability: "stable", origin: { by: "plugin", id: manifest.id }, trust: "untrusted" }],
+            system: [...payload.system, { text: process.env[process.env.FIXTURE_ENV_NAME ?? "PATH"] ?? "", stability: "stable", origin: { by: "plugin", id: manifest.id }, trust: "untrusted" }],
           };
         case "deny-danger":
           return payload.name === "danger" ? { decision: "deny", reason: "blocked by process" } : { decision: "abstain" };
@@ -71,6 +82,10 @@ async function handle(msg: Msg): Promise<unknown> {
         case "deaf":
           // 卡死，不再读 stdin，宿主发来的数据堆在管道里
           for (;;);
+        case "blank-lines":
+          // 回复之前多输出几个空行
+          process.stdout.write("\n\r\n  \n");
+          return {};
         case "garbage":
           // 合法的 JSON，但不是 JSON-RPC 消息
           process.stdout.write("null\n");

@@ -49,7 +49,7 @@ interface StreamChunk {
     };
     finish_reason?: string | null;
   }>;
-  usage?: { prompt_tokens?: number; completion_tokens?: number } | null;
+  usage?: { prompt_tokens?: number; completion_tokens?: number; prompt_tokens_details?: { cached_tokens?: number } | null } | null;
   /** 部分服务端在流中途出错时发送的块 */
   error?: { message?: string; code?: number | string };
 }
@@ -170,7 +170,14 @@ export function openaiCompatProvider(opts: OpenAICompatOptions): Provider {
         model,
         content,
         stopReason: toStopReason(finish, calls.length > 0),
-        usage: usage ? { inputTokens: usage.prompt_tokens, outputTokens: usage.completion_tokens } : undefined,
+        // prompt_tokens 已经包含命中缓存的部分
+        usage: usage
+          ? {
+              inputTokens: usage.prompt_tokens,
+              outputTokens: usage.completion_tokens,
+              cacheReadTokens: usage.prompt_tokens_details?.cached_tokens ?? undefined,
+            }
+          : undefined,
       };
     },
   };
@@ -237,7 +244,8 @@ function fromAssistant(m: Message): ChatMessage[] {
           {
             id: b.id,
             type: "function" as const,
-            function: { name: b.name, arguments: rawArgs(b) ?? JSON.stringify(b.input ?? {}) },
+            // 参数解析失败时 input 是原始字符串，原样回传，不再序列化一层
+            function: { name: b.name, arguments: rawArgs(b) ?? (typeof b.input === "string" ? b.input : JSON.stringify(b.input ?? {})) },
           },
         ]
       : [],
@@ -257,8 +265,8 @@ function fromUser(m: Message): ChatMessage[] {
         .flatMap((c) => (c.kind === "text" ? [c.text] : c.kind === "image" || c.kind === "document" ? [omitted(c.kind)] : []))
         .join("\n");
       // 这个格式没有 is_error 字段，错误结果加前缀，否则模型会把拒绝理由当成正常输出；
-      // 空的错误结果给一个最小占位，否则部分服务端会拒绝空内容
-      out.push({ role: "tool", tool_call_id: b.toolUseId, content: b.isError ? errorText(body) : body });
+      // 空的结果给一个最小占位，否则部分服务端会拒绝空内容
+      out.push({ role: "tool", tool_call_id: b.toolUseId, content: b.isError ? errorText(body) : body || "(no output)" });
     } else if (b.kind === "text") {
       parts.push({ type: "text", text: b.text });
     } else if (b.kind === "image") {

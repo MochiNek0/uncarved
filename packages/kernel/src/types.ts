@@ -72,7 +72,10 @@ export interface ChildRef {
 export type UserInput =
   | { kind: "message"; content: Block[] }
   | { kind: "approval"; toolUseId: string; approved: boolean; reason?: string }
-  /** 对插件清单变化的确认（4.6）。拒绝后只能换回可接受的插件清单 */
+  /**
+   * 对插件清单变化的确认（4.6）。只记录结果，不执行任何工作：批准后调用 recover() 继续未完成的工作。
+   * 拒绝后只能换回可接受的插件清单
+   */
   | { kind: "plugins"; approved: boolean };
 
 /** 恢复会话时插件变化的处理策略，严格程度 abort > ask > continue（4.6） */
@@ -83,10 +86,14 @@ export type StopReason = "end" | "tool_use" | "max_tokens" | "refusal" | "pause"
 /** aborted：被 Runtime.abort() 中断（4.4） */
 export type TurnEndReason = "end" | "max_tokens" | "refusal" | "stopped" | "aborted" | "error";
 
+/** 各 provider 统一的口径 */
 export interface Usage {
+  /** 输入总量，包括命中缓存和写入缓存的部分 */
   inputTokens?: number;
   outputTokens?: number;
+  /** inputTokens 中命中缓存的部分 */
   cacheReadTokens?: number;
+  /** inputTokens 中写入缓存的部分 */
   cacheWriteTokens?: number;
 }
 
@@ -122,7 +129,7 @@ export interface EventDataMap {
 
 export type CoreEventType = keyof EventDataMap;
 
-export interface Event<T extends string = string> {
+export interface LogEvent<T extends string = string> {
   v: 1;
   id: string;
   seq: number;

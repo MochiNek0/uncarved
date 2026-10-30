@@ -125,7 +125,27 @@ test("ext 与构造参数：body、headers 按 默认值 < ext 合并，保留�
   ).rejects.toThrow('must not set "stream"');
 });
 
-test("错误的工具结果加上 [error] 前缀，这个格式没有 is_error 字段", async () => {
+test("其他 provider 解析失败的工具参数（原始字符串）原样回传，不再序列化一层；命中缓存的 token 计入 cacheReadTokens", async () => {
+  const { fetchFn, bodies } = fakeServer([
+    [chunk({ content: "ok" }, "stop"), JSON.stringify({ choices: [], usage: { prompt_tokens: 12, completion_tokens: 3, prompt_tokens_details: { cached_tokens: 8 } } })],
+  ]);
+  const provider = openaiCompatProvider({ baseURL: "https://example.test/v1", model: "m", fetch: fetchFn });
+  const other = { by: "model" as const, provider: "openai-responses", model: "x" };
+  const res = await provider.complete(
+    {
+      system: [],
+      tools: [],
+      messages: [{ role: "assistant", content: [{ kind: "tool_use", id: "c1", name: "echo", input: '{"x": ', origin: other, trust: "trusted" }] }],
+    },
+    { signal: new AbortController().signal },
+  );
+  expect(bodies[0]!.messages).toEqual([
+    { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "echo", arguments: '{"x": ' } }] },
+  ]);
+  expect(res.usage).toEqual({ inputTokens: 12, outputTokens: 3, cacheReadTokens: 8 });
+});
+
+test("错误的工具结果加上 [error] 前缀，这个格式没有 is_error 字段；空的结果给占位", async () => {
   const { fetchFn, bodies } = fakeServer([[chunk({ content: "ok" }, "stop")]]);
   const provider = openaiCompatProvider({ baseURL: "https://example.test/v1", model: "m", fetch: fetchFn });
   const origin = { by: "plugin" as const, id: "policy" };
@@ -141,7 +161,12 @@ test("错误的工具结果加上 [error] 前缀，这个格式没有 is_error �
     {
       system: [],
       tools: [],
-      messages: [{ role: "user", content: [result("c1", "denied by policy", true), result("c2", undefined, true), result("c3", "fine", false)] }],
+      messages: [
+        {
+          role: "user",
+          content: [result("c1", "denied by policy", true), result("c2", undefined, true), result("c3", "fine", false), result("c4", undefined, false)],
+        },
+      ],
     },
     { signal: new AbortController().signal },
   );
@@ -149,6 +174,7 @@ test("错误的工具结果加上 [error] 前缀，这个格式没有 is_error �
     { role: "tool", tool_call_id: "c1", content: "[error] denied by policy" },
     { role: "tool", tool_call_id: "c2", content: "error" },
     { role: "tool", tool_call_id: "c3", content: "fine" },
+    { role: "tool", tool_call_id: "c4", content: "(no output)" },
   ]);
 });
 

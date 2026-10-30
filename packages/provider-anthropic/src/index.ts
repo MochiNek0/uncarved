@@ -99,7 +99,8 @@ export function anthropicProvider(opts: AnthropicProviderOptions = {}): Provider
         content,
         stopReason: toStopReason(msg.stop_reason, content.some((b) => b.kind === "tool_use")),
         usage: {
-          inputTokens: msg.usage.input_tokens,
+          // 这个 API 的 input_tokens 不含缓存部分，内核的 inputTokens 是输入总量
+          inputTokens: msg.usage.input_tokens + (msg.usage.cache_read_input_tokens ?? 0) + (msg.usage.cache_creation_input_tokens ?? 0),
           outputTokens: msg.usage.output_tokens,
           cacheReadTokens: msg.usage.cache_read_input_tokens ?? undefined,
           cacheWriteTokens: msg.usage.cache_creation_input_tokens ?? undefined,
@@ -180,8 +181,11 @@ function toBlockParam(b: Block): ContentBlockParam[] {
       return [{ type: "image", source: b.source } as ContentBlockParam];
     case "document":
       return [{ type: "document", source: b.source } as ContentBlockParam];
-    case "tool_use":
-      return [{ type: "tool_use", id: b.id, name: b.name, input: b.input as Record<string, unknown> }];
+    case "tool_use": {
+      // 其他 provider 解析参数失败时 input 是原始字符串，这个 API 只接受对象：包一层，否则整个请求被拒绝
+      const plain = typeof b.input === "object" && b.input !== null && !Array.isArray(b.input);
+      return [{ type: "tool_use", id: b.id, name: b.name, input: plain ? (b.input as Record<string, unknown>) : { raw_arguments: b.input } }];
+    }
     case "tool_result": {
       const inner = b.content.flatMap(toBlockParam) as ToolResultBlockParam["content"] & unknown[];
       return [

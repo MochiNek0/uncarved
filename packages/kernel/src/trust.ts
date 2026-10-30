@@ -98,6 +98,9 @@ export function asProjectPlugin(plugin: Plugin, grant: TrustGrant): Plugin {
 export async function loadProjectPlugin(dir: string, opts: TrustOptions & { entry?: string }): Promise<Plugin> {
   const root = path.resolve(dir);
   const { hash, files } = await hashDir(root);
+  // 入口必须是哈希过的文件，否则 "../x.js" 这样的入口会导入从未确认过的代码
+  const entry = path.relative(root, path.resolve(root, opts.entry ?? "index.ts")).split(path.sep).join("/");
+  if (!files.includes(entry)) throw new UntrustedPlugin(root, `entry ${JSON.stringify(opts.entry ?? "index.ts")} is not a file in the plugin directory`);
   await checkImports(root, files);
   const grant = await requireTrust({ path: root, hash, files }, opts);
   // 等用户确认可能要很久，期间目录可能被改：确认的必须就是要导入的内容
@@ -107,7 +110,7 @@ export async function loadProjectPlugin(dir: string, opts: TrustOptions & { entr
   if (prev !== undefined && prev !== hash) throw new UntrustedPlugin(root, "changed since it was imported; restart to load it");
   imported.set(root, hash);
 
-  const mod = (await import(pathToFileURL(path.join(root, opts.entry ?? "index.ts")).href)) as { default?: Plugin };
+  const mod = (await import(pathToFileURL(path.join(root, entry)).href)) as { default?: Plugin };
   if (!mod.default || typeof mod.default.id !== "string") throw new UntrustedPlugin(root, "default export is not a plugin");
   return asProjectPlugin(mod.default, grant);
 }
@@ -117,6 +120,10 @@ const CODE_FILE = /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;
 const SPECIFIER = /\b(?:from|import|require)\s*\(?\s*(["'`])([^"'`]*)\1/g;
 /** import( / require( 后面不是字符串字面量：模块名在运行时才确定 */
 const COMPUTED = /\b(?:import|require)\s*\(\s*(?!["'`][^"'`$]*["'`]\s*\))/;
+/** createRequire 返回的函数可以换个名字调用，SPECIFIER 认不出它加载的模块 */
+const CREATE_REQUIRE = /\bcreateRequire\b/;
+/** 类型声明文件不会被执行 */
+const DECLARATION_FILE = /\.d\.[cm]?ts$/;
 /** 只导入类型的语句，编译后不存在，不加载任何代码 */
 const TYPE_ONLY = /\b(?:import|export)\s+type\s+[^;]*?\bfrom\s*(["'`])[^"'`]*\1/gs;
 /** 内核自己的包目录：插件从这里导入的是宿主已经在运行的代码 */
@@ -125,7 +132,9 @@ const KERNEL_DIR = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 /**
  * 哈希只覆盖插件目录，所以插件代码不能加载目录之外的文件，否则那些文件变了也不会重新确认（7.1）。
  * 每个模块名都解析成文件：必须在插件目录内（包括插件自带的 node_modules），或者是内核自身、Node 内置模块。
- * 无法静态确定的动态 import 一律拒绝。
+ * 插件自己的代码里，无法静态确定的动态 import 和 createRequire 一律拒绝。
+ * 插件自带的依赖（node_modules 下）只检查写成字面量的模块名：依赖里常见的 require(变量)、可选依赖
+ * 属于依赖自己的运行时行为，和 eval 一样不在检查范围内；找不到的模块运行时也加载不到，跳过。
  *
  * 这只能防住正常写法的 import：插件是任意代码，可以在运行时读文件再 eval，那属于用户确认过的代码自己的行为
  */
@@ -137,10 +146,14 @@ async function checkImports(root: string, files: string[]): Promise<void> {
   const kernelDir = await realpath(KERNEL_DIR);
   const realRoot = await realpath(root);
   for (const rel of files) {
-    if (!CODE_FILE.test(rel)) continue;
+    if (!CODE_FILE.test(rel) || DECLARATION_FILE.test(rel)) continue;
+    const dependency = rel.split("/").includes("node_modules");
     const file = path.join(root, rel);
     const code = (await readFile(file, "utf8")).replace(TYPE_ONLY, "");
-    if (COMPUTED.test(code)) throw new UntrustedPlugin(root, `${rel}: dynamic import with a computed specifier is not allowed`);
+    if (!dependency) {
+      if (COMPUTED.test(code)) throw new UntrustedPlugin(root, `${rel}: dynamic import with a computed specifier is not allowed`);
+      if (CREATE_REQUIRE.test(code)) throw new UntrustedPlugin(root, `${rel}: createRequire is not allowed`);
+    }
     for (const [, , spec] of code.matchAll(SPECIFIER)) {
       if (isBuiltin(spec!)) continue;
       let target: string;
@@ -150,7 +163,10 @@ async function checkImports(root: string, files: string[]): Promise<void> {
         // 只需知道包落在哪个目录：exports 里的路径不能指出包目录，所以不必按导入条件解析到具体文件。
         // 用 require 的规则解析会漏掉只声明了 import 条件的包（包括内核自己）
         const found = await packageDir(path.dirname(file), spec!);
-        if (found === undefined) throw new UntrustedPlugin(root, `${rel}: cannot resolve ${JSON.stringify(spec)}`);
+        if (found === undefined) {
+          if (dependency) continue;
+          throw new UntrustedPlugin(root, `${rel}: cannot resolve ${JSON.stringify(spec)}`);
+        }
         target = found;
         if (within(kernelDir, target)) continue;
       }
@@ -176,14 +192,18 @@ async function packageDir(from: string, spec: string): Promise<string | undefine
 
 /**
  * 目录内容哈希：按相对路径排序，依次计入 路径、长度、内容。
- * 符号链接可能指向目录之外，一律拒绝
+ * 符号链接可能指向目录之外，一律拒绝。例外是 node_modules/.bin 下包管理器生成的命令链接：
+ * 代码不会 import 它们，不计入哈希
  */
 export async function hashDir(root: string): Promise<{ hash: string; files: string[] }> {
   const entries = await readdir(root, { recursive: true, withFileTypes: true });
   const files: string[] = [];
   for (const e of entries) {
     const rel = path.relative(root, path.join(e.parentPath, e.name)).split(path.sep).join("/");
-    if (e.isSymbolicLink()) throw new UntrustedPlugin(root, `symbolic link not allowed: ${rel}`);
+    if (e.isSymbolicLink()) {
+      if (/(^|\/)node_modules\/\.bin\//.test(rel)) continue;
+      throw new UntrustedPlugin(root, `symbolic link not allowed: ${rel}`);
+    }
     if (e.isFile()) files.push(rel);
   }
   files.sort();

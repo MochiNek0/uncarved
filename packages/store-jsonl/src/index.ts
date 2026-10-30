@@ -7,12 +7,12 @@
 // - 只追加，不提供删除（3.4：被引用的日志不得删除）
 // - 每个会话只能有一个写入者（4.3）。每次 append 持有 <id>.jsonl.lock（独占创建），检查和写入之间不会插进别的写入；
 //   另一个进程（或另一个实例）也在写同一个会话时，本实例的下一次 append 会发现文件和自己最后写入时不一致，
-//   拒绝写入（ConcurrentWrite）。持锁进程已经不在时锁视为失效，可以接管
+//   拒绝写入（ConcurrentWrite）。持锁进程已经不在、或者锁存在时间过长时锁视为失效，可以接管
 
 import { randomUUID } from "node:crypto";
 import { link, mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
 import path from "node:path";
-import type { Event, LogStore, TrustRecord, TrustStore } from "uncarved";
+import type { LogEvent, LogStore, TrustRecord, TrustStore } from "uncarved";
 
 export class CorruptLog extends Error {
   readonly sessionId: string;
@@ -44,7 +44,7 @@ export class JsonlLogStore implements LogStore {
     this.dir = dir;
   }
 
-  async append(sessionId: string, events: Event[]): Promise<void> {
+  async append(sessionId: string, events: LogEvent[]): Promise<void> {
     if (events.length === 0) return;
     const file = this.#file(sessionId);
     if (!this.#tails.has(sessionId)) await mkdir(this.dir, { recursive: true });
@@ -61,7 +61,7 @@ export class JsonlLogStore implements LogStore {
     }
   }
 
-  async #appendLocked(sessionId: string, file: string, events: Event[]): Promise<void> {
+  async #appendLocked(sessionId: string, file: string, events: LogEvent[]): Promise<void> {
     let tail = this.#tails.get(sessionId);
     let created = false;
     if (tail === undefined) {
@@ -94,7 +94,7 @@ export class JsonlLogStore implements LogStore {
   async #lastSeq(sessionId: string, last: Buffer): Promise<number> {
     if (last.length === 0) return 0;
     try {
-      return (JSON.parse(last.toString("utf8")) as Event).seq;
+      return (JSON.parse(last.toString("utf8")) as LogEvent).seq;
     } catch (cause) {
       // 完整读一遍，由 read 报出损坏的行号（也可能是更早的一行）
       for await (const _ of this.read(sessionId));
@@ -103,7 +103,7 @@ export class JsonlLogStore implements LogStore {
   }
 
   /** 分块读取，内存占用与日志长度无关 */
-  async *read(sessionId: string, fromSeq = 1): AsyncIterable<Event> {
+  async *read(sessionId: string, fromSeq = 1): AsyncIterable<LogEvent> {
     let fh;
     try {
       fh = await open(this.#file(sessionId), "r");
@@ -128,9 +128,9 @@ export class JsonlLogStore implements LogStore {
           pending.length = 0;
           start = nl + 1;
           line++;
-          let e: Event;
+          let e: LogEvent;
           try {
-            e = JSON.parse(text) as Event;
+            e = JSON.parse(text) as LogEvent;
           } catch (cause) {
             throw new CorruptLog(sessionId, line, cause);
           }
@@ -144,11 +144,14 @@ export class JsonlLogStore implements LogStore {
   }
 
   #file(sessionId: string): string {
-    // 会话 ID 直接作为文件名，禁止路径分隔符等字符，防止写到目录之外
-    if (!/^[A-Za-z0-9._-]+$/.test(sessionId) || sessionId.startsWith(".")) {
+    // 会话 ID 直接作为文件名，禁止路径分隔符等字符，防止写到目录之外；
+    // Windows 的设备名（CON、NUL 等）不能用作文件名，为了各平台行为一致一律拒绝
+    if (!/^[A-Za-z0-9._-]+$/.test(sessionId) || sessionId.startsWith(".") || /^(con|prn|aux|nul|com\d|lpt\d)(\.|$)/i.test(sessionId)) {
       throw new Error(`invalid session id for file storage: ${JSON.stringify(sessionId)}`);
     }
-    return path.join(this.dir, `${sessionId}.jsonl`);
+    // 文件名一律小写：Windows、macOS 的文件系统不区分大小写，只差大小写的两个 ID 会落到同一个文件上，
+    // 统一成小写后在所有平台上都是同一个会话，不会出现有的平台分开、有的平台混写
+    return path.join(this.dir, `${sessionId.toLowerCase()}.jsonl`);
   }
 }
 
@@ -204,6 +207,11 @@ const READ_CHUNK_BYTES = 64 * 1024;
 const LOCK_WAIT_MS = 10_000;
 /** 空锁文件（进程在创建和写入 pid 之间退出）超过这个时间视为失效 */
 const EMPTY_LOCK_STALE_MS = 5_000;
+/**
+ * 一次 append 持锁的时间很短，超过这个时间的锁即使记录的进程还活着也视为失效：
+ * 那个 pid 可能已经被无关的进程复用（例如容器重启后），或者锁来自另一台机器、另一个 pid 命名空间（共享卷），pid 在这里没有意义
+ */
+const LOCK_STALE_MS = 60_000;
 
 /**
  * 本进程当前持有的锁的内容。锁里写的是 "pid:随机串"：容器重启后进程号常常和崩溃前一样（例如都是 1），
@@ -260,6 +268,9 @@ async function stale(lockFile: string, owner: string): Promise<boolean> {
   const pid = Number(owner.split(":")[0]);
   if (!Number.isInteger(pid) || pid <= 0) return true;
   if (pid === process.pid) return !held.has(owner);
+  const info = await stat(lockFile).catch(() => undefined);
+  if (info === undefined) return false; // 已经释放，重新尝试创建
+  if (Date.now() - info.mtimeMs > LOCK_STALE_MS) return true;
   try {
     process.kill(pid, 0);
     return false;

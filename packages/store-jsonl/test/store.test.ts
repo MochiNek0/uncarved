@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { appendFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { readAll, Runtime, type Block, type Event, type Provider, type Tool } from "uncarved";
+import { readAll, Runtime, type Block, type LogEvent, type Provider, type Tool } from "uncarved";
 import { ConcurrentWrite, CorruptLog, JsonlLogStore, JsonlTrustStore } from "../src/index.ts";
 
 let dir: string;
@@ -13,7 +13,7 @@ afterEach(async () => {
   await rm(dir, { recursive: true, force: true });
 });
 
-const ev = (seq: number): Event => ({
+const ev = (seq: number): LogEvent => ({
   v: 1,
   id: `e${seq}`,
   seq,
@@ -97,7 +97,7 @@ test("末尾未写完的一行：读取时忽略，下次追加前截掉", async
 test("跨读取块的长行和多字节字符完整读出，末尾残行仍被忽略", async () => {
   const store = new JsonlLogStore(dir);
   // 每个事件都比一个读取块（64 KiB）大，多字节字符会落在块边界上
-  const big = (seq: number): Event => ({ ...ev(seq), data: { seq, text: "汉字🙂".repeat(20_000) } });
+  const big = (seq: number): LogEvent => ({ ...ev(seq), data: { seq, text: "汉字🙂".repeat(20_000) } });
   await store.append("s1", [big(1), big(2), big(3)]);
   await appendFile(path.join(dir, "s1.jsonl"), JSON.stringify(big(4)).slice(0, 100_000));
 
@@ -196,7 +196,7 @@ test("文件最后一个事件损坏时，追加报 CorruptLog 而不是解析�
 });
 
 test("最后一个事件和残行都跨多个读取块：截掉残行后从最后一个事件接着写", async () => {
-  const big = (seq: number): Event => ({ ...ev(seq), data: { seq, text: "汉字🙂".repeat(50_000) } });
+  const big = (seq: number): LogEvent => ({ ...ev(seq), data: { seq, text: "汉字🙂".repeat(50_000) } });
   const file = path.join(dir, "s1.jsonl");
   // 只有一个事件、前面没有换行
   await new JsonlLogStore(dir).append("s1", [big(1)]);
@@ -219,6 +219,26 @@ test("锁里的 pid 和本进程相同、但不是本进程持有的（例如容
   const t0 = Date.now();
   await new JsonlLogStore(dir).append("s1", [ev(1)]);
   expect(Date.now() - t0).toBeLessThan(1_000);
+});
+
+test("锁里的进程还活着、但锁已经很久没动（pid 被别的进程复用、锁来自别的机器）：视为失效，直接接管", async () => {
+  const lock = path.join(dir, "s1.jsonl.lock");
+  await writeFile(lock, String(process.ppid));
+  const old = new Date(Date.now() - 10 * 60_000);
+  await utimes(lock, old, old);
+  const t0 = Date.now();
+  await new JsonlLogStore(dir).append("s1", [ev(1)]);
+  expect(Date.now() - t0).toBeLessThan(1_000);
+});
+
+test("会话 ID 不区分大小写，各平台一致；Windows 设备名被拒绝", async () => {
+  const store = new JsonlLogStore(dir);
+  await store.append("Abc", [ev(1)]);
+  await store.append("aBC", [ev(2)]);
+  expect((await readAll(store, "ABC")).map((e) => e.seq)).toEqual([1, 2]);
+  for (const id of ["con", "NUL", "com1", "lpt9.x", "aux"]) {
+    await expect(store.append(id, [ev(1)])).rejects.toThrow("invalid session id");
+  }
 });
 
 test("信任记录损坏时报出文件和行号", async () => {

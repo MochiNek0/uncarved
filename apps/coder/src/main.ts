@@ -14,7 +14,7 @@ import {
   Runtime,
   UntrustedPlugin,
   type Block,
-  type Event,
+  type LogEvent,
   type EventDataMap,
   type PendingCall,
   type Plugin,
@@ -186,7 +186,7 @@ const usage: Required<Usage> = { inputTokens: 0, outputTokens: 0, cacheReadToken
 const addUsage = (u?: Usage) => {
   for (const k of Object.keys(usage) as (keyof Usage)[]) usage[k] += u?.[k] ?? 0;
 };
-if (resumeId) for (const e of await readAll(store, sessionId)) if (e.type === "model.responded") addUsage((e as Event<"model.responded">).data.usage);
+if (resumeId) for (const e of await readAll(store, sessionId)) if (e.type === "model.responded") addUsage((e as LogEvent<"model.responded">).data.usage);
 
 const toolNames = new Map<string, string>();
 let streamed = false;
@@ -254,7 +254,7 @@ function renderProgress(toolUseId: string, p: ShellProgress | TaskProgress) {
   if (lines.length > room) line(dim("  │ …"));
 }
 
-function renderEvent(e: Event) {
+function renderEvent(e: LogEvent) {
   switch (e.type) {
     case "model.responded": {
       const d = e.data as EventDataMap["model.responded"];

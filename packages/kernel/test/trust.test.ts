@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -120,6 +120,8 @@ test("插件代码不能加载目录之外的文件：那些文件不在哈希�
     `const m = await import("../../helper.ts");`,
     `const name = "../../helper.ts"; await import(name);`,
     `import x from ${JSON.stringify(pathToFileURL(path.join(dir, "helper.ts")).href)};`,
+    `import { createRequire } from "node:module"; createRequire(import.meta.url)("../../helper.ts");`,
+    `import { createRequire } from "node:module"; const load = createRequire(import.meta.url); load("../../helper.ts");`,
   ];
   for (const [i, code] of cases.entries()) {
     const root = await writePlugin(`escape${i}`);
@@ -160,6 +162,48 @@ test("包名也解析成文件：必须在插件目录内、内核自身或 Node
     `import { z } from "ok";\nimport path from "node:path";\nimport fs from "fs";\nimport type {\n  Plugin,\n} from "evil";\nexport type { Tool } from "does-not-exist";`,
   );
   await loadProjectPlugin(root, { trust: new MemoryTrustStore(), confirm: async () => true });
+});
+
+test("入口必须是目录内哈希过的文件", async () => {
+  await writeFile(path.join(dir, "outside.ts"), `export default { id: "outside", version: "1.0.0", kernel: "^0.1" };`);
+  const root = await writePlugin("entry");
+  for (const entry of ["../outside.ts", "missing.ts"]) {
+    const { confirm, asked } = recordingConfirm(true);
+    const err = await loadProjectPlugin(root, { trust: new MemoryTrustStore(), confirm, entry }).catch((e) => e);
+    expect(err).toBeInstanceOf(UntrustedPlugin);
+    expect(asked).toEqual([]);
+  }
+  const loaded = await loadProjectPlugin(root, { trust: new MemoryTrustStore(), confirm: async () => true, entry: "./index.ts" });
+  expect(loaded.id).toBe("entry");
+});
+
+test("插件自带的依赖：允许 require(变量)、找不到的可选依赖、类型声明文件和 .bin 链接，但字面量模块名仍不能指向目录之外", async () => {
+  await writeFile(path.join(dir, "helper.js"), "export const v = 1;");
+  const root = await writePlugin("deps");
+  const dep = path.join(root, "node_modules", "dep");
+  await mkdir(dep, { recursive: true });
+  await writeFile(path.join(dep, "package.json"), `{ "name": "dep", "main": "index.js" }`);
+  await writeFile(
+    path.join(dep, "index.js"),
+    `const name = "x";\ntry { require(name); } catch {}\ntry { require("optional-missing"); } catch {}\nconst { createRequire } = require("node:module");\nmodule.exports = {};`,
+  );
+  await writeFile(path.join(dep, "index.d.ts"), `export type T = import("types-only-missing").T;`);
+  await mkdir(path.join(root, "node_modules", ".bin"), { recursive: true });
+  // junction 在 Windows 上不需要管理员权限；其他平台忽略这个参数
+  await symlink(dep, path.join(root, "node_modules", ".bin", "dep"), "junction");
+  await writeFile(path.join(root, "lib", "util.ts"), `import "dep";`);
+  await loadProjectPlugin(root, { trust: new MemoryTrustStore(), confirm: async () => true });
+
+  // .bin 之外的符号链接仍然拒绝
+  const linked = await writePlugin("linked");
+  await mkdir(path.join(linked, "node_modules"));
+  await symlink(dep, path.join(linked, "node_modules", "dep"), "junction");
+  await expect(loadProjectPlugin(linked, { trust: new MemoryTrustStore(), confirm: async () => true })).rejects.toBeInstanceOf(UntrustedPlugin);
+
+  await writeFile(path.join(dep, "index.js"), `require("../../../helper.js");`);
+  const { confirm, asked } = recordingConfirm(true);
+  await expect(loadProjectPlugin(root, { trust: new MemoryTrustStore(), confirm })).rejects.toBeInstanceOf(UntrustedPlugin);
+  expect(asked).toEqual([]);
 });
 
 test("从内核自身导入是允许的：那是宿主已经在运行的代码", async () => {

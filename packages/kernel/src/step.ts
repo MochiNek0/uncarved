@@ -4,7 +4,7 @@
 import type {
   Block,
   Effect,
-  Event,
+  LogEvent,
   EventDataMap,
   Message,
   Origin,
@@ -35,7 +35,7 @@ export function initialState(sessionId: string): State {
   return { sessionId, lastSeq: 0, phase: "new", messages: [], batch: [], plugins: [], derived: {} };
 }
 
-export function step(s: State, e: Event): StepResult {
+export function step(s: State, e: LogEvent): StepResult {
   if (e.seq !== s.lastSeq + 1) {
     throw new InvalidTransition(e.type, s.phase, `expected seq ${s.lastSeq + 1}, got ${e.seq}`);
   }
@@ -183,7 +183,7 @@ export function step(s: State, e: Event): StepResult {
 }
 
 /** 只凭日志重建状态（I-5） */
-export function rebuild(sessionId: string, events: Iterable<Event>): State {
+export function rebuild(sessionId: string, events: Iterable<LogEvent>): State {
   let state = initialState(sessionId);
   for (const e of events) state = step(state, e).state;
   return state;

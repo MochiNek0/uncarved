@@ -42,7 +42,7 @@
 会话的唯一事实来源是一条有序的事件序列。
 
 ```ts
-interface Event {
+interface LogEvent {
   v: 1                    // 格式版本
   id: string              // 全局唯一
   seq: number             // 会话内单调递增
@@ -117,7 +117,7 @@ interface ContentSource { layer: Layer; path: string; hash: string }
 内核核心是一个纯函数：
 
 ```ts
-step(state: State, event: Event) => { state: State; effects: Effect[] }
+step(state: State, event: LogEvent) => { state: State; effects: Effect[] }
 ```
 
 `Effect` 是"希望外部去做的事"：
@@ -144,8 +144,8 @@ step(state: State, event: Event) => { state: State; effects: Effect[] }
 
 ```ts
 interface LogStore {
-  append(sessionId: string, events: Event[]): Promise<void>   // resolve 即代表已持久化
-  read(sessionId: string, fromSeq?: number): AsyncIterable<Event>
+  append(sessionId: string, events: LogEvent[]): Promise<void>   // resolve 即代表已持久化
+  read(sessionId: string, fromSeq?: number): AsyncIterable<LogEvent>
 }
 ```
 
