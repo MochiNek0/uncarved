@@ -241,3 +241,32 @@ test("流读取中出现的非 SDK 错误：转成可重试的 ProviderError", a
   expect(err).toBeInstanceOf(ProviderError);
   expect(err).toMatchObject({ retryable: true, message: expect.stringContaining("terminated") });
 });
+
+test("只有空白的 text 块也不发送：API 同样拒绝（例如工具只输出了换行）", async () => {
+  const { client, calls } = fakeClient({ model: "m", content: [], stop_reason: "end_turn", usage: { input_tokens: 0, output_tokens: 0 } });
+  const toolOrigin = { by: "tool" as const, name: "sh" };
+  await anthropicProvider({ client }).complete(
+    {
+      system: [],
+      tools: [],
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              kind: "tool_result",
+              toolUseId: "t",
+              isError: false,
+              content: [{ kind: "text", text: "\n", origin: toolOrigin, trust: "untrusted" }],
+              origin: toolOrigin,
+              trust: "untrusted",
+            },
+            { kind: "text", text: "  ", origin: user, trust: "trusted" },
+          ],
+        },
+      ],
+    },
+    { signal: new AbortController().signal },
+  );
+  expect(calls[0]!.messages).toEqual([{ role: "user", content: [{ type: "tool_result", tool_use_id: "t", is_error: false }] }]);
+});

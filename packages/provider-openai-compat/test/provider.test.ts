@@ -216,3 +216,19 @@ test("流读到一半连接出错：抛出可重试的 ProviderError", async () 
   expect(err).toBeInstanceOf(ProviderError);
   expect(err).toMatchObject({ retryable: true, message: expect.stringContaining("socket hang up") });
 });
+
+test("tool call 既没有 index 也没有 id 时，按新出现的 name 区分调用，不拼成一个", async () => {
+  const { fetchFn } = fakeServer([
+    [
+      chunk({ tool_calls: [{ function: { name: "read", arguments: '{"a":' } }] }),
+      chunk({ tool_calls: [{ function: { arguments: "1}" } }] }),
+      chunk({ tool_calls: [{ function: { name: "read", arguments: '{"b":2}' } }] }, "tool_calls"),
+    ],
+  ]);
+  const provider = openaiCompatProvider({ baseURL: "https://example.test/v1", model: "m", fetch: fetchFn });
+  const res = await provider.complete({ system: [], tools: [], messages: [] }, { signal: new AbortController().signal });
+  expect(res.content.map((b) => (b.kind === "tool_use" ? [b.name, b.input] : null))).toEqual([
+    ["read", { a: 1 }],
+    ["read", { b: 2 }],
+  ]);
+});

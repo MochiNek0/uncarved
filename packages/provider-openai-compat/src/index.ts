@@ -123,9 +123,12 @@ export function openaiCompatProvider(opts: OpenAICompatOptions): Provider {
             onDelta?.({ kind: "thinking", text: d.reasoning_content });
           }
           for (const tc of d.tool_calls ?? []) {
-            // 没有 index 时：带着新的 id 就是新的调用，否则接在最后一个调用后面
+            // 没有 index 时：带着新的 id 就是新的调用；也没有 id 时，最后一个调用已经开始接收参数后又来了 name，
+            // 也是新的调用；否则接在最后一个调用后面
             const last = calls.length - 1;
-            const index = tc.index ?? (last < 0 || (tc.id && tc.id !== calls[last]!.id) ? last + 1 : last);
+            const prev = calls[last];
+            const fresh = !prev || (tc.id ? tc.id !== prev.id : !!tc.function?.name && prev.arguments !== "");
+            const index = tc.index ?? (fresh ? last + 1 : last);
             const c = (calls[index] ??= { id: "", name: "", arguments: "" });
             if (tc.id) c.id = tc.id;
             if (tc.function?.name) c.name += tc.function.name;

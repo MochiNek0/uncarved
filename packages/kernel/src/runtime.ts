@@ -146,7 +146,11 @@ export class Runtime {
     this.#hooks = new HookBus((info) => this.#notify({ type: "hook-error", info }));
 
     const plugins = opts.plugins ?? [];
+    const ids = new Set<string>();
     for (const p of plugins) {
+      // 能力（needs）按 id 查找，同 id 的插件会拿到彼此的能力（8.2）
+      if (ids.has(p.id)) throw new Error(`duplicate plugin id ${p.id}`);
+      ids.add(p.id);
       checkCompat(p);
       if (p.layer === "project" && !isConfirmed(p)) throw new UntrustedPlugin(p.id, "not loaded via loadProjectPlugin");
       for (const t of p.tools ?? []) {

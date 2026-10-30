@@ -166,8 +166,8 @@ function toBlockParam(b: Block): ContentBlockParam[] {
 
   switch (b.kind) {
     case "text":
-      // API 拒绝空的 text 块（例如工具没有输出时）
-      return b.text ? [{ type: "text", text: b.text }] : [];
+      // API 拒绝空的、或只有空白的 text 块（例如工具没有输出、或只输出了换行时）
+      return b.text.trim() ? [{ type: "text", text: b.text }] : [];
     case "image":
       return [{ type: "image", source: b.source } as ContentBlockParam];
     case "document":

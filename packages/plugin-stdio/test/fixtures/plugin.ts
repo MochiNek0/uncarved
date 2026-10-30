@@ -54,6 +54,10 @@ async function handle(msg: Msg): Promise<unknown> {
           // 一条超长、没有换行的消息
           process.stdout.write("x".repeat(64 * 1024));
           return new Promise(() => {});
+        case "no-newline":
+          // 最后一条回复不带换行，写完后退出
+          process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: {} }), () => process.exit(0));
+          return new Promise(() => {});
         case "garbage":
           // 合法的 JSON，但不是 JSON-RPC 消息
           process.stdout.write("null\n");

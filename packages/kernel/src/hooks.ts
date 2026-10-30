@@ -166,16 +166,15 @@ export class HookBus {
     /** 对每个 hook 的输出做检查，抛错视同该 hook 出错 */
     check?: (value: TransformPayloads[P]) => void,
   ): Promise<TransformPayloads[P]> {
-    // 每个 hook 拿到一份拷贝：出错被跳过的 hook 原地改过的值不会留下来，
-    // 超时后仍在运行、或留着引用的 hook 也改不到之后的值
-    let ran = false;
+    // 每个 hook 拿到一份拷贝：出错被跳过的 hook 原地改过的值不会留下来。
+    // hook 的输出也立即拷贝：超时后仍在运行、或留着引用的 hook 改不到之后的值，
+    // 输出无法拷贝时算作这个 hook 出错
     for (const h of this.ordered(point)) {
       if (h.spec.kind !== "transform") continue;
-      ran = true;
       try {
         const input = structuredClone(value);
         const out = await invoke(h.spec.fn as AnyFn, input, ctx(h.plugin), h.spec.timeoutMs);
-        const next = out === undefined ? input : (out as TransformPayloads[P]);
+        const next = structuredClone(out === undefined ? input : (out as TransformPayloads[P]));
         check?.(next);
         value = next;
       } catch (error) {
@@ -186,8 +185,7 @@ export class HookBus {
         throw new HookFailure(h.plugin, point, error);
       }
     }
-    // 最后一个 hook 可能还留着它返回的值；check 与这里之间没有 await，拷贝的正是检查过的内容
-    return ran ? structuredClone(value) : value;
+    return value;
   }
 
   /** 全部执行后合并：deny > ask > allow > abstain；出错、超时或返回值不合法视为 deny */
@@ -219,7 +217,8 @@ export class HookBus {
   observe<P extends ObservePoint>(point: P, payload: ObservePayloads[P], ctx: HookContextFor): void {
     for (const h of this.ordered(point)) {
       if (h.spec.kind !== "observe") continue;
-      const p = invoke(h.spec.fn as AnyFn, payload, ctx(h.plugin), h.spec.timeoutMs).then(
+      // 每个 observe 一份拷贝：并发执行时，一个 hook 改了 payload 不能影响其他 hook 看到的内容
+      const p = invoke(h.spec.fn as AnyFn, structuredClone(payload), ctx(h.plugin), h.spec.timeoutMs).then(
         () => {},
         (error) => this.#onError({ plugin: h.plugin, point, error }),
       );

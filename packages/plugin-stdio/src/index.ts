@@ -49,6 +49,8 @@ export class PluginProcessError extends Error {
 }
 
 const SHUTDOWN_GRACE_MS = 2_000;
+/** 进程退出后等 stdout 读完的最长时间：孙进程可能继承了 stdout，管道迟迟不关 */
+const EXIT_DRAIN_MS = 1_000;
 const DEFAULT_MAX_MESSAGE_BYTES = 64 * 1024 * 1024;
 
 export async function spawnPlugin(opts: SpawnOptions): Promise<StdioPlugin> {
@@ -196,7 +198,10 @@ class Connection {
         this.#pending.clear();
         resolve({ code, signal });
       };
-      child.on("exit", (code, signal) => done(code, signal, `plugin process exited (code ${code}, signal ${signal})`));
+      const exited = (code: number | null, signal: string | null) => done(code, signal, `plugin process exited (code ${code}, signal ${signal})`);
+      // exit 可能先于 stdout 读完：等 close（stdio 都已关闭），最后一条回复才不会丢
+      child.on("close", exited);
+      child.on("exit", (code, signal) => setTimeout(() => exited(code, signal), EXIT_DRAIN_MS).unref());
       child.on("error", (err) => done(null, null, `plugin process failed: ${err.message}`));
     });
 
@@ -226,6 +231,13 @@ class Connection {
         start = nl + 1;
         this.#receive(line);
       }
+    });
+    // 流结束时最后一条消息可能没有换行
+    child.stdout!.on("end", () => {
+      if (overflowed || pending.length === 0) return;
+      const line = Buffer.concat(pending).toString("utf8");
+      pending = [];
+      if (line.trim()) this.#receive(line);
     });
   }
 

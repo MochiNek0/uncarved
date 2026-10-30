@@ -174,6 +174,15 @@ test("单条消息超过上限：结束插件进程，宿主不会无限缓存",
   expect((await p.exited).code).not.toBe(0);
 });
 
+test("最后一条消息没有换行：stdout 关闭时仍然处理", async () => {
+  const p = await start({ hooks: [hook("no-newline", "transform", "context.build")] });
+  const { provider, requests } = scripted([{ content: [text("ok")], stopReason: "end" }]);
+  const rt = await Runtime.create({ store: new MemoryLogStore(), provider, plugins: [p] });
+  await rt.send(say("hi"));
+  expect(requests).toHaveLength(1);
+  expect(await p.exited).toEqual({ code: 0, signal: null });
+});
+
 test("清单违反 5.5 时拒绝加载", async () => {
   await expect(start({ hooks: [hook("x", "transform", "context.build", { timeoutMs: 0 })] })).rejects.toBeInstanceOf(
     PluginIncompatible,

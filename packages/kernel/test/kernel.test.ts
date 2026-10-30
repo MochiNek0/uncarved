@@ -1536,6 +1536,76 @@ describe("能力声明（8.2）", () => {
     expect(err.cause.message).toContain("log:record");
     expect(types(await readAll(store, rt.state.sessionId))).not.toContain("derived.recorded");
   });
+
+  test("插件 id 重复时拒绝加载：能力按 id 查找，不能借用同名插件的能力", async () => {
+    const { provider } = scripted([]);
+    const a = plugin("same", { needs: ["log:record"] });
+    const b = plugin("same");
+    await expect(Runtime.create({ store: new MemoryLogStore(), provider, plugins: [a, b] })).rejects.toThrow("duplicate plugin id");
+  });
+});
+
+describe("hook 之间的隔离", () => {
+  test("transform 返回无法拷贝的值时，算作这个 hook 出错，不连累下一个", async () => {
+    const { provider } = scripted([]);
+    const rt = await Runtime.create({
+      store: new MemoryLogStore(),
+      provider,
+      plugins: [
+        plugin("bad", {
+          hooks: [{ kind: "transform", point: "context.build", fn: (r) => ({ ...r, ext: { f: () => {} } }) }],
+        }),
+        plugin("next", { hooks: [{ kind: "transform", point: "context.build", fn: (r) => r }] }),
+      ],
+    });
+    const err = await rt.send(say("hi")).catch((e) => e);
+    expect(err).toBeInstanceOf(HookFailure);
+    expect((err as HookFailure).plugin).toBe("bad");
+  });
+
+  test("最后一个 transform 返回无法拷贝的值时，也包装成 HookFailure", async () => {
+    const { provider } = scripted([]);
+    const rt = await Runtime.create({
+      store: new MemoryLogStore(),
+      provider,
+      plugins: [
+        plugin("bad", {
+          hooks: [{ kind: "transform", point: "context.build", fn: (r) => ({ ...r, ext: { f: () => {} } }) }],
+        }),
+      ],
+    });
+    const err = await rt.send(say("hi")).catch((e) => e);
+    expect(err).toBeInstanceOf(HookFailure);
+    expect((err as HookFailure).plugin).toBe("bad");
+  });
+
+  test("并发的 observe 各拿一份拷贝，一个改了 payload 不影响另一个", async () => {
+    const { provider } = scripted([{ content: [text("ok")], stopReason: "end" }]);
+    let seen: number | undefined;
+    const rt = await Runtime.create({
+      store: new MemoryLogStore(),
+      provider,
+      plugins: [
+        plugin("mutator", {
+          hooks: [{ kind: "observe", point: "model.after", fn: (r: ModelResponse) => void (r.content = []) }],
+        }),
+        plugin("reader", {
+          hooks: [
+            {
+              kind: "observe",
+              point: "model.after",
+              fn: async (r: ModelResponse) => {
+                await new Promise((resolve) => setTimeout(resolve, 0));
+                seen = r.content.length;
+              },
+            },
+          ],
+        }),
+      ],
+    });
+    await rt.send(say("hi"));
+    expect(seen).toBe(1);
+  });
 });
 
 describe("边界情况", () => {
