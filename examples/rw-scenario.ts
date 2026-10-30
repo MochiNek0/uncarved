@@ -40,7 +40,7 @@ const SYSTEM_ID = "scenario/system";
 const system: Plugin = {
   id: SYSTEM_ID,
   version: "0.1.0",
-  kernel: "^1",
+  kernel: "^0.1",
   needs: ["transform:context.build"],
   hooks: [
     {
@@ -65,7 +65,7 @@ const system: Plugin = {
 const policy: Plugin = {
   id: "scenario/policy",
   version: "0.1.0",
-  kernel: "^1",
+  kernel: "^0.1",
   needs: ["gate:tool.gate"],
   hooks: [
     {
@@ -86,7 +86,7 @@ const policy: Plugin = {
 const stats: Plugin = {
   id: "scenario/stats",
   version: "0.1.0",
-  kernel: "^1",
+  kernel: "^0.1",
   needs: ["observe:event", "log:record"],
   hooks: [
     {
@@ -106,7 +106,7 @@ const MAX_CALLS = 12;
 const budget: Plugin = {
   id: "scenario/budget",
   version: "0.1.0",
-  kernel: "^1",
+  kernel: "^0.1",
   needs: ["gate:turn.continue"],
   hooks: [
     {

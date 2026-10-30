@@ -78,7 +78,7 @@ test("在完整的内核循环里跑通：流式文本、推理、工具调用�
   const prompt = {
     id: "prompt",
     version: "1",
-    kernel: "^1",
+    kernel: "^0.1",
     needs: ["transform:context.build"],
     hooks: [
       {
@@ -95,7 +95,7 @@ test("在完整的内核循环里跑通：流式文本、推理、工具调用�
   const rt = await Runtime.create({
     store: new MemoryLogStore(),
     provider: openaiResponsesProvider({ baseURL: "https://example.test/v1/", model: "fake-1", apiKey: "k", fetch: fetchFn }),
-    plugins: [{ id: "p", version: "1", kernel: "^1", tools: [echo] }, prompt],
+    plugins: [{ id: "p", version: "1", kernel: "^0.1", tools: [echo] }, prompt],
   });
   const deltas: string[] = [];
   rt.subscribe((n) => n.type === "delta" && n.delta.kind !== "reset" && deltas.push(`${n.delta.kind}:${n.delta.text}`));

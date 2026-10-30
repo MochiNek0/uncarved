@@ -24,7 +24,7 @@ export function budget(opts: BudgetOptions = {}): Plugin {
   return {
     id: opts.id ?? "coder/budget",
     version: "0.1.0",
-    kernel: "^1",
+    kernel: "^0.1",
     needs: ["gate:turn.continue"],
     hooks: [
       {

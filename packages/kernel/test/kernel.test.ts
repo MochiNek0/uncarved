@@ -4,6 +4,7 @@ import {
   HookExpired,
   HookFailure,
   InvalidTransition,
+  KERNEL_VERSION,
   MemoryLogStore,
   ModelOutputModified,
   PluginIncompatible,
@@ -13,6 +14,7 @@ import {
   SessionDetached,
   ToolCallModified,
   UnresolvedRef,
+  checkCompat,
   initialState,
   readAll,
   rebuild,
@@ -86,7 +88,7 @@ function recordingTool(name: string, opts: Partial<Tool> = {}) {
 /** 没有显式给出 needs 时，按 hook 推出所需的扩展点能力（不含 log:*，写日志的能力要显式声明） */
 function plugin(id: string, extra: Partial<Plugin> = {}): Plugin {
   const needs = extra.needs ?? (extra.hooks ?? []).map((h) => `${h.kind}:${h.point}`).filter((n) => CAPABILITIES.has(n));
-  return { id, version: "1.0.0", kernel: "^1", ...extra, needs };
+  return { id, version: "1.0.0", kernel: "^0.1", ...extra, needs };
 }
 
 function deterministic() {
@@ -537,6 +539,19 @@ describe("等待、恢复与兼容", () => {
     await expect(
       Runtime.create({ store: new MemoryLogStore(), provider, plugins: [plugin("future", { kernel: "^2" })] }),
     ).rejects.toBeInstanceOf(PluginIncompatible);
+  });
+
+  test("内核版本按 semver 的 ^ 范围匹配，0.x 时小版本不兼容", () => {
+    expect(KERNEL_VERSION).toBe("0.1.0");
+    for (const kernel of ["^0.1", "^0.1.0", "^0"]) expect(() => checkCompat(plugin("ok", { kernel }))).not.toThrow();
+    for (const kernel of ["^0.2", "^0.1.1", "^0.0", "^0.0.1", "^1", "1", "~0.1", ">=0.1", "^0.1.x"]) {
+      expect(() => checkCompat(plugin("bad", { kernel }))).toThrow(PluginIncompatible);
+    }
+  });
+
+  test("KERNEL_VERSION 与 package.json 的版本一致", async () => {
+    const pkg = await Bun.file(new URL("../package.json", import.meta.url)).json();
+    expect(KERNEL_VERSION).toBe(pkg.version);
   });
 });
 

@@ -73,7 +73,7 @@ export async function prompts(opts: PromptsOptions): Promise<Plugin> {
   return {
     id,
     version: "0.1.0",
-    kernel: "^1",
+    kernel: "^0.1",
     needs: ["transform:context.build"],
     hooks: [{ kind: "transform", point: "context.build", fn: (req) => ({ ...req, system: [...system, ...req.system] }) }],
   };

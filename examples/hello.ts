@@ -35,7 +35,7 @@ async function promptSegments(root: string, rel: string, layer: Layer): Promise<
 const prompts: Plugin = {
   id: PROMPTS_ID,
   version: "0.1.0",
-  kernel: "^1",
+  kernel: "^0.1",
   needs: ["transform:context.build"],
   hooks: [
     {
@@ -59,7 +59,7 @@ const prompts: Plugin = {
 const readFileTool: Plugin = {
   id: "example/read-file",
   version: "0.1.0",
-  kernel: "^1",
+  kernel: "^0.1",
   tools: [
     {
       name: "read_file",

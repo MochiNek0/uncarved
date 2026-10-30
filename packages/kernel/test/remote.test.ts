@@ -47,7 +47,7 @@ function remote(spec: Partial<RemoteHookSpec> & Pick<RemoteHookSpec, "kind" | "p
 const plugin = (hooks: RemoteHookSpec[], extra: Partial<Plugin> = {}): Plugin => ({
   id: "remote",
   version: "1.0.0",
-  kernel: "^1",
+  kernel: "^0.1",
   // 按 hook 声明所需能力，注册检查测的才是 hook 本身的问题
   needs: hooks.map((h) => `${h.kind}:${h.point}`).filter((n) => CAPABILITIES.has(n)),
   hooks,

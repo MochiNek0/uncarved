@@ -30,7 +30,7 @@ const SYSTEM_ID = "agent/system";
 const system: Plugin = {
   id: SYSTEM_ID,
   version: "0.1.0",
-  kernel: "^1",
+  kernel: "^0.1",
   needs: ["transform:context.build"],
   hooks: [
     {
@@ -58,7 +58,7 @@ const system: Plugin = {
 const policy: Plugin = {
   id: "agent/policy",
   version: "0.1.0",
-  kernel: "^1",
+  kernel: "^0.1",
   needs: ["gate:tool.gate"],
   hooks: [
     {

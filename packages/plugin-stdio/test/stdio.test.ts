@@ -64,7 +64,7 @@ async function start(manifest: { hooks?: Array<{ kind: string; point: string }>;
   const p = await spawnPlugin({
     command: process.execPath,
     args: [path.join(fixtures, "plugin.ts")],
-    env: { FIXTURE_MANIFEST: JSON.stringify({ id: "fixture", version: "1.0.0", kernel: "^1", ...manifest, needs }) },
+    env: { FIXTURE_MANIFEST: JSON.stringify({ id: "fixture", version: "1.0.0", kernel: "^0.1", ...manifest, needs }) },
     ...extra,
   });
   running.push(p);
@@ -96,7 +96,7 @@ test("端到端：进程外 transform 改写系统提示词，进程外关卡拒
   const rt = await Runtime.create({
     store: new MemoryLogStore(),
     provider,
-    plugins: [p, { id: "tools", version: "1.0.0", kernel: "^1", tools: [danger] }],
+    plugins: [p, { id: "tools", version: "1.0.0", kernel: "^0.1", tools: [danger] }],
   });
   await rt.send(say("hi"));
 
@@ -200,7 +200,7 @@ test("项目层：确认之前不启动进程；确认按启动规格和目录�
     layer: "project",
     args: [path.join(fixtures, "plugin.ts"), ...args],
     env: {
-      FIXTURE_MANIFEST: JSON.stringify({ id: "fixture", version: "1.0.0", kernel: "^1", hooks: [] }),
+      FIXTURE_MANIFEST: JSON.stringify({ id: "fixture", version: "1.0.0", kernel: "^0.1", hooks: [] }),
       FIXTURE_MARK: mark,
     },
     trust: {

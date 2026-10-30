@@ -20,7 +20,7 @@ export function fsTools(root: string, opts: { id?: string; hidden?: string[] } =
   return {
     id: opts.id ?? "example/fs",
     version: "0.1.0",
-    kernel: "^1",
+    kernel: "^0.1",
     tools: [
       {
         name: "list_dir",

@@ -7,6 +7,7 @@ import path from "node:path";
 import {
   asProjectPlugin,
   checkCompat,
+  KERNEL_VERSION,
   hashDir,
   requireTrust,
   type HookContext,
@@ -75,7 +76,7 @@ export async function spawnPlugin(opts: SpawnOptions): Promise<StdioPlugin> {
   const conn = new Connection(child, opts.maxMessageBytes ?? DEFAULT_MAX_MESSAGE_BYTES, opts.onStderr);
 
   try {
-    const manifest = parseManifest(await conn.request("initialize", { kernel: 1 }, AbortSignal.timeout(opts.initTimeoutMs ?? 10_000)).result);
+    const manifest = parseManifest(await conn.request("initialize", { kernel: KERNEL_VERSION }, AbortSignal.timeout(opts.initTimeoutMs ?? 10_000)).result);
 
     const plugin: StdioPlugin = {
       id: manifest.id,

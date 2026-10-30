@@ -54,7 +54,7 @@ test("在完整的内核循环里跑通：流式文本、分段的工具参数�
   const rt = await Runtime.create({
     store: new MemoryLogStore(),
     provider: openaiCompatProvider({ baseURL: "https://example.test/v1/", model: "fake-1", apiKey: "k", fetch: fetchFn }),
-    plugins: [{ id: "p", version: "1", kernel: "^1", tools: [echo] }],
+    plugins: [{ id: "p", version: "1", kernel: "^0.1", tools: [echo] }],
   });
   const deltas: string[] = [];
   rt.subscribe((n) => n.type === "delta" && n.delta.kind !== "reset" && deltas.push(n.delta.text));

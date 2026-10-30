@@ -198,7 +198,7 @@ export function policy(opts: PolicyOptions): Policy {
     plugin: {
       id,
       version: "0.2.0",
-      kernel: "^1",
+      kernel: "^0.1",
       needs: ["transform:tool.before", "gate:tool.gate"],
       hooks: [
         {

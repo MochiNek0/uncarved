@@ -33,7 +33,7 @@ async function writePlugin(name: string, version = "1.0.0") {
   await writeFile(
     path.join(root, "index.ts"),
     `globalThis.__uncarvedTrustRuns = (globalThis.__uncarvedTrustRuns ?? 0) + 1;\n` +
-      `export default { id: "${name}", version: "${version}", kernel: "^1" };\n`,
+      `export default { id: "${name}", version: "${version}", kernel: "^0.1" };\n`,
   );
   await writeFile(path.join(root, "lib", "prompt.md"), "hello");
   return root;
@@ -99,7 +99,7 @@ test("内容变化后需要重新确认；同一进程内已导入的目录不�
 });
 
 test("绕过加载器、直接注册的项目层插件被拒绝", async () => {
-  const forged = { id: "forged", version: "1.0.0", kernel: "^1", layer: "project" as const };
+  const forged = { id: "forged", version: "1.0.0", kernel: "^0.1", layer: "project" as const };
   await expect(Runtime.create({ store: new MemoryLogStore(), provider, plugins: [forged] })).rejects.toBeInstanceOf(
     UntrustedPlugin,
   );
@@ -167,9 +167,9 @@ test("从内核自身导入是允许的：那是宿主已经在运行的代码",
   const root = path.join(import.meta.dir, `.tmp-plugin-${process.pid}`);
   try {
     await mkdir(root, { recursive: true });
-    await writeFile(path.join(root, "index.ts"), `import { KERNEL_MAJOR } from "uncarved";\nexport default { id: "k", version: "1.0.0", kernel: "^" + KERNEL_MAJOR };`);
+    await writeFile(path.join(root, "index.ts"), `import { KERNEL_VERSION } from "uncarved";\nexport default { id: "k", version: "1.0.0", kernel: "^" + KERNEL_VERSION };`);
     const loaded = await loadProjectPlugin(root, { trust: new MemoryTrustStore(), confirm: async () => true });
-    expect(loaded.kernel).toBe("^1");
+    expect(loaded.kernel).toBe("^0.1.0");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

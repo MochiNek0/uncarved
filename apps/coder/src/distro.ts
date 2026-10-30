@@ -40,7 +40,7 @@ export async function createCoder(opts: CoderOptions): Promise<Coder> {
   const tools: Plugin = {
     id: "coder/tools",
     version: "0.1.0",
-    kernel: "^1",
+    kernel: "^0.1",
     tools: [
       ...fsTools(cwd),
       shellTool({ cwd }),
@@ -69,7 +69,7 @@ async function subagent(opts: CoderOptions): Promise<() => Plugin[]> {
     const tools: Plugin = {
       id: "coder/tools-readonly",
       version: "0.1.0",
-      kernel: "^1",
+      kernel: "^0.1",
       tools: fsTools(opts.cwd).filter((t) => READ_ONLY.has(t.name)),
     };
     const pol = policy({ cwd: opts.cwd, mode: "readonly", id: "coder/policy-subagent" });

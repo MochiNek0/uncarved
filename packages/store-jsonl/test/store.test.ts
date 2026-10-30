@@ -62,7 +62,7 @@ test("进程重启后，从文件恢复等待审批的会话并继续", async ()
     {
       id: "p",
       version: "1.0.0",
-      kernel: "^1",
+      kernel: "^0.1",
       needs: ["gate:tool.gate"],
       tools: [echo],
       hooks: [{ kind: "gate" as const, point: "tool.gate" as const, fn: () => ({ decision: "ask" as const }) }],

@@ -4,7 +4,8 @@ import type { HookSpec, Layer } from "./hooks.ts";
 import { checkRemoteHook, isRemote } from "./remote.ts";
 import type { PluginManifestEntry, ResumePolicy, Tool } from "./types.ts";
 
-export const KERNEL_MAJOR = 1;
+/** 与 package.json 的 version 保持一致，插件用 semver 的 ^ 范围声明兼容的内核版本 */
+export const KERNEL_VERSION = "0.1.0";
 
 /** 内核提供的能力：每个扩展点一项（`<种类>:<扩展点>`），外加插件写入日志的能力 */
 export const CAPABILITIES: ReadonlySet<string> = new Set([
@@ -26,7 +27,7 @@ export const CAPABILITIES: ReadonlySet<string> = new Set([
 export interface Plugin {
   id: string;
   version: string;
-  /** 兼容的内核主版本，形如 "^1" */
+  /** 兼容的内核版本范围，只支持 ^ 范围，形如 "^0.1"、"^1"、"^1.2.0" */
   kernel: string;
   /** 需要的内核能力，见 CAPABILITIES */
   needs?: string[];
@@ -47,11 +48,9 @@ export class PluginIncompatible extends Error {
 }
 
 export function checkCompat(p: Plugin): void {
-  const m = /^\^(\d+)$/.exec(p.kernel);
-  if (!m) throw new PluginIncompatible(p.id, `unsupported kernel range "${p.kernel}"`);
-  if (Number(m[1]) !== KERNEL_MAJOR) {
-    throw new PluginIncompatible(p.id, `requires kernel ${p.kernel}, running ${KERNEL_MAJOR}`);
-  }
+  const ok = satisfiesCaret(p.kernel, KERNEL_VERSION);
+  if (ok === undefined) throw new PluginIncompatible(p.id, `unsupported kernel range "${p.kernel}"`);
+  if (!ok) throw new PluginIncompatible(p.id, `requires kernel ${p.kernel}, running ${KERNEL_VERSION}`);
   const missing = (p.needs ?? []).filter((n) => !CAPABILITIES.has(n));
   if (missing.length > 0) throw new PluginIncompatible(p.id, `missing capabilities ${missing.join(", ")}`);
   // 不认识的策略会被当成 continue，静默放行本该暂停的变化
@@ -68,6 +67,26 @@ export function checkCompat(p: Plugin): void {
   if (undeclared.length > 0) {
     throw new PluginIncompatible(p.id, `hooks use undeclared capabilities ${[...new Set(undeclared)].join(", ")}`);
   }
+}
+
+/**
+ * semver 的 ^ 范围：不低于范围本身，且第一个非零位（未写出的位不算）不变。
+ * ^1 → >=1.0.0 <2.0.0，^0.1 → >=0.1.0 <0.2.0，^0.0.3 → 只有 0.0.3。范围格式不对时返回 undefined
+ */
+function satisfiesCaret(range: string, version: string): boolean | undefined {
+  const m = /^\^(\d+)(?:\.(\d+)(?:\.(\d+))?)?$/.exec(range);
+  if (!m) return undefined;
+  const want = m.slice(1).filter((x) => x !== undefined).map(Number);
+  const have = version.split(".").map(Number);
+  const fixed = want.findIndex((x) => x !== 0);
+  const last = fixed === -1 ? want.length - 1 : fixed;
+  for (let i = 0; i <= last; i++) if (have[i] !== want[i]) return false;
+  for (let i = last + 1; i < 3; i++) {
+    const h = have[i] ?? 0;
+    const w = want[i] ?? 0;
+    if (h !== w) return h > w;
+  }
+  return true;
 }
 
 /** 所有 hook 都必须有超时，不能关闭（5.1）：Infinity、NaN、非正数一律拒绝 */

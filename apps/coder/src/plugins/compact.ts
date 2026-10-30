@@ -109,7 +109,7 @@ export function compactor(opts: CompactOptions): Compactor {
     plugin: {
       id,
       version: "0.1.0",
-      kernel: "^1",
+      kernel: "^0.1",
       needs: ["transform:context.project", "log:record", "log:emit"],
       hooks: [
         {
