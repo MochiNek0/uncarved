@@ -2,16 +2,29 @@
 //
 // 路径可以是相对路径（相对于工作目录）或绝对路径。policy 插件在 tool.before 里把它们统一成绝对路径，
 // 再由关卡判断是否在工作目录内；工具本身不做权限判断。
+//
+// 修改已有文件之前必须先读过它，且读过之后文件没有被别人（用户、bash 命令）改过，
+// 否则模型是按过时的内容在改，会覆盖掉别人的修改。
 
+import type { Stats } from "node:fs";
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { Tool } from "uncarved";
+import type { Block, Tool } from "uncarved";
+import { sha256, type Checkpoints } from "./checkpoint.ts";
 
 const MAX_LINES = 2000;
 const MAX_LINE_CHARS = 2000;
 const MAX_GLOB = 500;
 const MAX_GREP = 200;
 const MAX_GREP_FILE_BYTES = 1_000_000;
+const MAX_IMAGE_BYTES = 5_000_000;
+const IMAGE_TYPES: Record<string, string> = {
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+};
 /** 遍历目录时跳过 */
 export const SKIP_DIRS = new Set([".git", "node_modules"]);
 
@@ -29,13 +42,39 @@ export function display(cwd: string, full: string): string {
   return shown.split(path.sep).join("/");
 }
 
-export function fsTools(cwd: string): Tool[] {
+export interface FsOptions {
+  /** 给了就在每次写入前保存原内容，供撤销 */
+  checkpoints?: Checkpoints;
+}
+
+/** 读过或写过的文件当时的样子；只在本进程内有效，恢复会话后要重新读 */
+interface Seen {
+  mtimeMs: number;
+  size: number;
+}
+
+export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
   const at = (p: unknown) => resolveIn(cwd, p as string);
+  const seen = new Map<string, Seen>();
+  const remember = (full: string, info: Stats) => seen.set(full, { mtimeMs: info.mtimeMs, size: info.size });
+  /** 不能修改已有文件的原因；可以修改时返回 undefined */
+  const staleness = (full: string, info: Stats): string | undefined => {
+    const s = seen.get(full);
+    const shown = display(cwd, full);
+    if (!s) return `${shown} exists but has not been read in this session. Read it with read_file before changing it.`;
+    if (s.mtimeMs !== info.mtimeMs || s.size !== info.size) {
+      return `${shown} has been modified since it was last read (by the user or a command). Read it again before changing it.`;
+    }
+    return undefined;
+  };
+  const checkpoint = async (ctx: { sessionId: string; toolUseId: string }, tool: string, full: string, before: string | null, after: string) => {
+    await opts.checkpoints?.save(ctx.sessionId, { toolUseId: ctx.toolUseId, tool, path: full, before, afterHash: sha256(after) });
+  };
 
   const readFileTool: Tool = {
     name: "read_file",
     description:
-      "Read a UTF-8 text file. Returns lines prefixed with their 1-based line number and a tab. " +
+      "Read a UTF-8 text file, or an image (png, jpg, gif, webp). Text is returned as lines prefixed with their 1-based line number and a tab. " +
       `At most ${MAX_LINES} lines are returned per call; use offset (1-based start line) and limit to page through larger files.`,
     inputSchema: {
       type: "object",
@@ -49,7 +88,26 @@ export function fsTools(cwd: string): Tool[] {
     async execute(input) {
       const { path: p, offset = 1, limit = MAX_LINES } = input as { path: string; offset?: number; limit?: number };
       if (limit < 1) return { content: "limit must be at least 1", isError: true };
-      const text = await readFile(at(p), "utf8");
+      const full = at(p);
+      const info = await stat(full);
+      if (info.isDirectory()) return { content: `${display(cwd, full)} is a directory; use list_dir`, isError: true };
+      const mediaType = IMAGE_TYPES[path.extname(full).toLowerCase()];
+      if (mediaType) {
+        if (info.size > MAX_IMAGE_BYTES) return { content: `image is ${info.size} bytes; at most ${MAX_IMAGE_BYTES} can be read`, isError: true };
+        const image: Block = {
+          kind: "image",
+          source: { type: "base64", media_type: mediaType, data: (await readFile(full)).toString("base64") },
+          origin: { by: "tool", name: "read_file" },
+          trust: "untrusted",
+        };
+        return { content: [image] };
+      }
+      const buf = await readFile(full);
+      if (buf.subarray(0, 8000).includes(0)) {
+        return { content: `${display(cwd, full)} is a binary file (${buf.length} bytes) and cannot be shown as text`, isError: true };
+      }
+      remember(full, info);
+      const text = buf.toString("utf8");
       if (text.length === 0) return { content: "(empty file)" };
       const lines = text.split(/\r?\n/);
       if (lines.at(-1) === "") lines.pop();
@@ -68,7 +126,7 @@ export function fsTools(cwd: string): Tool[] {
     name: "write_file",
     description:
       "Create a file or overwrite it with the complete new content. Missing parent directories are created. " +
-      "Prefer edit_file for changing part of an existing file.",
+      "An existing file must have been read with read_file first. Prefer edit_file for changing part of an existing file.",
     inputSchema: {
       type: "object",
       properties: { path: str, content: str },
@@ -79,11 +137,19 @@ export function fsTools(cwd: string): Tool[] {
     concurrency: "exclusive",
     // 写入完整内容，重复执行结果相同
     idempotent: true,
-    async execute(input) {
+    async execute(input, ctx) {
       const { path: p, content } = input as { path: string; content: string };
       const full = at(p);
+      const info = await statOrUndefined(full);
+      if (info?.isDirectory()) return { content: `${display(cwd, full)} is a directory`, isError: true };
+      // 同样内容重复写入（崩溃后重跑）不算覆盖别人的修改
+      const before = info ? await readFile(full, "utf8") : null;
+      const problem = info && before !== content ? staleness(full, info) : undefined;
+      if (problem) return { content: problem, isError: true };
       await mkdir(path.dirname(full), { recursive: true });
       await writeFile(full, content);
+      remember(full, await stat(full));
+      if (before !== content) await checkpoint(ctx, "write_file", full, before, content);
       // 和 read_file 一样数行：末尾的换行不算多出一行
       const lines = content === "" ? 0 : content.split(/\r?\n/).length - (/\r?\n$/.test(content) ? 1 : 0);
       return { content: `Wrote ${lines} lines to ${display(cwd, full)}` };
@@ -94,7 +160,8 @@ export function fsTools(cwd: string): Tool[] {
     name: "edit_file",
     description:
       "Replace exact text in a file. old_string must match the file exactly (including whitespace and indentation) " +
-      "and must be unique unless replace_all is true. Read the file first.",
+      "and must be unique unless replace_all is true. The file must have been read with read_file first, " +
+      "and is refused if it changed since then.",
     inputSchema: {
       type: "object",
       properties: { path: str, old_string: str, new_string: str, replace_all: { type: "boolean" } },
@@ -105,7 +172,7 @@ export function fsTools(cwd: string): Tool[] {
     concurrency: "exclusive",
     // 第二次执行时 old_string 可能已经不存在，或者被替换两次
     idempotent: false,
-    async execute(input) {
+    async execute(input, ctx) {
       const { path: p, old_string, new_string, replace_all } = input as {
         path: string;
         old_string: string;
@@ -115,6 +182,12 @@ export function fsTools(cwd: string): Tool[] {
       if (old_string === new_string) return { content: "old_string and new_string are identical", isError: true };
       if (old_string === "") return { content: "old_string must not be empty; use write_file to create a file", isError: true };
       const full = at(p);
+      const info = await statOrUndefined(full);
+      if (!info) {
+        return { content: seen.has(full) ? `${display(cwd, full)} no longer exists` : `${display(cwd, full)} does not exist; use write_file to create it`, isError: true };
+      }
+      const problem = staleness(full, info);
+      if (problem) return { content: problem, isError: true };
       const text = await readFile(full, "utf8");
       // 文件是 CRLF 时，模型给的 LF 文本也能匹配
       const crlf = text.includes("\r\n") && !old_string.includes("\r\n");
@@ -126,7 +199,10 @@ export function fsTools(cwd: string): Tool[] {
         return { content: `old_string occurs ${count} times in ${display(cwd, full)}; add context to make it unique or set replace_all`, isError: true };
       }
       // 用函数作替换值，new_string 里的 $& $1 等不会被当成替换模式
-      await writeFile(full, replace_all ? text.replaceAll(from, () => to) : text.replace(from, () => to));
+      const next = replace_all ? text.replaceAll(from, () => to) : text.replace(from, () => to);
+      await writeFile(full, next);
+      remember(full, await stat(full));
+      await checkpoint(ctx, "edit_file", full, text, next);
       return { content: `Edited ${display(cwd, full)} (${replace_all ? count : 1} replacement${count > 1 && replace_all ? "s" : ""})` };
     },
   };
@@ -149,7 +225,7 @@ export function fsTools(cwd: string): Tool[] {
     name: "glob",
     description:
       `Find files by glob pattern (e.g. "src/**/*.ts"), relative to path (default: the working directory). ` +
-      `Skips .git and node_modules. Returns at most ${MAX_GLOB} paths.`,
+      `Skips files ignored by git, .git and node_modules. Returns at most ${MAX_GLOB} paths.`,
     inputSchema: {
       type: "object",
       properties: { pattern: str, path: str },
@@ -164,7 +240,12 @@ export function fsTools(cwd: string): Tool[] {
       const root = at(p);
       const out: string[] = [];
       let more = false;
-      for await (const rel of new Bun.Glob(pattern).scan({ cwd: root, onlyFiles: true })) {
+      const glob = new Bun.Glob(pattern);
+      const tracked = await gitFiles(root);
+      const candidates = tracked
+        ? filterAsync(tracked, async (rel) => glob.match(rel) && Boolean((await statOrUndefined(path.join(root, rel)))?.isFile()))
+        : glob.scan({ cwd: root, onlyFiles: true });
+      for await (const rel of candidates) {
         signal.throwIfAborted();
         if (rel.split(/[\\/]/).some((seg) => SKIP_DIRS.has(seg))) continue;
         if (out.length >= MAX_GLOB) {
@@ -183,7 +264,8 @@ export function fsTools(cwd: string): Tool[] {
     name: "grep",
     description:
       "Search file contents with a JavaScript regular expression. Searches path (a file or directory, default: the working directory), " +
-      `optionally only files matching the glob include (e.g. "**/*.ts"). Returns "file:line:text", at most ${MAX_GREP} matches.`,
+      `optionally only files matching the glob include (e.g. "**/*.ts"). Skips files ignored by git and binary files. ` +
+      `Returns "file:line:text", at most ${MAX_GREP} matches.`,
     inputSchema: {
       type: "object",
       properties: { pattern: str, path: str, include: str, ignore_case: { type: "boolean" } },
@@ -209,11 +291,13 @@ export function fsTools(cwd: string): Tool[] {
       const root = at(p);
       const filter = include ? new Bun.Glob(include) : undefined;
       const out: string[] = [];
-      const files = (await stat(root)).isFile() ? [root] : walk(root, signal);
+      const files = (await stat(root)).isFile() ? [root] : await listFiles(root, signal);
       search: for await (const file of files) {
+        signal.throwIfAborted();
         if (filter && !filter.match(path.relative(root, file).split(path.sep).join("/"))) continue;
-        const info = await stat(file);
-        if (info.size > MAX_GREP_FILE_BYTES) continue;
+        // git 列出的文件可能已在工作区删除
+        const info = await statOrUndefined(file);
+        if (!info?.isFile() || info.size > MAX_GREP_FILE_BYTES) continue;
         const buf = await readFile(file);
         if (buf.includes(0)) continue; // 二进制文件
         const lines = buf.toString("utf8").split(/\r?\n/);
@@ -231,6 +315,39 @@ export function fsTools(cwd: string): Tool[] {
   };
 
   return [readFileTool, writeFileTool, editFileTool, listDirTool, globTool, grepTool];
+}
+
+const statOrUndefined = (full: string) => stat(full).catch(() => undefined);
+
+/**
+ * root 在 git 仓库里时，用 git 列出未被忽略的文件（已跟踪的和未跟踪的），路径相对于 root、用正斜杠。
+ * 不在仓库里或没有 git 时返回 undefined
+ */
+async function gitFiles(root: string): Promise<string[] | undefined> {
+  try {
+    const proc = Bun.spawn(["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"], {
+      cwd: root,
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    const [out, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    if (code !== 0) return undefined;
+    // 合并冲突中的文件会出现多次
+    return [...new Set(out.split("\0").filter(Boolean))];
+  } catch {
+    return undefined;
+  }
+}
+
+async function listFiles(root: string, signal: AbortSignal): Promise<Iterable<string> | AsyncIterable<string>> {
+  const tracked = await gitFiles(root);
+  if (!tracked) return walk(root, signal);
+  return tracked.filter((rel) => !rel.split("/").some((seg) => SKIP_DIRS.has(seg))).map((rel) => path.join(root, rel));
+}
+
+async function* filterAsync<T>(items: Iterable<T>, keep: (item: T) => Promise<boolean>): AsyncIterable<T> {
+  for (const item of items) if (await keep(item)) yield item;
 }
 
 async function* walk(dir: string, signal: AbortSignal): AsyncIterable<string> {

@@ -22,7 +22,7 @@ export function stepsThisTurn(s: State): number {
 export function budget(opts: BudgetOptions = {}): Plugin {
   const max = opts.maxSteps ?? 100;
   return {
-    id: opts.id ?? "coder/budget",
+    id: opts.id ?? "jade/budget",
     version: "0.1.0",
     kernel: "^0.1",
     needs: ["gate:turn.continue"],

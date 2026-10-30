@@ -1,18 +1,21 @@
 // 组装发行版：把工具、提示词、权限、压缩、预算插件拼成一套插件清单。
 // 宿主（main.ts）和测试都通过这里创建，内核本身不知道这些插件的存在。
 
+import path from "node:path";
 import type { LogStore, Plugin, Provider } from "uncarved";
 import { budget } from "./plugins/budget.ts";
 import { compactor, type Compactor } from "./plugins/compact.ts";
 import { policy, type Mode, type Policy } from "./plugins/policy.ts";
 import { prompts } from "./plugins/prompts.ts";
 import { fsTools } from "./tools/fs.ts";
-import { shellTool } from "./tools/shell.ts";
+import { Checkpoints } from "./tools/checkpoint.ts";
+import { shellTools } from "./tools/shell.ts";
 import { taskTool } from "./tools/task.ts";
+import { todoTool } from "./tools/todo.ts";
 
 const READ_ONLY = new Set(["read_file", "list_dir", "glob", "grep"]);
 
-export interface CoderOptions {
+export interface JadeOptions {
   cwd: string;
   /** 用户层配置目录 */
   home: string;
@@ -27,23 +30,30 @@ export interface CoderOptions {
   today?: string;
 }
 
-export interface Coder {
+export interface Jade {
   plugins: Plugin[];
   policy: Policy;
   compact: Compactor;
+  /** write_file / edit_file 写入前的快照，供 /undo */
+  checkpoints: Checkpoints;
+  /** 宿主退出时调用：杀掉后台 shell */
+  shutdown(): void;
 }
 
-export async function createCoder(opts: CoderOptions): Promise<Coder> {
+export async function createJade(opts: JadeOptions): Promise<Jade> {
   const { cwd, store, provider } = opts;
 
   const subagentPlugins = await subagent(opts);
+  const checkpoints = new Checkpoints(path.join(opts.home, "checkpoints"));
+  const shell = shellTools({ cwd });
   const tools: Plugin = {
-    id: "coder/tools",
-    version: "0.1.0",
+    id: "jade/tools",
+    version: "0.2.0",
     kernel: "^0.1",
     tools: [
-      ...fsTools(cwd),
-      shellTool({ cwd }),
+      ...fsTools(cwd, { checkpoints }),
+      ...shell.tools,
+      todoTool(),
       taskTool({ store, provider, plugins: subagentPlugins }),
     ],
   };
@@ -59,20 +69,20 @@ export async function createCoder(opts: CoderOptions): Promise<Coder> {
     budget({ maxSteps: opts.maxSteps }),
     ...extra,
   ];
-  return { plugins, policy: pol, compact };
+  return { plugins, policy: pol, compact, checkpoints, shutdown: shell.shutdown };
 }
 
 /** 子 Agent 的插件：只读工具、子 Agent 提示词、只读策略、步数上限。每次调用返回新实例 */
-async function subagent(opts: CoderOptions): Promise<() => Plugin[]> {
+async function subagent(opts: JadeOptions): Promise<() => Plugin[]> {
   const system = await prompts({ cwd: opts.cwd, home: opts.home, role: "subagent", today: opts.today });
   return () => {
     const tools: Plugin = {
-      id: "coder/tools-readonly",
+      id: "jade/tools-readonly",
       version: "0.1.0",
       kernel: "^0.1",
       tools: fsTools(opts.cwd).filter((t) => READ_ONLY.has(t.name)),
     };
-    const pol = policy({ cwd: opts.cwd, mode: "readonly", id: "coder/policy-subagent" });
-    return [tools, system, pol.plugin, budget({ maxSteps: 40, id: "coder/budget-subagent" })];
+    const pol = policy({ cwd: opts.cwd, mode: "readonly", id: "jade/policy-subagent" });
+    return [tools, system, pol.plugin, budget({ maxSteps: 40, id: "jade/budget-subagent" })];
   };
 }

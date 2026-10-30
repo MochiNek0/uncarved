@@ -18,17 +18,25 @@ import {
   type ToolContext,
 } from "uncarved";
 import {
-  createCoder,
+  Checkpoints,
+  createJade,
   DERIVED_KEY,
+  estimateTokens,
   fsTools,
+  hasProvider,
   isSafeCommand,
+  loadEnvFile,
+  parseEnv,
   POLICY_KEY,
+  providerFromEnv,
   policy,
   shellTool,
+  shellTools,
   shellWords,
+  todoTool,
   validate,
   withRetry,
-  type CoderOptions,
+  type JadeOptions,
   type CompactState,
 } from "../src/index.ts";
 
@@ -58,18 +66,18 @@ const call = (...uses: Block[]): Step => ({ content: uses, stopReason: "tool_use
 const msg = (t: string) => ({ kind: "message" as const, content: [{ kind: "text" as const, text: t, origin: { by: "user" as const }, trust: "trusted" as const }] });
 
 async function workspace() {
-  const cwd = await mkdtemp(path.join(os.tmpdir(), "coder-cwd-"));
-  const home = await mkdtemp(path.join(os.tmpdir(), "coder-home-"));
+  const cwd = await mkdtemp(path.join(os.tmpdir(), "jade-cwd-"));
+  const home = await mkdtemp(path.join(os.tmpdir(), "jade-home-"));
   return { cwd, home };
 }
 
-async function setup(script: Step[], extra: Partial<CoderOptions> = {}) {
+async function setup(script: Step[], extra: Partial<JadeOptions> = {}) {
   const { cwd, home } = await workspace();
   const s = scripted(script);
   const store = extra.store ?? new MemoryLogStore();
-  const coder = await createCoder({ cwd, home, store, provider: s.provider, today: "2026-10-30", ...extra });
-  const rt = await Runtime.create({ store, provider: s.provider, plugins: coder.plugins });
-  return { cwd, home, store, coder, rt, ...s };
+  const jade = await createJade({ cwd, home, store, provider: s.provider, today: "2026-10-30", ...extra });
+  const rt = await Runtime.create({ store, provider: s.provider, plugins: jade.plugins });
+  return { cwd, home, store, jade, rt, ...s };
 }
 
 const events = async (store: LogStore, id: string, type: string) =>
@@ -108,7 +116,9 @@ describe("fs tools", () => {
   test("edit_file matches LF text in a CRLF file", async () => {
     const { cwd } = await workspace();
     await writeFile(path.join(cwd, "w.txt"), "one\r\ntwo\r\n");
-    const r = await run(fsTools(cwd), "edit_file", { path: "w.txt", old_string: "one\ntwo", new_string: "1\n2" });
+    const tools = fsTools(cwd);
+    await run(tools, "read_file", { path: "w.txt" });
+    const r = await run(tools, "edit_file", { path: "w.txt", old_string: "one\ntwo", new_string: "1\n2" });
     expect(r.isError).toBe(false);
     expect(await readFile(path.join(cwd, "w.txt"), "utf8")).toBe("1\r\n2\r\n");
   });
@@ -125,7 +135,9 @@ describe("fs tools", () => {
   test("edit_file replace_all treats $ in new_string literally", async () => {
     const { cwd } = await workspace();
     await writeFile(path.join(cwd, "d.txt"), "foo foo");
-    await run(fsTools(cwd), "edit_file", { path: "d.txt", old_string: "foo", new_string: "$&$1", replace_all: true });
+    const tools = fsTools(cwd);
+    await run(tools, "read_file", { path: "d.txt" });
+    await run(tools, "edit_file", { path: "d.txt", old_string: "foo", new_string: "$&$1", replace_all: true });
     expect(await readFile(path.join(cwd, "d.txt"), "utf8")).toBe("$&$1 $&$1");
   });
 
@@ -137,6 +149,69 @@ describe("fs tools", () => {
     expect((await run(tools, "write_file", { path: "f.txt", content: "x\ny\n" })).text).toBe("Wrote 2 lines to f.txt");
     expect((await run(tools, "write_file", { path: "g.txt", content: "x\r\ny" })).text).toBe("Wrote 2 lines to g.txt");
     expect((await run(tools, "write_file", { path: "h.txt", content: "" })).text).toBe("Wrote 0 lines to h.txt");
+  });
+
+  test("changing an existing file requires reading it first, and refuses if it changed since", async () => {
+    const { cwd } = await workspace();
+    const tools = fsTools(cwd);
+    const file = path.join(cwd, "s.txt");
+    await writeFile(file, "a\n");
+
+    const unread = await run(tools, "edit_file", { path: "s.txt", old_string: "a", new_string: "b" });
+    expect(unread).toMatchObject({ isError: true, text: expect.stringContaining("has not been read") });
+    expect((await run(tools, "write_file", { path: "s.txt", content: "z" })).isError).toBe(true);
+
+    await run(tools, "read_file", { path: "s.txt" });
+    expect((await run(tools, "edit_file", { path: "s.txt", old_string: "a", new_string: "b" })).isError).toBe(false);
+    // 自己的写入不算"被别人改过"
+    expect((await run(tools, "edit_file", { path: "s.txt", old_string: "b", new_string: "c" })).isError).toBe(false);
+
+    await writeFile(file, "someone else's change\n");
+    const stale = await run(tools, "edit_file", { path: "s.txt", old_string: "c", new_string: "d" });
+    expect(stale).toMatchObject({ isError: true, text: expect.stringContaining("modified since it was last read") });
+    expect(await readFile(file, "utf8")).toBe("someone else's change\n");
+  });
+
+  test("read_file returns images as image blocks and refuses other binary files", async () => {
+    const { cwd } = await workspace();
+    await writeFile(path.join(cwd, "p.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 1]));
+    await writeFile(path.join(cwd, "b.bin"), Buffer.from([1, 0, 2]));
+    const tools = fsTools(cwd);
+    const img = await tools.find((t) => t.name === "read_file")!.execute({ path: "p.png" }, ctx());
+    expect(img.content).toEqual([
+      expect.objectContaining({ kind: "image", source: { type: "base64", media_type: "image/png", data: "iVBORwAB" } }),
+    ]);
+    expect(await run(tools, "read_file", { path: "b.bin" })).toMatchObject({ isError: true, text: expect.stringContaining("binary file") });
+  });
+
+  test("writes save the previous content so they can be undone", async () => {
+    const { cwd, home } = await workspace();
+    const checkpoints = new Checkpoints(path.join(home, "checkpoints"));
+    const tools = fsTools(cwd, { checkpoints });
+    const exec = (name: string, input: unknown, toolUseId: string) => tools.find((t) => t.name === name)!.execute(input, { ...ctx(), toolUseId });
+    await exec("write_file", { path: "n.txt", content: "one\n" }, "w1");
+    await exec("edit_file", { path: "n.txt", old_string: "one", new_string: "two" }, "e1");
+
+    const [last, first] = await checkpoints.list("s");
+    expect(last).toMatchObject({ toolUseId: "e1", before: "one\n" });
+    expect(first).toMatchObject({ toolUseId: "w1", before: null });
+    expect(await checkpoints.unchangedSince(last!)).toBe(true);
+    await checkpoints.restore(last!);
+    expect(await readFile(path.join(cwd, "n.txt"), "utf8")).toBe("one\n");
+    await checkpoints.restore(first!);
+    expect(await Bun.file(path.join(cwd, "n.txt")).exists()).toBe(false);
+  });
+
+  test("glob and grep skip files ignored by git", async () => {
+    const { cwd } = await workspace();
+    Bun.spawnSync(["git", "init", "-q"], { cwd });
+    await mkdir(path.join(cwd, "dist"));
+    await writeFile(path.join(cwd, ".gitignore"), "dist/\n");
+    await writeFile(path.join(cwd, "a.ts"), "needle\n");
+    await writeFile(path.join(cwd, "dist", "a.js"), "needle\n");
+    const tools = fsTools(cwd);
+    expect((await run(tools, "glob", { pattern: "**/*.*s" })).text).toBe("a.ts");
+    expect((await run(tools, "grep", { pattern: "needle" })).text).toBe("a.ts:1:needle");
   });
 
   test("bash timeout and abort kill the shell's children instead of waiting for them", async () => {
@@ -153,6 +228,42 @@ describe("fs tools", () => {
     await tool.execute({ command: "sleep 10; echo done" }, { ...ctx(), signal: ac.signal }).catch(() => {});
     expect(Date.now() - t0).toBeLessThan(5000);
   }, 20_000);
+
+  test("background shells return at once; bash_output reads new output; kill_shell stops them", async () => {
+    const { cwd } = await workspace();
+    const shell = shellTools({ cwd });
+    const exec = async (name: string, input: unknown) => {
+      const r = await shell.tools.find((t) => t.name === name)!.execute(input, ctx());
+      return { text: r.content as string, isError: r.isError ?? false };
+    };
+    const t0 = Date.now();
+    const started = await exec("bash", { command: "echo first; sleep 30; echo never", run_in_background: true });
+    expect(started.text).toStartWith("Started background shell bg1");
+    expect(Date.now() - t0).toBeLessThan(2000);
+
+    let out = "";
+    for (let i = 0; i < 50 && !out.includes("<output>"); i++) {
+      out = (await exec("bash_output", { id: "bg1" })).text;
+      await Bun.sleep(100);
+    }
+    expect(out).toContain("running");
+    expect(out).toContain("first");
+    // 读走的输出不会再出现
+    expect((await exec("bash_output", { id: "bg1" })).text).toContain("(no new output)");
+
+    expect((await exec("kill_shell", { id: "bg1" })).text).toStartWith("bg1 stopped");
+    expect((await exec("bash_output", { id: "bg1" })).text).not.toContain("running");
+    expect((await exec("bash_output", { id: "bg9" })).isError).toBe(true);
+    shell.shutdown();
+  }, 20_000);
+
+  test("todo_write renders the list it is given", async () => {
+    const r = await todoTool().execute(
+      { todos: [{ content: "read", status: "completed" }, { content: "edit", status: "in_progress" }, { content: "test", status: "pending" }] },
+      ctx(),
+    );
+    expect(r.content).toBe("Todo list updated:\n[x] read\n[~] edit\n[ ] test");
+  });
 });
 
 // ---------- 权限 ----------
@@ -274,9 +385,10 @@ describe("policy", () => {
 
 // ---------- 整条链路 ----------
 
-describe("coder session", () => {
+describe("jade session", () => {
   test("edit needs approval; the logged input has the resolved path", async () => {
     const { cwd, rt, store, requests } = await setup([
+      call(use("u0", "read_file", { path: "a.txt" })),
       call(use("u1", "edit_file", { path: "a.txt", old_string: "x", new_string: "y" })),
       reply("done"),
     ]);
@@ -287,7 +399,7 @@ describe("coder session", () => {
     await rt.send({ kind: "approval", toolUseId: "u1", approved: true });
 
     expect(await readFile(path.join(cwd, "a.txt"), "utf8")).toBe("y\n");
-    const [decided] = await events(store, rt.state.sessionId, "tool.decided");
+    const [, decided] = await events(store, rt.state.sessionId, "tool.decided");
     expect((decided!.data as EventDataMap["tool.decided"]).input).toMatchObject({ path: path.join(cwd, "a.txt") });
 
     // 系统提示词：身份、环境两段，都是 stable
@@ -308,23 +420,89 @@ describe("coder session", () => {
   test("project instructions are untrusted and carry their source", async () => {
     const { cwd, home } = await workspace();
     await writeFile(path.join(cwd, "AGENTS.md"), "Use tabs.");
-    await writeFile(path.join(home, "CODER.md"), "Be brief.");
+    await writeFile(path.join(cwd, "CLAUDE.md"), "ignored: AGENTS.md wins");
+    await writeFile(path.join(home, "CLAUDE.md"), "Be brief.");
     const s = scripted([reply("ok")]);
-    const coder = await createCoder({ cwd, home, store: new MemoryLogStore(), provider: s.provider });
-    const rt = await Runtime.create({ store: new MemoryLogStore(), provider: s.provider, plugins: coder.plugins });
+    const jade = await createJade({ cwd, home, store: new MemoryLogStore(), provider: s.provider });
+    const rt = await Runtime.create({ store: new MemoryLogStore(), provider: s.provider, plugins: jade.plugins });
     await rt.send(msg("hi"));
-    const [, , user, project] = s.requests[0]!.system;
-    expect(user).toMatchObject({ trust: "trusted", origin: { source: { layer: "user", path: "CODER.md" } } });
+    const [, , user, project, ...rest] = s.requests[0]!.system;
+    expect(user).toMatchObject({ trust: "trusted", origin: { source: { layer: "user", path: "CLAUDE.md" } } });
     expect(project).toMatchObject({ trust: "untrusted", origin: { source: { layer: "project", path: "AGENTS.md" } } });
+    expect(rest).toEqual([]);
+  });
+
+  test("instructions are collected from the repository root down to the working directory", async () => {
+    const { cwd: repo, home } = await workspace();
+    Bun.spawnSync(["git", "init", "-q"], { cwd: repo });
+    const sub = path.join(repo, "pkg", "app");
+    await mkdir(sub, { recursive: true });
+    await writeFile(path.join(repo, "CLAUDE.md"), "root rules");
+    await writeFile(path.join(repo, "pkg", "AGENTS.md"), "pkg rules");
+    const s = scripted([reply("ok")]);
+    const jade = await createJade({ cwd: sub, home, store: new MemoryLogStore(), provider: s.provider });
+    const rt = await Runtime.create({ store: new MemoryLogStore(), provider: s.provider, plugins: jade.plugins });
+    await rt.send(msg("hi"));
+    const loaded = s.requests[0]!.system.slice(2);
+    expect(loaded.map((x) => (x.origin as { source?: { path: string } }).source?.path)).toEqual(["CLAUDE.md", "pkg/AGENTS.md"]);
+    expect(loaded[1]!.text).toContain("pkg rules");
+  });
+
+  test("the user's .env fills in only variables the shell has not set", async () => {
+    expect(parseEnv('# c\nexport A=1\nB = "two words"\nC=x # note\nD=\'$raw\'\nnot a line')).toEqual({
+      A: "1",
+      B: "two words",
+      C: "x",
+      D: "$raw",
+    });
+    const { home } = await workspace();
+    await writeFile(path.join(home, ".env"), "A=file\nB=file\n");
+    const env: Record<string, string | undefined> = { A: "shell" };
+    expect(await loadEnvFile(path.join(home, ".env"), env)).toBe(true);
+    expect(env).toEqual({ A: "shell", B: "file" });
+    expect(await loadEnvFile(path.join(home, "missing"), env)).toBe(false);
+    expect(hasProvider({ OPENAI_COMPAT_BASE_URL: "http://x" })).toBe(true);
+    expect(hasProvider({})).toBe(false);
+  });
+
+  test("OPENAI_COMPAT_EXTRA_BODY must be a JSON object", () => {
+    const env = { OPENAI_COMPAT_BASE_URL: "http://x", OPENAI_COMPAT_MODEL: "m" };
+    expect(providerFromEnv({ ...env, OPENAI_COMPAT_EXTRA_BODY: '{"enable_thinking":true}' }).id).toBe("openai-compat");
+    expect(() => providerFromEnv({ ...env, OPENAI_COMPAT_EXTRA_BODY: "enable_thinking" })).toThrow("must be a JSON object");
+    expect(() => providerFromEnv({ ...env, OPENAI_COMPAT_EXTRA_BODY: "[1]" })).toThrow("must be a JSON object");
+  });
+
+  test("old large tool output is cleared first, judged by the real usage of the previous request", async () => {
+    const big = Array.from({ length: 800 }, () => "a".repeat(40)).join("\n");
+    const { cwd, rt, store, requests } = await setup(
+      [
+        call(use("u1", "read_file", { path: "big.txt" })),
+        // 估算只有约 9k，真实用量 15k 超过阈值
+        { content: [text("read")], stopReason: "end", usage: { inputTokens: 15_000, outputTokens: 10 } },
+        reply("ok"),
+      ],
+      { compactTokens: 12_000 },
+    );
+    await writeFile(path.join(cwd, "big.txt"), big);
+    await rt.send(msg("read it"));
+    expect(estimateTokens(requests[1]!.messages)).toBeLessThan(12_000);
+    await rt.send(msg("next"));
+
+    // 没有调用总结，只清理了旧的工具输出
+    expect(requests.length).toBe(3);
+    const result = requests[2]!.messages[2]!.content[0]!;
+    expect(result.kind === "tool_result" && (result.content[0] as { text: string }).text).toContain("was cleared");
+    expect((rt.state.derived[DERIVED_KEY] as CompactState)).toEqual({ upTo: 0, summary: "", trimUpTo: 3 });
+    expect((await events(store, rt.state.sessionId, "jade/compact/trimmed")).length).toBe(1);
   });
 
   test("compaction is recorded once and reused after resume", async () => {
     const store = new MemoryLogStore();
-    const { coder, rt, requests, script, cwd, home, provider } = await setup([reply("A"), reply("B")], { store });
+    const { jade, rt, requests, script, cwd, home, provider } = await setup([reply("A"), reply("B")], { store });
     await rt.send(msg("first"));
     await rt.send(msg("second"));
 
-    coder.compact.request();
+    jade.compact.request();
     script.push(reply("SUMMARY"), reply("C"));
     await rt.send(msg("third"));
 
@@ -335,10 +513,10 @@ describe("coder session", () => {
     expect(main.messages.length).toBeLessThan(rt.state.messages.length);
     const compacted = rt.state.derived[DERIVED_KEY] as CompactState;
     expect(compacted.summary).toBe("SUMMARY");
-    expect((await events(store, rt.state.sessionId, "coder/compact/compacted")).length).toBe(1);
+    expect((await events(store, rt.state.sessionId, "jade/compact/compacted")).length).toBe(1);
 
     // 恢复后直接使用日志里的摘要，不再调用总结
-    const again = await createCoder({ cwd, home, store, provider, today: "2026-10-30" });
+    const again = await createJade({ cwd, home, store, provider, today: "2026-10-30" });
     const resumed = await Runtime.resume({ store, provider, plugins: again.plugins, sessionId: rt.state.sessionId });
     script.push(reply("D"));
     await resumed.send(msg("fourth"));
@@ -371,13 +549,13 @@ describe("coder session", () => {
     await rt.record(POLICY_KEY, { mode: "readonly", rules: [] });
     await rt.detach();
 
-    const again = await createCoder({ cwd, home, store, provider, today: "2026-10-30" });
+    const again = await createJade({ cwd, home, store, provider, today: "2026-10-30" });
     const resumed = await Runtime.resume({ store, provider, plugins: again.plugins, sessionId: rt.state.sessionId });
     script.push(call(use("u1", "write_file", { path: "a.txt", content: "x" })), reply("ok"));
     await resumed.send(msg("write it"));
 
     const [decided] = await events(store, rt.state.sessionId, "tool.decided");
-    expect(decided!.data).toMatchObject({ decision: "deny", decidedBy: "coder/policy" });
+    expect(decided!.data).toMatchObject({ decision: "deny", decidedBy: "jade/policy" });
     expect(again.policy.settings(resumed.state.derived).mode).toBe("readonly");
     const types = (await readAll(store, rt.state.sessionId)).map((e) => e.type);
     expect(types.slice(0, 3)).toEqual(["session.started", "derived.recorded", "session.detached"]);

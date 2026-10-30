@@ -12,7 +12,7 @@ export const MODES = ["ask", "auto-edit", "yolo", "readonly"] as const;
 export type Mode = (typeof MODES)[number];
 
 /** derived 中保存设置的键 */
-export const POLICY_KEY = "coder/policy";
+export const POLICY_KEY = "jade/policy";
 
 /** 本会话内"总是允许"的规则。prefix 只用于 bash，匹配命令开头 */
 export interface AllowRule {
@@ -123,7 +123,7 @@ function real(p: string): string {
 }
 
 export function policy(opts: PolicyOptions): Policy {
-  const id = opts.id ?? "coder/policy";
+  const id = opts.id ?? "jade/policy";
   const defaults: PolicySettings = { mode: opts.mode ?? "ask", rules: [] };
   const inside = (p: string) => {
     // 按真实路径比较：工作目录里指向外面的符号链接也算外面

@@ -9,3 +9,6 @@ export * from "./plugins/schema.ts";
 export * from "./tools/fs.ts";
 export * from "./tools/shell.ts";
 export * from "./tools/task.ts";
+export * from "./tools/checkpoint.ts";
+export * from "./tools/todo.ts";
+export * from "./config.ts";

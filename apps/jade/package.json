@@ -1,5 +1,5 @@
 {
-  "name": "@uncarved/coder",
+  "name": "@uncarved/jade",
   "private": true,
   "version": "0.1.0",
   "description": "A coding agent harness built on the uncarved kernel",
@@ -8,7 +8,7 @@
     ".": "./src/index.ts"
   },
   "bin": {
-    "coder": "./src/main.ts"
+    "jade": "./src/main.ts"
   },
   "dependencies": {
     "uncarved": "workspace:*",

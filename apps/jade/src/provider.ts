@@ -65,7 +65,8 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 /**
  * 按环境变量选择：
  * - OPENAI_API_KEY：OpenAI Responses API，可选 OPENAI_BASE_URL、OPENAI_MODEL
- * - OPENAI_COMPAT_BASE_URL + OPENAI_COMPAT_MODEL（+ OPENAI_COMPAT_API_KEY）：兼容 /chat/completions 的服务
+ * - OPENAI_COMPAT_BASE_URL + OPENAI_COMPAT_MODEL（+ OPENAI_COMPAT_API_KEY）：兼容 /chat/completions 的服务，
+ *   可选 OPENAI_COMPAT_EXTRA_BODY（JSON 对象，合并进每次请求体，例如开启思考的 {"enable_thinking":true}）
  * - 否则 Claude（ANTHROPIC_API_KEY），可选 ANTHROPIC_MODEL
  */
 export function providerFromEnv(env: Record<string, string | undefined> = process.env): Provider {
@@ -82,7 +83,19 @@ export function providerFromEnv(env: Record<string, string | undefined> = proces
       baseURL: env.OPENAI_COMPAT_BASE_URL,
       apiKey: env.OPENAI_COMPAT_API_KEY,
       model: env.OPENAI_COMPAT_MODEL,
+      extraBody: env.OPENAI_COMPAT_EXTRA_BODY ? jsonObject("OPENAI_COMPAT_EXTRA_BODY", env.OPENAI_COMPAT_EXTRA_BODY) : undefined,
     });
   }
   return anthropicProvider({ model: env.ANTHROPIC_MODEL, effort: "high" });
+}
+
+function jsonObject(name: string, text: string): Record<string, unknown> {
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    throw new Error(`${name} must be a JSON object, got ${JSON.stringify(text)}`);
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error(`${name} must be a JSON object, got ${text}`);
+  return value as Record<string, unknown>;
 }

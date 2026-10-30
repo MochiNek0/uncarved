@@ -15,11 +15,11 @@
         "uncarved": "workspace:*",
       },
     },
-    "apps/coder": {
-      "name": "@uncarved/coder",
+    "apps/jade": {
+      "name": "@uncarved/jade",
       "version": "0.1.0",
       "bin": {
-        "coder": "./src/main.ts",
+        "jade": "./src/main.ts",
       },
       "dependencies": {
         "@uncarved/provider-anthropic": "workspace:*",
@@ -37,7 +37,7 @@
       "name": "@uncarved/plugin-stdio",
       "version": "0.1.0",
       "peerDependencies": {
-        "uncarved": "workspace:*",
+        "uncarved": "workspace:^",
       },
     },
     "packages/provider-anthropic": {
@@ -47,28 +47,28 @@
         "@anthropic-ai/sdk": "^1.3.0",
       },
       "peerDependencies": {
-        "uncarved": "workspace:*",
+        "uncarved": "workspace:^",
       },
     },
     "packages/provider-openai-compat": {
       "name": "@uncarved/provider-openai-compat",
       "version": "0.1.0",
       "peerDependencies": {
-        "uncarved": "workspace:*",
+        "uncarved": "workspace:^",
       },
     },
     "packages/provider-openai-responses": {
       "name": "@uncarved/provider-openai-responses",
       "version": "0.1.0",
       "peerDependencies": {
-        "uncarved": "workspace:*",
+        "uncarved": "workspace:^",
       },
     },
     "packages/store-jsonl": {
       "name": "@uncarved/store-jsonl",
       "version": "0.1.0",
       "peerDependencies": {
-        "uncarved": "workspace:*",
+        "uncarved": "workspace:^",
       },
     },
   },
@@ -125,7 +125,7 @@
 
     "@typescript/typescript-win32-x64": ["@typescript/typescript-win32-x64@7.0.2", "https://registry.npmmirror.com/@typescript/typescript-win32-x64/-/typescript-win32-x64-7.0.2.tgz", { "os": "win32", "cpu": "x64" }, "sha512-0BQ3HkAHHlKLSp1qRvf3SUhGpGsDuhB/jgFw75guyqbxJqEaS0Cw/VFO8i2nHglJUzQCRtMMR/IBAKE3ETMC4g=="],
 
-    "@uncarved/coder": ["@uncarved/coder@workspace:apps/coder"],
+    "@uncarved/jade": ["@uncarved/jade@workspace:apps/jade"],
 
     "@uncarved/plugin-stdio": ["@uncarved/plugin-stdio@workspace:packages/plugin-stdio"],
 

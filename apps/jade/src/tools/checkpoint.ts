@@ -1,0 +1,87 @@
+// 文件快照：write_file / edit_file 写入前保存原内容，宿主的 /undo 用它恢复。
+//
+// 快照放在 <dir>/<sessionId>/<toolUseId>.json，不进日志：文件可能很大，而撤销是宿主的操作，不影响插件决策。
+// 哪些修改已经撤销由宿主用 Runtime.record 记在日志里（UNDO_KEY），恢复会话后仍然有效。
+
+import { createHash } from "node:crypto";
+import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import path from "node:path";
+
+/** derived 中保存已撤销的 toolUseId 的键 */
+export const UNDO_KEY = "jade/undo";
+
+export interface UndoState {
+  undone: string[];
+}
+
+export interface Checkpoint {
+  toolUseId: string;
+  tool: string;
+  /** 绝对路径 */
+  path: string;
+  /** 写入前的内容；null 表示文件原本不存在 */
+  before: string | null;
+  /** 写入后内容的 sha256，撤销前用来判断文件之后有没有被改过 */
+  afterHash: string;
+  /** 写入完成的时间（毫秒，带小数），决定撤销顺序 */
+  at: number;
+}
+
+export const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
+
+export class Checkpoints {
+  readonly #dir: string;
+
+  constructor(dir: string) {
+    this.#dir = dir;
+  }
+
+  async save(sessionId: string, cp: Omit<Checkpoint, "at">): Promise<void> {
+    const dir = path.join(this.#dir, safe(sessionId));
+    await mkdir(dir, { recursive: true });
+    const full: Checkpoint = { ...cp, at: performance.timeOrigin + performance.now() };
+    await writeFile(path.join(dir, `${safe(cp.toolUseId)}.json`), JSON.stringify(full));
+  }
+
+  /** 本会话的所有快照，最新的在前 */
+  async list(sessionId: string): Promise<Checkpoint[]> {
+    const dir = path.join(this.#dir, safe(sessionId));
+    let names: string[];
+    try {
+      names = await readdir(dir);
+    } catch {
+      return [];
+    }
+    const out: Checkpoint[] = [];
+    for (const n of names) {
+      if (!n.endsWith(".json")) continue;
+      try {
+        out.push(JSON.parse(await readFile(path.join(dir, n), "utf8")) as Checkpoint);
+      } catch {
+        // 写到一半的快照，忽略
+      }
+    }
+    return out.sort((a, b) => b.at - a.at);
+  }
+
+  /** 文件现在的内容是否还是这次写入的结果 */
+  async unchangedSince(cp: Checkpoint): Promise<boolean> {
+    try {
+      return sha256(await readFile(cp.path, "utf8")) === cp.afterHash;
+    } catch {
+      return false;
+    }
+  }
+
+  /** 把文件恢复成写入前的样子；原本不存在的文件删掉 */
+  async restore(cp: Checkpoint): Promise<void> {
+    if (cp.before === null) await rm(cp.path, { force: true });
+    else {
+      await mkdir(path.dirname(cp.path), { recursive: true });
+      await writeFile(cp.path, cp.before);
+    }
+  }
+}
+
+/** 会话和工具调用的 id 用作文件名 */
+const safe = (id: string) => id.replace(/[^A-Za-z0-9_.-]/g, "_");
