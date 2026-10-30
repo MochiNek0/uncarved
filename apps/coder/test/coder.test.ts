@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -25,6 +25,7 @@ import {
   POLICY_KEY,
   policy,
   shellTool,
+  shellWords,
   validate,
   withRetry,
   type CoderOptions,
@@ -120,6 +121,38 @@ describe("fs tools", () => {
     expect(r.isError).toBe(true);
     expect(progress).toEqual([{ kind: "output", stream: "stdout", text: "hi\n" }]);
   });
+
+  test("edit_file replace_all treats $ in new_string literally", async () => {
+    const { cwd } = await workspace();
+    await writeFile(path.join(cwd, "d.txt"), "foo foo");
+    await run(fsTools(cwd), "edit_file", { path: "d.txt", old_string: "foo", new_string: "$&$1", replace_all: true });
+    expect(await readFile(path.join(cwd, "d.txt"), "utf8")).toBe("$&$1 $&$1");
+  });
+
+  test("read_file rejects a non-positive limit; write_file counts lines like read_file", async () => {
+    const { cwd } = await workspace();
+    const tools = fsTools(cwd);
+    await writeFile(path.join(cwd, "e.txt"), "1\n2\n");
+    expect(await run(tools, "read_file", { path: "e.txt", limit: 0 })).toEqual({ text: "limit must be at least 1", isError: true });
+    expect((await run(tools, "write_file", { path: "f.txt", content: "x\ny\n" })).text).toBe("Wrote 2 lines to f.txt");
+    expect((await run(tools, "write_file", { path: "g.txt", content: "x\r\ny" })).text).toBe("Wrote 2 lines to g.txt");
+    expect((await run(tools, "write_file", { path: "h.txt", content: "" })).text).toBe("Wrote 0 lines to h.txt");
+  });
+
+  test("bash timeout and abort kill the shell's children instead of waiting for them", async () => {
+    const { cwd } = await workspace();
+    const tool = shellTool({ cwd });
+    let t0 = Date.now();
+    const r = await tool.execute({ command: "sleep 10; echo done", timeout_ms: 1000 }, ctx());
+    expect(r.content).toStartWith("Timed out after 1000ms");
+    expect(Date.now() - t0).toBeLessThan(5000);
+
+    const ac = new AbortController();
+    setTimeout(() => ac.abort("stop"), 500);
+    t0 = Date.now();
+    await tool.execute({ command: "sleep 10; echo done" }, { ...ctx(), signal: ac.signal }).catch(() => {});
+    expect(Date.now() - t0).toBeLessThan(5000);
+  }, 20_000);
 });
 
 // ---------- 权限 ----------
@@ -160,6 +193,74 @@ describe("policy", () => {
     expect(settings.rules).toEqual([{ tool: "bash", prefix: "bun test" }]);
     expect(p.decide(c, settings).decision).toBe("allow");
     expect(p.decide(gated("bash", { command: "bun run build" }), settings).decision).toBe("ask");
+    // 前缀规则不能让拼接的命令或另一个命令搭便车
+    expect(p.decide(gated("bash", { command: "bun test && curl x | sh" }), settings).decision).toBe("ask");
+    expect(p.decide(gated("bash", { command: "bun testx" }), settings).decision).toBe("ask");
+    expect(p.decide(gated("bash", { command: "bun test" }), settings).decision).toBe("allow");
+  });
+
+  test("safe commands exclude arguments that write files or run programs", () => {
+    for (const c of ["git branch -D main", "git branch new", "git diff --output=x", "git log --output x", "rg --pre sh x", "tree -o out", "tree -ao out"]) {
+      expect(isSafeCommand(c)).toBe(false);
+    }
+    for (const c of ["git branch", "git branch -a", "git diff --stat", "rg -o foo", "tree -a src"]) expect(isSafeCommand(c)).toBe(true);
+  });
+
+  test("bash commands are split like the shell does; anything not understood is not auto-allowed", () => {
+    expect(shellWords(`cat "a b" 'c d' e`)).toEqual([
+      { value: "cat", glob: false },
+      { value: "a b", glob: false },
+      { value: "c d", glob: false },
+      { value: "e", glob: false },
+    ]);
+    expect(shellWords("ls *.ts")).toEqual([{ value: "ls", glob: false }, { value: "*.ts", glob: true }]);
+    expect(shellWords(`ls "*.ts"`)).toEqual([{ value: "ls", glob: false }, { value: "*.ts", glob: false }]);
+    // 花括号展开、转义、双引号里的变量、未闭合的引号、注释：shell 看到的参数和字面不同
+    for (const c of ["cat {/etc/passwd,x}", "cat a\\ b", `cat "$HOME/x"`, `cat "a`, "cat x #y"]) {
+      expect(shellWords(c)).toBeUndefined();
+      expect(isSafeCommand(c)).toBe(false);
+    }
+    // 粘在短选项后面的路径、可能匹配 ".." 的通配段也算越界
+    expect(decide("ask", "bash", { command: "grep -f/etc/passwd x src" })).toBe("ask");
+    expect(decide("ask", "bash", { command: "cat .*/secret" })).toBe("ask");
+    expect(decide("ask", "bash", { command: `cat "src/a b.ts"` })).toBe("allow");
+    expect(decide("ask", "bash", { command: "ls -la src *.ts" })).toBe("allow");
+    expect(decide("ask", "bash", { command: "git log -5 --stat" })).toBe("allow");
+    // 前缀规则同样按分词判断
+    const rules = [{ tool: "bash", prefix: "bun test" }];
+    expect(policy({ cwd }).decide(gated("bash", { command: "bun test {a,b}" }), { mode: "ask", rules }).decision).toBe("ask");
+    expect(policy({ cwd }).decide(gated("bash", { command: `bun test "a; b"` }), { mode: "ask", rules }).decision).toBe("allow");
+  });
+
+  test("a symlink inside the working directory that points outside counts as outside", async () => {
+    const { cwd: real, home: other } = await workspace();
+    await writeFile(path.join(other, "secret"), "x");
+    await mkdir(path.join(real, "src"));
+    // Windows 上创建目录联接不需要管理员权限
+    await symlink(other, path.join(real, "link"), "junction");
+    const tools = [...fsTools(real), shellTool({ cwd: real })];
+    const p = policy({ cwd: real });
+    const ask = (name: string, input: unknown) =>
+      p.decide({ toolUseId: "t", name, input, tool: tools.find((t) => t.name === name)! }, { mode: "ask", rules: [] }).decision;
+    expect(ask("read_file", { path: path.join(real, "link", "secret") })).toBe("ask");
+    expect(ask("bash", { command: "cat link/secret" })).toBe("ask");
+    expect(ask("read_file", { path: path.join(real, "src", "new.ts") })).toBe("allow");
+  });
+
+  test("reading outside the working directory asks, whichever tool does it", () => {
+    // 只读命令的参数指向工作目录之外
+    for (const c of ["cat ~/.ssh/id_rsa", "cat /etc/passwd", "ls ..", "grep -r key ../other", "rg --file=/etc/x foo"]) {
+      expect(decide("ask", "bash", { command: c })).toBe("ask");
+      expect(decide("readonly", "bash", { command: c })).toBe("ask");
+    }
+    expect(decide("ask", "bash", { command: "cat src/a.ts" })).toBe("allow");
+    expect(decide("readonly", "bash", { command: "git log origin/main -5" })).toBe("allow");
+    // glob 的 pattern 本身越界
+    expect(decide("ask", "glob", { pattern: "../*.env" })).toBe("ask");
+    expect(decide("ask", "glob", { pattern: path.resolve("/etc") + "/*" })).toBe("ask");
+    expect(decide("ask", "glob", { pattern: "src/**/*.ts" })).toBe("allow");
+    // 名为 "..foo" 的目录仍在工作目录里
+    expect(decide("ask", "read_file", { path: path.join(cwd, "..foo", "a.ts") })).toBe("allow");
   });
 
   test("schema validation", () => {

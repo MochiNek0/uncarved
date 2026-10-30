@@ -25,7 +25,7 @@ export function resolveIn(cwd: string, p: string): string {
 /** 显示用：工作目录内的路径用相对形式，统一为正斜杠 */
 export function display(cwd: string, full: string): string {
   const rel = path.relative(cwd, full);
-  const shown = rel && !rel.startsWith("..") && !path.isAbsolute(rel) ? rel : full;
+  const shown = rel && rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel) ? rel : full;
   return shown.split(path.sep).join("/");
 }
 
@@ -48,6 +48,7 @@ export function fsTools(cwd: string): Tool[] {
     idempotent: true,
     async execute(input) {
       const { path: p, offset = 1, limit = MAX_LINES } = input as { path: string; offset?: number; limit?: number };
+      if (limit < 1) return { content: "limit must be at least 1", isError: true };
       const text = await readFile(at(p), "utf8");
       if (text.length === 0) return { content: "(empty file)" };
       const lines = text.split(/\r?\n/);
@@ -83,7 +84,9 @@ export function fsTools(cwd: string): Tool[] {
       const full = at(p);
       await mkdir(path.dirname(full), { recursive: true });
       await writeFile(full, content);
-      return { content: `Wrote ${content.split("\n").length} lines to ${display(cwd, full)}` };
+      // 和 read_file 一样数行：末尾的换行不算多出一行
+      const lines = content === "" ? 0 : content.split(/\r?\n/).length - (/\r?\n$/.test(content) ? 1 : 0);
+      return { content: `Wrote ${lines} lines to ${display(cwd, full)}` };
     },
   };
 
@@ -122,7 +125,8 @@ export function fsTools(cwd: string): Tool[] {
       if (count > 1 && !replace_all) {
         return { content: `old_string occurs ${count} times in ${display(cwd, full)}; add context to make it unique or set replace_all`, isError: true };
       }
-      await writeFile(full, replace_all ? text.replaceAll(from, to) : text.replace(from, () => to));
+      // 用函数作替换值，new_string 里的 $& $1 等不会被当成替换模式
+      await writeFile(full, replace_all ? text.replaceAll(from, () => to) : text.replace(from, () => to));
       return { content: `Edited ${display(cwd, full)} (${replace_all ? count : 1} replacement${count > 1 && replace_all ? "s" : ""})` };
     },
   };

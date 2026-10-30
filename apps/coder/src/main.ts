@@ -119,6 +119,12 @@ const provider = withRetry(providerFromEnv(), {
   onRetry: ({ attempt, delayMs, error }) => line(yellow(`[retry ${attempt} in ${Math.round(delayMs / 1000)}s: ${error.message}]`)),
 });
 
+const compactTokens = process.env.CODER_COMPACT_TOKENS ? Number(process.env.CODER_COMPACT_TOKENS) : undefined;
+// NaN 会让"是否超过阈值"永远为假，每次请求都压缩
+if (compactTokens !== undefined && !(Number.isInteger(compactTokens) && compactTokens > 0)) {
+  fail(`CODER_COMPACT_TOKENS must be a positive integer, got ${JSON.stringify(process.env.CODER_COMPACT_TOKENS)}`);
+}
+
 const coder = await createCoder({
   cwd,
   home,
@@ -126,7 +132,7 @@ const coder = await createCoder({
   provider,
   mode: opts.mode,
   projectPlugins: await projectPlugins(),
-  compactTokens: process.env.CODER_COMPACT_TOKENS ? Number(process.env.CODER_COMPACT_TOKENS) : undefined,
+  compactTokens,
 });
 
 /** .coder/plugins/<name>/index.ts：项目层插件，首次加载（及内容变化后）要用户确认（7.1） */
@@ -185,6 +191,8 @@ if (resumeId) for (const e of await readAll(store, sessionId)) if (e.type === "m
 const toolNames = new Map<string, string>();
 let streamed = false;
 let thinking = false;
+/** 本轮已经以 turn.ended（error/aborted）结束并显示过原因，随后抛出的同一个错误不再重复显示 */
+let turnFailed = false;
 /** 每个工具已经显示了多少行进度输出 */
 const progressLines = new Map<string, number>();
 const MAX_PROGRESS_LINES = 20;
@@ -281,6 +289,7 @@ function renderEvent(e: Event) {
       return;
     case "turn.ended": {
       const d = e.data as EventDataMap["turn.ended"];
+      turnFailed = d.reason === "error" || d.reason === "aborted";
       if (d.reason === "stopped") line(yellow("[stopped: step budget for this turn used up; send a message to continue]"));
       else if (d.reason === "aborted") line(yellow("[interrupted]"));
       else if (d.reason !== "end") line(yellow(`[turn ended: ${d.reason}${d.error ? ` — ${d.error}` : ""}]`));
@@ -358,11 +367,12 @@ async function leave() {
 
 async function guarded(fn: () => Promise<void>) {
   running = true;
+  turnFailed = false;
   try {
     await fn();
     await approvePending();
   } catch (err) {
-    line(red(`[error] ${err instanceof Error ? err.message : String(err)}`));
+    if (!turnFailed) line(red(`[error] ${err instanceof Error ? err.message : String(err)}`));
   } finally {
     running = false;
   }

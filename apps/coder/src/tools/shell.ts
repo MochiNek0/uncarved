@@ -38,13 +38,15 @@ export function shellTool(opts: ShellOptions): Tool {
         stdin: "ignore",
         stdout: "pipe",
         stderr: "pipe",
+        // 自成进程组，超时/中断时能连同子进程一起杀掉
+        detached: process.platform !== "win32",
       });
       let timedOut = false;
       const timer = setTimeout(() => {
         timedOut = true;
-        proc.kill();
+        killTree(shell, proc.pid);
       }, timeout);
-      const kill = () => proc.kill();
+      const kill = () => killTree(shell, proc.pid);
       signal.addEventListener("abort", kill, { once: true });
       try {
         const [stdout, stderr, code] = await Promise.all([
@@ -70,6 +72,26 @@ export interface ShellProgress {
   kind: "output";
   stream: "stdout" | "stderr";
   text: string;
+}
+
+/**
+ * 只杀 shell 本身不够：它启动的子进程还占着 stdout/stderr 管道，读取会一直等到它们退出。
+ * POSIX 上杀整个进程组。Windows 上 Git Bash（msys）模拟 fork，Windows 进程树里看不到父子关系，
+ * 要先在 msys 里按 WINPID 找到 shell 的 msys PID（它也是进程组号）杀掉整组；taskkill /T 兜底非 msys 的 shell
+ */
+function killTree(shell: string, pid: number) {
+  try {
+    if (process.platform !== "win32") return process.kill(-pid, "SIGKILL");
+    const script = `for d in /proc/[0-9]*; do [ "$(cat "$d/winpid" 2>/dev/null)" = "${pid}" ] && kill -9 -- "-\${d#/proc/}"; done`;
+    try {
+      Bun.spawnSync([shell, "-c", script], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+    } catch {
+      // 不是 msys/cygwin 的 shell
+    }
+    Bun.spawnSync(["taskkill", "/T", "/F", "/PID", String(pid)], { stdout: "ignore", stderr: "ignore" });
+  } catch {
+    // 已经退出
+  }
 }
 
 async function collect(stream: ReadableStream<Uint8Array>, onChunk: (text: string) => void): Promise<string> {
