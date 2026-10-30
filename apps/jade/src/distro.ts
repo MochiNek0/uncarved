@@ -25,7 +25,8 @@ export interface JadeOptions {
   mode?: Mode;
   /** 已经通过 loadProjectPlugin 确认过的项目层插件 */
   projectPlugins?: Plugin[];
-  compactTokens?: number;
+  /** 压缩阈值；传函数时每次投影前取值 */
+  compactTokens?: number | (() => number);
   maxSteps?: number;
   /** 测试用 */
   today?: string;

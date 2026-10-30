@@ -17,8 +17,10 @@ export interface StatusInfo {
   model: string;
   mode: string;
   session?: string;
-  /** 上一次请求的上下文用量，limit 是压缩阈值 */
+  /** 上一次请求的上下文用量，limit 是模型的上下文窗口 */
   context?: { used: number; limit: number };
+  /** 上一次请求的输入中命中缓存的比例（0–1）；服务不报告缓存用量时为 undefined */
+  cache?: number;
 }
 
 export interface CommandInfo {
@@ -30,8 +32,11 @@ export interface CommandInfo {
 export interface Screen {
   /** 能向用户提问；为 false 时 select / input 直接返回 undefined */
   readonly interactive: boolean;
-  /** 追加已经完成的输出，可以带 ANSI 颜色 */
-  log(text: string): void;
+  /**
+   * 追加已经完成的输出，可以带 ANSI 颜色。
+   * details：折叠起来的完整内容，终端界面里点击 text 展开；纯文本输出不显示
+   */
+  log(text: string, opts?: { details?: string }): void;
   /** 流式输出模型的正文或思考 */
   stream(kind: "text" | "thinking", text: string): void;
   /** 结束当前的流式块 */

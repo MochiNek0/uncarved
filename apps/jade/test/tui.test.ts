@@ -246,6 +246,30 @@ describe("terminal UI", () => {
     expect(calls.submit).toEqual(["hi"]);
   });
 
+  test("clicking a folded line expands and collapses its details", async () => {
+    const { screen, type, output, clear } = setup();
+    screen.log("first");
+    screen.log("  ⎿ summary (+2 lines)", { details: "    hidden-1\n    hidden-2" });
+    screen.log("after");
+    await sleep(80);
+    expect(output()).toContain("summary (+2 lines) ▸");
+    expect(output()).not.toContain("hidden-1");
+    // 标题占 4 行（边框和两行文字），对话区第 2 行在屏幕第 6 行
+    clear();
+    await type("\x1b[<0;5;6M");
+    await type("\x1b[<0;5;6m");
+    expect(output()).toContain("hidden-1");
+    expect(output()).toContain("▾");
+    // 点击展开的内容也能收起；点普通的行没有反应
+    clear();
+    await type("\x1b[<0;5;7M");
+    expect(output()).not.toContain("hidden-1");
+    expect(output()).toContain("▸");
+    clear();
+    await type("\x1b[<0;5;5M");
+    expect(output()).not.toContain("hidden-1");
+  });
+
   test("clear empties the conversation", async () => {
     const { screen, output, clear } = setup();
     screen.log("old stuff");

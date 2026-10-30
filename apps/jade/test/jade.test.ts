@@ -19,6 +19,8 @@ import {
 } from "uncarved";
 import {
   Checkpoints,
+  compactThreshold,
+  contextWindowFromEnv,
   createJade,
   DERIVED_KEY,
   estimateTokens,
@@ -729,5 +731,21 @@ describe("withRetry", () => {
     await expect(
       withRetry(inner, { baseDelayMs: 1 }).complete({ system: [], messages: [], tools: [] }, { signal: new AbortController().signal }),
     ).rejects.toThrow("bad request");
+  });
+});
+
+describe("context window", () => {
+  const env = { OPENAI_COMPAT_BASE_URL: "http://x/v1", OPENAI_COMPAT_MODEL: "m" };
+
+  test("JADE_CONTEXT_WINDOW, 256000 by default", () => {
+    expect(contextWindowFromEnv(env)).toBe(256_000);
+    expect(contextWindowFromEnv({ ...env, JADE_CONTEXT_WINDOW: "1000000" })).toBe(1_000_000);
+    expect(() => contextWindowFromEnv({ ...env, JADE_CONTEXT_WINDOW: "200k" })).toThrow("JADE_CONTEXT_WINDOW");
+  });
+
+  test("compaction threshold leaves room for the reply", () => {
+    expect(compactThreshold(200_000, { ANTHROPIC_API_KEY: "k" })).toBe(136_000);
+    expect(compactThreshold(200_000, { ...env, JADE_MAX_TOKENS: "8000" })).toBe(160_000);
+    expect(compactThreshold(32_768, { ...env, JADE_MAX_TOKENS: "32000" })).toBe(16_384);
   });
 });

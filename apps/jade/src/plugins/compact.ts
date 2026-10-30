@@ -25,8 +25,8 @@ export interface CompactState {
 
 export interface CompactOptions {
   provider: Provider;
-  /** 投影超过这个 token 数就压缩，默认 120000 */
-  thresholdTokens?: number;
+  /** 投影超过这个 token 数就压缩，默认 120000；传函数时每次投影前取值（换模型后窗口会变） */
+  thresholdTokens?: number | (() => number);
   /** 压缩后保留最近大约这么多 token 的原始消息，默认阈值的 30% */
   keepTokens?: number;
   id?: string;
@@ -62,8 +62,7 @@ const total = (u: Usage | undefined) => (u?.inputTokens === undefined ? undefine
 
 export function compactor(opts: CompactOptions): Compactor {
   const id = opts.id ?? "jade/compact";
-  const threshold = opts.thresholdTokens ?? 120_000;
-  const keep = opts.keepTokens ?? Math.floor(threshold * 0.3);
+  const thresholdOf = typeof opts.thresholdTokens === "function" ? opts.thresholdTokens : () => (opts.thresholdTokens as number | undefined) ?? 120_000;
   let forced = false;
   /** 最近一次投影：它对应的消息条数和压缩状态；收到回复后补上真实用量 */
   let last: { length: number; state: string; tokens?: number } | undefined;
@@ -104,6 +103,8 @@ export function compactor(opts: CompactOptions): Compactor {
 
   async function project(messages: Message[], ctx: HookContext): Promise<Message[]> {
     const prev = ctx.derived[DERIVED_KEY] as CompactState | undefined;
+    const threshold = thresholdOf();
+    const keep = opts.keepTokens ?? Math.floor(threshold * 0.3);
     const done = (out: Message[], c = prev) => {
       pending = { length: messages.length, state: JSON.stringify(c ?? null) };
       return out;

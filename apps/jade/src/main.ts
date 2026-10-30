@@ -26,6 +26,7 @@ import {
 import { hasProvider, loadEnvFile, updateEnvFile } from "./config.ts";
 import { createJade } from "./distro.ts";
 import { MODES, POLICY_KEY, type Mode, type PolicySettings } from "./plugins/policy.ts";
+import { compactThreshold, contextWindowFromEnv } from "./context.ts";
 import { listModels, providerFromEnv, providerInfo, switchable, withRetry, type ProviderKind } from "./provider.ts";
 import { SessionIndex } from "./sessions.ts";
 import { UNDO_KEY, type UndoState } from "./tools/checkpoint.ts";
@@ -156,7 +157,15 @@ const compactTokens = process.env.JADE_COMPACT_TOKENS ? Number(process.env.JADE_
 if (compactTokens !== undefined && !(Number.isInteger(compactTokens) && compactTokens > 0)) {
   fail(`JADE_COMPACT_TOKENS must be a positive integer, got ${JSON.stringify(process.env.JADE_COMPACT_TOKENS)}`);
 }
-const contextLimit = compactTokens ?? 120_000;
+/** 模型的上下文窗口：JADE_CONTEXT_WINDOW，/model 改配置后更新 */
+let contextWindow = 0;
+try {
+  contextWindow = contextWindowFromEnv();
+} catch (err) {
+  fail(errorText(err));
+}
+/** 压缩阈值：JADE_COMPACT_TOKENS，否则由上下文窗口推出 */
+const compactAt = () => compactTokens ?? compactThreshold(contextWindow);
 
 const modelLabel = () => (hasProvider() ? providerInfo().model || "(no model)" : "(no model)");
 
@@ -210,7 +219,7 @@ const index = new SessionIndex(path.join(home, "index.jsonl"));
 
 const extraPlugins = await projectPlugins();
 /** 每个会话用一套新的插件实例：插件里有按会话记的状态（例如压缩、重复调用的计数） */
-const makeJade = (mode?: Mode) => createJade({ cwd, home, store, provider, mode, projectPlugins: extraPlugins, compactTokens });
+const makeJade = (mode?: Mode) => createJade({ cwd, home, store, provider, mode, projectPlugins: extraPlugins, compactTokens: compactAt });
 
 let jade = await makeJade(opts.mode);
 for (const w of jade.warnings) screen.log(yellow(`[warning] ${w}`));
@@ -287,11 +296,16 @@ async function countUsage(e: LogEvent) {
   }
 }
 
-/** 上下文用量：最近一次回复的输入加输出，就是下一次请求的大致起点 */
+/** 上下文用量：最近一次回复的输入加输出，就是下一次请求的大致起点；以及这次输入的缓存命中率 */
 function showContext(u: Usage | undefined) {
   if (u?.inputTokens === undefined) return;
-  screen.status({ context: { used: u.inputTokens + (u.outputTokens ?? 0), limit: contextLimit } });
+  screen.status({
+    context: { used: u.inputTokens + (u.outputTokens ?? 0), limit: contextWindow },
+    cache: u.cacheReadTokens !== undefined && u.inputTokens > 0 ? u.cacheReadTokens / u.inputTokens : undefined,
+  });
 }
+
+const percent = (part: number, whole: number) => (whole > 0 ? `${Math.round((part / whole) * 100)}%` : "—");
 
 const toolNames = new Map<string, string>();
 /** 正在重新显示恢复的会话里已有的内容：只输出，不显示进行中的状态 */
@@ -309,6 +323,8 @@ let lastEnd: TurnEndReason | undefined;
 /** 每个工具已经显示了多少行进度输出 */
 const progressLines = new Map<string, number>();
 const MAX_PROGRESS_LINES = 20;
+/** 工具结果折叠起来的完整内容最多这么多行 */
+const MAX_DETAIL_LINES = 2000;
 
 function summarize(name: string, input: unknown): string {
   const i = (input ?? {}) as Record<string, unknown>;
@@ -417,8 +433,13 @@ function renderEvent(e: LogEvent) {
       if (quiet.delete(d.toolUseId) && !d.isError) return;
       const text = textOf(d.content).trim();
       const lines = text.split("\n");
-      if (d.isError) screen.log(red(`  ⎿ ${lines.slice(0, 4).map((l) => clip(l, 200)).join("\n    ")}`));
-      else screen.log(dim(`  ⎿ ${clip(lines[0] ?? "", 160)}${lines.length > 1 ? ` (+${lines.length - 1} lines)` : ""}`));
+      // 摘要省略了内容时，把完整结果折叠在摘要下面，点击展开
+      const shown = d.isError ? 4 : 1;
+      const width = d.isError ? 200 : 160;
+      const hidden = lines.length > shown || lines.some((l) => l.length > width);
+      const details = hidden ? detailsOf(lines, d.isError ? red : (s) => s) : undefined;
+      if (d.isError) screen.log(red(`  ⎿ ${lines.slice(0, shown).map((l) => clip(l, width)).join("\n    ")}`), { details });
+      else screen.log(dim(`  ⎿ ${clip(lines[0] ?? "", width)}${lines.length > 1 ? ` (+${lines.length - 1} lines)` : ""}`), { details });
       return;
     }
     case "tool.interrupted":
@@ -449,6 +470,13 @@ function renderEvent(e: LogEvent) {
       return;
     }
   }
+}
+
+/** 工具结果展开后的内容：缩进的全部行，超过 MAX_DETAIL_LINES 时截断 */
+function detailsOf(lines: string[], color: (s: string) => string): string {
+  const body = lines.slice(0, MAX_DETAIL_LINES).map((l) => color(`    ${l}`));
+  if (lines.length > MAX_DETAIL_LINES) body.push(dim(`    … ${lines.length - MAX_DETAIL_LINES} more lines`));
+  return body.join("\n");
 }
 
 // ---------- 审批 ----------
@@ -556,7 +584,7 @@ async function newSession() {
   notes.length = 0;
   lastEnd = undefined;
   screen.clear();
-  screen.status({ session: sessionId, mode, context: undefined });
+  screen.status({ session: sessionId, mode, context: undefined, cache: undefined });
   screen.log(dim(`Started a new session. The previous one can be resumed with: jade --resume ${old}`));
 }
 process.on("SIGINT", () => (running ? interrupt() : void quit(130)));
@@ -722,6 +750,7 @@ async function applyConfig(updates: Record<string, string | undefined>): Promise
   await updateEnvFile(envFile, updates);
   try {
     provider.set(retrying(providerFromEnv()));
+    contextWindow = contextWindowFromEnv();
   } catch (err) {
     screen.log(red(`Saved to ${shortPath(envFile)}, but the configuration is incomplete: ${errorText(err)}`));
     return false;
@@ -796,6 +825,11 @@ async function configureModel(arg: string | undefined) {
     { label: "Switch model", value: "model" as const, hint: `current: ${info.model}` },
     { label: "Change service, base URL or API key", value: "provider" as const, hint: info.baseURL },
     { label: "Output limit per reply", value: "max" as const, hint: process.env.JADE_MAX_TOKENS ? `${process.env.JADE_MAX_TOKENS} tokens` : "service default" },
+    {
+      label: "Context window",
+      value: "window" as const,
+      hint: `${contextWindow} tokens${process.env.JADE_CONTEXT_WINDOW ? "" : " (default)"}`,
+    },
   ]);
   if (action === "model") {
     const model = await chooseModel(process.env, info.model);
@@ -804,10 +838,14 @@ async function configureModel(arg: string | undefined) {
   else if (action === "max") {
     const max = await screen.input("Output limit per reply in tokens (empty for the service default)", { initial: process.env.JADE_MAX_TOKENS ?? "32000" });
     if (max !== undefined) await applyConfig({ JADE_MAX_TOKENS: max || undefined });
+  } else if (action === "window") {
+    const n = await screen.input("Context window in tokens (empty for the default 256000)", { initial: process.env.JADE_CONTEXT_WINDOW ?? "" });
+    if (n !== undefined) await applyConfig({ JADE_CONTEXT_WINDOW: n || undefined });
   }
 }
 
 // ---------- 命令 ----------
+
 
 const COMMAND_WIDTH = Math.max(...COMMANDS.map((c) => `/${c.name}${c.args ? ` ${c.args}` : ""}`.length)) + 2;
 
@@ -864,7 +902,16 @@ async function command(input: string): Promise<boolean> {
       screen.log(settings().rules.length ? settings().rules.map((r) => `${r.tool}${r.prefix ? ` "${r.prefix}…"` : ""}`).join("\n") : dim("(none)"));
       break;
     case "usage":
-      screen.log(`input ${usage.inputTokens}  output ${usage.outputTokens}  cache read ${usage.cacheReadTokens}  cache write ${usage.cacheWriteTokens}`);
+      screen.log(
+        `input ${usage.inputTokens}  output ${usage.outputTokens}  cache read ${usage.cacheReadTokens}  cache write ${usage.cacheWriteTokens}  ` +
+          `cache hit ${percent(usage.cacheReadTokens, usage.inputTokens)}`,
+      );
+      screen.log(
+        dim(
+          `context window ${contextWindow}${process.env.JADE_CONTEXT_WINDOW ? " (JADE_CONTEXT_WINDOW)" : " (default)"}, ` +
+            `compacts at ${compactAt()}${compactTokens !== undefined ? " (JADE_COMPACT_TOKENS)" : ""}`,
+        ),
+      );
       break;
     case "exit":
     case "quit":

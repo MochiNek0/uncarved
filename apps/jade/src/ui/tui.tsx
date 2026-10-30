@@ -40,15 +40,29 @@ const MAX_LINES = 10_000;
 /** 按显示宽度折行，保留颜色；每一项是屏幕上的一行 */
 const wrap = (text: string, width: number) => wrapAnsi(text, width, { hard: true, trim: false }).split("\n");
 
+/** 对话里的一项：普通的一行，或者带折叠内容的一段（点击展开、收起） */
+interface Line {
+  text: string;
+  fold?: { details: string; open: boolean };
+}
+
+function wrapLine(l: Line, width: number): string[] {
+  if (!l.fold) return wrap(l.text, width);
+  const head = wrap(`${l.text}${dim(l.fold.open ? " ▾" : " ▸")}`, width);
+  return l.fold.open ? [...head, ...wrap(l.fold.details, width)] : head;
+}
+
 /** 状态容器：频繁的流式更新合并到一帧再通知界面 */
 class Store {
   state: UiState;
   #listeners = new Set<() => void>();
   #timer: ReturnType<typeof setTimeout> | undefined;
-  /** 已经完成的输出，一项一行（折行前） */
-  #lines: string[] = [];
+  /** 已经完成的输出（折行前）；普通的一项一行 */
+  #lines: Line[] = [];
   /** 按 #width 折好的行 */
   #wrapped: string[] = [];
+  /** #wrapped 的每一行属于哪个可折叠项；普通行为 undefined */
+  #owners: (Line | undefined)[] = [];
   #width = 0;
 
   constructor(status: StatusInfo) {
@@ -73,37 +87,66 @@ class Store {
     for (const fn of this.#listeners) fn();
   }
 
-  append(texts: string[]) {
+  /** 追加普通的行；带 details 时追加一个可折叠项，texts 是收起时显示的部分 */
+  append(texts: string[], details?: string) {
     if (texts.length === 0) return;
-    const lines = texts.flatMap((t) => t.split("\n"));
+    const lines: Line[] =
+      details === undefined
+        ? texts.flatMap((t) => t.split("\n")).map((text) => ({ text }))
+        : [{ text: texts.join("\n"), fold: { details, open: false } }];
     this.#lines.push(...lines);
     if (this.#lines.length > MAX_LINES) {
       this.#lines = this.#lines.slice(-MAX_LINES * 0.8);
       this.#width = 0;
     }
-    let added = 0;
-    if (this.#width) {
-      const wrapped = lines.flatMap((l) => wrap(l, this.#width));
-      this.#wrapped.push(...wrapped);
-      added = wrapped.length;
-    }
+    const before = this.#wrapped.length;
+    if (this.#width) for (const l of lines) this.#push(l);
     // 往上翻看时新内容不能把正在看的地方顶走
-    const scroll = this.state.scroll > 0 ? this.state.scroll + added : 0;
+    const scroll = this.state.scroll > 0 ? this.state.scroll + this.#wrapped.length - before : 0;
     this.update({ version: this.state.version + 1, scroll });
+  }
+
+  #push(l: Line) {
+    const rows = wrapLine(l, this.#width);
+    this.#wrapped.push(...rows);
+    for (const _ of rows) this.#owners.push(l.fold ? l : undefined);
   }
 
   /** 按给定宽度折好的全部输出；宽度变了（终端缩放）才重新折行 */
   lines(width: number): string[] {
     if (width !== this.#width) {
       this.#width = width;
-      this.#wrapped = this.#lines.flatMap((l) => wrap(l, width));
+      this.#wrapped = [];
+      this.#owners = [];
+      for (const l of this.#lines) this.#push(l);
     }
     return this.#wrapped;
+  }
+
+  /**
+   * 展开或收起第 row 行（折好的行）所在的项；不是可折叠项时什么也不做。
+   * start、view 是当前可见的第一行和可见行数：可见部分的开头保持不动；
+   * 展开时标题如果在可见部分的底部，往下滚到能看见展开的内容，但标题不滚出去
+   */
+  toggle(row: number, start: number, view: number) {
+    const line = this.#owners[row];
+    if (!line?.fold) return;
+    let first = row;
+    while (first > 0 && this.#owners[first - 1] === line) first--;
+    let count = 0;
+    while (this.#owners[first + count] === line) count++;
+    line.fold.open = !line.fold.open;
+    const rows = wrapLine(line, this.#width);
+    this.#wrapped.splice(first, count, ...rows);
+    this.#owners.splice(first, count, ...rows.map(() => line));
+    const end = Math.max(start + view, line.fold.open ? Math.min(first + rows.length, first + view) : 0);
+    this.update({ version: this.state.version + 1, scroll: Math.max(0, this.#wrapped.length - end) }, true);
   }
 
   clear() {
     this.#lines = [];
     this.#wrapped = [];
+    this.#owners = [];
     this.update({ version: this.state.version + 1, live: undefined, scroll: 0 }, true);
   }
 
@@ -124,7 +167,7 @@ export interface TuiOptions {
   io?: { stdin: NodeJS.ReadStream; stdout: NodeJS.WriteStream };
 }
 
-/** 开关鼠标事件上报（SGR 格式），只用来接收滚轮；开着时终端里选中文字要按住 Shift */
+/** 开关鼠标事件上报（SGR 格式），用来接收滚轮和点击；开着时终端里选中文字要按住 Shift */
 const MOUSE_ON = "\x1b[?1000h\x1b[?1006h";
 const MOUSE_OFF = "\x1b[?1006l\x1b[?1000l";
 
@@ -175,10 +218,10 @@ export function tuiScreen(opts: TuiOptions): Screen {
 
   return {
     interactive: true,
-    log(text) {
+    log(text, o) {
       flushLive(true);
       store.update({ live: undefined });
-      store.append(text.split("\n"));
+      store.append(text.split("\n"), o?.details);
     },
     stream(kind, text) {
       const live = store.state.live;
@@ -230,8 +273,11 @@ export function tuiScreen(opts: TuiOptions): Screen {
 
 // ---------- 组件 ----------
 
-/** SGR 鼠标事件（Ink 去掉了开头的 ESC）；按钮号去掉 Shift/Alt/Ctrl 位后 64 是滚轮向上，65 向下 */
-const MOUSE = /^\[<(\d+);\d+;\d+[Mm]$/;
+/**
+ * SGR 鼠标事件（Ink 去掉了开头的 ESC）：按钮号、列、行（从 1 开始），M 是按下、m 是松开。
+ * 按钮号去掉 Shift/Alt/Ctrl 位后 0 是左键，64 是滚轮向上，65 向下
+ */
+const MOUSE = /^\[<(\d+);\d+;(\d+)([Mm])$/;
 const WHEEL_LINES = 3;
 
 function App({ store, version, commands, handlers }: { store: Store; version: string; commands: CommandInfo[]; handlers: TuiHandlers }) {
@@ -241,7 +287,7 @@ function App({ store, version, commands, handlers }: { store: Store; version: st
 
   // 对话区占掉标题和底部之外的全部高度，只画能看见的那几行
   const ref = useRef<DOMElement>(null);
-  const { height } = useBoxMetrics(ref);
+  const { height, top } = useBoxMetrics(ref);
   const width = Math.max(10, columns - 2);
   const done = store.lines(width);
   const live = state.live?.text ? wrap(state.live.kind === "thinking" ? dim(state.live.text) : state.live.text, width) : [];
@@ -262,6 +308,11 @@ function App({ store, version, commands, handlers }: { store: Store; version: st
       const button = Number(mouse[1]) & ~0b11100;
       if (button === 64) store.scrollBy(WHEEL_LINES, max);
       else if (button === 65) store.scrollBy(-WHEEL_LINES, max);
+      else if (button === 0 && mouse[3] === "M") {
+        // 点在对话区里已经完成的输出上：展开或收起那一项
+        const i = Number(mouse[2]) - 1 - top;
+        if (i >= 0 && i < shown.length && start + i < done.length) store.toggle(start + i, start, view);
+      }
       return;
     }
     // 选择框自己用 PgUp/PgDn 翻选项
@@ -373,7 +424,8 @@ function StatusBar({ status }: { status: StatusInfo }) {
         ) : (
           <Text dimColor>ctx —</Text>
         )}
-        <Text dimColor> · PgUp/PgDn scroll · shift+drag to select</Text>
+        {status.cache !== undefined && <Text dimColor> · cache {Math.round(status.cache * 100)}%</Text>}
+        <Text dimColor> · PgUp/PgDn scroll · click ▸ to expand · shift+drag to select</Text>
       </Text>
     </Box>
   );
