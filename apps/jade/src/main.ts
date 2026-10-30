@@ -17,17 +17,16 @@ import {
   type Block,
   type LogEvent,
   type EventDataMap,
-  type PendingCall,
   type Plugin,
   type TurnEndReason,
   type Usage,
   type UserInput,
 } from "uncarved";
-import { hasProvider, loadEnvFile, updateEnvFile } from "./config.ts";
+import { hasProvider, loadEnvFile } from "./config.ts";
 import { createJade } from "./distro.ts";
 import { MODES, POLICY_KEY, type Mode, type PolicySettings } from "./plugins/policy.ts";
 import { compactThreshold, contextWindowFromEnv } from "./context.ts";
-import { listModels, providerFromEnv, providerInfo, switchable, withRetry, type ProviderKind } from "./provider.ts";
+import { providerFromEnv, providerInfo, switchable, withRetry } from "./provider.ts";
 import { SessionIndex } from "./sessions.ts";
 import { UNDO_KEY, type UndoState } from "./tools/checkpoint.ts";
 import { display } from "./tools/fs.ts";
@@ -35,6 +34,8 @@ import type { ShellProgress } from "./tools/shell.ts";
 import type { TaskProgress } from "./tools/task.ts";
 import { renderTodos, type Todo } from "./tools/todo.ts";
 import { bold, cyan, dim, green, plainScreen, red, yellow, type CommandInfo, type Screen } from "./ui/screen.ts";
+import { configurator } from "./ui/configure.ts";
+import { clip, detailsOf, preview, shortPath, summarize } from "./ui/render.ts";
 import { tuiScreen } from "./ui/tui.tsx";
 
 const HELP = `Usage: jade [options] [prompt]
@@ -57,7 +58,7 @@ const COMMANDS: CommandInfo[] = [
   { name: "mode", args: `[${MODES.join("|")}]`, about: "show or change the permission mode" },
   { name: "clear", about: "start a new session (the current one stays resumable)" },
   { name: "compact", about: "compact the history before the next request" },
-  { name: "undo", about: "restore the file changed by the agent's most recent write_file/edit_file" },
+  { name: "undo", about: "restore the file changed by the agent's most recent write_file/edit_file/multi_edit" },
   { name: "retry", about: "request the model again after a failed request, without sending another message" },
   { name: "usage", about: "token usage of this session, including sub-agents and compaction" },
   { name: "sessions", about: "recent sessions in this directory" },
@@ -111,16 +112,8 @@ function fail(msg: string): never {
   process.exit(2);
 }
 
-const clip = (s: string, n: number) => (s.length > n ? s.slice(0, n) + "…" : s);
 const textOf = (blocks: Block[]) => blocks.flatMap((b) => (b.kind === "text" ? [b.text] : [])).join("\n");
 const errorText = (err: unknown) => (err instanceof Error ? err.message : String(err));
-
-/** 家目录下的路径显示成 ~/… */
-function shortPath(p: string): string {
-  const rel = path.relative(os.homedir(), p);
-  const shown = rel && !rel.startsWith("..") && !path.isAbsolute(rel) ? `~/${rel}` : rel === "" ? "~" : p;
-  return shown.split(path.sep).join("/");
-}
 
 async function gitBranch(dir: string): Promise<string | undefined> {
   try {
@@ -192,9 +185,21 @@ const provider = switchable({
   complete: () => Promise.reject(new Error("no model is configured; use /model")),
 });
 
+/** /model 的交互：改配置后换掉 provider、更新上下文窗口和状态栏 */
+const configure = configurator({
+  screen,
+  envFile,
+  apply: () => {
+    provider.set(retrying(providerFromEnv()));
+    contextWindow = contextWindowFromEnv();
+  },
+  contextWindow: () => contextWindow,
+  onApplied: () => screen.status({ model: modelLabel() }),
+});
+
 if (!hasProvider()) {
   screen.log(bold("Welcome to jade.") + " No model is configured yet; let's set one up.");
-  if (!(await configureProvider())) {
+  if (!(await configure.provider())) {
     await screen.close();
     process.exit(2);
   }
@@ -326,17 +331,6 @@ const MAX_PROGRESS_LINES = 20;
 /** 工具结果折叠起来的完整内容最多这么多行 */
 const MAX_DETAIL_LINES = 2000;
 
-function summarize(name: string, input: unknown): string {
-  const i = (input ?? {}) as Record<string, unknown>;
-  if (name === "bash") return clip(String(i.command ?? "").split("\n")[0]!, 120);
-  if (name === "task") return String(i.description ?? "");
-  if (name === "bash_output" || name === "kill_shell") return String(i.id ?? "");
-  if (name === "todo_write") return `${Array.isArray(i.todos) ? i.todos.length : 0} items`;
-  const where = typeof i.path === "string" ? display(cwd, i.path) : "";
-  if (name === "grep" || name === "glob") return `${i.pattern}${where && where !== "." ? ` in ${where}` : ""}`;
-  return where || clip(JSON.stringify(input), 120);
-}
-
 rt.subscribe(onNotice);
 
 function onNotice(n: Parameters<Parameters<Runtime["subscribe"]>[0]>[0]) {
@@ -377,7 +371,7 @@ function onNotice(n: Parameters<Parameters<Runtime["subscribe"]>[0]>[0]) {
 
 function renderProgress(toolUseId: string, p: ShellProgress | TaskProgress) {
   if (p.kind === "task-start") return screen.log(dim(`  ↳ sub-agent: ${p.description}`));
-  if (p.kind === "task-tool") return screen.log(dim(`    ${p.decision === "deny" ? "✗" : "·"} ${p.name}(${summarize(p.name, p.input)})`));
+  if (p.kind === "task-tool") return screen.log(dim(`    ${p.decision === "deny" ? "✗" : "·"} ${p.name}(${summarize(cwd, p.name, p.input)})`));
   const shown = progressLines.get(toolUseId) ?? 0;
   if (shown > MAX_PROGRESS_LINES) return;
   const lines = p.text.replace(/\n$/, "").split("\n");
@@ -410,7 +404,7 @@ function renderEvent(e: LogEvent) {
       const d = e.data as EventDataMap["tool.decided"];
       const name = toolNames.get(d.toolUseId) ?? "?";
       if (d.decision === "ask") return;
-      const head = `${bold(name)}(${summarize(name, d.input)})`;
+      const head = `${bold(name)}(${summarize(cwd, name, d.input)})`;
       if (d.decision === "deny") screen.log(red(`✗ ${head}`) + dim(d.reason ? ` — ${clip(d.reason, 200)}` : ""));
       else {
         activity(`Running ${name}`);
@@ -437,7 +431,7 @@ function renderEvent(e: LogEvent) {
       const shown = d.isError ? 4 : 1;
       const width = d.isError ? 200 : 160;
       const hidden = lines.length > shown || lines.some((l) => l.length > width);
-      const details = hidden ? detailsOf(lines, d.isError ? red : (s) => s) : undefined;
+      const details = hidden ? detailsOf(lines, d.isError ? red : (s) => s, MAX_DETAIL_LINES) : undefined;
       if (d.isError) screen.log(red(`  ⎿ ${lines.slice(0, shown).map((l) => clip(l, width)).join("\n    ")}`), { details });
       else screen.log(dim(`  ⎿ ${clip(lines[0] ?? "", width)}${lines.length > 1 ? ` (+${lines.length - 1} lines)` : ""}`), { details });
       return;
@@ -472,40 +466,19 @@ function renderEvent(e: LogEvent) {
   }
 }
 
-/** 工具结果展开后的内容：缩进的全部行，超过 MAX_DETAIL_LINES 时截断 */
-function detailsOf(lines: string[], color: (s: string) => string): string {
-  const body = lines.slice(0, MAX_DETAIL_LINES).map((l) => color(`    ${l}`));
-  if (lines.length > MAX_DETAIL_LINES) body.push(dim(`    … ${lines.length - MAX_DETAIL_LINES} more lines`));
-  return body.join("\n");
-}
-
 // ---------- 审批 ----------
-
-function preview(c: PendingCall): string {
-  const i = (c.input ?? {}) as Record<string, string>;
-  const lines = (s: string, mark: string, color: (s: string) => string, max = 30) => {
-    const all = s.split("\n");
-    const shown = all.slice(0, max).map((l) => color(`${mark} ${l}`));
-    if (all.length > max) shown.push(dim(`  … ${all.length - max} more lines`));
-    return shown.join("\n");
-  };
-  if (c.name === "edit_file") return `${lines(i.old_string ?? "", "-", red)}\n${lines(i.new_string ?? "", "+", green)}`;
-  if (c.name === "write_file") return lines(i.content ?? "", "+", green, 20);
-  if (c.name === "bash") return lines(i.command ?? "", "$", (s) => s);
-  return dim(clip(JSON.stringify(c.input, null, 2), 2000));
-}
 
 async function approvePending() {
   while (rt.state.phase === "awaiting") {
     for (const c of rt.state.batch.filter((x) => x.decision === "ask")) {
-      const head = `${c.name}(${summarize(c.name, c.input)})`;
+      const head = `${c.name}(${summarize(cwd, c.name, c.input)})`;
       if (!screen.interactive) {
         screen.log(red(`✗ ${head} denied: not running interactively`));
         await rt.send({ kind: "approval", toolUseId: c.toolUseId, approved: false, reason: "The user is not available to approve this action." });
         continue;
       }
       const rule = jade.policy.ruleFor(c);
-      const always = rule.prefix ? `always allow "${rule.prefix}…"` : `always allow ${rule.tool}`;
+      const always = rule.command ? "always allow this exact command" : rule.prefix ? `always allow "${rule.prefix}…"` : `always allow ${rule.tool}`;
       const answer = await screen.select(
         `Allow ${head}?`,
         [
@@ -680,7 +653,7 @@ async function replayHistory() {
       const d = e.data as EventDataMap["input.received"];
       if (d.kind === "approval") {
         const name = toolNames.get(d.toolUseId) ?? "?";
-        const head = `${bold(name)}(${summarize(name, asked.get(d.toolUseId))})`;
+        const head = `${bold(name)}(${summarize(cwd, name, asked.get(d.toolUseId))})`;
         screen.log(d.approved ? green(`✓ ${head}`) : red(`✗ ${head}`) + dim(d.reason ? ` — ${clip(d.reason, 200)}` : ""));
         continue;
       }
@@ -733,117 +706,6 @@ async function resumeSession() {
   screen.log(dim(`Resumed ${sessionId} (${rt.state.messages.length} messages, mode ${settings().mode})`));
 }
 
-// ---------- 模型配置 ----------
-
-const PROVIDERS: Array<{ kind: ProviderKind; label: string; hint: string }> = [
-  { kind: "openai-compat", label: "OpenAI-compatible service", hint: "any /chat/completions endpoint" },
-  { kind: "openai", label: "OpenAI", hint: "Responses API" },
-  { kind: "anthropic", label: "Anthropic", hint: "Claude" },
-];
-
-const MODEL_KEY: Record<ProviderKind, string> = { "openai-compat": "OPENAI_COMPAT_MODEL", openai: "OPENAI_MODEL", anthropic: "ANTHROPIC_MODEL" };
-const KEY_KEY: Record<ProviderKind, string> = { "openai-compat": "OPENAI_COMPAT_API_KEY", openai: "OPENAI_API_KEY", anthropic: "ANTHROPIC_API_KEY" };
-const URL_KEY: Record<ProviderKind, string> = { "openai-compat": "OPENAI_COMPAT_BASE_URL", openai: "OPENAI_BASE_URL", anthropic: "ANTHROPIC_BASE_URL" };
-
-/** 保存配置并换上新的 provider；失败时报告原因，旧的 provider 继续用 */
-async function applyConfig(updates: Record<string, string | undefined>): Promise<boolean> {
-  await updateEnvFile(envFile, updates);
-  try {
-    provider.set(retrying(providerFromEnv()));
-    contextWindow = contextWindowFromEnv();
-  } catch (err) {
-    screen.log(red(`Saved to ${shortPath(envFile)}, but the configuration is incomplete: ${errorText(err)}`));
-    return false;
-  }
-  const info = providerInfo();
-  screen.status({ model: modelLabel() });
-  screen.log(green(`Model: ${info.model} (${info.kind}${info.baseURL ? `, ${info.baseURL}` : ""}). Saved to ${shortPath(envFile)}.`));
-  return true;
-}
-
-/** 选模型：服务能列出模型时从列表里选，否则手动输入 */
-async function chooseModel(env: Record<string, string | undefined>, current: string | undefined): Promise<string | undefined> {
-  const models = await listModels(env);
-  if (models.length > 0) {
-    const OTHER = "\0other";
-    const picked = await screen.select(
-      "Choose a model",
-      [
-        ...models.map((m) => ({ label: m, value: m, hint: m === current ? "current" : undefined })),
-        { label: "Enter a name…", value: OTHER },
-      ],
-    );
-    if (picked !== OTHER) return picked;
-  }
-  return (await screen.input("Model name", { initial: current })) || undefined;
-}
-
-/** 选服务、填地址和密钥、选模型；返回是否配置成功 */
-async function configureProvider(): Promise<boolean> {
-  const current = hasProvider() ? providerInfo() : undefined;
-  const kind = await screen.select(
-    "Which service should jade use?",
-    PROVIDERS.map((p) => ({ label: p.label, value: p.kind, hint: p.kind === current?.kind ? `${p.hint} · current` : p.hint })),
-  );
-  if (!kind) return false;
-  const same = kind === current?.kind;
-
-  let baseURL: string | undefined = process.env[URL_KEY[kind]];
-  if (kind !== "anthropic") {
-    const fallback = kind === "openai" ? "https://api.openai.com/v1" : "";
-    const answer = await screen.input("Base URL", { initial: baseURL ?? fallback, placeholder: "https://example.com/v1" });
-    if (answer === undefined) return false;
-    if (kind === "openai-compat" && !answer) {
-      screen.log(red("A base URL is required."));
-      return false;
-    }
-    baseURL = answer || undefined;
-  }
-
-  const hasKey = Boolean(process.env[KEY_KEY[kind]]);
-  const key = await screen.input("API key", { mask: true, placeholder: hasKey ? "leave empty to keep the current key" : "" });
-  if (key === undefined) return false;
-
-  const env = { ...process.env, JADE_PROVIDER: kind, [URL_KEY[kind]]: baseURL, ...(key ? { [KEY_KEY[kind]]: key } : {}) };
-  const model = await chooseModel(env, same ? current?.model : undefined);
-  if (!model) return false;
-
-  const updates: Record<string, string | undefined> = { JADE_PROVIDER: kind, [URL_KEY[kind]]: baseURL, [MODEL_KEY[kind]]: model };
-  if (key) updates[KEY_KEY[kind]] = key;
-  // 其他服务常常默认只给 4096 个输出 token，带思考的模型很容易用完
-  if (kind !== "anthropic" && !process.env.JADE_MAX_TOKENS) {
-    const max = await screen.input("Output limit per reply in tokens (empty for the service default)", { initial: "32000" });
-    if (max) updates.JADE_MAX_TOKENS = max;
-  }
-  return applyConfig(updates);
-}
-
-async function configureModel(arg: string | undefined) {
-  const info = providerInfo();
-  if (arg) return void (await applyConfig({ [MODEL_KEY[info.kind]]: arg }));
-  const action = await screen.select(`Model: ${info.model} (${info.kind})`, [
-    { label: "Switch model", value: "model" as const, hint: `current: ${info.model}` },
-    { label: "Change service, base URL or API key", value: "provider" as const, hint: info.baseURL },
-    { label: "Output limit per reply", value: "max" as const, hint: process.env.JADE_MAX_TOKENS ? `${process.env.JADE_MAX_TOKENS} tokens` : "service default" },
-    {
-      label: "Context window",
-      value: "window" as const,
-      hint: `${contextWindow} tokens${process.env.JADE_CONTEXT_WINDOW ? "" : " (default)"}`,
-    },
-  ]);
-  if (action === "model") {
-    const model = await chooseModel(process.env, info.model);
-    if (model) await applyConfig({ [MODEL_KEY[info.kind]]: model });
-  } else if (action === "provider") await configureProvider();
-  else if (action === "max") {
-    const max = await screen.input("Output limit per reply in tokens (empty for the service default)", { initial: process.env.JADE_MAX_TOKENS ?? "32000" });
-    if (max !== undefined) await applyConfig({ JADE_MAX_TOKENS: max || undefined });
-  } else if (action === "window") {
-    const n = await screen.input("Context window in tokens (empty for the default 256000)", { initial: process.env.JADE_CONTEXT_WINDOW ?? "" });
-    if (n !== undefined) await applyConfig({ JADE_CONTEXT_WINDOW: n || undefined });
-  }
-}
-
 // ---------- 命令 ----------
 
 
@@ -858,7 +720,7 @@ async function command(input: string): Promise<boolean> {
       screen.log(dim(KEYS));
       break;
     case "model":
-      await configureModel(rest[0]);
+      await configure.model(rest[0]);
       break;
     case "mode": {
       let m = rest[0];
@@ -899,7 +761,7 @@ async function command(input: string): Promise<boolean> {
       }
       break;
     case "rules":
-      screen.log(settings().rules.length ? settings().rules.map((r) => `${r.tool}${r.prefix ? ` "${r.prefix}…"` : ""}`).join("\n") : dim("(none)"));
+      screen.log(settings().rules.length ? settings().rules.map((r) => `${r.tool}${r.command ? ` "${r.command}"` : r.prefix ? ` "${r.prefix}…"` : ""}`).join("\n") : dim("(none)"));
       break;
     case "usage":
       screen.log(

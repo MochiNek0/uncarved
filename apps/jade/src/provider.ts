@@ -11,6 +11,8 @@ export interface RetryOptions {
   /** 首次等待，之后每次翻倍，默认 1000ms；上游给了 retryAfterMs 时以它为准 */
   baseDelayMs?: number;
   maxDelayMs?: number;
+  /** 退避时间的随机数，默认 Math.random；测试用 */
+  random?: () => number;
   /** 每次重试前通知宿主（显示用） */
   onRetry?: (info: { attempt: number; delayMs: number; error: ProviderError }) => void;
 }
@@ -19,6 +21,7 @@ export function withRetry(inner: Provider, opts: RetryOptions = {}): Provider {
   const retries = opts.retries ?? 4;
   const base = opts.baseDelayMs ?? 1000;
   const max = opts.maxDelayMs ?? 60_000;
+  const random = opts.random ?? Math.random;
   return {
     id: `retry(${inner.id})`,
     async complete(request, options) {
@@ -36,7 +39,8 @@ export function withRetry(inner: Provider, opts: RetryOptions = {}): Provider {
           return { ...res, provider: res.provider ?? inner.id };
         } catch (err) {
           if (!(err instanceof ProviderError) || !err.retryable || attempt > retries || options.signal.aborted) throw err;
-          const delayMs = Math.min(err.retryAfterMs ?? base * 2 ** (attempt - 1), max);
+          // 没有 retryAfterMs 时随机取后一半，并行的子 Agent 同时遇到 429 时不会同时重试
+          const delayMs = Math.min(err.retryAfterMs ?? base * 2 ** (attempt - 1) * (0.5 + 0.5 * random()), max);
           // 失败的这次已经推送过增量的，先让订阅者作废它们（4.7）
           if (streamed) options.onDelta?.({ kind: "reset" });
           opts.onRetry?.({ attempt, delayMs, error: err });

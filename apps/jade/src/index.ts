@@ -7,6 +7,8 @@ export * from "./plugins/policy.ts";
 export * from "./plugins/prompts.ts";
 export * from "./plugins/schema.ts";
 export * from "./tools/fs.ts";
+export * from "./tools/grep.ts";
+export * from "./tools/web.ts";
 export * from "./tools/shell.ts";
 export * from "./tools/task.ts";
 export * from "./tools/checkpoint.ts";

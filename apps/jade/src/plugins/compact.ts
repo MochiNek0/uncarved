@@ -53,9 +53,14 @@ const TRIMMED = "[This tool output was cleared to save context. Run the tool aga
 /** 清理后要降到阈值的这个比例以下才算够，否则直接总结，免得很快又要压缩 */
 const TRIM_TARGET = 0.6;
 
-/** 粗略估算：4 个字符约 1 个 token */
+/** 中日韩文字和全角符号：大约一个字一个 token，不能按 4 个字符一个算 */
+const WIDE = /[　-鿿가-힯豈-﫿＀-￯]/g;
+
+/** 粗略估算：英文和代码 4 个字符约 1 个 token，中日韩文字每个字约 1 个 token */
 export function estimateTokens(messages: Message[]): number {
-  return Math.ceil(JSON.stringify(messages).length / 4);
+  const text = JSON.stringify(messages);
+  const wide = text.match(WIDE)?.length ?? 0;
+  return Math.ceil((text.length - wide) / 4 + wide);
 }
 
 const total = (u: Usage | undefined) => (u?.inputTokens === undefined ? undefined : u.inputTokens + (u.outputTokens ?? 0));

@@ -14,10 +14,11 @@ export type Mode = (typeof MODES)[number];
 /** derived 中保存设置的键 */
 export const POLICY_KEY = "jade/policy";
 
-/** 本会话内"总是允许"的规则。prefix 只用于 bash，匹配命令开头 */
+/** 本会话内"总是允许"的规则。prefix、command 只用于 bash：prefix 匹配命令开头的整词，command 只匹配完全相同的命令 */
 export interface AllowRule {
   tool: string;
   prefix?: string;
+  command?: string;
 }
 
 export interface PolicySettings {
@@ -104,12 +105,35 @@ export function isSafeCommand(command: string): boolean {
   return SAFE_COMMANDS.some((re) => re.test(c)) && !UNSAFE_ARGS.some((re) => re.test(c));
 }
 
-/** 前缀规则只匹配能完整分词、且前缀按整词对齐的命令，避免 "npm test && …" 搭便车 */
+/** 这些命令的第二个词后面跟的是要执行的东西（脚本名、子命令），前缀要带上第三个词 */
+const RUNNERS = /^(npm|pnpm|yarn|bun|npx|bunx|uv|poetry|pipenv|docker|kubectl|cargo|go|dotnet)\s+(run|exec|x|compose|tool)$/;
+/** 前缀规则批准过的命令再加上这些参数，性质就变了（强制、删除、跳过检查），要重新问 */
+const DANGEROUS_ARGS = /^(-f|--force|--force-with-lease|--hard|-D|--delete|--no-verify|-rf|-fr|-Rf|--prune)$|^--force[=-]/;
+
+/**
+ * 前缀规则只匹配能完整分词、且前缀按整词对齐的命令，避免 "npm test && …" 搭便车；
+ * 前缀之后出现危险参数（git push 之后的 --force）也不算
+ */
 function matchesPrefix(command: string, prefix: string): boolean {
   const words = shellWords(command);
   if (!words) return false;
   const c = joined(words);
-  return c === prefix || c.startsWith(prefix + " ");
+  if (c !== prefix && !c.startsWith(prefix + " ")) return false;
+  const extra = words.slice(prefix.split(" ").length);
+  return !extra.some((w) => DANGEROUS_ARGS.test(w.value));
+}
+
+/**
+ * bash 的"总是允许"默认规则：一般取前两个词（"cargo build"、"git commit"），
+ * 运行脚本的命令取三个词（"npm run build"）。第二个词就是选项（"rm -rf x"）、只有一个词、
+ * 或者分不了词时，只允许这一条命令本身
+ */
+export function bashRule(command: string): AllowRule {
+  const exact = { tool: "bash", command: command.trim() };
+  const words = shellWords(command)?.map((w) => w.value);
+  if (!words || words.length < 2 || words[1]!.startsWith("-") || words.some((w) => DANGEROUS_ARGS.test(w))) return exact;
+  const n = RUNNERS.test(words.slice(0, 2).join(" ")) && words.length >= 3 && !words[2]!.startsWith("-") ? 3 : 2;
+  return { tool: "bash", prefix: words.slice(0, n).join(" ") };
 }
 
 /** 真实路径：解析符号链接；路径还不存在时解析最近的已存在的上级目录 */
@@ -159,8 +183,7 @@ export function policy(opts: PolicyOptions): Policy {
     },
     ruleFor(call) {
       if (call.name !== "bash") return { tool: call.name };
-      const words = String((call.input as { command?: unknown }).command ?? "").trim().split(/\s+/);
-      return { tool: "bash", prefix: words.slice(0, 2).join(" ") };
+      return bashRule(String((call.input as { command?: unknown }).command ?? ""));
     },
     decide(call, { mode, rules }) {
       const { tool } = call;
@@ -172,7 +195,11 @@ export function policy(opts: PolicyOptions): Policy {
         (typeof input.path === "string" && !inside(input.path)) ||
         (call.name === "glob" && typeof input.pattern === "string" && globEscapes(input.pattern));
       const ruled = rules.some(
-        (r) => r.tool === call.name && (r.prefix === undefined || matchesPrefix(input.command ?? "", r.prefix)),
+        (r) =>
+          r.tool === call.name &&
+          (r.command !== undefined
+            ? (input.command ?? "").trim() === r.command
+            : r.prefix === undefined || matchesPrefix(input.command ?? "", r.prefix)),
       );
       // 只读命令也要和 read_file 一样：读工作目录之外的东西先问
       const safeBash = call.name === "bash" && isSafeCommand(input.command ?? "");

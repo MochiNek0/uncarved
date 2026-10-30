@@ -1,4 +1,4 @@
-// 文件工具：read_file / write_file / edit_file / list_dir / glob / grep。
+// 文件工具：read_file / write_file / edit_file / list_dir / glob，以及 grep（见 grep.ts）。
 //
 // 路径可以是相对路径（相对于工作目录）或绝对路径。policy 插件在 tool.before 里把它们统一成绝对路径，
 // 再由关卡判断是否在工作目录内；工具本身不做权限判断。
@@ -12,13 +12,13 @@ import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Block, Tool } from "uncarved";
 import { sha256, type Checkpoints } from "./checkpoint.ts";
+import { grepTool } from "./grep.ts";
 
 const MAX_LINES = 2000;
 const MAX_LINE_CHARS = 2000;
 const MAX_GLOB = 500;
-const MAX_GREP = 200;
-const MAX_GREP_FILE_BYTES = 1_000_000;
 const MAX_IMAGE_BYTES = 5_000_000;
+const MAX_PDF_BYTES = 10_000_000;
 const IMAGE_TYPES: Record<string, string> = {
   ".png": "image/png",
   ".jpg": "image/jpeg",
@@ -48,6 +48,8 @@ export interface FsOptions {
   checkpoints?: Checkpoints;
   /** 模型调用的次数，每次调用模型前加一（见 distro 的 model.before hook）。不给就不检查同一次回复里的先读后改 */
   responses?: { readonly calls: number };
+  /** grep 用的 ripgrep，默认 "rg"；null 表示不用（测试） */
+  rg?: string | null;
 }
 
 /** 读过或写过的文件当时的样子；只在本进程内有效，恢复的会话靠 checkpoints 里记的 sha256 */
@@ -94,7 +96,7 @@ export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
   const readFileTool: Tool = {
     name: "read_file",
     description:
-      "Read a UTF-8 text file, or an image (png, jpg, gif, webp). Text is returned as lines prefixed with their 1-based line number and a tab. " +
+      "Read a UTF-8 text file, an image (png, jpg, gif, webp) or a PDF. Text is returned as lines prefixed with their 1-based line number and a tab. " +
       `At most ${MAX_LINES} lines are returned per call; use offset (1-based start line) and limit to page through larger files.`,
     inputSchema: {
       type: "object",
@@ -121,6 +123,16 @@ export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
           trust: "untrusted",
         };
         return { content: [image] };
+      }
+      if (path.extname(full).toLowerCase() === ".pdf") {
+        if (info.size > MAX_PDF_BYTES) return { content: `PDF is ${info.size} bytes; at most ${MAX_PDF_BYTES} can be read`, isError: true };
+        const pdf: Block = {
+          kind: "document",
+          source: { type: "base64", media_type: "application/pdf", data: (await readFile(full)).toString("base64") },
+          origin: { by: "tool", name: "read_file" },
+          trust: "untrusted",
+        };
+        return { content: [pdf] };
       }
       const buf = await readFile(full);
       if (buf.subarray(0, 8000).includes(0)) {
@@ -176,12 +188,37 @@ export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
     },
   };
 
+  /** edit_file 和 multi_edit 共用：检查文件能否修改，按顺序应用全部替换，全部成功才写入 */
+  const applyEdits = async (ctx: { sessionId: string; toolUseId: string }, tool: string, p: string, edits: Edit[]) => {
+    const full = at(p);
+    const shown = display(cwd, full);
+    const info = await statOrUndefined(full);
+    if (!info) {
+      return { content: seen.has(full) ? `${shown} no longer exists` : `${shown} does not exist; use write_file to create it`, isError: true };
+    }
+    const text = await readFile(full, "utf8");
+    const problem = await staleness(ctx, full, info, text);
+    if (problem) return { content: problem, isError: true };
+    let next = text;
+    let total = 0;
+    for (const [i, e] of edits.entries()) {
+      const r = replaceIn(next, e, shown);
+      if (typeof r === "string") return { content: edits.length > 1 ? `edit ${i + 1} of ${edits.length}: ${r}. No edits were applied.` : r, isError: true };
+      next = r.text;
+      total += r.count;
+    }
+    await writeFile(full, next);
+    await remember(ctx, full, await stat(full), next, -1);
+    await checkpoint(ctx, tool, full, text, next);
+    return { content: `Edited ${shown} (${total} replacement${total === 1 ? "" : "s"})` };
+  };
+
   const editFileTool: Tool = {
     name: "edit_file",
     description:
       "Replace exact text in a file. old_string must match the file exactly (including whitespace and indentation) " +
       "and must be unique unless replace_all is true. The file must have been read with read_file first, " +
-      "and is refused if it changed since then.",
+      "and is refused if it changed since then. Use multi_edit for several changes to one file.",
     inputSchema: {
       type: "object",
       properties: { path: str, old_string: str, new_string: str, replace_all: { type: "boolean" } },
@@ -193,37 +230,40 @@ export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
     // 第二次执行时 old_string 可能已经不存在，或者被替换两次
     idempotent: false,
     async execute(input, ctx) {
-      const { path: p, old_string, new_string, replace_all } = input as {
-        path: string;
-        old_string: string;
-        new_string: string;
-        replace_all?: boolean;
-      };
-      if (old_string === new_string) return { content: "old_string and new_string are identical", isError: true };
-      if (old_string === "") return { content: "old_string must not be empty; use write_file to create a file", isError: true };
-      const full = at(p);
-      const info = await statOrUndefined(full);
-      if (!info) {
-        return { content: seen.has(full) ? `${display(cwd, full)} no longer exists` : `${display(cwd, full)} does not exist; use write_file to create it`, isError: true };
-      }
-      const text = await readFile(full, "utf8");
-      const problem = await staleness(ctx, full, info, text);
-      if (problem) return { content: problem, isError: true };
-      // 文件是 CRLF 时，模型给的 LF 文本也能匹配
-      const crlf = text.includes("\r\n") && !old_string.includes("\r\n");
-      const from = crlf ? old_string.replaceAll("\n", "\r\n") : old_string;
-      const to = crlf ? new_string.replaceAll("\n", "\r\n") : new_string;
-      const count = text.split(from).length - 1;
-      if (count === 0) return { content: `old_string not found in ${display(cwd, full)}`, isError: true };
-      if (count > 1 && !replace_all) {
-        return { content: `old_string occurs ${count} times in ${display(cwd, full)}; add context to make it unique or set replace_all`, isError: true };
-      }
-      // 用函数作替换值，new_string 里的 $& $1 等不会被当成替换模式
-      const next = replace_all ? text.replaceAll(from, () => to) : text.replace(from, () => to);
-      await writeFile(full, next);
-      await remember(ctx, full, await stat(full), next, -1);
-      await checkpoint(ctx, "edit_file", full, text, next);
-      return { content: `Edited ${display(cwd, full)} (${replace_all ? count : 1} replacement${count > 1 && replace_all ? "s" : ""})` };
+      const { path: p, ...edit } = input as { path: string } & Edit;
+      return applyEdits(ctx, "edit_file", p, [edit]);
+    },
+  };
+
+  const multiEditTool: Tool = {
+    name: "multi_edit",
+    description:
+      "Make several exact-text replacements in one file at once. The edits are applied in order, each to the result of the previous one, " +
+      "with the same rules as edit_file. Either all edits succeed or the file is left unchanged.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: str,
+        edits: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: { old_string: str, new_string: str, replace_all: { type: "boolean" } },
+            required: ["old_string", "new_string"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["path", "edits"],
+      additionalProperties: false,
+    },
+    effect: "write",
+    concurrency: "exclusive",
+    idempotent: false,
+    async execute(input, ctx) {
+      const { path: p, edits } = input as { path: string; edits: Edit[] };
+      if (edits.length === 0) return { content: "edits must not be empty", isError: true };
+      return applyEdits(ctx, "multi_edit", p, edits);
     },
   };
 
@@ -280,64 +320,56 @@ export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
     },
   };
 
-  const grepTool: Tool = {
-    name: "grep",
-    description:
-      "Search file contents with a JavaScript regular expression. Searches path (a file or directory, default: the working directory), " +
-      `optionally only files matching the glob include (e.g. "**/*.ts"). Skips files ignored by git and binary files. ` +
-      `Returns "file:line:text", at most ${MAX_GREP} matches.`,
-    inputSchema: {
-      type: "object",
-      properties: { pattern: str, path: str, include: str, ignore_case: { type: "boolean" } },
-      required: ["pattern"],
-      additionalProperties: false,
-    },
-    effect: "read",
-    concurrency: "safe",
-    idempotent: true,
-    async execute(input, { signal }) {
-      const { pattern, path: p = ".", include, ignore_case } = input as {
-        pattern: string;
-        path?: string;
-        include?: string;
-        ignore_case?: boolean;
-      };
-      let re: RegExp;
-      try {
-        re = new RegExp(pattern, ignore_case ? "i" : "");
-      } catch (err) {
-        return { content: `invalid regular expression: ${(err as Error).message}`, isError: true };
-      }
-      const root = at(p);
-      const filter = include ? new Bun.Glob(include) : undefined;
-      const out: string[] = [];
-      const files = (await stat(root)).isFile() ? [root] : await listFiles(root, signal);
-      search: for await (const file of files) {
-        signal.throwIfAborted();
-        if (filter && !filter.match(path.relative(root, file).split(path.sep).join("/"))) continue;
-        // git 列出的文件可能已在工作区删除
-        const info = await statOrUndefined(file);
-        if (!info?.isFile() || info.size > MAX_GREP_FILE_BYTES) continue;
-        const buf = await readFile(file);
-        if (buf.includes(0)) continue; // 二进制文件
-        const lines = buf.toString("utf8").split(/\r?\n/);
-        for (const [i, line] of lines.entries()) {
-          if (!re.test(line)) continue;
-          if (out.length >= MAX_GREP) {
-            out.push(`(stopped after ${MAX_GREP} matches; narrow the search)`);
-            break search;
-          }
-          out.push(`${display(cwd, file)}:${i + 1}:${line.length > 300 ? line.slice(0, 300) + "…" : line}`);
-        }
-      }
-      return { content: out.length > 0 ? out.join("\n") : "No matches" };
-    },
-  };
-
-  return [readFileTool, writeFileTool, editFileTool, listDirTool, globTool, grepTool];
+  return [readFileTool, writeFileTool, editFileTool, multiEditTool, listDirTool, globTool, grepTool(cwd, { rg: opts.rg })];
 }
 
-const statOrUndefined = (full: string) => stat(full).catch(() => undefined);
+interface Edit {
+  old_string: string;
+  new_string: string;
+  replace_all?: boolean;
+}
+
+/** 在 text 上做一次替换；失败时返回原因 */
+function replaceIn(text: string, { old_string, new_string, replace_all }: Edit, shown: string): { text: string; count: number } | string {
+  if (old_string === new_string) return "old_string and new_string are identical";
+  if (old_string === "") return "old_string must not be empty; use write_file to create a file";
+  // 文件是 CRLF 时，模型给的 LF 文本也能匹配
+  const crlf = text.includes("\r\n") && !old_string.includes("\r\n");
+  const from = crlf ? old_string.replaceAll("\n", "\r\n") : old_string;
+  const to = crlf ? new_string.replaceAll("\n", "\r\n") : new_string;
+  const count = text.split(from).length - 1;
+  if (count === 0) return `old_string not found in ${shown}${nearMiss(text, old_string)}`;
+  if (count > 1 && !replace_all) return `old_string occurs ${count} times in ${shown}; add context to make it unique or set replace_all`;
+  // 用函数作替换值，new_string 里的 $& $1 等不会被当成替换模式
+  return { text: replace_all ? text.replaceAll(from, () => to) : text.replace(from, () => to), count: replace_all ? count : 1 };
+}
+
+/**
+ * old_string 找不到时帮模型定位：忽略空白后能匹配到哪几行，或者第一行出现在哪里。
+ * 只给提示，不自动按模糊匹配修改：那样可能改错地方
+ */
+export function nearMiss(text: string, needle: string): string {
+  const norm = (l: string) => l.trim().replace(/\s+/g, " ");
+  const lines = text.split(/\r?\n/).map(norm);
+  const want = needle.split(/\r?\n/).map(norm);
+  while (want.length > 1 && want.at(-1) === "") want.pop();
+  while (want.length > 1 && want[0] === "") want.shift();
+  if (want.every((l) => l === "")) return "";
+  const hits: number[] = [];
+  for (let i = 0; i + want.length <= lines.length && hits.length < 3; i++) {
+    if (want.every((l, k) => (k === 0 || k === want.length - 1 ? lines[i + k]!.includes(l) : lines[i + k] === l))) hits.push(i);
+  }
+  if (hits.length > 0) {
+    const where = hits.map((i) => (want.length > 1 ? `${i + 1}-${i + want.length}` : `${i + 1}`)).join(", ");
+    return `. It matches line${hits.length > 1 || want.length > 1 ? "s" : ""} ${where} if whitespace is ignored: indentation, tabs or trailing spaces differ. Copy the exact text from read_file`;
+  }
+  const first = want.find((l) => l !== "")!;
+  const at = lines.findIndex((l) => l.includes(first));
+  if (at >= 0 && want.length > 1) return `. Its first line "${first.slice(0, 80)}" appears at line ${at + 1}, but the lines after it differ; read that part of the file again`;
+  return "";
+}
+
+export const statOrUndefined = (full: string) => stat(full).catch(() => undefined);
 
 /**
  * root 在 git 仓库里时，用 git 列出未被忽略的文件（已跟踪的和未跟踪的），路径相对于 root、用正斜杠。
@@ -360,7 +392,7 @@ async function gitFiles(root: string): Promise<string[] | undefined> {
   }
 }
 
-async function listFiles(root: string, signal: AbortSignal): Promise<Iterable<string> | AsyncIterable<string>> {
+export async function listFiles(root: string, signal: AbortSignal): Promise<Iterable<string> | AsyncIterable<string>> {
   const tracked = await gitFiles(root);
   if (!tracked) return walk(root, signal);
   return tracked.filter((rel) => !rel.split("/").some((seg) => SKIP_DIRS.has(seg))).map((rel) => path.join(root, rel));

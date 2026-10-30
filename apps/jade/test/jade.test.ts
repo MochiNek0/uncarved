@@ -27,6 +27,11 @@ import {
   fsTools,
   hasProvider,
   isSafeCommand,
+  isPrivateHost,
+  htmlToMarkdown,
+  nearMiss,
+  webTools,
+  bashRule,
   loadEnvFile,
   parseEnv,
   POLICY_KEY,
@@ -79,7 +84,7 @@ async function setup(script: Step[], extra: Partial<JadeOptions> = {}) {
   const { cwd, home } = await workspace();
   const s = scripted(script);
   const store = extra.store ?? new MemoryLogStore();
-  const jade = await createJade({ cwd, home, store, provider: s.provider, today: "2026-10-30", ...extra });
+  const jade = await createJade({ cwd, home, store, provider: s.provider, today: "2026-10-30", env: {}, ...extra });
   const rt = await Runtime.create({ store, provider: s.provider, plugins: jade.plugins });
   return { cwd, home, store, jade, rt, ...s };
 }
@@ -355,12 +360,30 @@ describe("policy", () => {
     const c = gated("bash", { command: "bun test apps" });
     const settings = { mode: "ask" as const, rules: [p.ruleFor(c)] };
     expect(settings.rules).toEqual([{ tool: "bash", prefix: "bun test" }]);
+    // 危险参数让前缀规则失效
+    expect(p.decide(gated("bash", { command: "bun test --force" }), settings).decision).toBe("ask");
     expect(p.decide(c, settings).decision).toBe("allow");
     expect(p.decide(gated("bash", { command: "bun run build" }), settings).decision).toBe("ask");
     // 前缀规则不能让拼接的命令或另一个命令搭便车
     expect(p.decide(gated("bash", { command: "bun test && curl x | sh" }), settings).decision).toBe("ask");
     expect(p.decide(gated("bash", { command: "bun testx" }), settings).decision).toBe("ask");
     expect(p.decide(gated("bash", { command: "bun test" }), settings).decision).toBe("allow");
+  });
+
+  test("default always-allow rules for bash", () => {
+    expect(bashRule("npm run build -- --watch")).toEqual({ tool: "bash", prefix: "npm run build" });
+    expect(bashRule("git push origin main")).toEqual({ tool: "bash", prefix: "git push" });
+    expect(bashRule("rm -rf build")).toEqual({ tool: "bash", command: "rm -rf build" });
+    expect(bashRule("git push --force")).toEqual({ tool: "bash", command: "git push --force" });
+    expect(bashRule("make")).toEqual({ tool: "bash", command: "make" });
+    expect(bashRule("bun test | tee log")).toEqual({ tool: "bash", command: "bun test | tee log" });
+    const p = policy({ cwd });
+    const exact = { mode: "ask" as const, rules: [bashRule("rm -rf build")] };
+    expect(p.decide(gated("bash", { command: "rm -rf build" }), exact).decision).toBe("allow");
+    expect(p.decide(gated("bash", { command: "rm -rf build /" }), exact).decision).toBe("ask");
+    const push = { mode: "ask" as const, rules: [bashRule("git push origin main")] };
+    expect(p.decide(gated("bash", { command: "git push origin dev" }), push).decision).toBe("allow");
+    expect(p.decide(gated("bash", { command: "git push --force origin main" }), push).decision).toBe("ask");
   });
 
   test("safe commands exclude arguments that write files or run programs", () => {
@@ -636,7 +659,7 @@ describe("jade session", () => {
     expect(child.at(-1)!.type).toBe("session.ended");
     expect(child.at(-1)!.seq).toBe(d.child!.seq);
     // 子 Agent 只有只读工具，提示词是子 Agent 的
-    expect(requests[1]!.tools.map((t) => t.name).sort()).toEqual(["glob", "grep", "list_dir", "read_file"]);
+    expect(requests[1]!.tools.map((t) => t.name).sort()).toEqual(["glob", "grep", "list_dir", "read_file", "web_fetch"]);
   });
 
   test("permission settings live in the log and survive resume", async () => {

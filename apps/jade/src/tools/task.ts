@@ -19,8 +19,8 @@ export function taskTool(opts: TaskOptions): Tool {
   return {
     name: "task",
     description:
-      "Delegate a self-contained research task to a sub-agent with read-only tools (read_file, list_dir, glob, grep). " +
-      "Use it for broad searches across many files so that only the conclusion comes back. " +
+      "Delegate a self-contained research task to a sub-agent with read-only tools (read_file, list_dir, glob, grep, and web_fetch / web_search when available). " +
+      "Use it for broad searches across many files, or web research across several pages, so that only the conclusion comes back. " +
       "The sub-agent sees nothing of this conversation: the prompt must contain everything it needs. " +
       "Several task calls in one response run in parallel.",
     inputSchema: {
