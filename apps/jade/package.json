@@ -11,10 +11,16 @@
     "jade": "./src/main.ts"
   },
   "dependencies": {
-    "uncarved": "workspace:*",
     "@uncarved/provider-anthropic": "workspace:*",
     "@uncarved/provider-openai-compat": "workspace:*",
     "@uncarved/provider-openai-responses": "workspace:*",
-    "@uncarved/store-jsonl": "workspace:*"
+    "@uncarved/store-jsonl": "workspace:*",
+    "ink": "7.1.1",
+    "react": "^19.2.0",
+    "string-width": "^8.2.0",
+    "uncarved": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.0"
   }
 }

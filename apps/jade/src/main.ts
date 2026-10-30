@@ -3,11 +3,11 @@
 //
 // 宿主负责内核不管的事：配置目录、会话索引、项目层插件的确认、审批界面、渲染、中断。
 // 不读当前目录的 .env（见 config.ts）：模型配置放在 $JADE_HOME/.env。
+// 交互运行时用终端界面（ui/tui.tsx），-p 和非交互运行时逐行输出（ui/screen.ts）。
 
 import { readdir, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { createInterface } from "node:readline/promises";
 import { JsonlLogStore, JsonlTrustStore } from "@uncarved/store-jsonl";
 import {
   loadProjectPlugin,
@@ -19,18 +19,22 @@ import {
   type EventDataMap,
   type PendingCall,
   type Plugin,
+  type TurnEndReason,
   type Usage,
+  type UserInput,
 } from "uncarved";
-import { hasProvider, loadEnvFile } from "./config.ts";
+import { hasProvider, loadEnvFile, updateEnvFile } from "./config.ts";
 import { createJade } from "./distro.ts";
 import { MODES, POLICY_KEY, type Mode, type PolicySettings } from "./plugins/policy.ts";
-import { providerFromEnv, withRetry } from "./provider.ts";
+import { listModels, providerFromEnv, providerInfo, switchable, withRetry, type ProviderKind } from "./provider.ts";
 import { SessionIndex } from "./sessions.ts";
 import { UNDO_KEY, type UndoState } from "./tools/checkpoint.ts";
 import { display } from "./tools/fs.ts";
 import type { ShellProgress } from "./tools/shell.ts";
 import type { TaskProgress } from "./tools/task.ts";
 import { renderTodos, type Todo } from "./tools/todo.ts";
+import { bold, cyan, dim, green, plainScreen, red, yellow, type CommandInfo, type Screen } from "./ui/screen.ts";
+import { tuiScreen } from "./ui/tui.tsx";
 
 const HELP = `Usage: jade [options] [prompt]
 
@@ -41,24 +45,35 @@ const HELP = `Usage: jade [options] [prompt]
       --cwd <dir>        working directory (default: current directory)
   -h, --help
 
-Commands in the session: /help /mode /compact /undo /sessions /hooks /rules /usage /exit
+Type / in the session for commands; /model configures the model.
 Model settings are read from $JADE_HOME/.env, and data lives in $JADE_HOME (default ~/.jade).
 Instructions are read from AGENTS.md (or CLAUDE.md) in $JADE_HOME and from the repository root down to the working directory.`;
 
-/** 会话里的命令：/help 的说明、输入 / 时的提示和 Tab 补全都从这里取 */
-const COMMANDS: Array<{ name: string; args?: string; about: string }> = [
-  { name: "help", about: "list the commands" },
+/** 会话里的命令：/help、输入 / 时的菜单都从这里取 */
+const COMMANDS: CommandInfo[] = [
+  { name: "help", about: "list the commands and keys" },
+  { name: "model", args: "[name]", about: "switch the model, or configure the provider, API key and output limit" },
   { name: "mode", args: `[${MODES.join("|")}]`, about: "show or change the permission mode" },
   { name: "compact", about: "compact the history before the next request" },
   { name: "undo", about: "restore the file changed by the agent's most recent write_file/edit_file" },
-  { name: "sessions", about: "recent sessions in this directory" },
-  { name: "hooks", about: "execution order of every extension point" },
-  { name: "rules", about: `"always allow" rules of this session` },
+  { name: "retry", about: "request the model again after a failed request, without sending another message" },
   { name: "usage", about: "token usage of this session, including sub-agents and compaction" },
+  { name: "sessions", about: "recent sessions in this directory" },
+  { name: "rules", about: `"always allow" rules of this session` },
+  { name: "hooks", about: "execution order of every extension point" },
   { name: "exit", about: "quit (the session stays resumable)" },
 ];
-const usageOf = (c: (typeof COMMANDS)[number]) => `/${c.name}${c.args ? ` ${c.args}` : ""}`;
-const COMMAND_WIDTH = Math.max(...COMMANDS.map((c) => usageOf(c).length)) + 2;
+/** 运行中也立即执行的命令（不碰运行时，或者只读） */
+const INSTANT = new Set(["help", "model", "usage", "sessions", "rules", "hooks", "exit", "quit"]);
+
+const KEYS = `Keys: enter send · \\ or alt+enter new line · ↑↓ history · esc interrupt · ctrl+c twice to exit
+While jade is working you can keep typing: messages are queued and sent when the current turn ends.`;
+
+/** 回复被输出上限截断后，自动让模型接着做的次数（每条用户消息） */
+const MAX_CONTINUES = 3;
+const CONTINUE_NOTE =
+  "Your previous reply was cut off because it reached the output token limit. Continue from where you stopped. " +
+  "If you were writing a large file or edit, split it into several smaller write_file/edit_file calls.";
 
 // ---------- 参数 ----------
 
@@ -91,99 +106,102 @@ function fail(msg: string): never {
   process.exit(2);
 }
 
-// ---------- 输出 ----------
-
-const tty = process.stdout.isTTY;
-const paint = (code: string) => (s: string) => (tty ? `\x1b[${code}m${s}\x1b[0m` : s);
-const dim = paint("2");
-const red = paint("31");
-const green = paint("32");
-const yellow = paint("33");
-const cyan = paint("36");
-const bold = paint("1");
-
-let atLineStart = true;
-function write(s: string) {
-  if (!s) return;
-  process.stdout.write(s);
-  atLineStart = s.endsWith("\n");
-}
-function line(s = "") {
-  if (!atLineStart) write("\n");
-  write(s + "\n");
-}
-
 const clip = (s: string, n: number) => (s.length > n ? s.slice(0, n) + "…" : s);
 const textOf = (blocks: Block[]) => blocks.flatMap((b) => (b.kind === "text" ? [b.text] : [])).join("\n");
+const errorText = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
-// ---------- 组装 ----------
+/** 家目录下的路径显示成 ~/… */
+function shortPath(p: string): string {
+  const rel = path.relative(os.homedir(), p);
+  const shown = rel && !rel.startsWith("..") && !path.isAbsolute(rel) ? `~/${rel}` : rel === "" ? "~" : p;
+  return shown.split(path.sep).join("/");
+}
+
+async function gitBranch(dir: string): Promise<string | undefined> {
+  try {
+    const proc = Bun.spawn(["git", "rev-parse", "--abbrev-ref", "HEAD"], { cwd: dir, stdout: "pipe", stderr: "ignore" });
+    const [out, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    return code === 0 ? out.trim() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// ---------- 配置与界面 ----------
 
 const cwd = path.resolve(opts.cwd ?? process.cwd());
 if (!(await stat(cwd).catch(() => undefined))?.isDirectory()) fail(`${cwd} is not a directory`);
 const home = process.env.JADE_HOME ?? path.join(os.homedir(), ".jade");
 const envFile = path.join(home, ".env");
 await loadEnvFile(envFile);
-if (!hasProvider()) {
+
+const tui = Boolean(process.stdin.isTTY && process.stdout.isTTY) && opts.print === undefined;
+if (!hasProvider() && !tui) {
   console.error(
     `jade: no model is configured.\n\n` +
-      `Put one of these in ${envFile} (or set them in the shell):\n` +
+      `Run jade in a terminal and use /model, or put one of these in ${envFile} (or set them in the shell):\n` +
       `  OPENAI_COMPAT_BASE_URL=…  OPENAI_COMPAT_API_KEY=…  OPENAI_COMPAT_MODEL=…   (any /chat/completions service)\n` +
       `  OPENAI_API_KEY=…  [OPENAI_BASE_URL=…  OPENAI_MODEL=…]                     (OpenAI Responses API)\n` +
       `  ANTHROPIC_API_KEY=…  [ANTHROPIC_MODEL=…]                                  (Claude)`,
   );
   process.exit(2);
 }
-const store = new JsonlLogStore(path.join(home, "sessions"));
-const trust = new JsonlTrustStore(path.join(home, "trust.jsonl"));
-const index = new SessionIndex(path.join(home, "index.jsonl"));
-const interactive = Boolean(process.stdin.isTTY);
-const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: interactive, completer: complete });
-const ask = async (q: string) => (interactive ? (await rl.question(q)).trim() : "");
-
-/** Tab 补全：命令名，以及 /mode 的参数 */
-function complete(input: string): [string[], string] {
-  if (!atPrompt || !input.startsWith("/")) return [[], input];
-  const mode = /^\/mode\s+(\S*)$/.exec(input);
-  if (mode) return [MODES.filter((m) => m.startsWith(mode[1]!)).map((m) => `/mode ${m}`), input];
-  if (/\s/.test(input)) return [[], input];
-  return [COMMANDS.filter((c) => `/${c.name}`.startsWith(input)).map((c) => `/${c.name}`), input];
-}
-
-// 输入以 / 开头时，在输入行下方列出匹配的命令。
-// readline 先处理按键（重绘时会清掉光标以下的内容），这里随后重画；画完把光标移回输入位置。
-/** 正在等待主输入（不是审批之类的提问） */
-let atPrompt = false;
-/** 输入行下方当前显示了几行提示 */
-let hinted = 0;
-if (interactive && process.stdout.isTTY) {
-  process.stdin.on("keypress", (_ch, key: { name?: string } | undefined) => {
-    if (!atPrompt) return;
-    // 回车后 readline 已经换行，光标就在原来提示所在的位置
-    if (key?.name === "return" || key?.name === "enter") {
-      if (hinted) process.stdout.write("\x1b[J");
-      hinted = 0;
-      return;
-    }
-    const input = rl.line;
-    const matches = input.startsWith("/") && !/\s/.test(input) ? COMMANDS.filter((c) => `/${c.name}`.startsWith(input)) : [];
-    if (!matches.length && !hinted) return;
-    const col = rl.getCursorPos().cols;
-    const rows = matches.map((c) => `\x1b[K${dim(`${usageOf(c).padEnd(COMMAND_WIDTH)}${c.about}`)}`);
-    if (rows.length) process.stdout.write(`\r\n${rows.join("\r\n")}\x1b[J\x1b[${rows.length}A\x1b[${col + 1}G`);
-    else process.stdout.write(`\x1b[1B\r\x1b[J\x1b[1A\x1b[${col + 1}G`);
-    hinted = rows.length;
-  });
-}
-
-const provider = withRetry(providerFromEnv(), {
-  onRetry: ({ attempt, delayMs, error }) => line(yellow(`[retry ${attempt} in ${Math.round(delayMs / 1000)}s: ${error.message}]`)),
-});
 
 const compactTokens = process.env.JADE_COMPACT_TOKENS ? Number(process.env.JADE_COMPACT_TOKENS) : undefined;
 // NaN 会让"是否超过阈值"永远为假，每次请求都压缩
 if (compactTokens !== undefined && !(Number.isInteger(compactTokens) && compactTokens > 0)) {
   fail(`JADE_COMPACT_TOKENS must be a positive integer, got ${JSON.stringify(process.env.JADE_COMPACT_TOKENS)}`);
 }
+const contextLimit = compactTokens ?? 120_000;
+
+const modelLabel = () => (hasProvider() ? providerInfo().model || "(no model)" : "(no model)");
+
+// 界面在启动过程中就已经可以输入；启动完成前提交的内容先存着，完成后再处理
+let ready = false;
+const early: string[] = [];
+
+const screen: Screen = tui
+  ? tuiScreen({
+      status: { cwd: shortPath(cwd), branch: await gitBranch(cwd), model: modelLabel(), mode: opts.mode ?? "ask" },
+      commands: COMMANDS,
+      handlers: {
+        submit: (text) => (ready ? onSubmit(text) : void early.push(text)),
+        interrupt: () => ready && interrupt(),
+        exit: () => (ready ? void quit() : process.exit(130)),
+      },
+    })
+  : plainScreen({ interactive: Boolean(process.stdin.isTTY) });
+
+/** 压缩、子 Agent 和主循环共用；/model 改配置后换掉里面的实现 */
+const provider = switchable({
+  id: "unconfigured",
+  complete: () => Promise.reject(new Error("no model is configured; use /model")),
+});
+
+if (!hasProvider()) {
+  screen.log(bold("Welcome to jade.") + " No model is configured yet; let's set one up.");
+  if (!(await configureProvider())) {
+    await screen.close();
+    process.exit(2);
+  }
+} else {
+  try {
+    provider.set(retrying(providerFromEnv()));
+  } catch (err) {
+    await screen.close();
+    fail(errorText(err));
+  }
+}
+
+function retrying(inner: ReturnType<typeof providerFromEnv>) {
+  return withRetry(inner, {
+    onRetry: ({ attempt, delayMs, error }) => screen.log(yellow(`[retry ${attempt} in ${Math.round(delayMs / 1000)}s: ${error.message}]`)),
+  });
+}
+
+const store = new JsonlLogStore(path.join(home, "sessions"));
+const trust = new JsonlTrustStore(path.join(home, "trust.jsonl"));
+const index = new SessionIndex(path.join(home, "index.jsonl"));
 
 const jade = await createJade({
   cwd,
@@ -194,6 +212,7 @@ const jade = await createJade({
   projectPlugins: await projectPlugins(),
   compactTokens,
 });
+for (const w of jade.warnings) screen.log(yellow(`[warning] ${w}`));
 
 /** .jade/plugins/<name>/index.ts：项目层插件，首次加载（及内容变化后）要用户确认（7.1） */
 async function projectPlugins(): Promise<Plugin[]> {
@@ -210,16 +229,20 @@ async function projectPlugins(): Promise<Plugin[]> {
       out.push(
         await loadProjectPlugin(dir, {
           trust,
-          confirm: async ({ path: p, hash, files }) => {
-            line(yellow(`Project plugin ${display(cwd, p)} is new or changed (${files.length} files, sha256 ${hash.slice(0, 12)}).`));
-            line(dim(files.map((f) => `  ${f}`).join("\n")));
-            return /^y/i.test(await ask("Load and run it? [y/N] "));
-          },
+          confirm: async ({ path: p, hash, files }) =>
+            (await screen.select(
+              `Project plugin ${display(cwd, p)} is new or changed. Load and run it?`,
+              [
+                { label: "No", value: false },
+                { label: "Yes, load it", value: true },
+              ],
+              { body: dim(`sha256 ${hash.slice(0, 12)}, ${files.length} files:\n${files.map((f) => `  ${f}`).join("\n")}`) },
+            )) ?? false,
         }),
       );
     } catch (err) {
       if (!(err instanceof UntrustedPlugin)) throw err;
-      line(yellow(`[skipped] ${err.message}`));
+      screen.log(yellow(`[skipped] ${err.message}`));
     }
   }
   return out;
@@ -228,7 +251,10 @@ async function projectPlugins(): Promise<Plugin[]> {
 let resumeId = opts.resume;
 if (opts.cont) {
   resumeId = (await index.list(cwd))[0]?.id;
-  if (!resumeId) fail(`no session to continue in ${cwd}`);
+  if (!resumeId) {
+    await screen.close();
+    fail(`no session to continue in ${cwd}`);
+  }
 }
 
 const rt = resumeId
@@ -238,7 +264,10 @@ const sessionId = rt.state.sessionId;
 
 // 权限设置记在日志里（derived），关卡从那里读，恢复会话后仍然有效
 const settings = () => jade.policy.settings(rt.state.derived);
-const saveSettings = (next: PolicySettings) => rt.record(POLICY_KEY, next);
+const saveSettings = async (next: PolicySettings) => {
+  await rt.record(POLICY_KEY, next);
+  screen.status({ mode: next.mode });
+};
 
 // ---------- 渲染 ----------
 
@@ -255,17 +284,26 @@ async function countUsage(e: LogEvent) {
     if (child) for (const c of await readAll(store, child.sessionId)) await countUsage(c);
   }
 }
-if (resumeId) for (const e of await readAll(store, sessionId)) await countUsage(e);
+
+/** 上下文用量：最近一次回复的输入加输出，就是下一次请求的大致起点 */
+function showContext(u: Usage | undefined) {
+  if (u?.inputTokens === undefined) return;
+  screen.status({ context: { used: u.inputTokens + (u.outputTokens ?? 0), limit: contextLimit } });
+}
 
 const toolNames = new Map<string, string>();
+/** 正在重新显示恢复的会话里已有的内容：只输出，不显示进行中的状态 */
+let replaying = false;
+const activity = (label: string) => {
+  if (!replaying) screen.busy(label);
+};
 /** 结果不用再显示的工具调用 */
 const quiet = new Set<string>();
 let streamed = false;
-let thinking = false;
-/** 思考刚结束，正文还没输出过非换行内容 */
-let afterThinking = false;
 /** 本轮已经以 turn.ended（error/aborted）结束并显示过原因，随后抛出的同一个错误不再重复显示 */
 let turnFailed = false;
+/** 最近一轮的结束原因 */
+let lastEnd: TurnEndReason | undefined;
 /** 每个工具已经显示了多少行进度输出 */
 const progressLines = new Map<string, number>();
 const MAX_PROGRESS_LINES = 20;
@@ -285,33 +323,28 @@ rt.subscribe((n) => {
   switch (n.type) {
     case "delta":
       if (n.delta.kind === "reset") {
-        // 终端里已经打印的内容擦不掉，标记一下
-        if (streamed) line(yellow("[output above discarded; retrying]"));
+        // 已经输出的内容收不回来，标记一下
+        if (streamed) {
+          screen.endStream();
+          screen.log(yellow("[output above discarded; retrying]"));
+        }
         streamed = false;
-        thinking = false;
-        afterThinking = false;
         return;
       }
       streamed = true;
       if (n.delta.kind === "thinking") {
-        if (!thinking) line(dim("thinking…"));
-        thinking = true;
-        write(dim(n.delta.text));
+        screen.busy("Thinking");
+        screen.stream("thinking", n.delta.text);
       } else {
-        // 不少模型在思考之后以空行开头，去掉；整块都是换行时等下一块
-        let text = n.delta.text;
-        if (thinking || afterThinking) text = text.replace(/^\n+/, "");
-        if (thinking) line();
-        thinking = false;
-        afterThinking = !text;
-        write(text);
+        screen.busy("Writing");
+        screen.stream("text", n.delta.text);
       }
       return;
     case "hook-error":
-      line(yellow(`[hook error] ${n.info.plugin} at ${n.info.point}: ${n.info.error instanceof Error ? n.info.error.message : String(n.info.error)}`));
+      screen.log(yellow(`[hook error] ${n.info.plugin} at ${n.info.point}: ${errorText(n.info.error)}`));
       return;
     case "warning":
-      line(yellow(`[warning] ${n.code}`));
+      screen.log(yellow(`[warning] ${n.code}`));
       return;
     case "awaiting":
       return;
@@ -323,29 +356,34 @@ rt.subscribe((n) => {
 });
 
 function renderProgress(toolUseId: string, p: ShellProgress | TaskProgress) {
-  if (p.kind === "task-start") return line(dim(`  ↳ sub-agent: ${p.description}`));
-  if (p.kind === "task-tool") return line(dim(`    ${p.decision === "deny" ? "✗" : "·"} ${p.name}(${summarize(p.name, p.input)})`));
+  if (p.kind === "task-start") return screen.log(dim(`  ↳ sub-agent: ${p.description}`));
+  if (p.kind === "task-tool") return screen.log(dim(`    ${p.decision === "deny" ? "✗" : "·"} ${p.name}(${summarize(p.name, p.input)})`));
   const shown = progressLines.get(toolUseId) ?? 0;
   if (shown > MAX_PROGRESS_LINES) return;
   const lines = p.text.replace(/\n$/, "").split("\n");
   const room = MAX_PROGRESS_LINES - shown;
   progressLines.set(toolUseId, shown + Math.min(lines.length, room + 1));
-  for (const l of lines.slice(0, room)) line(dim(`  │ ${clip(l, 200)}`));
-  if (lines.length > room) line(dim("  │ …"));
+  for (const l of lines.slice(0, room)) screen.log(dim(`  │ ${clip(l, 200)}`));
+  if (lines.length > room) screen.log(dim("  │ …"));
 }
 
 function renderEvent(e: LogEvent) {
   switch (e.type) {
+    case "model.requested":
+      activity("Waiting for the model");
+      return;
     case "model.responded": {
       const d = e.data as EventDataMap["model.responded"];
       void countUsage(e);
+      showContext(d.usage);
       for (const b of d.content) if (b.kind === "tool_use") toolNames.set(b.id, b.name);
       // 不支持流式的 provider：直接打印最终文本
-      if (!streamed) write(textOf(d.content));
+      if (!streamed) {
+        const text = textOf(d.content).trim();
+        if (text) screen.log(text);
+      }
       streamed = false;
-      thinking = false;
-      afterThinking = false;
-      if (!atLineStart) write("\n");
+      screen.endStream();
       return;
     }
     case "tool.decided": {
@@ -353,45 +391,57 @@ function renderEvent(e: LogEvent) {
       const name = toolNames.get(d.toolUseId) ?? "?";
       if (d.decision === "ask") return;
       const head = `${bold(name)}(${summarize(name, d.input)})`;
-      if (d.decision === "deny") line(red(`✗ ${head}`) + dim(d.reason ? ` — ${clip(d.reason, 200)}` : ""));
-      else if (name === "todo_write") {
-        // 清单本身就是参数：直接显示，结果不再显示
-        quiet.add(d.toolUseId);
-        line(cyan("● ") + bold("Todos"));
-        line(renderTodos((d.input as { todos?: Todo[] }).todos ?? []).replace(/^/gm, "  "));
-      } else if (d.decidedBy !== "user") line(cyan("● ") + head);
+      if (d.decision === "deny") screen.log(red(`✗ ${head}`) + dim(d.reason ? ` — ${clip(d.reason, 200)}` : ""));
+      else {
+        activity(`Running ${name}`);
+        if (name === "todo_write") {
+          // 清单本身就是参数：直接显示，结果不再显示
+          quiet.add(d.toolUseId);
+          screen.log(cyan("● ") + bold("Todos"));
+          screen.log(renderTodos((d.input as { todos?: Todo[] }).todos ?? []).replace(/^/gm, "  "));
+        } else if (d.decidedBy !== "user" || replaying) {
+          // 用户批准的调用在审批时已经显示过；重新显示历史时没有审批这一步
+          screen.log(cyan("● ") + head);
+        }
+      }
       return;
     }
     case "tool.completed": {
       const d = e.data as EventDataMap["tool.completed"];
       void countUsage(e);
+      activity("Working");
       if (quiet.delete(d.toolUseId) && !d.isError) return;
       const text = textOf(d.content).trim();
       const lines = text.split("\n");
-      if (d.isError) line(red(`  ⎿ ${lines.slice(0, 4).map((l) => clip(l, 200)).join("\n    ")}`));
-      else line(dim(`  ⎿ ${clip(lines[0] ?? "", 160)}${lines.length > 1 ? ` (+${lines.length - 1} lines)` : ""}`));
+      if (d.isError) screen.log(red(`  ⎿ ${lines.slice(0, 4).map((l) => clip(l, 200)).join("\n    ")}`));
+      else screen.log(dim(`  ⎿ ${clip(lines[0] ?? "", 160)}${lines.length > 1 ? ` (+${lines.length - 1} lines)` : ""}`));
       return;
     }
     case "tool.interrupted":
-      line(yellow(`  ⎿ interrupted before finishing; not retried`));
+      screen.log(yellow(`  ⎿ interrupted before finishing; not retried`));
       return;
     case "turn.ended": {
       const d = e.data as EventDataMap["turn.ended"];
+      lastEnd = d.reason;
       turnFailed = d.reason === "error" || d.reason === "aborted";
-      if (d.reason === "stopped") line(yellow("[stopped: step budget for this turn used up; send a message to continue]"));
-      else if (d.reason === "aborted") line(yellow("[interrupted]"));
-      else if (d.reason !== "end") line(yellow(`[turn ended: ${d.reason}${d.error ? ` — ${d.error}` : ""}]`));
+      if (d.reason === "stopped") screen.log(yellow("[stopped: step budget for this turn used up; send a message to continue]"));
+      else if (d.reason === "aborted") screen.log(yellow("[interrupted]"));
+      else if (d.reason === "max_tokens") {
+        const limit = process.env.JADE_MAX_TOKENS ? `${process.env.JADE_MAX_TOKENS} tokens` : "the provider's default";
+        screen.log(yellow(`[reply cut off at the output limit (${limit}); raise it with /model if this keeps happening]`));
+      } else if (d.reason !== "end") screen.log(yellow(`[turn ended: ${d.reason}${d.error ? ` — ${d.error}` : ""}]`));
+      if (turnFailed && !replaying && canRetry()) screen.log(dim("[send /retry to request again without adding a message]"));
       return;
     }
     case "jade/compact/compacted": {
       const d = e.data as { from: number; upTo: number; before: number };
       void countUsage(e);
-      line(dim(`[compacted ${d.upTo - d.from} messages, ~${d.before} tokens before]`));
+      screen.log(dim(`[compacted ${d.upTo - d.from} messages, ~${d.before} tokens before]`));
       return;
     }
     case "jade/compact/trimmed": {
       const d = e.data as { saved: number };
-      line(dim(`[cleared old tool output, ~${d.saved} tokens]`));
+      screen.log(dim(`[cleared old tool output, ~${d.saved} tokens]`));
       return;
     }
   }
@@ -416,22 +466,32 @@ function preview(c: PendingCall): string {
 async function approvePending() {
   while (rt.state.phase === "awaiting") {
     for (const c of rt.state.batch.filter((x) => x.decision === "ask")) {
-      line(yellow(`? ${bold(c.name)}(${summarize(c.name, c.input)})`));
-      line(preview(c));
-      if (!interactive) {
-        line(red("✗ denied: not running interactively"));
+      const head = `${c.name}(${summarize(c.name, c.input)})`;
+      if (!screen.interactive) {
+        screen.log(red(`✗ ${head} denied: not running interactively`));
         await rt.send({ kind: "approval", toolUseId: c.toolUseId, approved: false, reason: "The user is not available to approve this action." });
         continue;
       }
       const rule = jade.policy.ruleFor(c);
       const always = rule.prefix ? `always allow "${rule.prefix}…"` : `always allow ${rule.tool}`;
-      const a = (await ask(`Allow? [y]es / [n]o / [a] ${always} > `)).toLowerCase();
-      if (a.startsWith("a")) {
+      const answer = await screen.select(
+        `Allow ${head}?`,
+        [
+          { label: "Yes", value: "yes" as const },
+          { label: `Yes, and ${always} in this session`, value: "always" as const },
+          { label: "No, and tell jade what to do instead", value: "no" as const },
+        ],
+        { body: preview(c) },
+      );
+      if (answer === "always") {
         const s = settings();
         await saveSettings({ ...s, rules: [...s.rules, rule] });
       }
-      const approved = a.startsWith("y") || a.startsWith("a");
-      const reason = approved ? undefined : (await ask("Tell the agent what to do instead (optional): ")) || "The user rejected this action.";
+      const approved = answer === "yes" || answer === "always";
+      const reason = approved
+        ? undefined
+        : (answer === "no" ? await screen.input("What should jade do instead? (optional)") : undefined) || "The user rejected this action.";
+      screen.log(approved ? green(`✓ ${head}`) : red(`✗ ${head}`) + dim(reason ? ` — ${clip(reason, 200)}` : ""));
       await rt.send({ kind: "approval", toolUseId: c.toolUseId, approved, reason });
     }
   }
@@ -439,15 +499,14 @@ async function approvePending() {
 
 // ---------- 运行 ----------
 
+/** 正在执行一轮对话（或一个需要独占运行时的命令） */
 let running = false;
-rl.on("SIGINT", () => {
-  if (running) {
-    rt.abort("interrupted by user");
-    line(yellow("[interrupting…]"));
-    return;
-  }
-  void leave().then(() => process.exit(130));
-});
+
+function interrupt() {
+  if (!running) return;
+  rt.abort("interrupted by user");
+  screen.busy("Interrupting");
+}
 
 /** 离开会话但保留它：写入 session.detached，插件的收尾写入完成后再退出（4.2） */
 async function leave() {
@@ -455,131 +514,409 @@ async function leave() {
   try {
     await rt.detach();
   } catch (err) {
-    line(red(`[error] ${err instanceof Error ? err.message : String(err)}`));
+    screen.log(red(`[error] ${errorText(err)}`));
   }
-  line(dim(`Resume with: jade --resume ${sessionId}`));
+  screen.log(dim(`Resume with: jade --resume ${sessionId}`));
 }
 
+let quitting = false;
+async function quit(code = 0) {
+  if (quitting) return;
+  quitting = true;
+  if (running) rt.abort("exiting");
+  // 中断后等这一轮收尾，再写 session.detached
+  while (running) await new Promise((r) => setTimeout(r, 20));
+  await leave();
+  await screen.close();
+  process.exit(code);
+}
+process.on("SIGINT", () => (running ? interrupt() : void quit(130)));
+
 async function guarded(fn: () => Promise<void>) {
-  running = true;
   turnFailed = false;
   try {
     await fn();
     await approvePending();
   } catch (err) {
-    if (!turnFailed) line(red(`[error] ${err instanceof Error ? err.message : String(err)}`));
+    if (!turnFailed) screen.log(red(`[error] ${errorText(err)}`));
   } finally {
-    running = false;
+    screen.endStream();
   }
 }
 
 /** 宿主替用户告诉模型的事（例如 /undo），随下一条消息发出 */
 const notes: string[] = [];
+const hostNote = (text: string): Block => ({ kind: "text", text: `[Note from jade] ${text}`, origin: { by: "host" }, trust: "trusted" });
 
 async function say(text: string) {
   await index.add({ id: sessionId, cwd, title: clip(text.replace(/\s+/g, " "), 80), at: new Date().toISOString() });
-  const content: Block[] = notes.splice(0).map((n) => ({ kind: "text", text: `[Note from jade] ${n}`, origin: { by: "host" }, trust: "trusted" }));
+  const content: Block[] = notes.splice(0).map(hostNote);
   content.push({ kind: "text", text, origin: { by: "user" }, trust: "trusted" });
-  await guarded(() => rt.send({ kind: "message", content }));
+  await drive({ kind: "message", content });
+}
+
+/** 上一轮在模型回复之前就失败了：最后一条消息还没有回复 */
+const canRetry = () => rt.state.phase === "idle" && rt.state.messages.at(-1)?.role === "user";
+
+async function retry() {
+  if (!canRetry()) return screen.log(dim("Nothing to retry: the last message already has a reply."));
+  await drive({ kind: "retry" });
+}
+
+async function drive(input: UserInput) {
+  // 计时从这次输入开始，不接着上一条排队消息的
+  screen.busy(undefined);
+  screen.busy("Working");
+  lastEnd = undefined;
+  await guarded(() => rt.send(input));
+  // 回复被输出上限截断：让模型接着做，而不是把半截任务丢给用户
+  for (let i = 0; i < MAX_CONTINUES && lastEnd === "max_tokens"; i++) {
+    screen.log(dim(`[asking the model to continue (${i + 1}/${MAX_CONTINUES})]`));
+    lastEnd = undefined;
+    await guarded(() => rt.send({ kind: "message", content: [hostNote(CONTINUE_NOTE)] }));
+  }
 }
 
 /** 撤销本会话里还没撤销的最近一次文件写入 */
 async function undo() {
   const undone = new Set((rt.state.derived[UNDO_KEY] as UndoState | undefined)?.undone ?? []);
   const cp = (await jade.checkpoints.list(sessionId)).find((c) => !undone.has(c.toolUseId));
-  if (!cp) return line(dim("Nothing to undo."));
+  if (!cp) return screen.log(dim("Nothing to undo."));
   const shown = display(cwd, cp.path);
   if (!(await jade.checkpoints.unchangedSince(cp))) {
-    line(yellow(`${shown} has changed since the agent wrote it; undoing will discard those changes too.`));
-    if (!/^y/i.test(await ask("Undo anyway? [y/N] "))) return;
+    const ok = await screen.select(`${shown} has changed since the agent wrote it. Undo anyway and discard those changes too?`, [
+      { label: "No", value: false },
+      { label: "Yes, undo anyway", value: true },
+    ]);
+    if (!ok) return;
   }
   await jade.checkpoints.restore(cp);
   await rt.record(UNDO_KEY, { undone: [...undone, cp.toolUseId] } satisfies UndoState);
   const what = cp.before === null ? `deleted ${shown} (the agent had created it)` : `restored ${shown} to its content before the agent's ${cp.tool}`;
   notes.push(`The user undid one of your changes: ${what}. Read the file again before changing it.`);
-  line(green(`Undid ${cp.tool}: ${what}.`));
+  screen.log(green(`Undid ${cp.tool}: ${what}.`));
 }
 
-/** 恢复会话：先处理插件变化（4.6），再继续日志里没做完的工作 */
+/** 恢复的会话里已有的内容：终端界面里重新显示对话，逐行输出时只统计用量 */
+async function replayHistory() {
+  const events = await readAll(store, sessionId);
+  if (!tui) {
+    for (const e of events) {
+      await countUsage(e);
+      if (e.type === "model.responded") showContext((e as LogEvent<"model.responded">).data.usage);
+    }
+    return;
+  }
+  replaying = true;
+  /** 等待用户审批的调用的参数，用户的决定记在之后的 input.received 里 */
+  const asked = new Map<string, unknown>();
+  try {
+    for (const e of events) {
+      if (e.type === "tool.decided") {
+        const d = e.data as EventDataMap["tool.decided"];
+        if (d.decision === "ask") asked.set(d.toolUseId, d.input);
+      }
+      if (e.type !== "input.received") {
+        renderEvent(e);
+        continue;
+      }
+      const d = e.data as EventDataMap["input.received"];
+      if (d.kind === "approval") {
+        const name = toolNames.get(d.toolUseId) ?? "?";
+        const head = `${bold(name)}(${summarize(name, asked.get(d.toolUseId))})`;
+        screen.log(d.approved ? green(`✓ ${head}`) : red(`✗ ${head}`) + dim(d.reason ? ` — ${clip(d.reason, 200)}` : ""));
+        continue;
+      }
+      if (d.kind === "retry") {
+        screen.log(dim("[retried]"));
+        continue;
+      }
+      if (d.kind !== "message") continue;
+      // 宿主附带的说明（例如自动续写）不是用户说的话
+      const text = d.content.flatMap((b) => (b.kind === "text" && b.origin.by === "user" ? [b.text] : [])).join("\n");
+      if (text) echo(text);
+    }
+  } finally {
+    replaying = false;
+  }
+  screen.log(dim("─".repeat(20) + " resumed " + "─".repeat(20)));
+}
+
+/** 恢复会话：先显示之前的对话，处理插件变化（4.6），再继续日志里没做完的工作 */
 async function resumeSession() {
+  await replayHistory();
   const held = rt.state.held;
   if (held) {
-    line(yellow(`Plugins changed since this session was last used: ${held.plugins.map((p) => `${p.id}@${p.version}`).join(", ")}`));
+    screen.log(yellow(`Plugins changed since this session was last used: ${held.plugins.map((p) => `${p.id}@${p.version}`).join(", ")}`));
     if (held.resolution === "abort") {
-      line(red("A plugin requires this session to stop. Restore the previous plugins to continue."));
+      screen.log(red("A plugin requires this session to stop. Restore the previous plugins to continue."));
+      await screen.close();
       process.exit(1);
     }
-    const ok = /^y/i.test(await ask("Continue with the new plugins? Pending tool calls will be re-checked. [y/N] "));
+    const ok =
+      (await screen.select("Continue with the new plugins? Pending tool calls will be re-checked.", [
+        { label: "Yes, continue", value: true },
+        { label: "No, quit", value: false },
+      ])) ?? false;
     await guarded(() => rt.send({ kind: "plugins", approved: ok }));
-    if (!ok) process.exit(1);
+    if (!ok) {
+      await screen.close();
+      process.exit(1);
+    }
   }
-  await guarded(() => rt.recover());
+  running = true;
+  try {
+    await guarded(() => rt.recover());
+  } finally {
+    running = false;
+    screen.busy(undefined);
+  }
   // 命令行明确给了 --mode 时覆盖日志里的设置
   if (opts.mode && opts.mode !== settings().mode) await saveSettings({ ...settings(), mode: opts.mode });
-  line(dim(`Resumed ${sessionId} (${rt.state.messages.length} messages, mode ${settings().mode})`));
+  screen.log(dim(`Resumed ${sessionId} (${rt.state.messages.length} messages, mode ${settings().mode})`));
 }
 
+// ---------- 模型配置 ----------
+
+const PROVIDERS: Array<{ kind: ProviderKind; label: string; hint: string }> = [
+  { kind: "openai-compat", label: "OpenAI-compatible service", hint: "any /chat/completions endpoint" },
+  { kind: "openai", label: "OpenAI", hint: "Responses API" },
+  { kind: "anthropic", label: "Anthropic", hint: "Claude" },
+];
+
+const MODEL_KEY: Record<ProviderKind, string> = { "openai-compat": "OPENAI_COMPAT_MODEL", openai: "OPENAI_MODEL", anthropic: "ANTHROPIC_MODEL" };
+const KEY_KEY: Record<ProviderKind, string> = { "openai-compat": "OPENAI_COMPAT_API_KEY", openai: "OPENAI_API_KEY", anthropic: "ANTHROPIC_API_KEY" };
+const URL_KEY: Record<ProviderKind, string> = { "openai-compat": "OPENAI_COMPAT_BASE_URL", openai: "OPENAI_BASE_URL", anthropic: "ANTHROPIC_BASE_URL" };
+
+/** 保存配置并换上新的 provider；失败时报告原因，旧的 provider 继续用 */
+async function applyConfig(updates: Record<string, string | undefined>): Promise<boolean> {
+  await updateEnvFile(envFile, updates);
+  try {
+    provider.set(retrying(providerFromEnv()));
+  } catch (err) {
+    screen.log(red(`Saved to ${shortPath(envFile)}, but the configuration is incomplete: ${errorText(err)}`));
+    return false;
+  }
+  const info = providerInfo();
+  screen.status({ model: modelLabel() });
+  screen.log(green(`Model: ${info.model} (${info.kind}${info.baseURL ? `, ${info.baseURL}` : ""}). Saved to ${shortPath(envFile)}.`));
+  return true;
+}
+
+/** 选模型：服务能列出模型时从列表里选，否则手动输入 */
+async function chooseModel(env: Record<string, string | undefined>, current: string | undefined): Promise<string | undefined> {
+  const models = await listModels(env);
+  if (models.length > 0) {
+    const OTHER = "\0other";
+    const picked = await screen.select(
+      "Choose a model",
+      [
+        ...models.map((m) => ({ label: m, value: m, hint: m === current ? "current" : undefined })),
+        { label: "Enter a name…", value: OTHER },
+      ],
+    );
+    if (picked !== OTHER) return picked;
+  }
+  return (await screen.input("Model name", { initial: current })) || undefined;
+}
+
+/** 选服务、填地址和密钥、选模型；返回是否配置成功 */
+async function configureProvider(): Promise<boolean> {
+  const current = hasProvider() ? providerInfo() : undefined;
+  const kind = await screen.select(
+    "Which service should jade use?",
+    PROVIDERS.map((p) => ({ label: p.label, value: p.kind, hint: p.kind === current?.kind ? `${p.hint} · current` : p.hint })),
+  );
+  if (!kind) return false;
+  const same = kind === current?.kind;
+
+  let baseURL: string | undefined = process.env[URL_KEY[kind]];
+  if (kind !== "anthropic") {
+    const fallback = kind === "openai" ? "https://api.openai.com/v1" : "";
+    const answer = await screen.input("Base URL", { initial: baseURL ?? fallback, placeholder: "https://example.com/v1" });
+    if (answer === undefined) return false;
+    if (kind === "openai-compat" && !answer) {
+      screen.log(red("A base URL is required."));
+      return false;
+    }
+    baseURL = answer || undefined;
+  }
+
+  const hasKey = Boolean(process.env[KEY_KEY[kind]]);
+  const key = await screen.input("API key", { mask: true, placeholder: hasKey ? "leave empty to keep the current key" : "" });
+  if (key === undefined) return false;
+
+  const env = { ...process.env, JADE_PROVIDER: kind, [URL_KEY[kind]]: baseURL, ...(key ? { [KEY_KEY[kind]]: key } : {}) };
+  const model = await chooseModel(env, same ? current?.model : undefined);
+  if (!model) return false;
+
+  const updates: Record<string, string | undefined> = { JADE_PROVIDER: kind, [URL_KEY[kind]]: baseURL, [MODEL_KEY[kind]]: model };
+  if (key) updates[KEY_KEY[kind]] = key;
+  // 其他服务常常默认只给 4096 个输出 token，带思考的模型很容易用完
+  if (kind !== "anthropic" && !process.env.JADE_MAX_TOKENS) {
+    const max = await screen.input("Output limit per reply in tokens (empty for the service default)", { initial: "32000" });
+    if (max) updates.JADE_MAX_TOKENS = max;
+  }
+  return applyConfig(updates);
+}
+
+async function configureModel(arg: string | undefined) {
+  const info = providerInfo();
+  if (arg) return void (await applyConfig({ [MODEL_KEY[info.kind]]: arg }));
+  const action = await screen.select(`Model: ${info.model} (${info.kind})`, [
+    { label: "Switch model", value: "model" as const, hint: `current: ${info.model}` },
+    { label: "Change service, base URL or API key", value: "provider" as const, hint: info.baseURL },
+    { label: "Output limit per reply", value: "max" as const, hint: process.env.JADE_MAX_TOKENS ? `${process.env.JADE_MAX_TOKENS} tokens` : "service default" },
+  ]);
+  if (action === "model") {
+    const model = await chooseModel(process.env, info.model);
+    if (model) await applyConfig({ [MODEL_KEY[info.kind]]: model });
+  } else if (action === "provider") await configureProvider();
+  else if (action === "max") {
+    const max = await screen.input("Output limit per reply in tokens (empty for the service default)", { initial: process.env.JADE_MAX_TOKENS ?? "32000" });
+    if (max !== undefined) await applyConfig({ JADE_MAX_TOKENS: max || undefined });
+  }
+}
+
+// ---------- 命令 ----------
+
+const COMMAND_WIDTH = Math.max(...COMMANDS.map((c) => `/${c.name}${c.args ? ` ${c.args}` : ""}`.length)) + 2;
+
+/** 执行命令；返回 false 表示退出 */
 async function command(input: string): Promise<boolean> {
   const [cmd, ...rest] = input.slice(1).split(/\s+/);
   switch (cmd) {
     case "help":
-      line(COMMANDS.map((c) => `${usageOf(c).padEnd(COMMAND_WIDTH)}${c.about}`).join("\n"));
+      screen.log(COMMANDS.map((c) => `${`/${c.name}${c.args ? ` ${c.args}` : ""}`.padEnd(COMMAND_WIDTH)}${dim(c.about)}`).join("\n"));
+      screen.log(dim(KEYS));
+      break;
+    case "model":
+      await configureModel(rest[0]);
       break;
     case "mode": {
-      const m = rest[0];
-      if (m && !(MODES as readonly string[]).includes(m)) line(red(`unknown mode ${m}`));
-      else if (m) await saveSettings({ ...settings(), mode: m as Mode });
-      line(`mode: ${settings().mode}`);
+      let m = rest[0];
+      if (!m) {
+        m = await screen.select(
+          "Permission mode",
+          MODES.map((x) => ({ label: x, value: x, hint: x === settings().mode ? "current" : MODE_HINTS[x] })),
+        );
+        if (!m) break;
+      }
+      if (!(MODES as readonly string[]).includes(m)) screen.log(red(`unknown mode ${m}`));
+      else await saveSettings({ ...settings(), mode: m as Mode });
+      screen.log(`mode: ${settings().mode}`);
       break;
     }
     case "undo":
       await undo();
       break;
+    case "retry":
+      await retry();
+      break;
     case "compact":
       jade.compact.request();
-      line(dim("History will be compacted before the next request."));
+      screen.log(dim("History will be compacted before the next request."));
       break;
     case "sessions":
-      for (const s of (await index.list(cwd)).slice(0, 15)) line(`${s.id === sessionId ? "*" : " "} ${s.id}  ${dim(s.at.slice(0, 16))}  ${s.title}`);
+      for (const s of (await index.list(cwd)).slice(0, 15)) {
+        screen.log(`${s.id === sessionId ? "*" : " "} ${s.id}  ${dim(s.at.slice(0, 16))}  ${s.title}`);
+      }
+      screen.log(dim("Resume one with: jade --resume <id>"));
       break;
     case "hooks":
       for (const p of ["context.project", "context.build", "model.before", "model.after", "tool.before", "tool.gate", "tool.after", "turn.continue", "event", "session.start", "session.end"]) {
-        line(`${p.padEnd(16)} ${rt.hookOrder(p).join(" → ") || dim("(none)")}`);
+        screen.log(`${p.padEnd(16)} ${rt.hookOrder(p).join(" → ") || dim("(none)")}`);
       }
       break;
     case "rules":
-      line(settings().rules.length ? settings().rules.map((r) => `${r.tool}${r.prefix ? ` "${r.prefix}…"` : ""}`).join("\n") : dim("(none)"));
+      screen.log(settings().rules.length ? settings().rules.map((r) => `${r.tool}${r.prefix ? ` "${r.prefix}…"` : ""}`).join("\n") : dim("(none)"));
       break;
     case "usage":
-      line(`input ${usage.inputTokens}  output ${usage.outputTokens}  cache read ${usage.cacheReadTokens}  cache write ${usage.cacheWriteTokens}`);
+      screen.log(`input ${usage.inputTokens}  output ${usage.outputTokens}  cache read ${usage.cacheReadTokens}  cache write ${usage.cacheWriteTokens}`);
       break;
     case "exit":
     case "quit":
       return false;
     default:
-      line(red(`unknown command /${cmd}; try /help`));
+      screen.log(red(`unknown command /${cmd}; type / to see the commands`));
   }
   return true;
 }
 
-if (resumeId) await resumeSession();
-else line(dim(`jade · ${display(os.homedir(), cwd)} · mode ${settings().mode} · session ${sessionId}`));
+const MODE_HINTS: Record<string, string> = {
+  ask: "ask before edits and commands",
+  "auto-edit": "edit files without asking; ask before commands",
+  yolo: "never ask",
+  readonly: "read only, no edits or commands",
+};
 
-const first = opts.print ?? (opts.prompt.length > 0 ? opts.prompt.join(" ") : undefined);
-if (first) await say(first);
+// ---------- 输入 ----------
 
-if (opts.print === undefined && interactive) {
-  for (;;) {
-    atPrompt = true;
-    const input = (await rl.question(`\n${bold(">")} `)).trim();
-    atPrompt = false;
-    if (!input) continue;
-    if (input.startsWith("/")) {
-      if (!(await command(input))) break;
-      continue;
+/** 等待执行的输入：运行中提交的消息和需要独占运行时的命令排在这里，按顺序执行 */
+const queue: string[] = [];
+
+/** 把用户的输入回显到输出里 */
+const echo = (text: string) => screen.log(text.startsWith("/") ? cyan(`› ${text}`) : `\n${bold(`› ${text.replace(/\n/g, "\n  ")}`)}`);
+
+function onSubmit(text: string) {
+  const name = text.startsWith("/") ? text.slice(1).split(/\s+/)[0]! : undefined;
+  if (name !== undefined && INSTANT.has(name)) {
+    // 只读命令和 /model 不碰运行时状态，运行中也直接执行
+    echo(text);
+    if (name === "exit" || name === "quit") return void quit();
+    return void command(text).catch((err) => screen.log(red(`[error] ${errorText(err)}`)));
+  }
+  queue.push(text);
+  if (running) screen.queued(queue);
+  void pump();
+}
+
+async function pump() {
+  if (running) return;
+  running = true;
+  try {
+    while (queue.length > 0) {
+      const text = queue.shift()!;
+      screen.queued(queue);
+      echo(text);
+      if (text.startsWith("/")) {
+        try {
+          if (!(await command(text))) {
+            running = false;
+            return void quit();
+          }
+        } catch (err) {
+          screen.log(red(`[error] ${errorText(err)}`));
+        }
+      } else await say(text);
     }
-    await say(input);
+  } finally {
+    running = false;
+    screen.busy(undefined);
   }
 }
-await leave();
-rl.close();
+
+// ---------- 开始 ----------
+
+if (resumeId) await resumeSession();
+else if (tui) {
+  screen.log(`${bold(cyan("jade"))} ${dim(`· session ${sessionId}`)}`);
+  screen.log(dim("Type / for commands, /model to configure the model, esc to interrupt."));
+}
+else screen.log(dim(`jade · ${shortPath(cwd)} · ${modelLabel()} · mode ${settings().mode} · session ${sessionId}`));
+screen.status({ mode: settings().mode });
+
+const first = opts.print ?? (opts.prompt.length > 0 ? opts.prompt.join(" ") : undefined);
+if (tui) {
+  // 之后由输入框驱动：onSubmit → pump
+  ready = true;
+  for (const text of [...(first ? [first] : []), ...early.splice(0)]) onSubmit(text);
+} else {
+  if (first) {
+    running = true;
+    await say(first);
+    running = false;
+  }
+  await leave();
+  await screen.close();
+}

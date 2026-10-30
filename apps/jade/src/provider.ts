@@ -62,31 +62,117 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+export type ProviderKind = "openai-compat" | "openai" | "anthropic";
+export const PROVIDER_KINDS: readonly ProviderKind[] = ["openai-compat", "openai", "anthropic"];
+
+type Env = Record<string, string | undefined>;
+
+/** JADE_PROVIDER 指定时用它；否则按 OPENAI_API_KEY、OPENAI_COMPAT_BASE_URL、ANTHROPIC_API_KEY 的顺序 */
+export function providerKind(env: Env = process.env): ProviderKind {
+  const named = env.JADE_PROVIDER;
+  if (named) {
+    if (!(PROVIDER_KINDS as readonly string[]).includes(named)) {
+      throw new Error(`JADE_PROVIDER must be one of ${PROVIDER_KINDS.join(", ")}, got ${JSON.stringify(named)}`);
+    }
+    return named as ProviderKind;
+  }
+  if (env.OPENAI_API_KEY) return "openai";
+  if (env.OPENAI_COMPAT_BASE_URL) return "openai-compat";
+  return "anthropic";
+}
+
+export interface ProviderInfo {
+  kind: ProviderKind;
+  model: string;
+  baseURL?: string;
+}
+
+/** 当前配置会用哪个服务、哪个模型（状态栏和 /model 显示用） */
+export function providerInfo(env: Env = process.env): ProviderInfo {
+  const kind = providerKind(env);
+  if (kind === "openai") return { kind, model: env.OPENAI_MODEL ?? "gpt-5", baseURL: env.OPENAI_BASE_URL ?? "https://api.openai.com/v1" };
+  if (kind === "openai-compat") return { kind, model: env.OPENAI_COMPAT_MODEL ?? "", baseURL: env.OPENAI_COMPAT_BASE_URL };
+  return { kind, model: env.ANTHROPIC_MODEL ?? "claude-opus-5-5", baseURL: env.ANTHROPIC_BASE_URL };
+}
+
 /**
- * 按环境变量选择：
- * - OPENAI_API_KEY：OpenAI Responses API，可选 OPENAI_BASE_URL、OPENAI_MODEL
- * - OPENAI_COMPAT_BASE_URL + OPENAI_COMPAT_MODEL（+ OPENAI_COMPAT_API_KEY）：兼容 /chat/completions 的服务，
+ * 按环境变量创建，服务由 providerKind 决定：
+ * - openai：OpenAI Responses API，OPENAI_API_KEY，可选 OPENAI_BASE_URL、OPENAI_MODEL
+ * - openai-compat：兼容 /chat/completions 的服务，OPENAI_COMPAT_BASE_URL + OPENAI_COMPAT_MODEL（+ OPENAI_COMPAT_API_KEY），
  *   可选 OPENAI_COMPAT_EXTRA_BODY（JSON 对象，合并进每次请求体，例如开启思考的 {"enable_thinking":true}）
- * - 否则 Claude（ANTHROPIC_API_KEY），可选 ANTHROPIC_MODEL
+ * - anthropic：Claude，ANTHROPIC_API_KEY，可选 ANTHROPIC_MODEL
+ * JADE_MAX_TOKENS 是每次回复的输出上限。不设时 Claude 用 64000，其他服务用服务端默认值（有的只有 4096，思考很容易用完）
  */
-export function providerFromEnv(env: Record<string, string | undefined> = process.env): Provider {
-  if (env.OPENAI_API_KEY) {
+export function providerFromEnv(env: Env = process.env): Provider {
+  const kind = providerKind(env);
+  const maxTokens = env.JADE_MAX_TOKENS ? positiveInt("JADE_MAX_TOKENS", env.JADE_MAX_TOKENS) : undefined;
+  if (kind === "openai") {
+    if (!env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is required for the openai provider");
     return openaiResponsesProvider({
       baseURL: env.OPENAI_BASE_URL ?? "https://api.openai.com/v1",
       apiKey: env.OPENAI_API_KEY,
       model: env.OPENAI_MODEL ?? "gpt-5",
+      maxTokens,
     });
   }
-  if (env.OPENAI_COMPAT_BASE_URL) {
+  if (kind === "openai-compat") {
+    if (!env.OPENAI_COMPAT_BASE_URL) throw new Error("OPENAI_COMPAT_BASE_URL is required for the openai-compat provider");
     if (!env.OPENAI_COMPAT_MODEL) throw new Error("OPENAI_COMPAT_MODEL is required when OPENAI_COMPAT_BASE_URL is set");
     return openaiCompatProvider({
       baseURL: env.OPENAI_COMPAT_BASE_URL,
       apiKey: env.OPENAI_COMPAT_API_KEY,
       model: env.OPENAI_COMPAT_MODEL,
+      maxTokens,
       extraBody: env.OPENAI_COMPAT_EXTRA_BODY ? jsonObject("OPENAI_COMPAT_EXTRA_BODY", env.OPENAI_COMPAT_EXTRA_BODY) : undefined,
     });
   }
-  return anthropicProvider({ model: env.ANTHROPIC_MODEL, effort: "high" });
+  return anthropicProvider({ model: env.ANTHROPIC_MODEL, effort: "high", maxTokens });
+}
+
+/** 可以在会话中途换掉的 provider：/model 改配置后，压缩、子 Agent 等持有它的地方都跟着换 */
+export interface SwitchableProvider extends Provider {
+  set(next: Provider): void;
+}
+
+export function switchable(initial: Provider): SwitchableProvider {
+  let current = initial;
+  return {
+    id: "switchable",
+    set: (next) => {
+      current = next;
+    },
+    complete: (request, options) => current.complete(request, options),
+  };
+}
+
+/** 服务提供的模型列表；不支持或出错时返回空数组 */
+export async function listModels(env: Env = process.env, fetchImpl: typeof fetch = fetch): Promise<string[]> {
+  const kind = providerKind(env);
+  const info = providerInfo(env);
+  const base = (info.baseURL ?? "https://api.anthropic.com").replace(/\/$/, "");
+  const headers: Record<string, string> =
+    kind === "anthropic"
+      ? { "x-api-key": env.ANTHROPIC_API_KEY ?? "", "anthropic-version": "2023-06-01" }
+      : (kind === "openai" ? env.OPENAI_API_KEY : env.OPENAI_COMPAT_API_KEY)
+        ? { authorization: `Bearer ${kind === "openai" ? env.OPENAI_API_KEY : env.OPENAI_COMPAT_API_KEY}` }
+        : {};
+  try {
+    const res = await fetchImpl(kind === "anthropic" ? `${base}/v1/models?limit=100` : `${base}/models`, {
+      headers,
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) return [];
+    const body = (await res.json()) as { data?: Array<{ id?: unknown }> };
+    return (body.data ?? []).flatMap((m) => (typeof m.id === "string" ? [m.id] : []));
+  } catch {
+    return [];
+  }
+}
+
+function positiveInt(name: string, text: string): number {
+  const n = Number(text);
+  if (!Number.isInteger(n) || n <= 0) throw new Error(`${name} must be a positive integer, got ${JSON.stringify(text)}`);
+  return n;
 }
 
 function jsonObject(name: string, text: string): Record<string, unknown> {

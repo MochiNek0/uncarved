@@ -1,0 +1,208 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { PassThrough, Writable } from "node:stream";
+import { parseEnv, providerFromEnv, providerInfo, providerKind, updateEnvFile } from "../src/index.ts";
+import { edit, layout } from "../src/ui/editor.ts";
+import type { Screen } from "../src/ui/screen.ts";
+import { tuiScreen, type TuiHandlers } from "../src/ui/tui.tsx";
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const strip = (s: string) => s.replace(/\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[78]/g, "");
+
+describe("editor", () => {
+  test("edits by code point and keeps surrogate pairs intact", () => {
+    let s = edit.insert({ value: "", cursor: 0 }, "a😀中");
+    expect(s).toEqual({ value: "a😀中", cursor: 4 });
+    s = edit.left(s);
+    expect(s.cursor).toBe(3);
+    s = edit.backspace(s);
+    expect(s).toEqual({ value: "a中", cursor: 1 });
+    expect(edit.deleteWord({ value: "git status --short", cursor: 18 })).toEqual({ value: "git status ", cursor: 11 });
+    expect(edit.deleteWord({ value: "git status  ", cursor: 12 })).toEqual({ value: "git ", cursor: 4 });
+  });
+
+  test("moves between lines and to line ends", () => {
+    const s = { value: "first\nsecond line", cursor: 9 };
+    expect(edit.home(s).cursor).toBe(6);
+    expect(edit.end(s).cursor).toBe(17);
+    expect(edit.up(s).cursor).toBe(3);
+    expect(edit.down({ value: "first\nsecond line", cursor: 2 }).cursor).toBe(8);
+    expect(edit.onFirstLine(s)).toBe(false);
+    expect(edit.onLastLine(s)).toBe(true);
+    expect(edit.killBefore(s)).toEqual({ value: "first\nond line", cursor: 6 });
+  });
+
+  test("wraps by display width and locates the cursor", () => {
+    // 中文占两列
+    expect(layout("中文abc", 2, 4)).toEqual({ rows: ["中文", "abc"], row: 1, col: 0 });
+    expect(layout("ab\ncd", 5, 10)).toEqual({ rows: ["ab", "cd"], row: 1, col: 2 });
+    expect(layout("abcd", 4, 4)).toEqual({ rows: ["abcd", ""], row: 1, col: 0 });
+    expect(layout("", 0, 4)).toEqual({ rows: [""], row: 0, col: 0 });
+  });
+});
+
+describe("model configuration", () => {
+  test("JADE_PROVIDER overrides the default order", () => {
+    const env = { OPENAI_API_KEY: "k", OPENAI_COMPAT_BASE_URL: "http://x", OPENAI_COMPAT_MODEL: "m" };
+    expect(providerKind(env)).toBe("openai");
+    expect(providerKind({ ...env, JADE_PROVIDER: "openai-compat" })).toBe("openai-compat");
+    expect(providerInfo({ ...env, JADE_PROVIDER: "openai-compat" })).toEqual({ kind: "openai-compat", model: "m", baseURL: "http://x" });
+    expect(() => providerKind({ JADE_PROVIDER: "gemini" })).toThrow("JADE_PROVIDER");
+    expect(() => providerFromEnv({ ...env, JADE_MAX_TOKENS: "lots" })).toThrow("JADE_MAX_TOKENS");
+  });
+
+  test("updateEnvFile replaces, appends and removes keys and keeps everything else", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "jade-env-"));
+    const file = path.join(dir, ".env");
+    await writeFile(file, "# comment\nA=1\nB=2\nA=3\nC=keep\n");
+    const env: Record<string, string | undefined> = { B: "2" };
+    await updateEnvFile(file, { A: "new", B: undefined, D: 'has space "and quotes"' }, env);
+    const text = await readFile(file, "utf8");
+    expect(text).toBe('# comment\nA=new\nC=keep\nD="has space "and quotes""\n');
+    expect(parseEnv(text)).toEqual({ A: "new", C: "keep", D: 'has space "and quotes"' });
+    expect(env).toEqual({ A: "new", D: 'has space "and quotes"' });
+  });
+});
+
+describe("terminal UI", () => {
+  let screen: Screen | undefined;
+  afterEach(async () => {
+    await screen?.close();
+    screen = undefined;
+  });
+
+  function setup() {
+    const stdin = Object.assign(new PassThrough(), { isTTY: true, setRawMode: () => {}, ref: () => {}, unref: () => {} });
+    let out = "";
+    const stdout = Object.assign(
+      new Writable({
+        write(chunk, _enc, done) {
+          out += chunk.toString();
+          done();
+        },
+      }),
+      { isTTY: true, columns: 100, rows: 40 },
+    );
+    const calls = { submit: [] as string[], interrupt: 0, exit: 0 };
+    const handlers: TuiHandlers = {
+      submit: (t) => void calls.submit.push(t),
+      interrupt: () => void calls.interrupt++,
+      exit: () => void calls.exit++,
+    };
+    screen = tuiScreen({
+      status: { cwd: "~/proj", branch: "main", model: "test-model", mode: "ask" },
+      commands: [
+        { name: "help", about: "list the commands" },
+        { name: "mode", args: "[ask|yolo]", about: "change the mode" },
+        { name: "model", about: "configure the model" },
+      ],
+      handlers,
+      io: { stdin: stdin as unknown as NodeJS.ReadStream, stdout: stdout as unknown as NodeJS.WriteStream },
+    });
+    const type = async (s: string) => {
+      stdin.write(s);
+      await sleep(80);
+    };
+    return { screen, calls, type, output: () => strip(out), clear: () => void (out = "") };
+  }
+
+  test("shows the status bar and submits typed messages", async () => {
+    const { calls, type, output } = setup();
+    await sleep(80);
+    expect(output()).toContain("~/proj");
+    expect(output()).toContain("(main)");
+    expect(output()).toContain("test-model");
+    await type("你好 jade");
+    await type("\r");
+    expect(calls.submit).toEqual(["你好 jade"]);
+  });
+
+  test("typing / lists matching commands; arrows select and enter runs the selection", async () => {
+    const { calls, type, output } = setup();
+    await type("/mo");
+    expect(output()).toContain("/mode [ask|yolo]");
+    expect(output()).toContain("/model");
+    await type("\x1b[B");
+    await type("\r");
+    expect(calls.submit).toEqual(["/model"]);
+    // Tab 补全，带参数的命令补上空格
+    await type("/m");
+    await type("\t");
+    await type("yolo");
+    await type("\r");
+    expect(calls.submit).toEqual(["/model", "/mode yolo"]);
+    // 文字和回车合在一块到达
+    await type("fast typing\r");
+    expect(calls.submit).toEqual(["/model", "/mode yolo", "fast typing"]);
+  });
+
+  test("select and input dialogs take the keyboard and return the answer", async () => {
+    const { screen, type, output } = setup();
+    const picked = screen.select("Allow bash(ls)?", [
+      { label: "Yes", value: "yes" },
+      { label: "No", value: "no" },
+    ]);
+    await sleep(80);
+    expect(output()).toContain("Allow bash(ls)?");
+    await type("\x1b[B");
+    await type("\r");
+    expect(await picked).toBe("no");
+
+    const key = screen.input("API key", { mask: true });
+    await sleep(80);
+    await type("sk-secret");
+    await type("\r");
+    expect(await key).toBe("sk-secret");
+    expect(output()).not.toContain("sk-secret");
+    expect(output()).toContain("•••••••••");
+  });
+
+  test("long choice lists scroll with the selection", async () => {
+    const { screen, type, output, clear } = setup();
+    const picked = screen.select(
+      "Choose a model",
+      Array.from({ length: 30 }, (_, i) => ({ label: `model-${i}`, value: i })),
+    );
+    await sleep(80);
+    expect(output()).toContain("model-9");
+    expect(output()).not.toContain("model-10");
+    expect(output()).toContain("↓ 20 more");
+    clear();
+    await type("\x1b[6~");
+    expect(output()).toContain("model-10");
+    expect(output()).toContain("↑");
+    await type("\r");
+    expect(await picked).toBe(10);
+  });
+
+  test("esc interrupts while busy; ctrl+c twice exits while idle", async () => {
+    const { screen, calls, type } = setup();
+    screen.busy("Thinking");
+    await sleep(50);
+    await type("\x1b");
+    await sleep(100);
+    expect(calls.interrupt).toBe(1);
+    screen.busy(undefined);
+    await sleep(50);
+    await type("\x03");
+    expect(calls.exit).toBe(0);
+    await type("\x03");
+    expect(calls.exit).toBe(1);
+  });
+
+  test("streamed output and logs are printed above the input", async () => {
+    const { screen, output } = setup();
+    screen.stream("thinking", "pondering\n");
+    screen.stream("text", "\n\nfirst line\nsecond");
+    screen.endStream();
+    screen.log("done");
+    await sleep(80);
+    const out = output();
+    expect(out).toContain("✻ thinking");
+    expect(out).toContain("pondering");
+    expect(out.indexOf("first line")).toBeLessThan(out.indexOf("second"));
+    expect(out).toContain("done");
+  });
+});
