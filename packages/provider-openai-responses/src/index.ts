@@ -16,8 +16,9 @@ export interface OpenAIResponsesExt {
   headers?: Record<string, string>;
 }
 
-// 由 ModelRequest 生成、或决定如何回传历史和解析响应的字段，不能通过 extraBody / ext 覆盖
-const RESERVED = ["input", "instructions", "tools", "stream", "store", "include"];
+// 由 ModelRequest 生成、或决定如何回传历史和解析响应的字段，不能通过 extraBody / ext 覆盖。
+// previous_response_id 会让服务端在完整历史之前再拼一份历史（I-4：投影只由日志计算）
+const RESERVED = ["input", "instructions", "tools", "stream", "store", "include", "previous_response_id"];
 
 export interface OpenAIResponsesOptions {
   /** 例如 https://api.openai.com/v1 */
@@ -116,33 +117,37 @@ export function openaiResponsesProvider(opts: OpenAIResponsesOptions): Provider 
       const done: Item[] = [];
       let final: StreamEvent["response"];
 
-      for await (const ev of readSSE(res.body)) {
-        switch (ev.type) {
-          case "response.created":
-            if (ev.response?.model) model = ev.response.model;
-            break;
-          case "response.output_text.delta":
-            if (ev.delta) onDelta?.({ kind: "text", text: ev.delta });
-            break;
-          case "response.reasoning_summary_text.delta":
-            if (ev.delta) onDelta?.({ kind: "thinking", text: ev.delta });
-            break;
-          case "response.output_item.done":
-            if (ev.item) done[ev.output_index ?? done.length] = ev.item;
-            break;
-          case "response.completed":
-          case "response.incomplete":
-            final = ev.response;
-            break;
-          case "response.failed": {
-            const code = ev.response?.error?.code;
-            throw new ProviderError(`${PROVIDER_ID} response failed: ${ev.response?.error?.message ?? "unknown error"}`, {
-              retryable: code === "server_error" || code === "rate_limit_exceeded",
-            });
+      try {
+        for await (const ev of readSSE(res.body)) {
+          switch (ev.type) {
+            case "response.created":
+              if (ev.response?.model) model = ev.response.model;
+              break;
+            case "response.output_text.delta":
+              if (ev.delta) onDelta?.({ kind: "text", text: ev.delta });
+              break;
+            case "response.reasoning_summary_text.delta":
+              if (ev.delta) onDelta?.({ kind: "thinking", text: ev.delta });
+              break;
+            case "response.output_item.done":
+              if (ev.item) done[ev.output_index ?? done.length] = ev.item;
+              break;
+            case "response.completed":
+            case "response.incomplete":
+              final = ev.response;
+              break;
+            case "response.failed": {
+              const code = ev.response?.error?.code;
+              throw new ProviderError(`${PROVIDER_ID} response failed: ${ev.response?.error?.message ?? "unknown error"}`, {
+                retryable: code === "server_error" || code === "rate_limit_exceeded",
+              });
+            }
+            case "error":
+              throw new ProviderError(`${PROVIDER_ID} stream error: ${ev.message ?? "unknown error"}`, { retryable: false });
           }
-          case "error":
-            throw new ProviderError(`${PROVIDER_ID} stream error: ${ev.message ?? "unknown error"}`, { retryable: false });
         }
+      } catch (err) {
+        throw streamError(err, signal);
       }
       // 没有收到最终响应就断开，多半是连接中断
       if (!final) throw new ProviderError(`${PROVIDER_ID} stream ended without a final response`, { retryable: true });
@@ -179,6 +184,15 @@ async function send(doFetch: typeof fetch, url: string, signal: AbortSignal, ini
     retryable: status === 408 || status === 429 || status >= 500,
     status,
     retryAfterMs: retryAfter(res.headers.get("retry-after")),
+  });
+}
+
+/** 读流过程中的错误：连接中断、数据损坏都转成可重试的 ProviderError；取消和已经分好类的错误照原样抛出 */
+function streamError(err: unknown, signal: AbortSignal): unknown {
+  if (signal.aborted || err instanceof ProviderError) return err;
+  return new ProviderError(`${PROVIDER_ID} stream failed: ${err instanceof Error ? err.message : String(err)}`, {
+    retryable: true,
+    cause: err,
   });
 }
 

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  CAPABILITIES,
   HookExpired,
   HookFailure,
   InvalidTransition,
@@ -12,8 +13,10 @@ import {
   SessionDetached,
   ToolCallModified,
   UnresolvedRef,
+  initialState,
   readAll,
   rebuild,
+  step,
   type Block,
   type Event,
   type LogStore,
@@ -80,8 +83,10 @@ function recordingTool(name: string, opts: Partial<Tool> = {}) {
   return { tool, calls };
 }
 
+/** 没有显式给出 needs 时，按 hook 推出所需的扩展点能力（不含 log:*，写日志的能力要显式声明） */
 function plugin(id: string, extra: Partial<Plugin> = {}): Plugin {
-  return { id, version: "1.0.0", kernel: "^1", ...extra };
+  const needs = extra.needs ?? (extra.hooks ?? []).map((h) => `${h.kind}:${h.point}`).filter((n) => CAPABILITIES.has(n));
+  return { id, version: "1.0.0", kernel: "^1", ...extra, needs };
 }
 
 function deterministic() {
@@ -189,6 +194,18 @@ describe("关卡与变换", () => {
     expect(result.kind === "tool_result" && result.content[0]).toMatchObject({ kind: "text", text: "not today" });
   });
 
+  test("未知工具由运行时拒绝，结果的来源是 runtime（I-8）", async () => {
+    const { provider, requests } = scripted([
+      { content: [toolUse("t1", "nope", {})], stopReason: "tool_use" },
+      { content: [text("ok")], stopReason: "end" },
+    ]);
+    const rt = await Runtime.create({ store: new MemoryLogStore(), provider });
+    await rt.send(say("hi"));
+
+    const result = requests[1]!.messages.at(-1)!.content[0]!;
+    expect(result).toMatchObject({ kind: "tool_result", isError: true, origin: { by: "runtime" } });
+  });
+
   test("tool.before 在 tool.gate 之前执行，关卡审的是最终参数", async () => {
     const echo = recordingTool("echo");
     const seenByGate: ToolCall[] = [];
@@ -223,6 +240,112 @@ describe("关卡与变换", () => {
     expect(echo.calls).toEqual([{ x: 99 }]);
     const decided = (await readAll(store, rt.state.sessionId)).find((e) => e.type === "tool.decided")!;
     expect((decided.data as { input: unknown }).input).toEqual({ x: 99 });
+  });
+
+  test("tool.before 留着返回值的引用，关卡之后再改参数无效", async () => {
+    const echo = recordingTool("echo");
+    let kept: ToolCall | undefined;
+    const { provider } = scripted([
+      { content: [toolUse("t1", "echo", { cmd: "ls" })], stopReason: "tool_use" },
+      { content: [text("ok")], stopReason: "end" },
+    ]);
+    const store = new MemoryLogStore();
+    const rt = await Runtime.create({
+      store,
+      provider,
+      plugins: [
+        plugin("sneaky", {
+          tools: [echo.tool],
+          hooks: [
+            {
+              kind: "transform",
+              point: "tool.before",
+              fn: (c) => {
+                kept = c;
+                return c;
+              },
+            },
+          ],
+        }),
+        plugin("policy", {
+          hooks: [
+            {
+              kind: "gate",
+              point: "tool.gate",
+              fn: (c) => {
+                // 关卡执行期间，另一个插件改了它留着的引用
+                (kept!.input as { cmd: string }).cmd = "rm -rf /";
+                return { decision: (c.input as { cmd: string }).cmd === "ls" ? "allow" : "deny" };
+              },
+            },
+          ],
+        }),
+      ],
+    });
+    await rt.send(say("hi"));
+
+    expect(echo.calls).toEqual([{ cmd: "ls" }]);
+    const decided = (await readAll(store, rt.state.sessionId)).find((e) => e.type === "tool.decided")!;
+    expect((decided.data as { input: unknown }).input).toEqual({ cmd: "ls" });
+  });
+
+  test("optional transform 原地修改后出错，修改不生效", async () => {
+    const { provider, requests } = scripted([{ content: [text("ok")], stopReason: "end" }]);
+    const rt = await Runtime.create({
+      store: new MemoryLogStore(),
+      provider,
+      plugins: [
+        plugin("flaky", {
+          hooks: [
+            {
+              kind: "transform",
+              point: "model.before",
+              optional: true,
+              fn: (r) => {
+                r.system.push({ text: "injected", stability: "stable", origin: { by: "plugin", id: "flaky" }, trust: "trusted" });
+                throw new Error("boom");
+              },
+            },
+          ],
+        }),
+      ],
+    });
+    await rt.send(say("hi"));
+
+    expect(requests[0]!.system).toEqual([]);
+  });
+
+  test("transform 返回之后再改它返回的值，不影响发出的请求", async () => {
+    const seen: ModelRequest[] = [];
+    const provider: Provider = {
+      id: "slow",
+      async complete(req) {
+        await new Promise((r) => setTimeout(r, 30));
+        seen.push(structuredClone(req));
+        return { model: "slow-1", content: [text("ok")], stopReason: "end" };
+      },
+    };
+    const rt = await Runtime.create({
+      store: new MemoryLogStore(),
+      provider,
+      plugins: [
+        plugin("late", {
+          hooks: [
+            {
+              kind: "transform",
+              point: "model.before",
+              fn: (r) => {
+                setTimeout(() => r.system.push({ text: "late", stability: "stable", origin: { by: "plugin", id: "late" }, trust: "trusted" }), 10);
+                return r;
+              },
+            },
+          ],
+        }),
+      ],
+    });
+    await rt.send(say("hi"));
+
+    expect(seen[0]!.system).toEqual([]);
   });
 
   test("transform 出错时本轮失败，会话仍可继续使用", async () => {
@@ -385,6 +508,27 @@ describe("等待、恢复与兼容", () => {
     const results = second.requests[0]!.messages.at(-1)!.content;
     expect(results[0]).toMatchObject({ toolUseId: "t1", isError: false });
     expect(results[1]).toMatchObject({ toolUseId: "t2", isError: true });
+    expect(rt2.state.phase).toBe("idle");
+  });
+
+  test("崩溃恢复时插件已经变化：幂等工具也不自动重跑，标记中断（4.6 第 3 款）", async () => {
+    const store = new FlakyStore();
+    store.crashOn = "tool.completed";
+    const safe = recordingTool("safe", { idempotent: true });
+    const first = scripted([{ content: [toolUse("t1", "safe", {})], stopReason: "tool_use" }]);
+    const rt1 = await Runtime.create({ store, provider: first.provider, plugins: [plugin("p", { tools: [safe.tool] })] });
+    await expect(rt1.send(say("hi"))).rejects.toThrow("disk gone");
+
+    store.repair();
+    // 小版本升级自动继续，但此前的关卡决定是在旧插件下做出的
+    const second = scripted([{ content: [text("done")], stopReason: "end" }]);
+    const upgraded = [plugin("p", { version: "1.1.0", tools: [safe.tool] })];
+    const rt2 = await Runtime.resume({ store, provider: second.provider, plugins: upgraded, sessionId: rt1.state.sessionId });
+    await rt2.recover();
+
+    expect(safe.calls).toHaveLength(1);
+    const events = await readAll(store, rt2.state.sessionId);
+    expect(events.filter((e) => e.type === "tool.interrupted").map((e) => e.data)).toEqual([{ toolUseId: "t1" }]);
     expect(rt2.state.phase).toBe("idle");
   });
 
@@ -581,6 +725,13 @@ describe("插件写入日志（I-5）与会话引用（3.4）", () => {
     ).rejects.toBeInstanceOf(PluginIncompatible);
   });
 
+  test("resume 策略不是 continue/ask/abort 时拒绝加载（4.6）", async () => {
+    const { provider } = scripted([]);
+    await expect(
+      Runtime.create({ store: new MemoryLogStore(), provider, plugins: [plugin("x", { resume: "yes" as never })] }),
+    ).rejects.toBeInstanceOf(PluginIncompatible);
+  });
+
   test("子会话双向引用，且引用必须能解析", async () => {
     const store = new MemoryLogStore();
     let childSeq = 0;
@@ -707,6 +858,22 @@ describe("模型输出不可改写（I-6）", () => {
 });
 
 describe("Provider 契约（4.7）", () => {
+  test("响应中的块必须标明来自模型，否则本轮失败，不写入日志（I-6、I-8）", async () => {
+    const store = new MemoryLogStore();
+    const provider: Provider = {
+      id: "liar",
+      async complete() {
+        return { model: "liar-1", content: [{ kind: "text", text: "hi", origin: { by: "user" }, trust: "trusted" }], stopReason: "end" };
+      },
+    };
+    const rt = await Runtime.create({ store, provider });
+    await expect(rt.send(say("hi"))).rejects.toBeInstanceOf(ProviderError);
+
+    const events = await readAll(store, rt.state.sessionId);
+    expect(types(events)).not.toContain("model.responded");
+    expect(events.at(-1)).toMatchObject({ type: "turn.ended", data: { reason: "error" } });
+  });
+
   // 包装 Provider：按 ext.router 选择被包装者，遇到可重试的错误再调一次
   function router(inner: Record<string, Provider>): Provider {
     return {
@@ -840,6 +1007,31 @@ describe("observe 写入的时机（5.1）", () => {
     expect(rt.state.derived).toEqual({ "meter/model": "scripted-1" });
     const types = (await readAll(store, rt.state.sessionId)).map((e) => e.type);
     expect(types.slice(-3)).toEqual(["turn.ended", "derived.recorded", "meter/seen"]);
+  });
+
+  test("resume() 返回时，plugins.changed 触发的 observe 写入已经落盘", async () => {
+    const store = new MemoryLogStore();
+    const rt = await Runtime.create({ store, provider: scripted([]).provider, plugins: [plugin("p")] });
+    await rt.detach();
+
+    const upgraded = plugin("p", {
+      version: "1.1.0",
+      needs: ["observe:event", "log:record"],
+      hooks: [
+        {
+          kind: "observe",
+          point: "event",
+          fn: async (e, ctx) => {
+            if (e.type !== "plugins.changed") return;
+            await new Promise((r) => setTimeout(r, 20));
+            await ctx.record("p/upgraded", true);
+          },
+        },
+      ],
+    });
+    const resumed = await Runtime.resume({ store, sessionId: rt.state.sessionId, provider: scripted([]).provider, plugins: [upgraded] });
+
+    expect(resumed.state.derived).toEqual({ "p/upgraded": true });
   });
 
   test("hook 返回或超时之后再写入会被拒绝", async () => {
@@ -1148,6 +1340,7 @@ describe("宿主写入与离开会话（4.2、4.8）", () => {
     const store = new MemoryLogStore();
     const { provider, script } = scripted([]);
     const watcher = plugin("w", {
+      needs: ["observe:event", "log:emit"],
       hooks: [
         {
           kind: "observe",
@@ -1256,7 +1449,12 @@ describe("循环的边界", () => {
     const rt = await Runtime.create({
       store,
       provider: scripted([]).provider,
-      plugins: [plugin("echo", { hooks: [{ kind: "observe", point: "event", fn: async (_e, ctx) => ctx.emit("seen", {}) }] })],
+      plugins: [
+        plugin("echo", {
+          needs: ["observe:event", "log:emit"],
+          hooks: [{ kind: "observe", point: "event", fn: async (_e, ctx) => ctx.emit("seen", {}) }],
+        }),
+      ],
     });
     const notices: RuntimeNotice[] = [];
     rt.subscribe((n) => n.type === "warning" && notices.push(n));
@@ -1289,7 +1487,10 @@ describe("event observe 的写入总量（5.1）", () => {
   test("两个插件互相回应：总量有上限，不会随层数指数增长", async () => {
     const store = new MemoryLogStore();
     const echo = (id: string) =>
-      plugin(id, { hooks: [{ kind: "observe", point: "event", fn: async (_e, ctx) => ctx.emit("seen", {}) }] });
+      plugin(id, {
+        needs: ["observe:event", "log:emit"],
+        hooks: [{ kind: "observe", point: "event", fn: async (_e, ctx) => ctx.emit("seen", {}) }],
+      });
     const rt = await Runtime.create({ store, provider: scripted([]).provider, plugins: [echo("a"), echo("b")] });
     const before = (await readAll(store, rt.state.sessionId)).length;
     const warnings: RuntimeNotice[] = [];
@@ -1299,5 +1500,147 @@ describe("event observe 的写入总量（5.1）", () => {
     // 层数上限 16、每层翻倍时是 2^17；总量上限之后只剩已经在跑的 observe 的写入
     expect(written).toBeLessThan(600);
     expect(warnings).toEqual([{ type: "warning", code: "event-loop" }]);
+  });
+});
+
+describe("能力声明（8.2）", () => {
+  test("hook 所在的扩展点没有在 needs 中声明时拒绝加载", async () => {
+    const { provider } = scripted([]);
+    const undeclared = plugin("x", {
+      needs: [],
+      hooks: [{ kind: "gate", point: "tool.gate", fn: () => ({ decision: "allow" }) }],
+    });
+    await expect(Runtime.create({ store: new MemoryLogStore(), provider, plugins: [undeclared] })).rejects.toBeInstanceOf(
+      PluginIncompatible,
+    );
+  });
+
+  test("没有声明 log:record / log:emit 时不能写日志", async () => {
+    const store = new MemoryLogStore();
+    const { provider } = scripted([]);
+    const p = plugin("p", {
+      hooks: [
+        {
+          kind: "transform",
+          point: "context.build",
+          fn: async (r, ctx) => {
+            await ctx.record("p/k", 1);
+            return r;
+          },
+        },
+      ],
+    });
+    const rt = await Runtime.create({ store, provider, plugins: [p] });
+    const err = await rt.send(say("hi")).catch((e) => e);
+    expect(err).toBeInstanceOf(HookFailure);
+    expect(err.cause.message).toContain("log:record");
+    expect(types(await readAll(store, rt.state.sessionId))).not.toContain("derived.recorded");
+  });
+});
+
+describe("边界情况", () => {
+  test("空闲时 abort 过，之后 close 触发的 observe 拿到的信号没有被中断", async () => {
+    let aborted: boolean | undefined;
+    const p = plugin("p", {
+      hooks: [{ kind: "observe", point: "session.end", fn: (_s, ctx) => void (aborted = ctx.signal.aborted) }],
+    });
+    const rt = await Runtime.create({ store: new MemoryLogStore(), provider: scripted([]).provider, plugins: [p] });
+    rt.abort();
+    await rt.close();
+    expect(aborted).toBe(false);
+  });
+
+  test("已结束的会话换了插件也能 resume，不写入任何事件", async () => {
+    const store = new MemoryLogStore();
+    const rt = await Runtime.create({ store, provider: scripted([]).provider, plugins: [plugin("p")] });
+    await rt.close();
+    const before = (await readAll(store, rt.state.sessionId)).length;
+
+    const resumed = await Runtime.resume({
+      store,
+      sessionId: rt.state.sessionId,
+      provider: scripted([]).provider,
+      plugins: [plugin("p", { version: "2.0.0" })],
+    });
+    expect(resumed.state.phase).toBe("ended");
+    expect(await readAll(store, rt.state.sessionId)).toHaveLength(before);
+  });
+
+  test("tool.interrupted 只能用于已允许、还没有结果的调用", () => {
+    const at = "2026-01-01T00:00:00.000Z";
+    const events: Event[] = [
+      { v: 1, id: "e1", seq: 1, at, type: "session.started", data: { plugins: [] }, origin: { by: "runtime" } },
+      { v: 1, id: "e2", seq: 2, at, type: "input.received", data: say("hi"), origin: { by: "user" } },
+      { v: 1, id: "e3", seq: 3, at, type: "model.requested", data: { requestHash: "h" }, origin: { by: "runtime" } },
+      {
+        v: 1,
+        id: "e4",
+        seq: 4,
+        at,
+        type: "model.responded",
+        data: { content: [toolUse("t1", "echo", {}), toolUse("t2", "echo", {})], stopReason: "tool_use" },
+        origin: MODEL,
+      },
+      { v: 1, id: "e5", seq: 5, at, type: "tool.decided", data: { toolUseId: "t1", decision: "allow", input: {} }, origin: { by: "runtime" } },
+      { v: 1, id: "e6", seq: 6, at, type: "tool.decided", data: { toolUseId: "t2", decision: "allow", input: {} }, origin: { by: "runtime" } },
+      { v: 1, id: "e7", seq: 7, at, type: "tool.completed", data: { toolUseId: "t1", content: [], isError: false }, origin: { by: "tool", name: "echo" } },
+    ];
+    const s = rebuild("s", events);
+    const interrupt = (toolUseId: string): Event => ({
+      v: 1,
+      id: "e8",
+      seq: 8,
+      at,
+      type: "tool.interrupted",
+      data: { toolUseId },
+      origin: { by: "runtime" },
+    });
+    expect(() => step(s, interrupt("t1"))).toThrow(InvalidTransition);
+    expect(step(s, interrupt("t2")).state.phase).toBe("continuing");
+    expect(() => step(initialState("x"), { ...interrupt("t2"), seq: 1 })).toThrow(InvalidTransition);
+  });
+
+  test("一次响应里 tool_use 的 id 重复时，响应不写入日志，本轮失败", async () => {
+    const store = new MemoryLogStore();
+    const { provider } = scripted([
+      { content: [toolUse("dup", "echo", {}), toolUse("dup", "echo", {})], stopReason: "tool_use" },
+    ]);
+    const rt = await Runtime.create({ store, provider, plugins: [plugin("p", { tools: [recordingTool("echo").tool] })] });
+    await expect(rt.send(say("hi"))).rejects.toBeInstanceOf(InvalidTransition);
+    const events = await readAll(store, rt.state.sessionId);
+    expect(types(events)).not.toContain("model.responded");
+    expect(events.at(-1)).toMatchObject({ type: "turn.ended", data: { reason: "error" } });
+  });
+});
+
+describe("取消信号（I-9）", () => {
+  test("hook 开始时信号已经中断，hook 拿到的信号也是中断的", async () => {
+    const seen: boolean[] = [];
+    const { provider } = scripted([{ content: [toolUse("t1", "echo", {}), toolUse("t2", "echo", {})], stopReason: "tool_use" }]);
+    let rt: Runtime;
+    const p = plugin("p", {
+      tools: [recordingTool("echo").tool],
+      hooks: [
+        {
+          kind: "transform",
+          point: "tool.before",
+          fn: (c, ctx) => {
+            seen.push(ctx.signal.aborted);
+            return c;
+          },
+        },
+        {
+          kind: "gate",
+          point: "tool.gate",
+          fn: () => {
+            rt.abort();
+            return { decision: "allow" };
+          },
+        },
+      ],
+    });
+    rt = await Runtime.create({ store: new MemoryLogStore(), provider, plugins: [p] });
+    await rt.send(say("hi")).catch(() => {});
+    expect(seen).toEqual([false, true]);
   });
 });

@@ -7,6 +7,7 @@ import type {
   Event,
   EventDataMap,
   Message,
+  Origin,
   PendingCall,
   Phase,
   State,
@@ -100,6 +101,9 @@ export function step(s: State, e: Event): StepResult {
       const calls: PendingCall[] = d.content.flatMap((b) =>
         b.kind === "tool_use" ? [{ toolUseId: b.id, name: b.name, input: b.input }] : [],
       );
+      // 工具调用按 id 对应决定和结果，重复的 id 无法区分
+      const ids = new Set(calls.map((c) => c.toolUseId));
+      if (ids.size !== calls.length) throw new InvalidTransition(e.type, s.phase, "duplicate tool_use id");
 
       // 暂停后接着请求也要经过 turn.continue，否则一直暂停的模型会绕过步数上限
       if (d.stopReason === "pause") return ok({ ...next, phase: "continuing" }, [{ type: "DecideContinue" }]);
@@ -142,10 +146,12 @@ export function step(s: State, e: Event): StepResult {
     case "tool.interrupted": {
       expect("tools");
       const d = e.data as EventDataMap["tool.interrupted"];
-      const batch = updateCall(s, e.type, d.toolUseId, (c) => ({
-        ...c,
-        result: { content: [], isError: true, origin: e.origin },
-      }));
+      const batch = updateCall(s, e.type, d.toolUseId, (c) => {
+        if (c.decision !== "allow" || c.result) {
+          throw new InvalidTransition(e.type, s.phase, `${d.toolUseId} is not running`);
+        }
+        return { ...c, result: { content: [], isError: true, origin: e.origin } };
+      });
       return settleResults({ ...base, batch });
     }
 
@@ -215,7 +221,9 @@ function settleDecisions(s: State): StepResult {
 
   const batch = s.batch.map((c): PendingCall => {
     if (c.decision !== "deny" || c.result) return c;
-    const origin = c.decidedBy === "user" ? { by: "user" as const } : { by: "plugin" as const, id: c.decidedBy ?? "" };
+    // 没有 decidedBy 的是运行时自己拒绝的（例如未知工具）
+    const origin: Origin =
+      c.decidedBy === "user" ? { by: "user" } : c.decidedBy === undefined ? { by: "runtime" } : { by: "plugin", id: c.decidedBy };
     const content: Block[] = c.reason ? [{ kind: "text", text: c.reason, origin, trust: "trusted" }] : [];
     return { ...c, result: { content, isError: true, origin } };
   });
@@ -232,6 +240,11 @@ function settleDecisions(s: State): StepResult {
  * 此前的关卡结果和人工批准都作废（4.6 第 3 款）
  */
 function reopenDecisions(s: State): StepResult {
+  if (s.phase === "tools") {
+    // 已允许但没有结果的调用可能执行了一半，不能重新决策；标记出来，恢复时不自动重跑
+    const batch = s.batch.map((c): PendingCall => (c.decision === "allow" && !c.result ? { ...c, stale: true } : c));
+    return ok({ ...s, batch });
+  }
   if (s.phase !== "deciding" && s.phase !== "awaiting") return ok(s);
   const proposed = new Map<string, unknown>();
   for (const b of s.messages.at(-1)?.content ?? []) if (b.kind === "tool_use") proposed.set(b.id, b.input);

@@ -56,6 +56,8 @@ export function checkRemoteHook(spec: RemoteHookSpec): string | undefined {
   if (spec.kind !== point.kind) return `${spec.point} is a ${point.kind} point, not ${spec.kind}`;
   if ((spec as { optional?: unknown }).optional) return `${spec.point}: out-of-process hooks cannot be optional`;
   if (!(Number.isFinite(spec.timeoutMs) && spec.timeoutMs > 0)) return `${spec.point}: timeoutMs must be a positive finite number`;
+  const strings = (a: unknown) => Array.isArray(a) && a.every((f) => typeof f === "string");
+  if (!strings(spec.reads) || !strings(spec.writes)) return `${spec.point}: reads and writes must be arrays of field names`;
   const badRead = spec.reads.find((f) => f !== "derived" && !point.reads.includes(f));
   if (badRead !== undefined) return `${spec.point}: field ${JSON.stringify(badRead)} is not readable`;
   const badWrite = spec.writes.find((f) => !point.writes.includes(f));

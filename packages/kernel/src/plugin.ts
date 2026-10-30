@@ -54,9 +54,19 @@ export function checkCompat(p: Plugin): void {
   }
   const missing = (p.needs ?? []).filter((n) => !CAPABILITIES.has(n));
   if (missing.length > 0) throw new PluginIncompatible(p.id, `missing capabilities ${missing.join(", ")}`);
+  // 不认识的策略会被当成 continue，静默放行本该暂停的变化
+  if (p.resume !== undefined && !Object.hasOwn(POLICY_RANK, p.resume)) {
+    throw new PluginIncompatible(p.id, `unsupported resume policy ${JSON.stringify(p.resume)}`);
+  }
   for (const h of p.hooks ?? []) {
     const problem = isRemote(h) ? checkRemoteHook(h) : checkTimeout(h.point, h.timeoutMs);
     if (problem) throw new PluginIncompatible(p.id, problem);
+  }
+  // 用到的扩展点必须在 needs 中声明（8.2）；写日志的能力在调用 record/emit 时检查
+  const needs = new Set(p.needs ?? []);
+  const undeclared = (p.hooks ?? []).map((h) => `${h.kind}:${h.point}`).filter((n) => !needs.has(n));
+  if (undeclared.length > 0) {
+    throw new PluginIncompatible(p.id, `hooks use undeclared capabilities ${[...new Set(undeclared)].join(", ")}`);
   }
 }
 

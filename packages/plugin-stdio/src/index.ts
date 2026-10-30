@@ -4,7 +4,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import path from "node:path";
-import { createInterface } from "node:readline";
 import {
   asProjectPlugin,
   checkCompat,
@@ -30,6 +29,8 @@ export interface SpawnOptions {
   trust?: TrustOptions & { dir: string };
   /** 等待 initialize 回复的时间，默认 10 秒 */
   initTimeoutMs?: number;
+  /** 插件发来的单条消息（一行）的上限，超过时结束插件进程。默认 64 MiB */
+  maxMessageBytes?: number;
   /** 插件进程的 stderr，不属于协议 */
   onStderr?: (text: string) => void;
 }
@@ -48,13 +49,19 @@ export class PluginProcessError extends Error {
 }
 
 const SHUTDOWN_GRACE_MS = 2_000;
+const DEFAULT_MAX_MESSAGE_BYTES = 64 * 1024 * 1024;
 
 export async function spawnPlugin(opts: SpawnOptions): Promise<StdioPlugin> {
   const layer = opts.layer ?? "distro";
   let grant: TrustGrant | undefined;
   if (layer === "project") {
     if (!opts.trust) throw new PluginProcessError("project-layer plugins require trust options");
-    grant = await requireTrust(await describeForTrust(opts, opts.trust.dir), opts.trust);
+    const described = await describeForTrust(opts, opts.trust.dir);
+    grant = await requireTrust(described, opts.trust);
+    // 等用户确认可能要很久，期间目录可能被改：确认的必须就是要启动的内容
+    if ((await describeForTrust(opts, opts.trust.dir)).hash !== described.hash) {
+      throw new PluginProcessError(`plugin directory ${described.path} changed while waiting for confirmation`);
+    }
   }
 
   const child = spawn(opts.command, opts.args ?? [], {
@@ -63,12 +70,10 @@ export async function spawnPlugin(opts: SpawnOptions): Promise<StdioPlugin> {
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
   });
-  const conn = new Connection(child, opts.onStderr);
+  const conn = new Connection(child, opts.maxMessageBytes ?? DEFAULT_MAX_MESSAGE_BYTES, opts.onStderr);
 
   try {
     const manifest = parseManifest(await conn.request("initialize", { kernel: 1 }, AbortSignal.timeout(opts.initTimeoutMs ?? 10_000)).result);
-    const needs = new Set(manifest.needs ?? []);
-    conn.allow = (method) => needs.has(method === "log/record" ? "log:record" : "log:emit");
 
     const plugin: StdioPlugin = {
       id: manifest.id,
@@ -104,12 +109,14 @@ export async function spawnPlugin(opts: SpawnOptions): Promise<StdioPlugin> {
   }
 }
 
-/** 启动规格（按键排序）与插件目录内容一起计算哈希 */
+/** 启动规格（命令、参数、按键排序的环境变量、工作目录）与插件目录内容一起计算哈希 */
 async function describeForTrust(opts: SpawnOptions, dir: string) {
   const root = path.resolve(dir);
   const content = await hashDir(root);
   const env = Object.fromEntries(Object.entries(opts.env ?? {}).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
-  const spec = JSON.stringify({ command: opts.command, args: opts.args ?? [], env });
+  // 工作目录决定命令和参数里的相对路径指向哪里
+  const cwd = path.resolve(opts.cwd ?? process.cwd());
+  const spec = JSON.stringify({ command: opts.command, args: opts.args ?? [], env, cwd });
   const hash = createHash("sha256").update(spec).update("\0").update(content.hash).digest("hex");
   return { path: root, hash, files: content.files };
 }
@@ -167,16 +174,15 @@ interface RpcMessage {
 
 class Connection {
   readonly exited: Promise<{ code: number | null; signal: string | null }>;
-  /** 进行中的 hook 调用；插件只能在调用期间使用 log/record、log/emit（7.3） */
+  /** 进行中的 hook 调用；插件只能在调用期间使用 log/record、log/emit（7.3），能力由内核检查（8.2） */
   readonly active = new Map<Id, HookContext>();
-  allow: (method: string) => boolean = () => false;
 
   #child: ChildProcess;
   #nextId = 1;
   #pending = new Map<Id, { resolve: (v: unknown) => void; reject: (e: unknown) => void }>();
   #dead: Error | undefined;
 
-  constructor(child: ChildProcess, onStderr?: (text: string) => void) {
+  constructor(child: ChildProcess, maxMessageBytes: number, onStderr?: (text: string) => void) {
     this.#child = child;
     child.stdin!.on("error", () => {}); // 进程退出后写入失败，由 exit 统一处理
     child.stderr!.setEncoding("utf8");
@@ -194,7 +200,33 @@ class Connection {
       child.on("error", (err) => done(null, null, `plugin process failed: ${err.message}`));
     });
 
-    createInterface({ input: child.stdout! }).on("line", (line) => this.#receive(line));
+    // 按行切分。不用 readline：它会无限缓存一条没有换行的消息
+    let pending: Buffer[] = [];
+    let size = 0;
+    let overflowed = false;
+    child.stdout!.on("data", (chunk: Buffer) => {
+      if (overflowed) return;
+      let start = 0;
+      for (;;) {
+        const nl = chunk.indexOf(0x0a, start);
+        const end = nl < 0 ? chunk.length : nl;
+        size += end - start;
+        if (size > maxMessageBytes) {
+          // 流已经不可信：结束进程，进行中的调用随 exit 一起失败
+          overflowed = true;
+          pending = [];
+          this.#child.kill();
+          return;
+        }
+        pending.push(chunk.subarray(start, end));
+        if (nl < 0) return;
+        const line = Buffer.concat(pending).toString("utf8");
+        pending = [];
+        size = 0;
+        start = nl + 1;
+        this.#receive(line);
+      }
+    });
   }
 
   request(method: string, params: Record<string, unknown>, signal?: AbortSignal): { id: Id; result: Promise<unknown> } {
@@ -238,14 +270,18 @@ class Connection {
   }
 
   #receive(line: string): void {
-    let msg: RpcMessage;
+    let parsed: unknown;
     try {
-      msg = JSON.parse(line) as RpcMessage;
+      parsed = JSON.parse(line);
     } catch {
-      // 流已经不可信：结束进程，进行中的调用随 exit 一起失败
+      parsed = undefined;
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      // 不是 JSON-RPC 消息（包括 null、数字这类合法 JSON），流已经不可信：结束进程，进行中的调用随 exit 一起失败
       this.#child.kill();
       return;
     }
+    const msg = parsed as RpcMessage;
     if (msg.method === undefined) {
       const p = msg.id === undefined ? undefined : this.#pending.get(msg.id);
       if (!p) return; // 已取消或超时的调用，迟到的回复直接丢弃
@@ -261,7 +297,6 @@ class Connection {
   async #serve(id: Id, method: string, params: Record<string, unknown>): Promise<void> {
     try {
       if (method !== "log/record" && method !== "log/emit") throw new Error(`unknown method ${method}`);
-      if (!this.allow(method)) throw new Error(`${method} requires capability ${method === "log/record" ? "log:record" : "log:emit"}`);
       const ctx = this.active.get(params.call as Id);
       if (!ctx) throw new Error("no active hook call");
       if (method === "log/record") await ctx.record(String(params.key), params.value);

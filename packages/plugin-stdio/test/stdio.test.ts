@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  CAPABILITIES,
   HookFailure,
   HookTimeout,
   MemoryLogStore,
@@ -57,11 +58,13 @@ function hook(name: string, kind: string, point: string, extra: object = {}) {
   return { name, kind, point, reads: [], writes: [], timeoutMs: 5000, ...extra };
 }
 
-async function start(manifest: object, extra: Partial<SpawnOptions> = {}) {
+/** 清单没有给出 needs 时，按 hook 推出所需的扩展点能力（不含 log:*） */
+async function start(manifest: { hooks?: Array<{ kind: string; point: string }>; needs?: string[] }, extra: Partial<SpawnOptions> = {}) {
+  const needs = manifest.needs ?? (manifest.hooks ?? []).map((h) => `${h.kind}:${h.point}`).filter((n) => CAPABILITIES.has(n));
   const p = await spawnPlugin({
     command: process.execPath,
     args: [path.join(fixtures, "plugin.ts")],
-    env: { FIXTURE_MANIFEST: JSON.stringify({ id: "fixture", version: "1.0.0", kernel: "^1", ...manifest }) },
+    env: { FIXTURE_MANIFEST: JSON.stringify({ id: "fixture", version: "1.0.0", kernel: "^1", ...manifest, needs }) },
     ...extra,
   });
   running.push(p);
@@ -127,7 +130,7 @@ test("超时：插件收到 $/cancel，本轮失败", async () => {
 
 test("log/record 只在声明了能力时可用，记录带插件来源", async () => {
   const withNeed = await start({
-    needs: ["log:record"],
+    needs: ["transform:context.build", "log:record"],
     hooks: [hook("record", "transform", "context.build")],
   });
   const store = new MemoryLogStore();
@@ -153,6 +156,22 @@ test("进程崩溃：进行中和之后的调用都失败，exited 带上退出�
 
   const second = await rt.send(say("again")).catch((e) => e);
   expect(second.cause).toBeInstanceOf(PluginProcessError);
+});
+
+test("插件输出不是对象的 JSON：结束插件进程，宿主不受影响", async () => {
+  const p = await start({ hooks: [hook("garbage", "transform", "context.build")] });
+  const rt = await Runtime.create({ store: new MemoryLogStore(), provider: scripted([]).provider, plugins: [p] });
+  const err = await rt.send(say("hi")).catch((e) => e);
+  expect(err.cause).toBeInstanceOf(PluginProcessError);
+  expect((await p.exited).code).not.toBe(0);
+});
+
+test("单条消息超过上限：结束插件进程，宿主不会无限缓存", async () => {
+  const p = await start({ hooks: [hook("flood", "transform", "context.build")] }, { maxMessageBytes: 1024 });
+  const rt = await Runtime.create({ store: new MemoryLogStore(), provider: scripted([]).provider, plugins: [p] });
+  const err = await rt.send(say("hi")).catch((e) => e);
+  expect(err.cause).toBeInstanceOf(PluginProcessError);
+  expect((await p.exited).code).not.toBe(0);
 });
 
 test("清单违反 5.5 时拒绝加载", async () => {
@@ -198,4 +217,7 @@ test("项目层：确认之前不启动进程；确认按启动规格和目录�
   await expect(start({}, opts(false, ["--extra"]))).rejects.toBeInstanceOf(UntrustedPlugin);
   expect(asked).toHaveLength(3);
   expect(asked[2]).not.toBe(asked[1]);
+  // 工作目录决定相对路径指向哪里，换了工作目录也要重新确认
+  await expect(start({}, { ...opts(false), cwd: dir })).rejects.toBeInstanceOf(UntrustedPlugin);
+  expect(asked).toHaveLength(4);
 });

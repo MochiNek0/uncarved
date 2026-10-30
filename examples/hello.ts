@@ -36,6 +36,7 @@ const prompts: Plugin = {
   id: PROMPTS_ID,
   version: "0.1.0",
   kernel: "^1",
+  needs: ["transform:context.build"],
   hooks: [
     {
       kind: "transform",

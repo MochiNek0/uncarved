@@ -41,6 +41,7 @@ const system: Plugin = {
   id: SYSTEM_ID,
   version: "0.1.0",
   kernel: "^1",
+  needs: ["transform:context.build"],
   hooks: [
     {
       kind: "transform",
@@ -65,6 +66,7 @@ const policy: Plugin = {
   id: "scenario/policy",
   version: "0.1.0",
   kernel: "^1",
+  needs: ["gate:tool.gate"],
   hooks: [
     {
       kind: "gate",
@@ -85,6 +87,7 @@ const stats: Plugin = {
   id: "scenario/stats",
   version: "0.1.0",
   kernel: "^1",
+  needs: ["observe:event", "log:record"],
   hooks: [
     {
       kind: "observe",
@@ -104,6 +107,7 @@ const budget: Plugin = {
   id: "scenario/budget",
   version: "0.1.0",
   kernel: "^1",
+  needs: ["gate:turn.continue"],
   hooks: [
     {
       kind: "gate",

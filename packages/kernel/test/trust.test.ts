@@ -174,3 +174,15 @@ test("从内核自身导入是允许的：那是宿主已经在运行的代码",
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("确认期间目录内容变了：拒绝加载，不执行改过的代码（确认的不是要运行的）", async () => {
+  const root = await writePlugin("swapped");
+  const trust = new MemoryTrustStore();
+  const confirm: ConfirmTrust = async () => {
+    // 用户看确认提示的时候，目录被改了
+    await writeFile(path.join(root, "lib", "prompt.md"), "swapped while asking");
+    return true;
+  };
+  await expect(loadProjectPlugin(root, { trust, confirm })).rejects.toBeInstanceOf(UntrustedPlugin);
+  expect(globalThis.__uncarvedTrustRuns).toBe(0);
+});

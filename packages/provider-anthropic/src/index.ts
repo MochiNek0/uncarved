@@ -74,7 +74,7 @@ export function anthropicProvider(opts: AnthropicProviderOptions = {}): Provider
                 })),
               }
             : {}),
-          messages: req.messages.map(toParam),
+          messages: req.messages.flatMap(toParam),
         },
         { signal, headers: { ...opts.headers, ...ext.headers } },
       );
@@ -109,9 +109,15 @@ export function anthropicProvider(opts: AnthropicProviderOptions = {}): Provider
   };
 }
 
-/** SDK 的错误转成 ProviderError；取消和非 SDK 错误照原样抛出 */
+/** SDK 的错误转成 ProviderError；读流中途的其他错误（连接中断等）可以重试；取消照原样抛出 */
 function toProviderError(err: unknown, signal: AbortSignal): unknown {
-  if (signal.aborted || !(err instanceof Anthropic.APIError) || err instanceof Anthropic.APIUserAbortError) return err;
+  if (signal.aborted || err instanceof Anthropic.APIUserAbortError) return err;
+  if (!(err instanceof Anthropic.APIError)) {
+    return new ProviderError(`${PROVIDER_ID} stream failed: ${err instanceof Error ? err.message : String(err)}`, {
+      retryable: true,
+      cause: err,
+    });
+  }
   const status = err.status;
   const retryAfter = Number(err.headers?.get("retry-after"));
   return new ProviderError(`${PROVIDER_ID} ${status === undefined ? "request failed" : `HTTP ${status}`}: ${err.message}`, {
@@ -148,8 +154,10 @@ function fromBlock(b: ContentBlock, origin: Origin): Block {
   }
 }
 
-function toParam(m: Message): MessageParam {
-  return { role: m.role, content: m.content.flatMap(toBlockParam) };
+/** 没有可发送内容的消息整条省略：API 拒绝空的 content，相邻的同角色消息会被合并成一轮 */
+function toParam(m: Message): MessageParam[] {
+  const content = m.content.flatMap(toBlockParam);
+  return content.length > 0 ? [{ role: m.role, content }] : [];
 }
 
 function toBlockParam(b: Block): ContentBlockParam[] {
@@ -158,7 +166,8 @@ function toBlockParam(b: Block): ContentBlockParam[] {
 
   switch (b.kind) {
     case "text":
-      return [{ type: "text", text: b.text }];
+      // API 拒绝空的 text 块（例如工具没有输出时）
+      return b.text ? [{ type: "text", text: b.text }] : [];
     case "image":
       return [{ type: "image", source: b.source } as ContentBlockParam];
     case "document":

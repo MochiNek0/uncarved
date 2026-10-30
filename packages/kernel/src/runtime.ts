@@ -10,7 +10,8 @@ import {
   type TransformPayloads,
   type TransformPoint,
 } from "./hooks.ts";
-import { checkCompat, resumePolicy, type Plugin } from "./plugin.ts";
+import { checkCompat, PluginIncompatible, resumePolicy, type Plugin } from "./plugin.ts";
+import { ProviderError } from "./provider.ts";
 import { initialState, rebuild, step } from "./step.ts";
 import { isConfirmed, UntrustedPlugin } from "./trust.ts";
 import { readAll, type LogStore } from "./store.ts";
@@ -121,6 +122,8 @@ export class Runtime {
   #tools = new Map<string, Tool>();
   #plugins: Plugin[];
   #manifest: PluginManifestEntry[];
+  /** 每个插件声明的能力 */
+  #needs: Map<string, Set<string>>;
   #now: () => string;
   #newId: () => string;
 
@@ -154,6 +157,7 @@ export class Runtime {
     }
     this.#plugins = plugins;
     this.#manifest = plugins.map((p) => ({ id: p.id, version: p.version }));
+    this.#needs = new Map(plugins.map((p) => [p.id, new Set(p.needs ?? [])]));
   }
 
   static async create(opts: RuntimeOptions & { sessionId?: string; parent?: SessionRef }): Promise<Runtime> {
@@ -183,9 +187,12 @@ export class Runtime {
     const rt = new Runtime(opts, rebuild(opts.sessionId, events));
     const s = rt.#state;
     const recorded = s.held?.plugins ?? s.plugins;
-    if (JSON.stringify(recorded) !== JSON.stringify(rt.#manifest)) {
+    // 已结束的会话不再接受任何事件（5.1），插件变化无需记录
+    if (s.phase !== "ended" && JSON.stringify(recorded) !== JSON.stringify(rt.#manifest)) {
       const resolution = resumePolicy(s.plugins, rt.#plugins);
       await rt.#commit("plugins.changed", { plugins: rt.#manifest, resolution }, RUNTIME);
+      // 返回前等它触发的 observe 及其写入完成（5.1）
+      await rt.#settle();
       // 接下来该做什么一律由 recover() 根据状态决定
       rt.#queue.length = 0;
     }
@@ -247,7 +254,7 @@ export class Runtime {
           const rerun: string[] = [];
           for (const c of s.batch) {
             if (c.decision !== "allow" || c.result) continue;
-            if (this.#tools.get(c.name)?.idempotent) rerun.push(c.toolUseId);
+            if (!c.stale && this.#tools.get(c.name)?.idempotent) rerun.push(c.toolUseId);
             else await this.#commit("tool.interrupted", { toolUseId: c.toolUseId }, RUNTIME);
           }
           if (rerun.length > 0) this.#queue.push({ type: "RunTools", toolUseIds: rerun });
@@ -309,6 +316,8 @@ export class Runtime {
     this.#busy = true;
     this.#cascade = 0;
     this.#cascadeWarned = false;
+    // 之前的中断只针对当时的那一轮，不能带进这次调用触发的 hook
+    if (this.#abort.signal.aborted) this.#abort = new AbortController();
     try {
       await this.#settle();
       await fn();
@@ -419,6 +428,12 @@ export class Runtime {
       signal,
       onDelta: (delta) => this.#notify({ type: "delta", delta }),
     });
+    // I-6 的检查靠 origin 认出模型块，来源不对的块写进日志后就再也认不出来了（I-8）
+    if (res.content.some((b) => b.origin?.by !== "model")) {
+      throw new ProviderError(`provider ${res.provider ?? this.#provider.id} returned a block not attributed to the model`, {
+        retryable: false,
+      });
+    }
     await this.#commit(
       "model.responded",
       { content: res.content, stopReason: res.stopReason, usage: res.usage },
@@ -527,6 +542,8 @@ export class Runtime {
 
   /** depth：这个事件是 event observe 写入链上的第几层，0 表示不是由 event observe 写入的 */
   #append(type: string, data: unknown, origin: Origin, depth = 0): Promise<void> {
+    // 调用时立即拷贝：工具、provider、插件可能还留着 data 的引用，之后再改不能影响日志和状态（I-5）
+    data = structuredClone(data);
     const run = async () => {
       const event = {
         v: 1,
@@ -567,12 +584,16 @@ export class Runtime {
   #ctxAt(depth: number): HookContextFor {
     return (plugin) => {
       const origin: Origin = { by: "plugin", id: plugin };
+      // 写日志的能力必须在 needs 中声明（8.2）
+      const declared = (need: string) =>
+        this.#needs.get(plugin)?.has(need) ? Promise.resolve() : Promise.reject(new PluginIncompatible(plugin, `requires capability ${need}`));
       return {
         sessionId: this.#state.sessionId,
         signal: this.#abort.signal,
         derived: structuredClone(this.#state.derived),
-        record: (key, value) => this.#commit("derived.recorded", { key, value }, origin, depth),
-        emit: (type, data) => this.#append(`${plugin}/${type}`, data, origin, depth),
+        record: (key, value) =>
+          declared("log:record").then(() => this.#commit("derived.recorded", { key, value }, origin, depth)),
+        emit: (type, data) => declared("log:emit").then(() => this.#append(`${plugin}/${type}`, data, origin, depth)),
       };
     };
   }

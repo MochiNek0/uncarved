@@ -151,3 +151,68 @@ test("错误的工具结果加上 [error] 前缀，这个格式没有 is_error �
     { role: "tool", tool_call_id: "c3", content: "fine" },
   ]);
 });
+
+// 原样返回给定的 SSE 文本，不自动补 [DONE]
+const rawSSE = (sse: string) => (async () => new Response(sse, { status: 200 })) as unknown as typeof fetch;
+
+test("流在 finish_reason 和 [DONE] 之前断开：抛出可重试的 ProviderError，不当成正常回复", async () => {
+  const provider = openaiCompatProvider({ baseURL: "https://example.test/v1", model: "m", fetch: rawSSE(`data: ${chunk({ content: "half" })}\n\n`) });
+  const err = await provider.complete({ system: [], tools: [], messages: [] }, { signal: new AbortController().signal }).catch((e) => e);
+  expect(err).toBeInstanceOf(ProviderError);
+  expect(err.retryable).toBe(true);
+});
+
+test("流里的 error 块：抛出 ProviderError，不返回空回复", async () => {
+  const sse = `data: ${JSON.stringify({ error: { message: "overloaded", code: 529 } })}\n\ndata: [DONE]\n\n`;
+  const provider = openaiCompatProvider({ baseURL: "https://example.test/v1", model: "m", fetch: rawSSE(sse) });
+  const err = await provider.complete({ system: [], tools: [], messages: [] }, { signal: new AbortController().signal }).catch((e) => e);
+  expect(err).toBeInstanceOf(ProviderError);
+  expect(err).toMatchObject({ retryable: true, message: expect.stringContaining("overloaded") });
+});
+
+test("服务端没给 tool call id 时生成唯一的 id", async () => {
+  const { fetchFn } = fakeServer([
+    [
+      chunk({ tool_calls: [{ index: 0, function: { name: "a", arguments: "{}" } }, { index: 1, function: { name: "b", arguments: "{}" } }] }, "tool_calls"),
+    ],
+  ]);
+  const provider = openaiCompatProvider({ baseURL: "https://example.test/v1", model: "m", fetch: fetchFn });
+  const res = await provider.complete({ system: [], tools: [], messages: [] }, { signal: new AbortController().signal });
+  const ids = res.content.flatMap((b) => (b.kind === "tool_use" ? [b.id] : []));
+  expect(ids).toHaveLength(2);
+  expect(ids.every((id) => id.length > 0)).toBe(true);
+  expect(new Set(ids).size).toBe(2);
+});
+
+test("tool call 缺少 index 时按 id 区分调用，不丢弃", async () => {
+  const { fetchFn } = fakeServer([
+    [
+      chunk({ tool_calls: [{ id: "a", function: { name: "x", arguments: '{"n":' } }] }),
+      chunk({ tool_calls: [{ function: { arguments: "1}" } }] }),
+      chunk({ tool_calls: [{ id: "b", function: { name: "y", arguments: "{}" } }] }, "tool_calls"),
+    ],
+  ]);
+  const provider = openaiCompatProvider({ baseURL: "https://example.test/v1", model: "m", fetch: fetchFn });
+  const res = await provider.complete({ system: [], tools: [], messages: [] }, { signal: new AbortController().signal });
+  expect(res.content.map((b) => (b.kind === "tool_use" ? [b.id, b.name, b.input] : null))).toEqual([
+    ["a", "x", { n: 1 }],
+    ["b", "y", {}],
+  ]);
+  expect(res.stopReason).toBe("tool_use");
+});
+
+test("流读到一半连接出错：抛出可重试的 ProviderError", async () => {
+  const fetchFn = (async () =>
+    new Response(
+      new ReadableStream<Uint8Array>({
+        start(ctrl) {
+          ctrl.enqueue(new TextEncoder().encode(`data: ${chunk({ content: "half" })}\n\n`));
+          ctrl.error(new TypeError("socket hang up"));
+        },
+      }),
+    )) as unknown as typeof fetch;
+  const provider = openaiCompatProvider({ baseURL: "https://example.test/v1", model: "m", fetch: fetchFn });
+  const err = await provider.complete({ system: [], tools: [], messages: [] }, { signal: new AbortController().signal }).catch((e) => e);
+  expect(err).toBeInstanceOf(ProviderError);
+  expect(err).toMatchObject({ retryable: true, message: expect.stringContaining("socket hang up") });
+});

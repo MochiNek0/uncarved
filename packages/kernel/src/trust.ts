@@ -100,6 +100,8 @@ export async function loadProjectPlugin(dir: string, opts: TrustOptions & { entr
   const { hash, files } = await hashDir(root);
   await checkImports(root, files);
   const grant = await requireTrust({ path: root, hash, files }, opts);
+  // 等用户确认可能要很久，期间目录可能被改：确认的必须就是要导入的内容
+  if ((await hashDir(root)).hash !== hash) throw new UntrustedPlugin(root, "changed while waiting for confirmation");
 
   const prev = imported.get(root);
   if (prev !== undefined && prev !== hash) throw new UntrustedPlugin(root, "changed since it was imported; restart to load it");

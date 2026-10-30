@@ -63,6 +63,7 @@ test("进程重启后，从文件恢复等待审批的会话并继续", async ()
       id: "p",
       version: "1.0.0",
       kernel: "^1",
+      needs: ["gate:tool.gate"],
       tools: [echo],
       hooks: [{ kind: "gate" as const, point: "tool.gate" as const, fn: () => ({ decision: "ask" as const }) }],
     },
@@ -164,4 +165,20 @@ test("两个实例同时追加同一个 seq：只有一个成功，日志保持�
   expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
   expect((results.find((r) => r.status === "rejected") as PromiseRejectedResult).reason).toBeInstanceOf(ConcurrentWrite);
   expect((await readAll(a, "s1")).map((e) => e.seq)).toEqual([1, 2]);
+});
+
+test("同一实例每次追加都检查 seq 紧接着上一次：重复的 seq 被拒绝，不写坏日志", async () => {
+  const store = new JsonlLogStore(dir);
+  await store.append("s1", [ev(1)]);
+  // 例如上一次写入已经落盘，但 append 因释放锁失败而 reject，调用方用同一个 seq 重写
+  await expect(store.append("s1", [ev(1)])).rejects.toBeInstanceOf(ConcurrentWrite);
+  await store.append("s1", [ev(2)]);
+  expect((await readAll(store, "s1")).map((e) => e.seq)).toEqual([1, 2]);
+});
+
+test("文件最后一个事件损坏时，追加报 CorruptLog 而不是解析错误", async () => {
+  await writeFile(path.join(dir, "s1.jsonl"), JSON.stringify(ev(1)) + "\n{not json\n");
+  const err = await new JsonlLogStore(dir).append("s1", [ev(3)]).catch((e) => e);
+  expect(err).toBeInstanceOf(CorruptLog);
+  expect(err.line).toBe(2);
 });

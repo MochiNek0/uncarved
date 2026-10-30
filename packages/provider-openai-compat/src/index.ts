@@ -42,11 +42,14 @@ interface StreamChunk {
     delta?: {
       content?: string | null;
       reasoning_content?: string | null;
-      tool_calls?: Array<{ index: number; id?: string; function?: { name?: string; arguments?: string } }>;
+      /** 部分服务端不给 index */
+      tool_calls?: Array<{ index?: number; id?: string; function?: { name?: string; arguments?: string } }>;
     };
     finish_reason?: string | null;
   }>;
   usage?: { prompt_tokens?: number; completion_tokens?: number } | null;
+  /** 部分服务端在流中途出错时发送的块 */
+  error?: { message?: string; code?: number | string };
 }
 
 export function openaiCompatProvider(opts: OpenAICompatOptions): Provider {
@@ -94,28 +97,48 @@ export function openaiCompatProvider(opts: OpenAICompatOptions): Provider {
       let finish: string | null = null;
       let usage: StreamChunk["usage"] = null;
       const calls: Array<{ id: string; name: string; arguments: string }> = [];
+      let done = false;
 
-      for await (const chunk of readSSE(res.body)) {
-        if (chunk.model) model = chunk.model;
-        if (chunk.usage) usage = chunk.usage;
-        const choice = chunk.choices?.[0];
-        if (!choice) continue;
-        const d = choice.delta ?? {};
-        if (d.content) {
-          text += d.content;
-          onDelta?.({ kind: "text", text: d.content });
+      try {
+        for await (const chunk of readSSE(res.body, () => (done = true))) {
+          if (chunk.error) {
+            const code = chunk.error.code;
+            throw new ProviderError(`${PROVIDER_ID} stream error: ${chunk.error.message ?? JSON.stringify(chunk.error)}`, {
+              // 部分服务端把 HTTP 状态码放在 code 里
+              retryable: typeof code === "number" && (code === 408 || code === 429 || code >= 500),
+              status: typeof code === "number" ? code : undefined,
+            });
+          }
+          if (chunk.model) model = chunk.model;
+          if (chunk.usage) usage = chunk.usage;
+          const choice = chunk.choices?.[0];
+          if (!choice) continue;
+          const d = choice.delta ?? {};
+          if (d.content) {
+            text += d.content;
+            onDelta?.({ kind: "text", text: d.content });
+          }
+          if (d.reasoning_content) {
+            reasoning += d.reasoning_content;
+            onDelta?.({ kind: "thinking", text: d.reasoning_content });
+          }
+          for (const tc of d.tool_calls ?? []) {
+            // 没有 index 时：带着新的 id 就是新的调用，否则接在最后一个调用后面
+            const last = calls.length - 1;
+            const index = tc.index ?? (last < 0 || (tc.id && tc.id !== calls[last]!.id) ? last + 1 : last);
+            const c = (calls[index] ??= { id: "", name: "", arguments: "" });
+            if (tc.id) c.id = tc.id;
+            if (tc.function?.name) c.name += tc.function.name;
+            if (tc.function?.arguments) c.arguments += tc.function.arguments;
+          }
+          if (choice.finish_reason) finish = choice.finish_reason;
         }
-        if (d.reasoning_content) {
-          reasoning += d.reasoning_content;
-          onDelta?.({ kind: "thinking", text: d.reasoning_content });
-        }
-        for (const tc of d.tool_calls ?? []) {
-          const c = (calls[tc.index] ??= { id: "", name: "", arguments: "" });
-          if (tc.id) c.id = tc.id;
-          if (tc.function?.name) c.name += tc.function.name;
-          if (tc.function?.arguments) c.arguments += tc.function.arguments;
-        }
-        if (choice.finish_reason) finish = choice.finish_reason;
+      } catch (err) {
+        throw streamError(err, signal);
+      }
+      // 既没有 finish_reason 也没有 [DONE]：连接中途断开，内容不完整
+      if (finish === null && !done) {
+        throw new ProviderError(`${PROVIDER_ID} stream ended before the response finished`, { retryable: true });
       }
 
       const origin: Origin = { by: "model", provider: PROVIDER_ID, model };
@@ -125,7 +148,8 @@ export function openaiCompatProvider(opts: OpenAICompatOptions): Provider {
       for (const c of calls.filter(Boolean)) {
         content.push({
           kind: "tool_use",
-          id: c.id,
+          // 部分服务端不给 id；同一批里重复的 id 无法对应结果。生成的 id 随响应写入日志，重建时不受影响
+          id: c.id || `call_${crypto.randomUUID()}`,
           name: c.name,
           input: parseArgs(c.arguments),
           origin,
@@ -164,6 +188,15 @@ async function send(doFetch: typeof fetch, url: string, signal: AbortSignal, ini
     retryable: status === 408 || status === 429 || status >= 500,
     status,
     retryAfterMs: retryAfter(res.headers.get("retry-after")),
+  });
+}
+
+/** 读流过程中的错误：连接中断、数据损坏都转成可重试的 ProviderError；取消和已经分好类的错误照原样抛出 */
+function streamError(err: unknown, signal: AbortSignal): unknown {
+  if (signal.aborted || err instanceof ProviderError) return err;
+  return new ProviderError(`${PROVIDER_ID} stream failed: ${err instanceof Error ? err.message : String(err)}`, {
+    retryable: true,
+    cause: err,
   });
 }
 
@@ -247,7 +280,8 @@ function toStopReason(finish: string | null, hasToolCalls: boolean): StopReason 
   }
 }
 
-async function* readSSE(body: ReadableStream<Uint8Array>): AsyncGenerator<StreamChunk> {
+/** onDone：收到 [DONE] 时调用，用来区分正常结束和连接断开 */
+async function* readSSE(body: ReadableStream<Uint8Array>, onDone: () => void): AsyncGenerator<StreamChunk> {
   const decoder = new TextDecoder();
   let buffer = "";
   for await (const bytes of body as unknown as AsyncIterable<Uint8Array>) {
@@ -258,7 +292,10 @@ async function* readSSE(body: ReadableStream<Uint8Array>): AsyncGenerator<Stream
       buffer = buffer.slice(nl + 1);
       if (!line.startsWith("data:")) continue;
       const data = line.slice(5).trim();
-      if (data === "[DONE]") return;
+      if (data === "[DONE]") {
+        onDone();
+        return;
+      }
       yield JSON.parse(data) as StreamChunk;
     }
   }

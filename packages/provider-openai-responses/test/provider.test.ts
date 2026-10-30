@@ -79,6 +79,7 @@ test("在完整的内核循环里跑通：流式文本、推理、工具调用�
     id: "prompt",
     version: "1",
     kernel: "^1",
+    needs: ["transform:context.build"],
     hooks: [
       {
         kind: "transform" as const,
@@ -285,4 +286,30 @@ test("错误的工具结果加上 [error] 前缀，这个格式没有 is_error �
     { type: "function_call_output", call_id: "c1", output: "[error] denied by policy" },
     { type: "function_call_output", call_id: "c2", output: "fine" },
   ]);
+});
+
+test("流读到一半连接出错：抛出可重试的 ProviderError", async () => {
+  const fetchFn = (async () =>
+    new Response(
+      new ReadableStream<Uint8Array>({
+        start(ctrl) {
+          ctrl.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type: "response.created", response: { model: "m" } })}\n\n`));
+          ctrl.error(new TypeError("socket hang up"));
+        },
+      }),
+    )) as unknown as typeof fetch;
+  const provider = openaiResponsesProvider({ baseURL: "https://example.test/v1", model: "m", fetch: fetchFn });
+  const err = await provider.complete({ system: [], tools: [], messages: [] }, { signal: new AbortController().signal }).catch((e) => e);
+  expect(err).toBeInstanceOf(ProviderError);
+  expect(err).toMatchObject({ retryable: true, message: expect.stringContaining("socket hang up") });
+});
+
+test("previous_response_id 不能通过 ext 传入：历史每次都完整发送", async () => {
+  const provider = openaiResponsesProvider({ baseURL: "https://example.test/v1", model: "m", fetch: fakeServer([]).fetchFn });
+  await expect(
+    provider.complete(
+      { system: [], tools: [], messages: [], ext: { [PROVIDER_ID]: { body: { previous_response_id: "resp_1" } } } },
+      { signal: new AbortController().signal },
+    ),
+  ).rejects.toThrow('must not set "previous_response_id"');
 });

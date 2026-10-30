@@ -142,9 +142,10 @@ test("没有原始数据的思考块和空的错误结果", async () => {
   );
 
   expect(res.stopReason).toBe("pause");
+  // 思考块没有原始数据无法回传，整条 assistant 消息因此没有内容，被省略
   const sent = calls[0]!.messages as Array<{ content: unknown[] }>;
-  expect(sent[0]!.content).toEqual([]);
-  expect(sent[1]!.content).toEqual([{ type: "tool_result", tool_use_id: "t", is_error: true }]);
+  expect(sent).toHaveLength(1);
+  expect(sent[0]!.content).toEqual([{ type: "tool_result", tool_use_id: "t", is_error: true }]);
 });
 
 const hi: ModelRequest = {
@@ -188,4 +189,55 @@ test("SDK 的错误转成 ProviderError；取消照原样抛出", async () => {
   expect(await fail(new Anthropic.APIError(400, {}, "bad", new Headers()))).toMatchObject({ retryable: false, status: 400 });
   expect(await fail(new Anthropic.APIConnectionError({ message: "reset" }))).toMatchObject({ retryable: true, status: undefined });
   expect(await fail(new Anthropic.APIUserAbortError())).not.toBeInstanceOf(ProviderError);
+});
+
+test("空的 text 块不发送；没有内容的消息整条省略", async () => {
+  const { client, calls } = fakeClient({ model: "m", content: [], stop_reason: "end_turn", usage: { input_tokens: 0, output_tokens: 0 } });
+  const toolOrigin = { by: "tool" as const, name: "sh" };
+  await anthropicProvider({ client }).complete(
+    {
+      system: [],
+      tools: [],
+      messages: [
+        { role: "user", content: [{ kind: "text", text: "", origin: user, trust: "trusted" }] },
+        {
+          role: "assistant",
+          content: [{ kind: "thinking", text: "no signature", origin: { by: "model", provider: "other", model: "x" }, trust: "trusted" }],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              kind: "tool_result",
+              toolUseId: "t",
+              isError: false,
+              content: [{ kind: "text", text: "", origin: toolOrigin, trust: "untrusted" }],
+              origin: toolOrigin,
+              trust: "untrusted",
+            },
+            { kind: "text", text: "go on", origin: user, trust: "trusted" },
+          ],
+        },
+      ],
+    },
+    { signal: new AbortController().signal },
+  );
+  expect(calls[0]!.messages).toEqual([
+    {
+      role: "user",
+      content: [
+        { type: "tool_result", tool_use_id: "t", is_error: false },
+        { type: "text", text: "go on" },
+      ],
+    },
+  ]);
+});
+
+test("流读取中出现的非 SDK 错误：转成可重试的 ProviderError", async () => {
+  const signal = new AbortController().signal;
+  const err = await anthropicProvider({ client: fakeClient(() => { throw new TypeError("terminated"); }).client })
+    .complete(hi, { signal })
+    .catch((e) => e);
+  expect(err).toBeInstanceOf(ProviderError);
+  expect(err).toMatchObject({ retryable: true, message: expect.stringContaining("terminated") });
 });

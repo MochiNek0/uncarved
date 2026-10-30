@@ -160,6 +160,8 @@ export interface PendingCall {
   decidedBy?: string;
   /** 做出最终决定的事件，子会话以它作为 parent 引用（3.4） */
   decidedAt?: string;
+  /** 已决定执行，但之后插件清单变了：决定不再可靠，恢复时不自动重跑（4.6 第 3 款） */
+  stale?: boolean;
   result?: ToolResultRecord;
 }
 

@@ -50,6 +50,14 @@ async function handle(msg: Msg): Promise<unknown> {
           return {};
         case "crash":
           process.exit(3);
+        case "flood":
+          // 一条超长、没有换行的消息
+          process.stdout.write("x".repeat(64 * 1024));
+          return new Promise(() => {});
+        case "garbage":
+          // 合法的 JSON，但不是 JSON-RPC 消息
+          process.stdout.write("null\n");
+          return new Promise(() => {});
       }
     }
   }

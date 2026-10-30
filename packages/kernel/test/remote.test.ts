@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  CAPABILITIES,
   HookFailure,
   HookTimeout,
   MemoryLogStore,
@@ -47,6 +48,8 @@ const plugin = (hooks: RemoteHookSpec[], extra: Partial<Plugin> = {}): Plugin =>
   id: "remote",
   version: "1.0.0",
   kernel: "^1",
+  // 按 hook 声明所需能力，注册检查测的才是 hook 本身的问题
+  needs: hooks.map((h) => `${h.kind}:${h.point}`).filter((n) => CAPABILITIES.has(n)),
   hooks,
   ...extra,
 });
@@ -62,6 +65,7 @@ describe("注册检查（5.5）", () => {
     ["关卡声明写字段", remote({ kind: "gate", point: "tool.gate", call, writes: ["input"] })],
     ["种类与扩展点不符", remote({ kind: "observe", point: "tool.gate", call })],
     ["未知扩展点", remote({ kind: "observe", point: "nope" as "event", call })],
+    ["缺少 reads", { ...remote({ kind: "observe", point: "event", call }), reads: undefined } as unknown as RemoteHookSpec],
   ];
   for (const [name, spec] of cases) {
     test(`拒绝：${name}`, async () => {
