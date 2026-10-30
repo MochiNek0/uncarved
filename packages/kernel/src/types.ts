@@ -73,6 +73,11 @@ export type UserInput =
   | { kind: "message"; content: Block[] }
   | { kind: "approval"; toolUseId: string; approved: boolean; reason?: string }
   /**
+   * 上一轮在模型回复之前就失败了（例如请求报错）：不追加新内容，用现有的消息重新请求模型。
+   * 否则用户只能再发一条消息，历史里会留下连续几条"继续"。只能在最后一条消息是 user 时使用
+   */
+  | { kind: "retry" }
+  /**
    * 对插件清单变化的确认（4.6）。只记录结果，不执行任何工作：批准后调用 recover() 继续未完成的工作。
    * 拒绝后只能换回可接受的插件清单
    */

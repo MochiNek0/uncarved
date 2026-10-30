@@ -382,6 +382,39 @@ describe("关卡与变换", () => {
     expect(rt.state.messages.at(-1)!.content[0]).toMatchObject({ text: "second try" });
   });
 
+  test("retry 用现有消息重新请求模型，不追加用户消息；模型已经回复过时拒绝且不写日志", async () => {
+    let fail = true;
+    const { provider, requests } = scripted([{ content: [text("second try")], stopReason: "end" }]);
+    const store = new MemoryLogStore();
+    const rt = await Runtime.create({
+      store,
+      provider,
+      plugins: [
+        plugin("broken", {
+          hooks: [
+            {
+              kind: "transform",
+              point: "context.build",
+              fn: () => {
+                if (fail) throw new Error("boom");
+              },
+            },
+          ],
+        }),
+      ],
+    });
+    await expect(rt.send(say("hi"))).rejects.toBeInstanceOf(HookFailure);
+
+    fail = false;
+    await rt.send({ kind: "retry" });
+    expect(requests[0]!.messages.map((m) => m.role)).toEqual(["user"]);
+    expect(rt.state.messages.at(-1)!.content[0]).toMatchObject({ text: "second try" });
+
+    const before = (await readAll(store, rt.state.sessionId)).length;
+    await expect(rt.send({ kind: "retry" })).rejects.toBeInstanceOf(InvalidTransition);
+    expect(await readAll(store, rt.state.sessionId)).toHaveLength(before);
+  });
+
   test("optional 的 transform 出错时跳过并通知", async () => {
     const { provider } = scripted([{ content: [text("ok")], stopReason: "end" }]);
     const rt = await Runtime.create({

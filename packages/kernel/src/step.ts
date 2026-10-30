@@ -72,6 +72,11 @@ export function step(s: State, e: LogEvent): StepResult {
         const messages: Message[] = [...s.messages, { role: "user", content: d.content }];
         return ok({ ...base, phase: "model", messages }, [{ type: "CallModel" }]);
       }
+      if (d.kind === "retry") {
+        expect("idle");
+        if (s.messages.at(-1)?.role !== "user") throw new InvalidTransition(e.type, s.phase, "nothing to retry: the last message is not from the user");
+        return ok({ ...base, phase: "model" }, [{ type: "CallModel" }]);
+      }
       expect("awaiting");
       const target = s.batch.find((c) => c.toolUseId === d.toolUseId && c.decision === "ask");
       if (!target) throw new InvalidTransition(e.type, s.phase, `no pending approval for ${d.toolUseId}`);
