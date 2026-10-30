@@ -20,6 +20,8 @@ export interface PromptsOptions {
   id?: string;
   /** 默认当天，测试时可以固定 */
   today?: string;
+  /** bash 工具实际执行的程序；null 表示找不到 shell、没有 bash 工具。子 Agent 不用 */
+  shell?: string | null;
 }
 
 /** 同一目录里按顺序找，用第一个存在的 */
@@ -29,7 +31,9 @@ const MAIN = `You are Jade, a coding agent working in the user's repository thro
 
 # How to work
 - Read before you change: use glob/grep/read_file to understand the code, then edit. Never guess file contents.
-- Prefer edit_file for changes to existing files; use write_file only for new files or full rewrites.
+- Prefer edit_file for changes to existing files, even several edits in a row; use write_file only for new files or when most of the file changes.
+- A successful write_file or edit_file means the file now has exactly the content you gave; do not read it back to check.
+- A file must be read before you change it, and the change must come in a later response than the read: you cannot use a result you have not seen yet.
 - Match the surrounding code's style, naming and comment density. Keep changes minimal and focused on the request.
 - After changing code, verify it the way the project does (tests, type check, build) with bash when that is feasible, and report failures honestly.
 - Use the task tool for broad searches so that only conclusions come back into this conversation.
@@ -41,6 +45,12 @@ const MAIN = `You are Jade, a coding agent working in the user's repository thro
 - Reply in the user's language. Be concise: say what you did and what you found, not what you are about to do.
 - Reference code as path:line.
 - Do not commit, push or run destructive commands unless the user asks.`;
+
+const VERIFY = "- After changing code, verify it the way the project does (tests, type check, build) with bash when that is feasible, and report failures honestly.";
+/** 找不到 shell 时没有 bash 工具，替换掉上面那条 */
+const NO_SHELL =
+  "- There is no shell in this session (no bash tool), so you cannot run commands. After changing code, tell the user which commands would verify it.";
+if (!MAIN.includes(VERIFY)) throw new Error("prompts: VERIFY is out of sync with MAIN");
 
 const SUBAGENT = `You are a read-only research sub-agent for a coding agent. You have read_file, list_dir, glob and grep.
 Investigate the task you are given, then reply with a concise report: the answer first, then the evidence as path:line references.
@@ -56,7 +66,8 @@ export async function prompts(opts: PromptsOptions): Promise<Plugin> {
     trust,
   });
 
-  const system: SystemSegment[] = [segment(opts.role === "subagent" ? SUBAGENT : MAIN, "trusted")];
+  const main = opts.shell === null ? MAIN.replace(VERIFY, NO_SHELL) : MAIN;
+  const system: SystemSegment[] = [segment(opts.role === "subagent" ? SUBAGENT : main, "trusted")];
   system.push(segment(await environment(opts), "trusted"));
 
   if (opts.role !== "subagent") {
@@ -117,6 +128,7 @@ async function environment(opts: PromptsOptions): Promise<string> {
     "# Environment",
     `- Working directory: ${opts.cwd}`,
     `- Platform: ${process.platform} (${os.release()})`,
+    ...(opts.shell ? [`- Shell for the bash tool: ${opts.shell} (POSIX syntax, also on Windows)`] : []),
     `- Today: ${opts.today ?? new Date().toISOString().slice(0, 10)}`,
   ];
   const branch = await git(opts.cwd, ["rev-parse", "--abbrev-ref", "HEAD"]);

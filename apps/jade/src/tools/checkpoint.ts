@@ -64,6 +64,26 @@ export class Checkpoints {
     return out.sort((a, b) => b.at - a.at);
   }
 
+  /**
+   * 记下本会话读过或写过的文件当时内容的 sha256。fs 工具在内存里也记一份，
+   * 这里的是给恢复的会话用的：之前的进程里读过、写过的文件，内容没变就不用再读一遍
+   */
+  async markSeen(sessionId: string, file: string, hash: string): Promise<void> {
+    const dir = path.join(this.#dir, safe(sessionId), "seen");
+    await mkdir(dir, { recursive: true });
+    await writeFile(path.join(dir, `${sha256(file)}.json`), JSON.stringify({ path: file, hash }));
+  }
+
+  /** markSeen 记下的 sha256；没有记录返回 undefined */
+  async seenHash(sessionId: string, file: string): Promise<string | undefined> {
+    try {
+      const rec = JSON.parse(await readFile(path.join(this.#dir, safe(sessionId), "seen", `${sha256(file)}.json`), "utf8")) as { path: string; hash: string };
+      return rec.path === file ? rec.hash : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   /** 文件现在的内容是否还是这次写入的结果 */
   async unchangedSince(cp: Checkpoint): Promise<boolean> {
     try {

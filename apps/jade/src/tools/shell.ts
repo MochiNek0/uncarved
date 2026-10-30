@@ -21,15 +21,21 @@ export interface ShellOptions {
 }
 
 export interface ShellTools {
-  /** bash、bash_output、kill_shell */
+  /** bash、bash_output、kill_shell；找不到 shell 时为空 */
   tools: Tool[];
+  /** 实际执行的 shell 程序；找不到时为 undefined */
+  executable?: string;
+  /** 找不到 shell 时的说明，宿主显示给用户 */
+  unavailable?: string;
   /** 杀掉所有还在运行的后台进程 */
   shutdown(): void;
 }
 
 /** 只要 bash 工具时用（测试） */
 export function shellTool(opts: ShellOptions): Tool {
-  return shellTools(opts).tools[0]!;
+  const { tools, unavailable } = shellTools(opts);
+  if (!tools[0]) throw new Error(unavailable);
+  return tools[0];
 }
 
 interface Background {
@@ -45,7 +51,13 @@ interface Background {
 
 export function shellTools(opts: ShellOptions): ShellTools {
   const shell = opts.shell ?? process.env.JADE_SHELL ?? "bash";
-  const executable = realShell(shell);
+  const found = findShell(shell);
+  // 找不到 shell 时不提供这几个工具：否则模型每次调用都要用户先批准，执行时才失败，模型还会反复重试
+  if (!found) {
+    const hint = process.platform === "win32" ? "install Git for Windows, or set JADE_SHELL to the path of a bash executable" : "set JADE_SHELL to the path of a shell";
+    return { tools: [], unavailable: `${shell} was not found, so the bash tool is disabled; ${hint}`, shutdown() {} };
+  }
+  const executable = found;
   const background = new Map<string, Background>();
   let nextId = 1;
 
@@ -189,6 +201,7 @@ export function shellTools(opts: ShellOptions): ShellTools {
 
   return {
     tools: [bash, bashOutput, killShell],
+    executable,
     shutdown() {
       for (const bg of background.values()) if (bg.exitCode === undefined) killTree(executable, bg.proc.pid);
     },
@@ -203,15 +216,36 @@ export interface ShellProgress {
 }
 
 /**
- * Git for Windows 的 bin\bash.exe、bin\sh.exe 只是启动器，真正的 shell 是它启动的 usr\bin 下的同名程序。
- * killTree 按 WINPID 找 msys 进程，用启动器的 pid 找不到，所以直接启动真正的 shell
+ * 找到要执行的 shell 程序，找不到返回 undefined。
+ *
+ * Windows 上 Git for Windows 安装时默认只把 Git\cmd 加进 PATH，PATH 里通常找不到 bash，
+ * 所以 bash、sh 还要从 git.exe 的位置和常见安装目录找 Git 的安装目录。
+ * Git 的 bin\bash.exe、bin\sh.exe 只是启动器，真正的 shell 是它启动的 usr\bin 下的同名程序；
+ * killTree 按 WINPID 找 msys 进程，用启动器的 pid 找不到，所以直接用 usr\bin 下的。
+ * Git Bash 优先于 PATH 里别的 bash（例如 System32\bash.exe 是 WSL 的启动器，看不到 Windows 路径）
  */
-function realShell(shell: string): string {
-  if (process.platform !== "win32") return shell;
-  const m = /^(.*\\Git)\\bin\\(bash|sh)\.exe$/i.exec(Bun.which(shell) ?? "");
-  if (!m) return shell;
-  const real = path.join(m[1]!, "usr", "bin", `${m[2]}.exe`);
-  return existsSync(real) ? real : shell;
+export function findShell(shell: string): string | undefined {
+  const found = Bun.which(shell) ?? undefined;
+  if (process.platform !== "win32") return found;
+  const name = /^(bash|sh)(\.exe)?$/i.exec(shell)?.[1]?.toLowerCase();
+  if (!name) return found;
+  const inGit = (root: string) => {
+    const real = path.join(root, "usr", "bin", `${name}.exe`);
+    return existsSync(real) ? real : undefined;
+  };
+  const m = /^(.*\\Git)\\(usr\\)?bin\\(bash|sh)\.exe$/i.exec(found ?? "");
+  if (m) return inGit(m[1]!) ?? found;
+  // git.exe 在 Git\cmd、Git\bin 或 Git\mingw64\bin 下
+  const git = Bun.which("git");
+  const roots = git ? [path.dirname(path.dirname(git)), path.dirname(path.dirname(path.dirname(git)))] : [];
+  for (const base of [process.env.ProgramFiles, process.env["ProgramFiles(x86)"], process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, "Programs")]) {
+    if (base) roots.push(path.join(base, "Git"));
+  }
+  for (const root of roots) {
+    const real = inGit(root);
+    if (real) return real;
+  }
+  return found;
 }
 
 /**

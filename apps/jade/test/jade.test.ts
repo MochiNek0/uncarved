@@ -29,7 +29,9 @@ import {
   parseEnv,
   POLICY_KEY,
   providerFromEnv,
+  SessionIndex,
   policy,
+  prompts,
   shellTool,
   shellTools,
   shellWords,
@@ -170,6 +172,55 @@ describe("fs tools", () => {
     const stale = await run(tools, "edit_file", { path: "s.txt", old_string: "c", new_string: "d" });
     expect(stale).toMatchObject({ isError: true, text: expect.stringContaining("modified since it was last read") });
     expect(await readFile(file, "utf8")).toBe("someone else's change\n");
+  });
+
+  test("a resumed session can change files it read or wrote before, unless they changed since", async () => {
+    const { cwd, home } = await workspace();
+    const checkpoints = new Checkpoints(path.join(home, "checkpoints"));
+    await writeFile(path.join(cwd, "r.txt"), "read\n");
+    const before = fsTools(cwd, { checkpoints });
+    await run(before, "write_file", { path: "w.txt", content: "mine\n" });
+    await run(before, "read_file", { path: "r.txt" });
+    await writeFile(path.join(cwd, "o.txt"), "other\n");
+
+    // 新进程：内存里的记录没了
+    const after = fsTools(cwd, { checkpoints });
+    expect((await run(after, "write_file", { path: "w.txt", content: "mine again\n" })).isError).toBe(false);
+    expect((await run(after, "edit_file", { path: "r.txt", old_string: "read", new_string: "edited" })).isError).toBe(false);
+    expect(await run(after, "edit_file", { path: "o.txt", old_string: "other", new_string: "x" })).toMatchObject({
+      isError: true,
+      text: expect.stringContaining("has not been read"),
+    });
+    await writeFile(path.join(cwd, "w.txt"), "the user's change\n");
+    expect(await run(fsTools(cwd, { checkpoints }), "write_file", { path: "w.txt", content: "z" })).toMatchObject({
+      isError: true,
+      text: expect.stringContaining("modified since"),
+    });
+  });
+
+  test("a read in the same response as the change does not count", async () => {
+    const { cwd } = await workspace();
+    await writeFile(path.join(cwd, "q.txt"), "a\n");
+    const responses = { calls: 1 };
+    const tools = fsTools(cwd, { responses });
+    await run(tools, "read_file", { path: "q.txt" });
+    expect(await run(tools, "write_file", { path: "q.txt", content: "b\n" })).toMatchObject({
+      isError: true,
+      text: expect.stringContaining("same response"),
+    });
+    responses.calls++;
+    // 下一次回复里又读了一遍：之前那次读取仍然有效
+    await run(tools, "read_file", { path: "q.txt" });
+    expect((await run(tools, "write_file", { path: "q.txt", content: "b\n" })).isError).toBe(false);
+    // 自己写的内容模型知道，同一次回复里接着改没问题
+    expect((await run(tools, "edit_file", { path: "q.txt", old_string: "b", new_string: "c" })).isError).toBe(false);
+  });
+
+  test("bash is left out when the shell cannot be found", () => {
+    const shell = shellTools({ cwd: os.tmpdir(), shell: "no-such-shell-for-jade" });
+    expect(shell.tools).toEqual([]);
+    expect(shell.unavailable).toContain("no-such-shell-for-jade was not found");
+    expect(() => shellTool({ cwd: os.tmpdir(), shell: "no-such-shell-for-jade" })).toThrow("was not found");
   });
 
   test("read_file returns images as image blocks and refuses other binary files", async () => {
@@ -407,6 +458,33 @@ describe("jade session", () => {
     expect(requests[0]!.tools.map((t) => t.name)).toContain("task");
   });
 
+  test("identical calls in one response run once; repeated failures get a note", async () => {
+    const { rt, requests } = await setup([
+      call(use("u1", "read_file", { path: "missing.txt" }), use("u2", "read_file", { path: "missing.txt" })),
+      call(use("u3", "read_file", { path: "missing.txt" })),
+      reply("gave up"),
+    ]);
+    await rt.send(msg("read it"));
+    const resultText = (b: Block) => (b.kind === "tool_result" ? b.content.map((c) => (c.kind === "text" ? c.text : "")).join("\n") : "");
+    const [first, dup] = requests[1]!.messages.at(-1)!.content.map(resultText);
+    expect(first).not.toContain("failed");
+    expect(dup).toContain("identical to an earlier call");
+    // 下一次回复里再发同一个调用会执行，第二次失败时提醒模型
+    expect(resultText(requests[2]!.messages.at(-1)!.content[0]!)).toContain("This exact call has now failed 2 times");
+  });
+
+  test("the session list keeps the first message as the title and the last use as the time", async () => {
+    const { home, cwd } = await workspace();
+    const index = new SessionIndex(path.join(home, "index.jsonl"));
+    await index.add({ id: "a", cwd, title: "draw a pelican", at: "1" });
+    await index.add({ id: "b", cwd, title: "other", at: "2" });
+    await index.add({ id: "a", cwd, title: "continue", at: "3" });
+    expect(await index.list(cwd)).toEqual([
+      { id: "a", cwd, title: "draw a pelican", at: "3" },
+      { id: "b", cwd, title: "other", at: "2" },
+    ]);
+  });
+
   test("invalid arguments are denied with a reason the model can read", async () => {
     const { rt, requests } = await setup([call(use("u1", "read_file", { file: "a" })), reply("ok")]);
     await rt.send(msg("read it"));
@@ -415,6 +493,22 @@ describe("jade session", () => {
     if (result.kind !== "tool_result") return;
     expect(result.isError).toBe(true);
     expect((result.content[0] as { text: string }).text).toContain("input.path is required");
+  });
+
+  test("the system prompt names the shell, or says there is none", async () => {
+    const { cwd, home } = await workspace();
+    const system = async (shell: string | null) => {
+      const hook = (await prompts({ cwd, home, shell })).hooks![0]!;
+      if (hook.kind !== "transform" || !("fn" in hook)) throw new Error("expected a local transform");
+      const req = (await hook.fn({ system: [], messages: [], tools: [] } as never, {} as never)) as ModelRequest;
+      return req.system.map((s) => s.text).join("\n");
+    };
+    const withShell = await system("/usr/bin/bash");
+    expect(withShell).toContain("Shell for the bash tool: /usr/bin/bash");
+    expect(withShell).toContain("with bash when that is feasible");
+    const without = await system(null);
+    expect(without).toContain("There is no shell in this session");
+    expect(without).not.toContain("with bash");
   });
 
   test("project instructions are untrusted and carry their source", async () => {

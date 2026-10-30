@@ -7,6 +7,7 @@ import { budget } from "./plugins/budget.ts";
 import { compactor, type Compactor } from "./plugins/compact.ts";
 import { policy, type Mode, type Policy } from "./plugins/policy.ts";
 import { prompts } from "./plugins/prompts.ts";
+import { repeats } from "./plugins/repeats.ts";
 import { fsTools } from "./tools/fs.ts";
 import { Checkpoints } from "./tools/checkpoint.ts";
 import { shellTools } from "./tools/shell.ts";
@@ -38,6 +39,8 @@ export interface Jade {
   checkpoints: Checkpoints;
   /** 宿主退出时调用：杀掉后台 shell */
   shutdown(): void;
+  /** 启动时要告诉用户的问题，例如找不到 shell */
+  warnings: string[];
 }
 
 export async function createJade(opts: JadeOptions): Promise<Jade> {
@@ -46,12 +49,24 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
   const subagentPlugins = await subagent(opts);
   const checkpoints = new Checkpoints(path.join(opts.home, "checkpoints"));
   const shell = shellTools({ cwd });
+  // 文件工具据此判断读取和修改是不是同一次回复里发出的
+  const responses = { calls: 0 };
   const tools: Plugin = {
     id: "jade/tools",
     version: "0.2.0",
     kernel: "^0.1",
+    needs: ["transform:model.before"],
+    hooks: [
+      {
+        kind: "transform",
+        point: "model.before",
+        fn: () => {
+          responses.calls++;
+        },
+      },
+    ],
     tools: [
-      ...fsTools(cwd, { checkpoints }),
+      ...fsTools(cwd, { checkpoints, responses }),
       ...shell.tools,
       todoTool(),
       taskTool({ store, provider, plugins: subagentPlugins }),
@@ -63,13 +78,15 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
   const compact = compactor({ provider, thresholdTokens: opts.compactTokens });
   const plugins = [
     tools,
-    await prompts({ cwd, home: opts.home, today: opts.today }),
+    await prompts({ cwd, home: opts.home, today: opts.today, shell: shell.executable ?? null }),
     pol.plugin,
     compact.plugin,
     budget({ maxSteps: opts.maxSteps }),
+    repeats({ responses }),
     ...extra,
   ];
-  return { plugins, policy: pol, compact, checkpoints, shutdown: shell.shutdown };
+  const warnings = shell.unavailable ? [shell.unavailable] : [];
+  return { plugins, policy: pol, compact, checkpoints, shutdown: shell.shutdown, warnings };
 }
 
 /** 子 Agent 的插件：只读工具、子 Agent 提示词、只读策略、步数上限。每次调用返回新实例 */

@@ -23,7 +23,7 @@ export class SessionIndex {
     await appendFile(this.file, JSON.stringify(entry) + "\n");
   }
 
-  /** 最近使用的在前；同一个会话多次记录时取最后一次 */
+  /** 最近使用的在前；同一个会话多次记录时取最后一次的时间、第一次的标题（之后的消息常常只是"继续"） */
   async list(cwd?: string): Promise<SessionEntry[]> {
     let text: string;
     try {
@@ -36,8 +36,9 @@ export class SessionIndex {
       if (!line.trim()) continue;
       try {
         const e = JSON.parse(line) as SessionEntry;
+        const first = latest.get(e.id);
         latest.delete(e.id);
-        latest.set(e.id, e);
+        latest.set(e.id, first ? { ...e, title: first.title } : e);
       } catch {
         // 末尾未写完的一行
       }

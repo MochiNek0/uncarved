@@ -4,7 +4,8 @@
 // 再由关卡判断是否在工作目录内；工具本身不做权限判断。
 //
 // 修改已有文件之前必须先读过它，且读过之后文件没有被别人（用户、bash 命令）改过，
-// 否则模型是按过时的内容在改，会覆盖掉别人的修改。
+// 否则模型是按过时的内容在改，会覆盖掉别人的修改。和修改在同一次回复里发出的读取不算：
+// 那次修改的内容是模型看到读取结果之前就写好的。
 
 import type { Stats } from "node:fs";
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
@@ -43,28 +44,47 @@ export function display(cwd: string, full: string): string {
 }
 
 export interface FsOptions {
-  /** 给了就在每次写入前保存原内容，供撤销 */
+  /** 给了就在每次写入前保存原内容，供撤销；也用它记下读过的文件，恢复会话后不用重新读 */
   checkpoints?: Checkpoints;
+  /** 模型调用的次数，每次调用模型前加一（见 distro 的 model.before hook）。不给就不检查同一次回复里的先读后改 */
+  responses?: { readonly calls: number };
 }
 
-/** 读过或写过的文件当时的样子；只在本进程内有效，恢复会话后要重新读 */
+/** 读过或写过的文件当时的样子；只在本进程内有效，恢复的会话靠 checkpoints 里记的 sha256 */
 interface Seen {
   mtimeMs: number;
   size: number;
+  /** 读取时的 responses.calls；写入的文件模型知道内容，记为 -1 */
+  call: number;
 }
 
 export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
   const at = (p: unknown) => resolveIn(cwd, p as string);
   const seen = new Map<string, Seen>();
-  const remember = (full: string, info: Stats) => seen.set(full, { mtimeMs: info.mtimeMs, size: info.size });
-  /** 不能修改已有文件的原因；可以修改时返回 undefined */
-  const staleness = (full: string, info: Stats): string | undefined => {
+  /** 文件没变时保留更早的 call：之前的回复里读过，这次回复里又读一遍，不影响修改 */
+  const remember = async (ctx: { sessionId: string }, full: string, info: Stats, text: string, call: number) => {
     const s = seen.get(full);
+    const same = s !== undefined && s.mtimeMs === info.mtimeMs && s.size === info.size;
+    seen.set(full, { mtimeMs: info.mtimeMs, size: info.size, call: same ? Math.min(s.call, call) : call });
+    await opts.checkpoints?.markSeen(ctx.sessionId, full, sha256(text));
+  };
+  /** 不能修改已有文件的原因；可以修改时返回 undefined。text 是文件现在的内容 */
+  const staleness = async (ctx: { sessionId: string }, full: string, info: Stats, text: string): Promise<string | undefined> => {
     const shown = display(cwd, full);
-    if (!s) return `${shown} exists but has not been read in this session. Read it with read_file before changing it.`;
-    if (s.mtimeMs !== info.mtimeMs || s.size !== info.size) {
-      return `${shown} has been modified since it was last read (by the user or a command). Read it again before changing it.`;
+    const modified = `${shown} has been modified since it was last read (by the user or a command). Read it again before changing it.`;
+    const s = seen.get(full);
+    if (s) {
+      if (s.mtimeMs !== info.mtimeMs || s.size !== info.size) return modified;
+      if (opts.responses && s.call === opts.responses.calls) {
+        return `${shown} was read in the same response as this change, so the change was written before its content was seen. Check the read_file result, then make the change in your next response.`;
+      }
+      return undefined;
     }
+    // 恢复的会话：之前的进程里读过或写过
+    const hash = await opts.checkpoints?.seenHash(ctx.sessionId, full);
+    if (hash === undefined) return `${shown} exists but has not been read in this session. Read it with read_file before changing it.`;
+    if (hash !== sha256(text)) return modified;
+    seen.set(full, { mtimeMs: info.mtimeMs, size: info.size, call: -1 });
     return undefined;
   };
   const checkpoint = async (ctx: { sessionId: string; toolUseId: string }, tool: string, full: string, before: string | null, after: string) => {
@@ -85,7 +105,7 @@ export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
     effect: "read",
     concurrency: "safe",
     idempotent: true,
-    async execute(input) {
+    async execute(input, ctx) {
       const { path: p, offset = 1, limit = MAX_LINES } = input as { path: string; offset?: number; limit?: number };
       if (limit < 1) return { content: "limit must be at least 1", isError: true };
       const full = at(p);
@@ -106,8 +126,8 @@ export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
       if (buf.subarray(0, 8000).includes(0)) {
         return { content: `${display(cwd, full)} is a binary file (${buf.length} bytes) and cannot be shown as text`, isError: true };
       }
-      remember(full, info);
       const text = buf.toString("utf8");
+      await remember(ctx, full, info, text, opts.responses?.calls ?? -1);
       if (text.length === 0) return { content: "(empty file)" };
       const lines = text.split(/\r?\n/);
       if (lines.at(-1) === "") lines.pop();
@@ -144,11 +164,11 @@ export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
       if (info?.isDirectory()) return { content: `${display(cwd, full)} is a directory`, isError: true };
       // 同样内容重复写入（崩溃后重跑）不算覆盖别人的修改
       const before = info ? await readFile(full, "utf8") : null;
-      const problem = info && before !== content ? staleness(full, info) : undefined;
+      const problem = info && before !== null && before !== content ? await staleness(ctx, full, info, before) : undefined;
       if (problem) return { content: problem, isError: true };
       await mkdir(path.dirname(full), { recursive: true });
       await writeFile(full, content);
-      remember(full, await stat(full));
+      await remember(ctx, full, await stat(full), content, -1);
       if (before !== content) await checkpoint(ctx, "write_file", full, before, content);
       // 和 read_file 一样数行：末尾的换行不算多出一行
       const lines = content === "" ? 0 : content.split(/\r?\n/).length - (/\r?\n$/.test(content) ? 1 : 0);
@@ -186,9 +206,9 @@ export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
       if (!info) {
         return { content: seen.has(full) ? `${display(cwd, full)} no longer exists` : `${display(cwd, full)} does not exist; use write_file to create it`, isError: true };
       }
-      const problem = staleness(full, info);
-      if (problem) return { content: problem, isError: true };
       const text = await readFile(full, "utf8");
+      const problem = await staleness(ctx, full, info, text);
+      if (problem) return { content: problem, isError: true };
       // 文件是 CRLF 时，模型给的 LF 文本也能匹配
       const crlf = text.includes("\r\n") && !old_string.includes("\r\n");
       const from = crlf ? old_string.replaceAll("\n", "\r\n") : old_string;
@@ -201,7 +221,7 @@ export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
       // 用函数作替换值，new_string 里的 $& $1 等不会被当成替换模式
       const next = replace_all ? text.replaceAll(from, () => to) : text.replace(from, () => to);
       await writeFile(full, next);
-      remember(full, await stat(full));
+      await remember(ctx, full, await stat(full), next, -1);
       await checkpoint(ctx, "edit_file", full, text, next);
       return { content: `Edited ${display(cwd, full)} (${replace_all ? count : 1} replacement${count > 1 && replace_all ? "s" : ""})` };
     },
