@@ -1,5 +1,5 @@
 // 宿主的输出与交互接口。两种实现：
-// - 终端界面（tui.tsx）：输出在上方滚动，输入框、状态栏固定在底部，运行中也能输入
+// - 终端界面（tui.tsx）：全屏，标题在顶部，对话在中间自己滚动，输入框、状态栏固定在底部，运行中也能输入
 // - 纯文本（这里）：-p 和非交互运行时使用，逐行输出，提问用 readline
 
 import { createInterface, type Interface } from "node:readline/promises";
@@ -16,6 +16,7 @@ export interface StatusInfo {
   branch?: string;
   model: string;
   mode: string;
+  session?: string;
   /** 上一次请求的上下文用量，limit 是压缩阈值 */
   context?: { used: number; limit: number };
 }
@@ -44,6 +45,8 @@ export interface Screen {
   select<T>(title: string, choices: Choice<T>[], opts?: { body?: string }): Promise<T | undefined>;
   /** 让用户输入一行；取消时返回 undefined */
   input(title: string, opts?: { initial?: string; mask?: boolean; placeholder?: string }): Promise<string | undefined>;
+  /** 清空已经显示的对话（开始新会话时） */
+  clear(): void;
   close(): Promise<void>;
 }
 
@@ -115,6 +118,7 @@ export function plainScreen(opts: { interactive: boolean }): Screen {
       if (!opts.interactive) return undefined;
       return (await ask(`${title}${o?.initial ? ` [${o.initial}]` : ""}: `)) || o?.initial || "";
     },
+    clear: () => {},
     async close() {
       rl?.close();
     },

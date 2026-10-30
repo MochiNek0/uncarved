@@ -54,6 +54,7 @@ const COMMANDS: CommandInfo[] = [
   { name: "help", about: "list the commands and keys" },
   { name: "model", args: "[name]", about: "switch the model, or configure the provider, API key and output limit" },
   { name: "mode", args: `[${MODES.join("|")}]`, about: "show or change the permission mode" },
+  { name: "clear", about: "start a new session (the current one stays resumable)" },
   { name: "compact", about: "compact the history before the next request" },
   { name: "undo", about: "restore the file changed by the agent's most recent write_file/edit_file" },
   { name: "retry", about: "request the model again after a failed request, without sending another message" },
@@ -67,7 +68,10 @@ const COMMANDS: CommandInfo[] = [
 const INSTANT = new Set(["help", "model", "usage", "sessions", "rules", "hooks", "exit", "quit"]);
 
 const KEYS = `Keys: enter send · \\ or alt+enter new line · ↑↓ history · esc interrupt · ctrl+c twice to exit
+      mouse wheel or PgUp/PgDn scroll the conversation · ctrl+home/ctrl+end jump to the top/bottom · shift+drag selects text
 While jade is working you can keep typing: messages are queued and sent when the current turn ends.`;
+
+const VERSION: string = (await Bun.file(new URL("../package.json", import.meta.url)).json()).version;
 
 /** 回复被输出上限截断后，自动让模型接着做的次数（每条用户消息） */
 const MAX_CONTINUES = 3;
@@ -163,6 +167,7 @@ const early: string[] = [];
 const screen: Screen = tui
   ? tuiScreen({
       status: { cwd: shortPath(cwd), branch: await gitBranch(cwd), model: modelLabel(), mode: opts.mode ?? "ask" },
+      version: VERSION,
       commands: COMMANDS,
       handlers: {
         submit: (text) => (ready ? onSubmit(text) : void early.push(text)),
@@ -203,15 +208,11 @@ const store = new JsonlLogStore(path.join(home, "sessions"));
 const trust = new JsonlTrustStore(path.join(home, "trust.jsonl"));
 const index = new SessionIndex(path.join(home, "index.jsonl"));
 
-const jade = await createJade({
-  cwd,
-  home,
-  store,
-  provider,
-  mode: opts.mode,
-  projectPlugins: await projectPlugins(),
-  compactTokens,
-});
+const extraPlugins = await projectPlugins();
+/** 每个会话用一套新的插件实例：插件里有按会话记的状态（例如压缩、重复调用的计数） */
+const makeJade = (mode?: Mode) => createJade({ cwd, home, store, provider, mode, projectPlugins: extraPlugins, compactTokens });
+
+let jade = await makeJade(opts.mode);
 for (const w of jade.warnings) screen.log(yellow(`[warning] ${w}`));
 
 /** .jade/plugins/<name>/index.ts：项目层插件，首次加载（及内容变化后）要用户确认（7.1） */
@@ -257,10 +258,11 @@ if (opts.cont) {
   }
 }
 
-const rt = resumeId
+// /clear 换成新的运行时和会话
+let rt = resumeId
   ? await Runtime.resume({ store, provider, plugins: jade.plugins, sessionId: resumeId })
   : await Runtime.create({ store, provider, plugins: jade.plugins });
-const sessionId = rt.state.sessionId;
+let sessionId = rt.state.sessionId;
 
 // 权限设置记在日志里（derived），关卡从那里读，恢复会话后仍然有效
 const settings = () => jade.policy.settings(rt.state.derived);
@@ -319,7 +321,9 @@ function summarize(name: string, input: unknown): string {
   return where || clip(JSON.stringify(input), 120);
 }
 
-rt.subscribe((n) => {
+rt.subscribe(onNotice);
+
+function onNotice(n: Parameters<Parameters<Runtime["subscribe"]>[0]>[0]) {
   switch (n.type) {
     case "delta":
       if (n.delta.kind === "reset") {
@@ -353,7 +357,7 @@ rt.subscribe((n) => {
     case "event":
       return renderEvent(n.event);
   }
-});
+}
 
 function renderProgress(toolUseId: string, p: ShellProgress | TaskProgress) {
   if (p.kind === "task-start") return screen.log(dim(`  ↳ sub-agent: ${p.description}`));
@@ -516,7 +520,12 @@ async function leave() {
   } catch (err) {
     screen.log(red(`[error] ${errorText(err)}`));
   }
-  screen.log(dim(`Resume with: jade --resume ${sessionId}`));
+}
+
+/** 关掉界面后再提示怎么恢复：终端界面退出备用屏幕后，里面的内容就看不到了 */
+async function closeScreen() {
+  await screen.close();
+  if (rt.state.messages.length > 0) console.log(dim(`Resume with: jade --resume ${sessionId}`));
 }
 
 let quitting = false;
@@ -527,8 +536,28 @@ async function quit(code = 0) {
   // 中断后等这一轮收尾，再写 session.detached
   while (running) await new Promise((r) => setTimeout(r, 20));
   await leave();
-  await screen.close();
+  await closeScreen();
   process.exit(code);
+}
+
+/** /clear：离开当前会话（保持可恢复），换一套新的插件和运行时开始新会话，权限模式沿用 */
+async function newSession() {
+  const mode = settings().mode;
+  await leave();
+  jade = await makeJade(mode);
+  rt = await Runtime.create({ store, provider, plugins: jade.plugins });
+  rt.subscribe(onNotice);
+  const old = sessionId;
+  sessionId = rt.state.sessionId;
+  for (const k of Object.keys(usage) as (keyof Usage)[]) usage[k] = 0;
+  toolNames.clear();
+  quiet.clear();
+  progressLines.clear();
+  notes.length = 0;
+  lastEnd = undefined;
+  screen.clear();
+  screen.status({ session: sessionId, mode, context: undefined });
+  screen.log(dim(`Started a new session. The previous one can be resumed with: jade --resume ${old}`));
 }
 process.on("SIGINT", () => (running ? interrupt() : void quit(130)));
 
@@ -813,6 +842,9 @@ async function command(input: string): Promise<boolean> {
     case "retry":
       await retry();
       break;
+    case "clear":
+      await newSession();
+      break;
     case "compact":
       jade.compact.request();
       screen.log(dim("History will be compacted before the next request."));
@@ -899,12 +931,9 @@ async function pump() {
 // ---------- 开始 ----------
 
 if (resumeId) await resumeSession();
-else if (tui) {
-  screen.log(`${bold(cyan("jade"))} ${dim(`· session ${sessionId}`)}`);
-  screen.log(dim("Type / for commands, /model to configure the model, esc to interrupt."));
-}
+else if (tui) screen.log(dim("Type / for commands, /model to configure the model, esc to interrupt."));
 else screen.log(dim(`jade · ${shortPath(cwd)} · ${modelLabel()} · mode ${settings().mode} · session ${sessionId}`));
-screen.status({ mode: settings().mode });
+screen.status({ mode: settings().mode, session: sessionId });
 
 const first = opts.print ?? (opts.prompt.length > 0 ? opts.prompt.join(" ") : undefined);
 if (tui) {
@@ -918,5 +947,5 @@ if (tui) {
     running = false;
   }
   await leave();
-  await screen.close();
+  await closeScreen();
 }

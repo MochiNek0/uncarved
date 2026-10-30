@@ -1,9 +1,11 @@
-// 终端界面（Ink）：已完成的输出进 <Static> 往上滚，底部固定显示进行中的流式输出、运行状态、
-// 排队的消息、输入框（或对话框）和状态栏。运行中也能输入：提交的内容由宿主决定立即执行还是排队。
+// 终端界面（Ink）：全屏（备用屏幕缓冲区）分三块——顶部标题（版本、模型、目录），中间是对话，
+// 自己滚动（滚轮、PgUp/PgDn），底部固定显示运行状态、排队的消息、输入框（或对话框）和状态栏。
+// 运行中也能输入：提交的内容由宿主决定立即执行还是排队。
 
-import { Box, render, Static, Text, useBoxMetrics, useCursor, useInput, usePaste, useWindowSize, type DOMElement, type Key } from "ink";
+import { writeSync } from "node:fs";
+import { Box, render, Text, useBoxMetrics, useCursor, useInput, usePaste, useWindowSize, type DOMElement, type Key } from "ink";
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
-import stringWidth from "string-width";
+import wrapAnsi from "wrap-ansi";
 import { edit, empty, layout, type EditState } from "./editor.ts";
 import { dim, type Choice, type CommandInfo, type Screen, type StatusInfo } from "./screen.ts";
 
@@ -21,28 +23,36 @@ type Dialog =
   | { kind: "input"; title: string; initial?: string; mask?: boolean; placeholder?: string; resolve(v: string | undefined): void };
 
 interface UiState {
-  entries: Array<{ id: number; text: string }>;
-  /** entries 至少占了多少行（按字符折行估算，不会多估），用来让底部区域贴住终端底边 */
-  staticLines: number;
+  /** 对话内容变化时递增，让界面重画 */
+  version: number;
   live?: { kind: "text" | "thinking"; text: string };
+  /** 对话区离底部滚上去了多少行；0 表示跟着最新的输出 */
+  scroll: number;
   busy?: { label: string; since: number };
   queued: string[];
   dialogs: Dialog[];
   status: StatusInfo;
 }
 
+/** 对话最多保留这么多行（折行前），超出时丢掉最早的一段 */
+const MAX_LINES = 10_000;
+
+/** 按显示宽度折行，保留颜色；每一项是屏幕上的一行 */
+const wrap = (text: string, width: number) => wrapAnsi(text, width, { hard: true, trim: false }).split("\n");
+
 /** 状态容器：频繁的流式更新合并到一帧再通知界面 */
 class Store {
   state: UiState;
   #listeners = new Set<() => void>();
   #timer: ReturnType<typeof setTimeout> | undefined;
-  #nextId = 0;
+  /** 已经完成的输出，一项一行（折行前） */
+  #lines: string[] = [];
+  /** 按 #width 折好的行 */
+  #wrapped: string[] = [];
+  #width = 0;
 
-  readonly #columns: () => number;
-
-  constructor(status: StatusInfo, columns: () => number) {
-    this.state = { entries: [], staticLines: 0, queued: [], dialogs: [], status };
-    this.#columns = columns;
+  constructor(status: StatusInfo) {
+    this.state = { version: 0, scroll: 0, queued: [], dialogs: [], status };
   }
 
   subscribe = (fn: () => void) => {
@@ -65,28 +75,62 @@ class Store {
 
   append(texts: string[]) {
     if (texts.length === 0) return;
-    // 空行在 Ink 里没有高度，用一个空格占位
-    const added = texts.map((text) => ({ id: this.#nextId++, text: text === "" ? " " : text }));
-    // Ink 按词折行，行数只会比按字符折行多
-    const width = Math.max(1, this.#columns());
-    const lines = texts.reduce((n, t) => n + t.split("\n").reduce((m, l) => m + Math.max(1, Math.ceil(stringWidth(l) / width)), 0), 0);
-    this.update({ entries: [...this.state.entries, ...added], staticLines: this.state.staticLines + lines });
+    const lines = texts.flatMap((t) => t.split("\n"));
+    this.#lines.push(...lines);
+    if (this.#lines.length > MAX_LINES) {
+      this.#lines = this.#lines.slice(-MAX_LINES * 0.8);
+      this.#width = 0;
+    }
+    let added = 0;
+    if (this.#width) {
+      const wrapped = lines.flatMap((l) => wrap(l, this.#width));
+      this.#wrapped.push(...wrapped);
+      added = wrapped.length;
+    }
+    // 往上翻看时新内容不能把正在看的地方顶走
+    const scroll = this.state.scroll > 0 ? this.state.scroll + added : 0;
+    this.update({ version: this.state.version + 1, scroll });
+  }
+
+  /** 按给定宽度折好的全部输出；宽度变了（终端缩放）才重新折行 */
+  lines(width: number): string[] {
+    if (width !== this.#width) {
+      this.#width = width;
+      this.#wrapped = this.#lines.flatMap((l) => wrap(l, width));
+    }
+    return this.#wrapped;
+  }
+
+  clear() {
+    this.#lines = [];
+    this.#wrapped = [];
+    this.update({ version: this.state.version + 1, live: undefined, scroll: 0 }, true);
+  }
+
+  /** 往上（正数）或往下滚 n 行，不超过 max */
+  scrollBy(n: number, max: number) {
+    const scroll = Math.max(0, Math.min(max, this.state.scroll + n));
+    if (scroll !== this.state.scroll) this.update({ scroll }, true);
   }
 }
 
 export interface TuiOptions {
   status: StatusInfo;
+  /** 标题里显示的版本号 */
+  version: string;
   commands: CommandInfo[];
   handlers: TuiHandlers;
   /** 测试时替换终端 */
   io?: { stdin: NodeJS.ReadStream; stdout: NodeJS.WriteStream };
 }
 
+/** 开关鼠标事件上报（SGR 格式），只用来接收滚轮；开着时终端里选中文字要按住 Shift */
+const MOUSE_ON = "\x1b[?1000h\x1b[?1006h";
+const MOUSE_OFF = "\x1b[?1006l\x1b[?1000l";
+
 export function tuiScreen(opts: TuiOptions): Screen {
   const stdout = opts.io?.stdout ?? process.stdout;
-  const store = new Store(opts.status, () => stdout.columns ?? 80);
-  // 先把光标移到终端最底下一行，输入框从底部开始，之后的输出从它上面往上滚；原来屏幕上的内容进入回滚区
-  stdout.write("\n".repeat(Math.max(0, (stdout.rows ?? 24) - 1)));
+  const store = new Store(opts.status);
 
   const styled = (kind: "text" | "thinking", lines: string[]) => (kind === "thinking" ? lines.map((l) => (l ? dim(l) : l)) : lines);
 
@@ -110,10 +154,24 @@ export function tuiScreen(opts: TuiOptions): Screen {
       store.update({ dialogs: [...store.state.dialogs, d] }, true);
     });
 
-  const instance = render(<App store={store} commands={opts.commands} handlers={opts.handlers} />, {
+  // 切到备用屏幕后光标还停在原来的位置（不少终端不会自动归位），Ink 从那里往下画第一帧会让屏幕滚动，
+  // 之后每帧只重写变化的行，整个界面就错位了。所以先自己切过去、清屏、把光标移到左上角
+  stdout.write("\x1b[?1049h\x1b[2J\x1b[H");
+  const instance = render(<App store={store} version={opts.version} commands={opts.commands} handlers={opts.handlers} />, {
     exitOnCtrlC: false,
+    alternateScreen: true,
+    // 全屏每帧只重写变化的行
+    incrementalRendering: true,
     ...(opts.io ? { ...opts.io, interactive: true, patchConsole: false } : {}),
   });
+  stdout.write(MOUSE_ON);
+  // 没走 close 就退出（process.exit）时也要把终端还原，否则会留在备用屏幕、鼠标上报也开着
+  const restore = () => {
+    try {
+      writeSync(1, `${MOUSE_OFF}\x1b[?1049l\x1b[?25h`);
+    } catch {}
+  };
+  if (!opts.io) process.on("exit", restore);
 
   return {
     interactive: true,
@@ -154,40 +212,83 @@ export function tuiScreen(opts: TuiOptions): Screen {
     select: <T,>(title: string, choices: Choice<T>[], o?: { body?: string }) =>
       ask<T | undefined>({ kind: "select", title, body: o?.body, choices: choices as Choice<unknown>[], resolve: () => {} }),
     input: (title, o) => ask<string | undefined>({ kind: "input", title, ...o, resolve: () => {} }),
+    clear() {
+      store.clear();
+    },
     async close() {
       flushLive(true);
       store.update({ live: undefined, busy: undefined }, true);
-      // 等最后一帧画完再卸载
+      // 等最后一帧画完再卸载；卸载时 Ink 退出备用屏幕
       await new Promise((r) => setTimeout(r, 50));
+      stdout.write(MOUSE_OFF);
       instance.unmount();
       await instance.waitUntilExit();
+      process.off("exit", restore);
     },
   };
 }
 
 // ---------- 组件 ----------
 
-function App({ store, commands, handlers }: { store: Store; commands: CommandInfo[]; handlers: TuiHandlers }) {
+/** SGR 鼠标事件（Ink 去掉了开头的 ESC）；按钮号去掉 Shift/Alt/Ctrl 位后 64 是滚轮向上，65 向下 */
+const MOUSE = /^\[<(\d+);\d+;\d+[Mm]$/;
+const WHEEL_LINES = 3;
+
+function App({ store, version, commands, handlers }: { store: Store; version: string; commands: CommandInfo[]; handlers: TuiHandlers }) {
   const state = useSyncExternalStore(store.subscribe, store.get);
   const dialog = state.dialogs[0];
-  const { rows } = useWindowSize();
+  const { columns, rows } = useWindowSize();
 
-  // 让底部区域一直贴着终端底边：它变矮时（菜单、对话框关闭）上一帧的高度保留下来，空白垫在上面，
-  // 否则 Ink 擦掉旧内容后输入框会往上浮。新输出写进上方时，垫的空白相应减少，被新内容顶替。
-  // 高度不能达到终端行数，否则 Ink 每帧都清屏重画。
+  // 对话区占掉标题和底部之外的全部高度，只画能看见的那几行
   const ref = useRef<DOMElement>(null);
   const { height } = useBoxMetrics(ref);
-  const seen = useRef(state.staticLines);
-  const reserve = Math.max(0, Math.min(height - (state.staticLines - seen.current), rows - 2));
-  useEffect(() => {
-    seen.current = state.staticLines;
+  const width = Math.max(10, columns - 2);
+  const done = store.lines(width);
+  const live = state.live?.text ? wrap(state.live.kind === "thinking" ? dim(state.live.text) : state.live.text, width) : [];
+  const total = done.length + live.length;
+  // 往上翻看时最后一行用来提示
+  const scrolled = state.scroll > 0 && total > height;
+  const view = Math.max(0, scrolled ? height - 1 : height);
+  const max = Math.max(0, total - view);
+  const scroll = Math.min(state.scroll, max);
+  const end = total - scroll;
+  const start = Math.max(0, end - view);
+  const shown = [...done.slice(start, Math.min(end, done.length)), ...live.slice(Math.max(0, start - done.length), Math.max(0, end - done.length))];
+  const page = Math.max(1, view - 2);
+
+  useInput((input, key) => {
+    const mouse = MOUSE.exec(input);
+    if (mouse) {
+      const button = Number(mouse[1]) & ~0b11100;
+      if (button === 64) store.scrollBy(WHEEL_LINES, max);
+      else if (button === 65) store.scrollBy(-WHEEL_LINES, max);
+      return;
+    }
+    // 选择框自己用 PgUp/PgDn 翻选项
+    if (dialog?.kind === "select") return;
+    if (key.pageUp) store.scrollBy(page, max);
+    else if (key.pageDown) store.scrollBy(-page, max);
+    else if (key.ctrl && key.home) store.scrollBy(max, max);
+    else if (key.ctrl && key.end) store.scrollBy(-max, max);
   });
 
+  // 总高度要比终端少一行，否则 Ink 认为输出占满了屏幕，每帧清屏重画
   return (
-    <>
-      <Static items={state.entries}>{(e) => <Text key={e.id}>{e.text}</Text>}</Static>
-      <Box ref={ref} flexDirection="column" justifyContent="flex-end" minHeight={reserve}>
-        {state.live?.text ? <Text dimColor={state.live.kind === "thinking"}>{state.live.text}</Text> : null}
+    <Box flexDirection="column" width={columns} height={Math.max(1, rows - 1)} overflow="hidden">
+      <Header status={state.status} version={version} />
+      <Box ref={ref} flexDirection="column" flexGrow={1} flexShrink={1} flexBasis={0} overflow="hidden" paddingX={1}>
+        {shown.map((l, i) => (
+          <Text key={i} wrap="truncate-end">
+            {l || " "}
+          </Text>
+        ))}
+        {scrolled ? (
+          <Text dimColor wrap="truncate-end">
+            {`── ↓ ${scroll} more lines · wheel / PgDn to scroll · ctrl+end to jump to the bottom ──`}
+          </Text>
+        ) : null}
+      </Box>
+      <Box flexDirection="column" flexShrink={0}>
         {state.busy && !dialog ? <Spinner label={state.busy.label} since={state.busy.since} /> : null}
         {state.queued.map((q, i) => (
           <Text key={i} dimColor wrap="truncate-end">
@@ -202,10 +303,30 @@ function App({ store, commands, handlers }: { store: Store; commands: CommandInf
             <InputDialog key={dialogKey(dialog)} dialog={dialog} />
           )
         ) : null}
-        <Prompt commands={commands} handlers={handlers} busy={Boolean(state.busy)} active={!dialog} />
+        <Prompt commands={commands} handlers={handlers} busy={Boolean(state.busy)} active={!dialog} onSubmit={() => store.scrollBy(-max, max)} />
         <StatusBar status={state.status} />
       </Box>
-    </>
+    </Box>
+  );
+}
+
+function Header({ status, version }: { status: StatusInfo; version: string }) {
+  return (
+    <Box flexDirection="column" flexShrink={0} borderStyle="round" borderColor="cyan" paddingX={1}>
+      <Text wrap="truncate-end">
+        <Text color="cyan" bold>
+          ◆ jade
+        </Text>
+        <Text dimColor> v{version}</Text>
+        {status.session ? <Text dimColor>{`  ·  session ${status.session}`}</Text> : null}
+      </Text>
+      <Text wrap="truncate-end">
+        <Text color="cyan">{status.model}</Text>
+        <Text dimColor> · </Text>
+        <Text>{status.cwd}</Text>
+        {status.branch ? <Text color="magenta"> ({status.branch})</Text> : null}
+      </Text>
+    </Box>
   );
 }
 
@@ -243,11 +364,6 @@ function StatusBar({ status }: { status: StatusInfo }) {
   return (
     <Box paddingX={1}>
       <Text wrap="truncate-end">
-        <Text dimColor>{status.cwd}</Text>
-        {status.branch ? <Text color="magenta"> ({status.branch})</Text> : null}
-        <Text dimColor> · </Text>
-        <Text color="cyan">{status.model}</Text>
-        <Text dimColor> · </Text>
         <Text color={modeColor}>{status.mode}</Text>
         <Text dimColor> · </Text>
         {ctx ? (
@@ -257,6 +373,7 @@ function StatusBar({ status }: { status: StatusInfo }) {
         ) : (
           <Text dimColor>ctx —</Text>
         )}
+        <Text dimColor> · PgUp/PgDn scroll · shift+drag to select</Text>
       </Text>
     </Box>
   );
@@ -276,6 +393,8 @@ function editKey(s: EditState, input: string, key: Key): EditState | undefined {
   if (key.ctrl && input === "u") return edit.killBefore(s);
   if (key.ctrl && input === "k") return edit.killAfter(s);
   if (key.ctrl || key.meta || key.escape || key.return || key.tab || key.upArrow || key.downArrow || key.pageUp || key.pageDown) return undefined;
+  // 鼠标事件由 App 处理
+  if (MOUSE.test(input)) return undefined;
   // 其余是普通输入；快速输入时一次可能有多个字符
   const text = input.replace(/\r\n?/g, "\n").replace(/[\x00-\x09\x0b-\x1f\x7f]/g, "");
   return text ? edit.insert(s, text) : undefined;
@@ -335,7 +454,14 @@ function origin(node: DOMElement): { x: number; y: number } {
   return { x, y };
 }
 
-function Prompt({ commands, handlers, busy, active }: { commands: CommandInfo[]; handlers: TuiHandlers; busy: boolean; active: boolean }) {
+function Prompt({ commands, handlers, busy, active, onSubmit }: {
+  commands: CommandInfo[];
+  handlers: TuiHandlers;
+  busy: boolean;
+  active: boolean;
+  /** 提交后对话区回到底部 */
+  onSubmit(): void;
+}) {
   const [state, setState] = useState<EditState>(empty);
   const [selected, setSelected] = useState(0);
   const [notice, setNotice] = useState<string>();
@@ -362,6 +488,7 @@ function Prompt({ commands, handlers, busy, active }: { commands: CommandInfo[];
     history.current = [...history.current.filter((h) => h !== text), text].slice(-100);
     browsing.current = -1;
     set(empty);
+    onSubmit();
     handlers.submit(text);
   };
   const recall = (i: number) => {
@@ -462,7 +589,7 @@ function SelectDialog({ dialog }: { dialog: Extract<Dialog, { kind: "select" }> 
   const { rows } = useWindowSize();
   // 预览（例如要写入的文件）过长时截断：整个界面高过终端时 Ink 会每帧清屏重画
   const lines = dialog.body?.split("\n") ?? [];
-  const room = Math.max(3, rows - Math.min(n, VISIBLE) - 12);
+  const room = Math.max(3, rows - Math.min(n, VISIBLE) - 16);
   const body = lines.length > room ? [...lines.slice(0, room), dim(`… ${lines.length - room} more lines`)].join("\n") : dialog.body;
   useInput((input, key) => {
     if (key.upArrow || input === "k") return setSelected((selected - 1 + n) % n);

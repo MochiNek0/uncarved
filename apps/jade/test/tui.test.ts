@@ -92,7 +92,8 @@ describe("terminal UI", () => {
       exit: () => void calls.exit++,
     };
     screen = tuiScreen({
-      status: { cwd: "~/proj", branch: "main", model: "test-model", mode: "ask" },
+      status: { cwd: "~/proj", branch: "main", model: "test-model", mode: "ask", session: "s-123" },
+      version: "9.9.9",
       commands: [
         { name: "help", about: "list the commands" },
         { name: "mode", args: "[ask|yolo]", about: "change the mode" },
@@ -105,7 +106,7 @@ describe("terminal UI", () => {
       stdin.write(s);
       await sleep(80);
     };
-    return { screen, calls, type, output: () => strip(out), clear: () => void (out = "") };
+    return { screen, calls, type, output: () => strip(out), raw: () => out, clear: () => void (out = "") };
   }
 
   test("shows the status bar and submits typed messages", async () => {
@@ -204,5 +205,57 @@ describe("terminal UI", () => {
     expect(out).toContain("pondering");
     expect(out.indexOf("first line")).toBeLessThan(out.indexOf("second"));
     expect(out).toContain("done");
+  });
+
+  test("runs fullscreen with a header showing the version, model and directory", async () => {
+    const { output, raw } = setup();
+    await sleep(80);
+    // 第一帧之前先清屏并把光标移到左上角，否则从原来的光标位置画起，整个界面错位
+    expect(raw().startsWith("\x1b[?1049h\x1b[2J\x1b[H")).toBe(true);
+    const out = output();
+    expect(out).toContain("◆ jade v9.9.9");
+    expect(out).toContain("session s-123");
+    expect(out).toContain("test-model · ~/proj (main)");
+  });
+
+  test("the conversation scrolls by itself with PgUp/PgDn and the mouse wheel; typing is unaffected", async () => {
+    const { screen, calls, type, output, clear } = setup();
+    screen.log(Array.from({ length: 100 }, (_, i) => `line-${i}`).join("\n"));
+    await sleep(80);
+    expect(output()).toContain("line-99");
+    expect(output()).not.toContain("line-50");
+    clear();
+    await type("\x1b[5~");
+    await type("\x1b[5~");
+    expect(output()).toContain("line-50");
+    expect(output()).toContain("more lines");
+    // 往上翻看时来了新输出，看的地方不动
+    clear();
+    screen.log("newest");
+    await sleep(80);
+    expect(output()).not.toContain("newest");
+    // 滚轮向下，Ctrl+End 回到底部
+    clear();
+    await type("\x1b[<65;10;10M");
+    expect(output()).not.toContain("<65");
+    await type("\x1b[1;5F");
+    expect(output()).toContain("newest");
+    // 鼠标事件不会进输入框
+    await type("\x1b[<64;10;10M");
+    await type("hi\r");
+    expect(calls.submit).toEqual(["hi"]);
+  });
+
+  test("clear empties the conversation", async () => {
+    const { screen, output, clear } = setup();
+    screen.log("old stuff");
+    await sleep(80);
+    expect(output()).toContain("old stuff");
+    clear();
+    screen.clear();
+    screen.log("fresh");
+    await sleep(80);
+    expect(output()).toContain("fresh");
+    expect(output()).not.toContain("old stuff");
   });
 });

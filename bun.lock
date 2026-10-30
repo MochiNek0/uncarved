@@ -30,6 +30,7 @@
         "react": "^19.2.0",
         "string-width": "^8.2.0",
         "uncarved": "workspace:*",
+        "wrap-ansi": "^10.0.2",
       },
       "devDependencies": {
         "@types/react": "^19.2.0",
