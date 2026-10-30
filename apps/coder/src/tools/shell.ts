@@ -1,5 +1,7 @@
 // bash 工具：在工作目录里执行一条 shell 命令。输出边读边通过 ctx.progress 推给宿主。
 
+import { existsSync } from "node:fs";
+import path from "node:path";
 import type { Tool } from "uncarved";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -14,6 +16,7 @@ export interface ShellOptions {
 
 export function shellTool(opts: ShellOptions): Tool {
   const shell = opts.shell ?? process.env.CODER_SHELL ?? "bash";
+  const executable = realShell(shell);
   return {
     name: "bash",
     description:
@@ -33,7 +36,7 @@ export function shellTool(opts: ShellOptions): Tool {
     async execute(input, { signal, progress }) {
       const { command, timeout_ms } = input as { command: string; timeout_ms?: number };
       const timeout = Math.min(Math.max(timeout_ms ?? DEFAULT_TIMEOUT_MS, 1000), MAX_TIMEOUT_MS);
-      const proc = Bun.spawn([shell, "-c", command], {
+      const proc = Bun.spawn([executable, "-c", command], {
         cwd: opts.cwd,
         stdin: "ignore",
         stdout: "pipe",
@@ -44,9 +47,9 @@ export function shellTool(opts: ShellOptions): Tool {
       let timedOut = false;
       const timer = setTimeout(() => {
         timedOut = true;
-        killTree(shell, proc.pid);
+        killTree(executable, proc.pid);
       }, timeout);
-      const kill = () => killTree(shell, proc.pid);
+      const kill = () => killTree(executable, proc.pid);
       signal.addEventListener("abort", kill, { once: true });
       try {
         const [stdout, stderr, code] = await Promise.all([
@@ -72,6 +75,18 @@ export interface ShellProgress {
   kind: "output";
   stream: "stdout" | "stderr";
   text: string;
+}
+
+/**
+ * Git for Windows 的 bin\bash.exe、bin\sh.exe 只是启动器，真正的 shell 是它启动的 usr\bin 下的同名程序。
+ * killTree 按 WINPID 找 msys 进程，用启动器的 pid 找不到，所以直接启动真正的 shell
+ */
+function realShell(shell: string): string {
+  if (process.platform !== "win32") return shell;
+  const m = /^(.*\\Git)\\bin\\(bash|sh)\.exe$/i.exec(Bun.which(shell) ?? "");
+  if (!m) return shell;
+  const real = path.join(m[1]!, "usr", "bin", `${m[2]}.exe`);
+  return existsSync(real) ? real : shell;
 }
 
 /**
