@@ -29,9 +29,11 @@ export interface OpenAICompatOptions {
   fetch?: typeof fetch;
 }
 
+type ContentPart = { type: "text"; text: string } | { type: "image_url"; image_url: { url: string } };
+
 interface ChatMessage {
   role: "system" | "user" | "assistant" | "tool";
-  content: string | null;
+  content: string | ContentPart[] | null;
   tool_calls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }>;
   tool_call_id?: string;
 }
@@ -238,19 +240,44 @@ function fromAssistant(m: Message): ChatMessage[] {
 
 function fromUser(m: Message): ChatMessage[] {
   const out: ChatMessage[] = [];
-  const texts: string[] = [];
+  const parts: ContentPart[] = [];
   for (const b of m.content) {
     if (b.kind === "tool_result") {
-      const body = b.content.flatMap((c) => (c.kind === "text" ? [c.text] : [])).join("\n");
+      // tool 消息只能是文本：图片、文档换成占位说明，让模型知道少了内容
+      const body = b.content
+        .flatMap((c) => (c.kind === "text" ? [c.text] : c.kind === "image" || c.kind === "document" ? [omitted(c.kind)] : []))
+        .join("\n");
       // 这个格式没有 is_error 字段，错误结果加前缀，否则模型会把拒绝理由当成正常输出；
       // 空的错误结果给一个最小占位，否则部分服务端会拒绝空内容
       out.push({ role: "tool", tool_call_id: b.toolUseId, content: b.isError ? errorText(body) : body });
     } else if (b.kind === "text") {
-      texts.push(b.text);
+      parts.push({ type: "text", text: b.text });
+    } else if (b.kind === "image") {
+      const url = sourceURL(b.source);
+      parts.push(url ? { type: "image_url", image_url: { url } } : { type: "text", text: omitted("image") });
+    } else if (b.kind === "document") {
+      // 兼容服务端普遍不支持文件输入
+      parts.push({ type: "text", text: omitted("document") });
     }
   }
-  if (texts.length > 0) out.push({ role: "user", content: texts.join("\n") });
+  if (parts.length > 0) {
+    // 只有文本时仍发字符串：不支持多段内容的服务端也能用
+    const texts = parts.flatMap((p) => (p.type === "text" ? [p.text] : []));
+    out.push({ role: "user", content: texts.length === parts.length ? texts.join("\n") : parts });
+  }
   return out;
+}
+
+/** image 块的 source 按 Anthropic Messages API 的格式解释：{ type: "base64", media_type, data } 或 { type: "url", url } */
+function sourceURL(source: unknown): string | undefined {
+  const s = source as { type?: unknown; media_type?: unknown; data?: unknown; url?: unknown } | null | undefined;
+  if (s?.type === "base64" && typeof s.media_type === "string" && typeof s.data === "string") return `data:${s.media_type};base64,${s.data}`;
+  if (s?.type === "url" && typeof s.url === "string") return s.url;
+  return undefined;
+}
+
+function omitted(kind: "image" | "document"): string {
+  return `[${kind} omitted: not supported by ${PROVIDER_ID}]`;
 }
 
 function rawArgs(b: Block): string | undefined {
@@ -285,23 +312,59 @@ function toStopReason(finish: string | null, hasToolCalls: boolean): StopReason 
 
 /** onDone：收到 [DONE] 时调用，用来区分正常结束和连接断开 */
 async function* readSSE(body: ReadableStream<Uint8Array>, onDone: () => void): AsyncGenerator<StreamChunk> {
+  for await (const data of sseData(body)) {
+    if (data.trim() === "[DONE]") {
+      onDone();
+      return;
+    }
+    yield JSON.parse(data) as StreamChunk;
+  }
+}
+
+/**
+ * 按 SSE 规范切分事件，返回每个事件的 data：一个事件的多行 data 以换行拼接，空行结束一个事件。
+ * 部分服务端事件之间不空行：已攒下的 data 本身是完整的 JSON 时，新的 data 行视为下一个事件
+ */
+async function* sseData(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
+  let data: string[] = [];
+  const complete = (text: string) => {
+    if (text.trim() === "[DONE]") return true;
+    try {
+      JSON.parse(text);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  for await (const line of sseLines(body)) {
+    if (line === "") {
+      if (data.length > 0) yield data.join("\n");
+      data = [];
+    } else if (line.startsWith("data:")) {
+      if (data.length > 0 && complete(data.join("\n"))) {
+        yield data.join("\n");
+        data = [];
+      }
+      data.push(line.slice(line[5] === " " ? 6 : 5));
+    }
+    // event:、id:、retry: 和注释行（以 : 开头）都不需要
+  }
+}
+
+/** 逐行读取（去掉行尾的 \r）。部分服务端最后一个事件后面没有空行：流结束时补一个空行 */
+async function* sseLines(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
   const decoder = new TextDecoder();
   let buffer = "";
   for await (const bytes of body as unknown as AsyncIterable<Uint8Array>) {
     buffer += decoder.decode(bytes, { stream: true });
     let nl: number;
     while ((nl = buffer.indexOf("\n")) >= 0) {
-      const line = buffer.slice(0, nl).trim();
+      yield buffer.slice(0, nl).replace(/\r$/, "");
       buffer = buffer.slice(nl + 1);
-      if (!line.startsWith("data:")) continue;
-      const data = line.slice(5).trim();
-      if (data === "[DONE]") {
-        onDone();
-        return;
-      }
-      yield JSON.parse(data) as StreamChunk;
     }
   }
+  if (buffer) yield buffer.replace(/\r$/, "");
+  yield "";
 }
 
 function errorText(body: string): string {

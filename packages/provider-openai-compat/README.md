@@ -39,6 +39,8 @@ const provider = openaiCompatProvider({
 - 支持流式工具调用，兼容不返回 `index` 的服务端。
 - 服务端返回 `reasoning_content` 时作为思考块保留。
 - 出错（包括流中途的错误块）时抛出内核的 `ProviderError`，带 `retryable`、`status`、`retryAfterMs`。
+- **图片**：`image` 块的 `source` 按 Anthropic Messages API 的格式解释，`{ type: "base64", media_type, data }` 或 `{ type: "url", url }`，用户消息里的图片转成 `image_url`。
+- **无法表达的内容**：文档、其他格式的图片、工具结果里的图片和文档（`tool` 消息只能是文本）会换成 `[image omitted: ...]` 这样的占位文字，不会静默丢弃。
 
 ## 许可证
 

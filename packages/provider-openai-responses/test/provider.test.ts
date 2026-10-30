@@ -313,3 +313,65 @@ test("previous_response_id 不能通过 ext 传入：历史每次都完整发送
     ),
   ).rejects.toThrow('must not set "previous_response_id"');
 });
+
+test("SSE：一个事件的多行 data 按换行拼接；事件之间不空行、CRLF 换行、末尾没有空行也能解析", async () => {
+  const multiLine = `event: response.output_item.done\r\ndata: {"type":"response.output_item.done","output_index":0,\r\ndata: "item":${JSON.stringify(message("m1", "hi"))}}\r\n\r\n`;
+  const sse = `: keep-alive\n\n${multiLine}data: ${JSON.stringify(created)}\ndata: ${JSON.stringify(completed())}`;
+  const fetchFn = (async () => new Response(sse, { status: 200 })) as unknown as typeof fetch;
+  const provider = openaiResponsesProvider({ baseURL: "https://example.test/v1", model: "m", fetch: fetchFn });
+  const res = await provider.complete({ system: [], tools: [], messages: [] }, { signal: new AbortController().signal });
+  expect(res.content).toMatchObject([{ kind: "text", text: "hi" }]);
+  expect(res.stopReason).toBe("end");
+});
+
+test("用户消息里的图片和文档转成 input_image / input_file；无法表达的块和工具结果里的图片换成占位说明，不静默丢弃", async () => {
+  const { fetchFn, bodies } = fakeServer([[itemDone(0, message("m1", "ok")), completed()]]);
+  const provider = openaiResponsesProvider({ baseURL: "https://example.test/v1", model: "m", fetch: fetchFn });
+  const user = { by: "user" as const };
+  const tool = { by: "tool" as const, name: "shot" };
+  await provider.complete(
+    {
+      system: [],
+      tools: [],
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              kind: "tool_result",
+              toolUseId: "c1",
+              content: [{ kind: "image", source: { type: "url", url: "https://example.test/a.png" }, origin: tool, trust: "untrusted" }],
+              isError: false,
+              origin: tool,
+              trust: "untrusted",
+            },
+            { kind: "text", text: "look", origin: user, trust: "trusted" },
+            { kind: "image", source: { type: "base64", media_type: "image/png", data: "AAA" }, origin: user, trust: "trusted" },
+            { kind: "image", source: { type: "url", url: "https://example.test/a.png" }, origin: user, trust: "trusted" },
+            { kind: "document", source: { type: "base64", media_type: "application/pdf", data: "PDF" }, origin: user, trust: "trusted" },
+            { kind: "document", source: { type: "url", url: "https://example.test/a.pdf" }, origin: user, trust: "trusted" },
+            { kind: "document", source: { type: "text", media_type: "text/plain", data: "notes" }, origin: user, trust: "trusted" },
+            { kind: "image", source: { type: "file", file_id: "f1" }, origin: user, trust: "trusted" },
+          ],
+        },
+      ],
+    },
+    { signal: new AbortController().signal },
+  );
+  expect(bodies[0]!.input).toEqual([
+    { type: "function_call_output", call_id: "c1", output: "[image omitted: not supported by openai-responses]" },
+    {
+      type: "message",
+      role: "user",
+      content: [
+        { type: "input_text", text: "look" },
+        { type: "input_image", image_url: "data:image/png;base64,AAA" },
+        { type: "input_image", image_url: "https://example.test/a.png" },
+        { type: "input_file", filename: "document.pdf", file_data: "data:application/pdf;base64,PDF" },
+        { type: "input_file", file_url: "https://example.test/a.pdf" },
+        { type: "input_text", text: "notes" },
+        { type: "input_text", text: "[image omitted: not supported by openai-responses]" },
+      ],
+    },
+  ]);
+});

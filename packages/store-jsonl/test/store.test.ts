@@ -94,6 +94,18 @@ test("末尾未写完的一行：读取时忽略，下次追加前截掉", async
   expect((await readFile(file, "utf8")).split("\n")).toHaveLength(3);
 });
 
+test("跨读取块的长行和多字节字符完整读出，末尾残行仍被忽略", async () => {
+  const store = new JsonlLogStore(dir);
+  // 每个事件都比一个读取块（64 KiB）大，多字节字符会落在块边界上
+  const big = (seq: number): Event => ({ ...ev(seq), data: { seq, text: "汉字🙂".repeat(20_000) } });
+  await store.append("s1", [big(1), big(2), big(3)]);
+  await appendFile(path.join(dir, "s1.jsonl"), JSON.stringify(big(4)).slice(0, 100_000));
+
+  const events = await readAll(new JsonlLogStore(dir), "s1");
+  expect(events.map((e) => e.seq)).toEqual([1, 2, 3]);
+  expect(events[2]).toEqual(big(3));
+});
+
 test("中间某行损坏时报错，不跳过", async () => {
   await writeFile(path.join(dir, "s1.jsonl"), `${JSON.stringify(ev(1))}\n{broken\n${JSON.stringify(ev(3))}\n`);
   const err = await readAll(new JsonlLogStore(dir), "s1").catch((e) => e);

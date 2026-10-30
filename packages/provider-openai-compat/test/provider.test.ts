@@ -232,3 +232,66 @@ test("tool call 既没有 index 也没有 id 时，按新出现的 name 区分�
     ["read", { b: 2 }],
   ]);
 });
+
+test("SSE：一个事件的多行 data 按换行拼接；事件之间不空行、CRLF 换行、末尾没有空行也能解析", async () => {
+  const multiLine = `data: {"model":"fake-1","choices":[{"delta":\r\ndata: {"content":"a"}}]}\r\n\r\n`;
+  const noBlank = `data: ${chunk({ content: "b" })}\ndata: ${chunk({ content: "c" }, "stop")}\n`;
+  const sse = `: keep-alive\n\nevent: message\n${multiLine}${noBlank}data: [DONE]`;
+  const provider = openaiCompatProvider({ baseURL: "https://example.test/v1", model: "m", fetch: rawSSE(sse) });
+  const res = await provider.complete({ system: [], tools: [], messages: [] }, { signal: new AbortController().signal });
+  expect(res.content).toMatchObject([{ kind: "text", text: "abc" }]);
+  expect(res.stopReason).toBe("end");
+});
+
+test("用户消息里的图片转成 image_url；无法表达的图片、文档和工具结果里的图片换成占位说明，不静默丢弃", async () => {
+  const { fetchFn, bodies } = fakeServer([[chunk({ content: "ok" }, "stop")]]);
+  const provider = openaiCompatProvider({ baseURL: "https://example.test/v1", model: "m", fetch: fetchFn });
+  const user = { by: "user" as const };
+  const tool = { by: "tool" as const, name: "shot" };
+  await provider.complete(
+    {
+      system: [],
+      tools: [],
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              kind: "tool_result",
+              toolUseId: "c1",
+              content: [
+                { kind: "text", text: "captured", origin: tool, trust: "untrusted" },
+                { kind: "image", source: { type: "base64", media_type: "image/png", data: "AAA" }, origin: tool, trust: "untrusted" },
+              ],
+              isError: false,
+              origin: tool,
+              trust: "untrusted",
+            },
+            { kind: "text", text: "look", origin: user, trust: "trusted" },
+            { kind: "image", source: { type: "base64", media_type: "image/png", data: "AAA" }, origin: user, trust: "trusted" },
+            { kind: "image", source: { type: "url", url: "https://example.test/a.png" }, origin: user, trust: "trusted" },
+            { kind: "image", source: { type: "file", file_id: "f1" }, origin: user, trust: "trusted" },
+            { kind: "document", source: { type: "base64", media_type: "application/pdf", data: "AAA" }, origin: user, trust: "trusted" },
+          ],
+        },
+        { role: "user", content: [{ kind: "text", text: "plain", origin: user, trust: "trusted" }] },
+      ],
+    },
+    { signal: new AbortController().signal },
+  );
+  expect(bodies[0]!.messages).toEqual([
+    { role: "tool", tool_call_id: "c1", content: "captured\n[image omitted: not supported by openai-compat]" },
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "look" },
+        { type: "image_url", image_url: { url: "data:image/png;base64,AAA" } },
+        { type: "image_url", image_url: { url: "https://example.test/a.png" } },
+        { type: "text", text: "[image omitted: not supported by openai-compat]" },
+        { type: "text", text: "[document omitted: not supported by openai-compat]" },
+      ],
+    },
+    // 只有文本时仍是字符串
+    { role: "user", content: "plain" },
+  ]);
+});

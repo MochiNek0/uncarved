@@ -17,7 +17,7 @@ Uncarved 是一个极简、完全可定制的 Agent 内核。它只提供**一�
 | [`@uncarved/provider-openai-responses`](./packages/provider-openai-responses) | OpenAI Responses API |
 | [`@uncarved/provider-openai-compat`](./packages/provider-openai-compat) | 任意兼容 `/chat/completions` 的服务 |
 
-运行环境：Node.js ≥ 22 或 Bun。
+运行环境：Node.js ≥ 22.18 或 Bun。
 
 ## 安装
 

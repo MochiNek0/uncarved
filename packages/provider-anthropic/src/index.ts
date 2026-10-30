@@ -119,14 +119,22 @@ function toProviderError(err: unknown, signal: AbortSignal): unknown {
     });
   }
   const status = err.status;
-  const retryAfter = Number(err.headers?.get("retry-after"));
   return new ProviderError(`${PROVIDER_ID} ${status === undefined ? "request failed" : `HTTP ${status}`}: ${err.message}`, {
     // 没有状态码的是连接错误
     retryable: status === undefined || status === 408 || status === 429 || status >= 500,
     status,
-    retryAfterMs: Number.isFinite(retryAfter) ? retryAfter * 1000 : undefined,
+    retryAfterMs: retryAfter(err.headers?.get("retry-after") ?? null),
     cause: err,
   });
+}
+
+/** Retry-After 可以是秒数，也可以是 HTTP 日期 */
+function retryAfter(v: string | null): number | undefined {
+  if (!v) return undefined;
+  const seconds = Number(v);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  const at = Date.parse(v);
+  return Number.isNaN(at) ? undefined : Math.max(0, at - Date.now());
 }
 
 /** 缓存标记打在最后一个 stable 段上 */

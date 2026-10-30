@@ -85,24 +85,44 @@ export class JsonlLogStore implements LogStore {
     }
   }
 
+  /** 分块读取，内存占用与日志长度无关 */
   async *read(sessionId: string, fromSeq = 1): AsyncIterable<Event> {
-    let text: string;
+    let fh;
     try {
-      text = await readFile(this.#file(sessionId), "utf8");
+      fh = await open(this.#file(sessionId), "r");
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
       throw err;
     }
-    const lines = text.split("\n");
-    lines.pop(); // 最后一个换行之后的内容：空串，或未完成的一行
-    for (const [i, line] of lines.entries()) {
-      let e: Event;
-      try {
-        e = JSON.parse(line) as Event;
-      } catch (cause) {
-        throw new CorruptLog(sessionId, i + 1, cause);
+    try {
+      // 还没遇到换行的内容；读到文件末尾时仍留在这里的是未完成的一行，忽略
+      const pending: Buffer[] = [];
+      let line = 0;
+      for (;;) {
+        // 每次新分配：pending 里留着上一块的切片
+        const chunk = Buffer.allocUnsafe(READ_CHUNK_BYTES);
+        const { bytesRead } = await fh.read(chunk, 0, chunk.length, null);
+        if (bytesRead === 0) return;
+        const data = chunk.subarray(0, bytesRead);
+        let start = 0;
+        for (let nl = data.indexOf(0x0a); nl >= 0; nl = data.indexOf(0x0a, start)) {
+          pending.push(data.subarray(start, nl));
+          const text = Buffer.concat(pending).toString("utf8");
+          pending.length = 0;
+          start = nl + 1;
+          line++;
+          let e: Event;
+          try {
+            e = JSON.parse(text) as Event;
+          } catch (cause) {
+            throw new CorruptLog(sessionId, line, cause);
+          }
+          if (e.seq >= fromSeq) yield e;
+        }
+        if (start < data.length) pending.push(data.subarray(start));
       }
-      if (e.seq >= fromSeq) yield e;
+    } finally {
+      await fh.close();
     }
   }
 
@@ -156,6 +176,7 @@ export class JsonlTrustStore implements TrustStore {
   }
 }
 
+const READ_CHUNK_BYTES = 64 * 1024;
 const LOCK_WAIT_MS = 10_000;
 /** 空锁文件（进程在创建和写入 pid 之间退出）超过这个时间视为失效 */
 const EMPTY_LOCK_STALE_MS = 5_000;

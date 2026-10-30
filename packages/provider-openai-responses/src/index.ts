@@ -285,18 +285,46 @@ function fromAssistant(m: Message, store: boolean): Item[] {
 
 function fromUser(m: Message): Item[] {
   const out: Item[] = [];
-  const texts: Array<{ type: "input_text"; text: string }> = [];
+  const parts: Array<Record<string, unknown>> = [];
   for (const b of m.content) {
     if (b.kind === "tool_result") {
-      const body = b.content.flatMap((c) => (c.kind === "text" ? [c.text] : [])).join("\n");
+      // 工具结果按文本发送：图片、文档换成占位说明，让模型知道少了内容
+      const body = b.content
+        .flatMap((c) => (c.kind === "text" ? [c.text] : c.kind === "image" || c.kind === "document" ? [omitted(c.kind)] : []))
+        .join("\n");
       // 这个格式没有 is_error 字段，错误结果加前缀，否则模型会把拒绝理由当成正常输出；空的错误结果给一个最小占位
       out.push({ type: "function_call_output", call_id: b.toolUseId, output: b.isError ? errorText(body) : body });
     } else if (b.kind === "text") {
-      texts.push({ type: "input_text", text: b.text });
+      parts.push({ type: "input_text", text: b.text });
+    } else if (b.kind === "image" || b.kind === "document") {
+      parts.push(toInputPart(b.kind, b.source) ?? { type: "input_text", text: omitted(b.kind) });
     }
   }
-  if (texts.length > 0) out.push({ type: "message", role: "user", content: texts });
+  if (parts.length > 0) out.push({ type: "message", role: "user", content: parts });
   return out;
+}
+
+/**
+ * image、document 块的 source 按 Anthropic Messages API 的格式解释：
+ * { type: "base64", media_type, data }、{ type: "url", url }，文档另有 { type: "text", data }
+ */
+function toInputPart(kind: "image" | "document", source: unknown): Record<string, unknown> | undefined {
+  const s = source as { type?: unknown; media_type?: unknown; data?: unknown; url?: unknown } | null | undefined;
+  const base64 = s?.type === "base64" && typeof s.media_type === "string" && typeof s.data === "string";
+  const url = s?.type === "url" && typeof s.url === "string" ? s.url : undefined;
+  if (kind === "image") {
+    if (base64) return { type: "input_image", image_url: `data:${s!.media_type};base64,${s!.data}` };
+    if (url) return { type: "input_image", image_url: url };
+    return undefined;
+  }
+  if (base64 && s!.media_type === "application/pdf") return { type: "input_file", filename: "document.pdf", file_data: `data:application/pdf;base64,${s!.data}` };
+  if (url) return { type: "input_file", file_url: url };
+  if (s?.type === "text" && typeof s.data === "string") return { type: "input_text", text: s.data };
+  return undefined;
+}
+
+function omitted(kind: "image" | "document"): string {
+  return `[${kind} omitted: not supported by ${PROVIDER_ID}]`;
 }
 
 function ownItem(b: Block): Item | undefined {
@@ -314,21 +342,57 @@ function parseArgs(s: string): unknown {
 }
 
 async function* readSSE(body: ReadableStream<Uint8Array>): AsyncGenerator<StreamEvent> {
+  // event: 行与 data 中的 type 重复，只看 data
+  for await (const data of sseData(body)) {
+    if (data.trim() === "[DONE]") return;
+    yield JSON.parse(data) as StreamEvent;
+  }
+}
+
+/**
+ * 按 SSE 规范切分事件，返回每个事件的 data：一个事件的多行 data 以换行拼接，空行结束一个事件。
+ * 部分服务端事件之间不空行：已攒下的 data 本身是完整的 JSON 时，新的 data 行视为下一个事件
+ */
+async function* sseData(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
+  let data: string[] = [];
+  const complete = (text: string) => {
+    if (text.trim() === "[DONE]") return true;
+    try {
+      JSON.parse(text);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  for await (const line of sseLines(body)) {
+    if (line === "") {
+      if (data.length > 0) yield data.join("\n");
+      data = [];
+    } else if (line.startsWith("data:")) {
+      if (data.length > 0 && complete(data.join("\n"))) {
+        yield data.join("\n");
+        data = [];
+      }
+      data.push(line.slice(line[5] === " " ? 6 : 5));
+    }
+    // event:、id:、retry: 和注释行（以 : 开头）都不需要
+  }
+}
+
+/** 逐行读取（去掉行尾的 \r）。部分服务端最后一个事件后面没有空行：流结束时补一个空行 */
+async function* sseLines(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
   const decoder = new TextDecoder();
   let buffer = "";
   for await (const bytes of body as unknown as AsyncIterable<Uint8Array>) {
     buffer += decoder.decode(bytes, { stream: true });
     let nl: number;
     while ((nl = buffer.indexOf("\n")) >= 0) {
-      const line = buffer.slice(0, nl).trim();
+      yield buffer.slice(0, nl).replace(/\r$/, "");
       buffer = buffer.slice(nl + 1);
-      // event: 行与 data 中的 type 重复，只看 data
-      if (!line.startsWith("data:")) continue;
-      const data = line.slice(5).trim();
-      if (data === "[DONE]") return;
-      yield JSON.parse(data) as StreamEvent;
     }
   }
+  if (buffer) yield buffer.replace(/\r$/, "");
+  yield "";
 }
 
 function errorText(body: string): string {

@@ -75,7 +75,7 @@ export function fsTools(root: string, opts: { id?: string; hidden?: string[] } =
  * 按环境变量（可写在 .env 里）选择 provider，代码里不写死任何服务商：
  * - OPENAI_API_KEY：OpenAI Responses API，可选 OPENAI_BASE_URL、OPENAI_MODEL
  * - OPENAI_COMPAT_BASE_URL + OPENAI_COMPAT_API_KEY + OPENAI_COMPAT_MODEL：任意兼容 /chat/completions 的服务
- * - 都没有：Claude（ANTHROPIC_API_KEY）
+ * - 都没有：Claude（ANTHROPIC_API_KEY），可选 ANTHROPIC_BASE_URL、ANTHROPIC_MODEL
  */
 export function providerFromEnv(): Provider {
   const env = process.env;
@@ -94,5 +94,5 @@ export function providerFromEnv(): Provider {
       model: env.OPENAI_COMPAT_MODEL,
     });
   }
-  return anthropicProvider({ effort: "medium" });
+  return anthropicProvider({ effort: "medium", model: env.ANTHROPIC_MODEL });
 }

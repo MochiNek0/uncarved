@@ -10,7 +10,7 @@
 npm install uncarved
 ```
 
-内核不包含模型调用，还需要一个 provider，例如 [`@uncarved/provider-anthropic`](https://www.npmjs.com/package/@uncarved/provider-anthropic)。运行环境：Node.js ≥ 22 或 Bun。
+内核不包含模型调用，还需要一个 provider，例如 [`@uncarved/provider-anthropic`](https://www.npmjs.com/package/@uncarved/provider-anthropic)。运行环境：Node.js ≥ 22.18 或 Bun（`loadProjectPlugin` 直接导入 `.ts` 入口，依赖 Node 22.18 起默认开启的类型剥离）。
 
 ## 快速开始
 
@@ -95,6 +95,8 @@ hook 用到的能力必须在 `needs` 里声明，否则拒绝加载。可用能
 | `log` | `record`、`emit` |
 
 权限类决策遵循**拒绝优先**：任何一个插件的拒绝都不能被其他插件的允许推翻。所有 hook 都有超时，不能关闭。
+
+> **注意：没有任何 `tool.gate` 插件表态时，工具调用默认放行。** 内核不内置权限策略：所有 gate 都返回 `abstain`（或根本没有 gate）时，任何工具都会直接执行，包括 `effect` 为 `write`、`external` 的工具。需要审批或限制时，请加载一个 `tool.gate` 插件，例如对 `effect !== "read"` 的调用返回 `ask`。gate 出错、超时或返回值不合法时按 `deny` 处理。
 
 `kernel` 字段按 semver 的 `^` 规则匹配内核版本：在 0.x 阶段，小版本之间视为不兼容，`^0.1` 只接受 0.1.x。
 

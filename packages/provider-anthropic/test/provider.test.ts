@@ -185,6 +185,11 @@ test("SDK 的错误转成 ProviderError；取消照原样抛出", async () => {
   const limited = await fail(new Anthropic.APIError(429, {}, "rate limited", new Headers({ "retry-after": "2" })));
   expect(limited).toBeInstanceOf(ProviderError);
   expect(limited).toMatchObject({ retryable: true, status: 429, retryAfterMs: 2000 });
+  // Retry-After 也可以是 HTTP 日期
+  const at = new Date(Date.now() + 60_000).toUTCString();
+  const dated = await fail(new Anthropic.APIError(503, {}, "busy", new Headers({ "retry-after": at })));
+  expect(dated.retryAfterMs).toBeGreaterThan(50_000);
+  expect(dated.retryAfterMs).toBeLessThanOrEqual(60_000);
 
   expect(await fail(new Anthropic.APIError(400, {}, "bad", new Headers()))).toMatchObject({ retryable: false, status: 400 });
   expect(await fail(new Anthropic.APIConnectionError({ message: "reset" }))).toMatchObject({ retryable: true, status: undefined });
