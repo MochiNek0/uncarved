@@ -40,7 +40,8 @@ const provider = openaiResponsesProvider({
 
 - **无状态**：默认 `store: false`，每次发送完整历史，不依赖服务端保存的会话。
 - **原样回传**：模型输出的每个 item 原样存进内容块的 `ext`，下一轮原样发回，所以推理模型的 `encrypted_content` 能跨轮保留。
-- 出错时抛出内核的 `ProviderError`，带 `retryable`、`status`、`retryAfterMs`。
+- 出错时抛出内核的 `ProviderError`，带 `retryable`、`status`、`retryAfterMs`。**不会自动重试**，需要时在外层包装一个 Provider 按 `retryable` 重试。服务端返回普通 JSON 或网页而不是事件流时报不可重试的错误。
+- 不设请求超时，中断靠调用方的 `signal`。
 - **图片和文档**：`source` 按 Anthropic Messages API 的格式解释。用户消息里的图片（`base64`、`url`）转成 `input_image`；文档中 base64 的 PDF 和 `url` 转成 `input_file`，`text` 转成 `input_text`。
 - **无法表达的内容**：其他格式的图片和文档、工具结果里的图片和文档会换成 `[image omitted: ...]` 这样的占位文字，不会静默丢弃。
 

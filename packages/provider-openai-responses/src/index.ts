@@ -62,6 +62,8 @@ interface StreamEvent {
     } | null;
   };
   message?: string;
+  /** type 为 error 时的错误码 */
+  code?: string | null;
 }
 
 export function openaiResponsesProvider(opts: OpenAIResponsesOptions): Provider {
@@ -143,7 +145,9 @@ export function openaiResponsesProvider(opts: OpenAIResponsesOptions): Provider 
               });
             }
             case "error":
-              throw new ProviderError(`${PROVIDER_ID} stream error: ${ev.message ?? "unknown error"}`, { retryable: false });
+              throw new ProviderError(`${PROVIDER_ID} stream error: ${ev.message ?? "unknown error"}`, {
+                retryable: ev.code === "server_error" || ev.code === "rate_limit_exceeded",
+              });
           }
         }
       } catch (err) {
@@ -178,9 +182,16 @@ async function send(doFetch: typeof fetch, url: string, signal: AbortSignal, ini
       cause: err,
     });
   }
-  if (res.ok && res.body) return res as Response & { body: ReadableStream<Uint8Array> };
   const status = res.status;
-  throw new ProviderError(`${PROVIDER_ID} HTTP ${status}: ${(await res.text()).slice(0, 500)}`, {
+  // 读错误响应体失败（例如连接被重置）时只报状态码
+  const body = async () => (await res.text().catch(() => "")).slice(0, 500);
+  if (res.ok && res.body) {
+    // 代理或服务端没有理会 stream: true，返回了普通 JSON 或网页：再试一次也一样
+    const type = res.headers.get("content-type") ?? "";
+    if (!/^(application\/json|text\/html)\b/i.test(type)) return res as Response & { body: ReadableStream<Uint8Array> };
+    throw new ProviderError(`${PROVIDER_ID} expected an event stream, got ${type}: ${await body()}`, { retryable: false, status });
+  }
+  throw new ProviderError(`${PROVIDER_ID} HTTP ${status}: ${await body()}`, {
     retryable: status === 408 || status === 429 || status >= 500,
     status,
     retryAfterMs: retryAfter(res.headers.get("retry-after")),
@@ -277,7 +288,9 @@ function fromAssistant(m: Message, store: boolean): Item[] {
     if (b.kind === "text") {
       out.push({ type: "message", role: "assistant", content: [{ type: "output_text", text: b.text }] });
     } else if (b.kind === "tool_use") {
-      out.push({ type: "function_call", call_id: b.id, name: b.name, arguments: JSON.stringify(b.input ?? {}) });
+      // 参数解析失败时 input 是原始字符串，原样回传，不再序列化一层
+      const args = typeof b.input === "string" ? b.input : JSON.stringify(b.input ?? {});
+      out.push({ type: "function_call", call_id: b.id, name: b.name, arguments: args });
     }
   }
   return out;

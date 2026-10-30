@@ -133,7 +133,8 @@ export function openaiCompatProvider(opts: OpenAICompatOptions): Provider {
             const index = tc.index ?? (fresh ? last + 1 : last);
             const c = (calls[index] ??= { id: "", name: "", arguments: "" });
             if (tc.id) c.id = tc.id;
-            if (tc.function?.name) c.name += tc.function.name;
+            // 名字一般只在第一块里给出；部分服务端每一块都重复完整的名字，不能再拼上去
+            if (tc.function?.name && tc.function.name !== c.name) c.name += tc.function.name;
             if (tc.function?.arguments) c.arguments += tc.function.arguments;
           }
           if (choice.finish_reason) finish = choice.finish_reason;
@@ -187,9 +188,16 @@ async function send(doFetch: typeof fetch, url: string, signal: AbortSignal, ini
       cause: err,
     });
   }
-  if (res.ok && res.body) return res as Response & { body: ReadableStream<Uint8Array> };
   const status = res.status;
-  throw new ProviderError(`${PROVIDER_ID} HTTP ${status}: ${(await res.text()).slice(0, 500)}`, {
+  // 读错误响应体失败（例如连接被重置）时只报状态码
+  const body = async () => (await res.text().catch(() => "")).slice(0, 500);
+  if (res.ok && res.body) {
+    // 代理或服务端没有理会 stream: true，返回了普通 JSON 或网页：再试一次也一样
+    const type = res.headers.get("content-type") ?? "";
+    if (!/^(application\/json|text\/html)\b/i.test(type)) return res as Response & { body: ReadableStream<Uint8Array> };
+    throw new ProviderError(`${PROVIDER_ID} expected an event stream, got ${type}: ${await body()}`, { retryable: false, status });
+  }
+  throw new ProviderError(`${PROVIDER_ID} HTTP ${status}: ${await body()}`, {
     retryable: status === 408 || status === 429 || status >= 500,
     status,
     retryAfterMs: retryAfter(res.headers.get("retry-after")),
@@ -234,7 +242,8 @@ function fromAssistant(m: Message): ChatMessage[] {
         ]
       : [],
   );
-  // 思考块和 opaque 块在这个格式里无法回传，省略
+  // 思考块和 opaque 块在这个格式里无法回传，省略；省略后什么都不剩时整条省略，内容为空的 assistant 消息会被拒绝
+  if (!text && toolCalls.length === 0) return [];
   return [{ role: "assistant", content: text || null, ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}) }];
 }
 

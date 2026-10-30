@@ -25,7 +25,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
-    "prepublishOnly": "bun run build"
+    "prepublishOnly": "node ../../scripts/require-bun-publish.mjs && bun run build"
   },
   "peerDependencies": {
     "uncarved": "workspace:^"

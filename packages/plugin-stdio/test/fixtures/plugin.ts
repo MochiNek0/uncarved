@@ -14,6 +14,12 @@ interface Msg {
 
 const manifest = JSON.parse(process.env.FIXTURE_MANIFEST!);
 if (process.env.FIXTURE_MARK) writeFileSync(process.env.FIXTURE_MARK, "started");
+// 不肯退出的插件：忽略 SIGTERM，不回复 shutdown，stdin 关闭后也不退出
+const stubborn = process.env.FIXTURE_STUBBORN === "1";
+if (stubborn) {
+  process.on("SIGTERM", () => {});
+  setInterval(() => {}, 1_000);
+}
 
 const send = (m: object) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...m }) + "\n");
 let nextId = 1;
@@ -30,7 +36,7 @@ async function handle(msg: Msg): Promise<unknown> {
     case "initialize":
       return manifest;
     case "shutdown":
-      return {};
+      return stubborn ? new Promise(() => {}) : {};
     case "hook": {
       const { hook, payload } = msg.params!;
       switch (hook) {
@@ -40,6 +46,10 @@ async function handle(msg: Msg): Promise<unknown> {
               ...payload.system,
               { text: "from process", stability: "stable", origin: { by: "plugin", id: manifest.id }, trust: "untrusted" },
             ],
+          };
+        case "env":
+          return {
+            system: [...payload.system, { text: process.env.PATH ?? "", stability: "stable", origin: { by: "plugin", id: manifest.id }, trust: "untrusted" }],
           };
         case "deny-danger":
           return payload.name === "danger" ? { decision: "deny", reason: "blocked by process" } : { decision: "abstain" };
@@ -58,6 +68,9 @@ async function handle(msg: Msg): Promise<unknown> {
           // 最后一条回复不带换行，写完后退出
           process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: {} }), () => process.exit(0));
           return new Promise(() => {});
+        case "deaf":
+          // 卡死，不再读 stdin，宿主发来的数据堆在管道里
+          for (;;);
         case "garbage":
           // 合法的 JSON，但不是 JSON-RPC 消息
           process.stdout.write("null\n");

@@ -9,6 +9,7 @@
   "scripts": {
     "build": "bun run --filter uncarved build && bun run --filter '@uncarved/*' build",
     "test": "bun test",
+    "smoke:node": "node scripts/smoke-node.mjs",
     "typecheck": "tsc -p tsconfig.json"
   },
   "devDependencies": {

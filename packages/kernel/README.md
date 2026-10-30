@@ -66,6 +66,8 @@ await rt.send({
 | `rt.close()` | 结束会话，之后日志不再接受事件 |
 | `rt.detach()` | 宿主离开会话，会话保持可恢复，之后本实例不再可用 |
 
+**取消是协作式的**：`abort()` 之后不再开始新的步骤，正在运行的 hook、Provider、工具通过 `signal` 得知中断。忽略 `signal` 的 hook 最多运行到自己的超时；忽略 `signal` 的 Provider 或工具会让这一轮一直等到它们自己返回。内置的 Provider 都不设请求超时，需要时用 `AbortSignal.timeout()` 之类的方式在外层中断。
+
 内核状态完全由事件日志重建。`MemoryLogStore` 只在内存里；要持久化可以用 [`@uncarved/store-jsonl`](https://www.npmjs.com/package/@uncarved/store-jsonl)，或自己实现 `LogStore` 接口。
 
 ## 插件
@@ -99,6 +101,15 @@ hook 用到的能力必须在 `needs` 里声明，否则拒绝加载。可用能
 > **注意：没有任何 `tool.gate` 插件表态时，工具调用默认放行。** 内核不内置权限策略：所有 gate 都返回 `abstain`（或根本没有 gate）时，任何工具都会直接执行，包括 `effect` 为 `write`、`external` 的工具。需要审批或限制时，请加载一个 `tool.gate` 插件，例如对 `effect !== "read"` 的调用返回 `ask`。gate 出错、超时或返回值不合法时按 `deny` 处理。
 
 `kernel` 字段按 semver 的 `^` 规则匹配内核版本：在 0.x 阶段，小版本之间视为不兼容，`^0.1` 只接受 0.1.x。
+
+编写插件时注意：
+
+- **`ctx.record`、`ctx.emit` 一定要 `await`。** hook 已经结束、能力没有声明、会话已经关闭时它们会 reject；没人处理的 rejection 在 Node 下默认会让整个进程退出。
+- **项目层插件目录里不能有符号链接**（链接可能指向确认范围之外的文件）。pnpm 安装的 `node_modules` 由符号链接组成，这样的插件无法加载：请用 npm 安装依赖，或把插件打包成单个文件。
+
+## TypeScript
+
+类型声明用到了 `AbortSignal` 等全局类型。项目的 `lib` 里没有 `DOM`、也没有安装 `@types/node` 时，请开启 `skipLibCheck` 或安装 `@types/node`。
 
 ## Provider
 

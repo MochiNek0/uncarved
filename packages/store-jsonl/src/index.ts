@@ -9,6 +9,7 @@
 //   另一个进程（或另一个实例）也在写同一个会话时，本实例的下一次 append 会发现文件和自己最后写入时不一致，
 //   拒绝写入（ConcurrentWrite）。持锁进程已经不在时锁视为失效，可以接管
 
+import { randomUUID } from "node:crypto";
 import { link, mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import type { Event, LogStore, TrustRecord, TrustStore } from "uncarved";
@@ -62,10 +63,12 @@ export class JsonlLogStore implements LogStore {
 
   async #appendLocked(sessionId: string, file: string, events: Event[]): Promise<void> {
     let tail = this.#tails.get(sessionId);
+    let created = false;
     if (tail === undefined) {
       // 第一次写（或上次出错）：截掉残行，从文件里取最后一个事件
-      const kept = (await dropTornTail(file)) ?? Buffer.alloc(0);
-      tail = { size: kept.length, seq: lastSeq(kept, sessionId) };
+      const kept = await dropTornTail(file);
+      created = kept === undefined;
+      tail = { size: kept?.size ?? 0, seq: kept ? await this.#lastSeq(sessionId, kept.last) : 0 };
     }
     // 每次都确认要写的事件紧接着最后一个事件：调用方以为失败、其实已经落盘的写入不会被重复写入
     if (events[0]!.seq !== tail.seq + 1) {
@@ -79,9 +82,23 @@ export class JsonlLogStore implements LogStore {
       const data = Buffer.from(events.map((e) => JSON.stringify(e) + "\n").join(""));
       await fh.writeFile(data);
       await fh.sync();
+      // 新建的文件还要同步目录，否则断电后目录里可能没有这个文件
+      if (created) await syncDir(this.dir);
       this.#tails.set(sessionId, { size: size + data.length, seq: events.at(-1)!.seq });
     } finally {
       await fh.close();
+    }
+  }
+
+  /** 最后一行里事件的 seq，没有事件为 0 */
+  async #lastSeq(sessionId: string, last: Buffer): Promise<number> {
+    if (last.length === 0) return 0;
+    try {
+      return (JSON.parse(last.toString("utf8")) as Event).seq;
+    } catch (cause) {
+      // 完整读一遍，由 read 报出损坏的行号（也可能是更早的一行）
+      for await (const _ of this.read(sessionId));
+      throw new CorruptLog(sessionId, 0, cause);
     }
   }
 
@@ -153,7 +170,13 @@ export class JsonlTrustStore implements TrustStore {
     }
     const lines = text.split("\n");
     lines.pop(); // 未写完的一行从未确认成功，忽略
-    return lines.some((line) => (JSON.parse(line) as TrustRecord).hash === hash);
+    return lines.some((line, i) => {
+      try {
+        return (JSON.parse(line) as TrustRecord).hash === hash;
+      } catch (cause) {
+        throw new Error(`trust store ${this.file}: corrupt record at line ${i + 1}`, { cause });
+      }
+    });
   }
 
   async add(record: TrustRecord): Promise<void> {
@@ -162,11 +185,12 @@ export class JsonlTrustStore implements TrustStore {
     const lockFile = `${this.file}.lock`;
     const release = await acquire(lockFile, (holder) => new Error(`trust store lock ${lockFile} is held by process ${holder}`));
     try {
-      await dropTornTail(this.file);
+      const created = (await dropTornTail(this.file)) === undefined;
       const fh = await open(this.file, "a");
       try {
         await fh.writeFile(JSON.stringify(record) + "\n");
         await fh.sync();
+        if (created) await syncDir(path.dirname(this.file));
       } finally {
         await fh.close();
       }
@@ -182,6 +206,12 @@ const LOCK_WAIT_MS = 10_000;
 const EMPTY_LOCK_STALE_MS = 5_000;
 
 /**
+ * 本进程当前持有的锁的内容。锁里写的是 "pid:随机串"：容器重启后进程号常常和崩溃前一样（例如都是 1），
+ * 只比较 pid 会把上次留下的锁当成自己的，永远等下去
+ */
+const held = new Set<string>();
+
+/**
  * 独占创建锁文件并写入本进程 pid；被占用时等待，持有者已退出时接管。返回释放函数。
  * 等待超时时抛出 timeout(持有者 pid) 给出的错误
  */
@@ -190,12 +220,17 @@ async function acquire(lockFile: string, timeout: (holder: string) => Error): Pr
   for (;;) {
     try {
       const fh = await open(lockFile, "wx");
+      const token = `${process.pid}:${randomUUID()}`;
+      held.add(token);
       try {
-        await fh.writeFile(String(process.pid));
+        await fh.writeFile(token);
       } finally {
         await fh.close();
       }
-      return () => rm(lockFile, { force: true });
+      return async () => {
+        await rm(lockFile, { force: true });
+        held.delete(token);
+      };
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       // Windows 上锁文件正在被删除（待删除状态）时，创建同名文件报 EPERM：等它删完
@@ -212,7 +247,7 @@ async function acquire(lockFile: string, timeout: (holder: string) => Error): Pr
       await takeOver(lockFile, owner);
       continue;
     }
-    if (Date.now() > deadline) throw timeout(owner || "?");
+    if (Date.now() > deadline) throw timeout(owner?.split(":")[0] || "?");
     await new Promise((r) => setTimeout(r, 10));
   }
 }
@@ -222,9 +257,9 @@ async function stale(lockFile: string, owner: string): Promise<boolean> {
     const info = await stat(lockFile).catch(() => undefined);
     return info !== undefined && Date.now() - info.mtimeMs > EMPTY_LOCK_STALE_MS;
   }
-  const pid = Number(owner);
+  const pid = Number(owner.split(":")[0]);
   if (!Number.isInteger(pid) || pid <= 0) return true;
-  if (pid === process.pid) return false;
+  if (pid === process.pid) return !held.has(owner);
   try {
     process.kill(pid, 0);
     return false;
@@ -252,22 +287,22 @@ async function takeOver(lockFile: string, owner: string): Promise<void> {
   await rm(moved, { force: true });
 }
 
-/** 已截掉残行的文件内容里最后一个事件的 seq，没有事件为 0 */
-function lastSeq(kept: Buffer, sessionId: string): number {
-  const end = kept.length - 1;
-  if (end < 0) return 0;
-  const line = kept.subarray(kept.lastIndexOf(0x0a, end - 1) + 1, end).toString("utf8");
+/** fsync 目录，让新建的文件名落盘。Windows 不支持打开目录做 fsync，也不需要 */
+async function syncDir(dir: string): Promise<void> {
+  if (process.platform === "win32") return;
+  const fh = await open(dir, "r");
   try {
-    return (JSON.parse(line) as Event).seq;
-  } catch (cause) {
-    let lines = 0;
-    for (const b of kept) if (b === 0x0a) lines++;
-    throw new CorruptLog(sessionId, lines, cause);
+    await fh.sync();
+  } finally {
+    await fh.close();
   }
 }
 
-/** 截掉最后一个换行之后的残留内容，返回保留的内容；文件不存在返回 undefined */
-async function dropTornTail(file: string): Promise<Buffer | undefined> {
+/**
+ * 截掉最后一个换行之后的残留内容，返回保留部分的大小和其中最后一行（不含换行）；文件不存在返回 undefined。
+ * 从文件末尾往前分块找换行，内存占用与日志长度无关
+ */
+async function dropTornTail(file: string): Promise<{ size: number; last: Buffer } | undefined> {
   let fh;
   try {
     fh = await open(file, "r+");
@@ -276,13 +311,36 @@ async function dropTornTail(file: string): Promise<Buffer | undefined> {
     throw err;
   }
   try {
-    const buf = await fh.readFile();
-    const end = buf.lastIndexOf(0x0a) + 1;
-    if (end < buf.length) {
-      await fh.truncate(end);
+    const { size } = await fh.stat();
+    let keep: number | undefined; // 最后一个换行之后的位置
+    let start = 0; // 最后一行的起点
+    for (let pos = size; pos > 0; ) {
+      const len = Math.min(READ_CHUNK_BYTES, pos);
+      pos -= len;
+      const chunk = Buffer.allocUnsafe(len);
+      await fh.read(chunk, 0, len, pos);
+      let before = len;
+      if (keep === undefined) {
+        const nl = chunk.lastIndexOf(0x0a);
+        if (nl < 0) continue;
+        keep = pos + nl + 1;
+        before = nl;
+      }
+      // lastIndexOf 的起点是负数时从末尾算起，要单独排除
+      const prev = before > 0 ? chunk.lastIndexOf(0x0a, before - 1) : -1;
+      if (prev >= 0) {
+        start = pos + prev + 1;
+        break;
+      }
+    }
+    keep ??= 0;
+    if (keep < size) {
+      await fh.truncate(keep);
       await fh.sync();
     }
-    return buf.subarray(0, end);
+    const last = Buffer.alloc(Math.max(keep - 1 - start, 0));
+    if (last.length > 0) await fh.read(last, 0, last.length, start);
+    return { size: keep, last };
   } finally {
     await fh.close();
   }

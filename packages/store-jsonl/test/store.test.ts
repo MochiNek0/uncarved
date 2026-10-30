@@ -194,3 +194,35 @@ test("文件最后一个事件损坏时，追加报 CorruptLog 而不是解析�
   expect(err).toBeInstanceOf(CorruptLog);
   expect(err.line).toBe(2);
 });
+
+test("最后一个事件和残行都跨多个读取块：截掉残行后从最后一个事件接着写", async () => {
+  const big = (seq: number): Event => ({ ...ev(seq), data: { seq, text: "汉字🙂".repeat(50_000) } });
+  const file = path.join(dir, "s1.jsonl");
+  // 只有一个事件、前面没有换行
+  await new JsonlLogStore(dir).append("s1", [big(1)]);
+  await appendFile(file, JSON.stringify(big(2)).slice(0, 300_000));
+  await new JsonlLogStore(dir).append("s1", [big(2)]);
+  await appendFile(file, JSON.stringify(big(3)).slice(0, 300_000));
+  await new JsonlLogStore(dir).append("s1", [big(3)]);
+  expect((await readAll(new JsonlLogStore(dir), "s1")).map((e) => e.seq)).toEqual([1, 2, 3]);
+  await expect(new JsonlLogStore(dir).append("s1", [ev(3)])).rejects.toBeInstanceOf(ConcurrentWrite);
+});
+
+test("文件只有残行、没有换行：截成空文件，从 seq 1 写起", async () => {
+  await writeFile(path.join(dir, "s1.jsonl"), JSON.stringify(ev(1)).slice(0, 20));
+  await new JsonlLogStore(dir).append("s1", [ev(1)]);
+  expect((await readAll(new JsonlLogStore(dir), "s1")).map((e) => e.seq)).toEqual([1]);
+});
+
+test("锁里的 pid 和本进程相同、但不是本进程持有的（例如容器重启后 pid 复用）：视为失效，直接接管", async () => {
+  await writeFile(path.join(dir, "s1.jsonl.lock"), String(process.pid));
+  const t0 = Date.now();
+  await new JsonlLogStore(dir).append("s1", [ev(1)]);
+  expect(Date.now() - t0).toBeLessThan(1_000);
+});
+
+test("信任记录损坏时报出文件和行号", async () => {
+  const file = path.join(dir, "trusted.jsonl");
+  await writeFile(file, `{broken\n`);
+  await expect(new JsonlTrustStore(file).has("h1")).rejects.toThrow(`trust store ${file}: corrupt record at line 1`);
+});

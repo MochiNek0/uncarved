@@ -1247,6 +1247,65 @@ describe("中断与进度", () => {
     expect((await readAll(store, rt.state.sessionId)).at(-1)!.data).toEqual({ reason: "aborted", error: "user pressed Ctrl+C" });
   });
 
+  test("关卡判断期间被中断：剩下的调用不再走关卡", async () => {
+    const a = recordingTool("a");
+    const { provider } = scripted([
+      { content: [toolUse("t1", "a", {}), toolUse("t2", "a", {}), toolUse("t3", "a", {})], stopReason: "tool_use" },
+    ]);
+    let gates = 0;
+    let rt!: Runtime;
+    rt = await Runtime.create({
+      store: new MemoryLogStore(),
+      provider,
+      plugins: [
+        plugin("p", { tools: [a.tool] }),
+        plugin("g", {
+          hooks: [
+            {
+              kind: "gate",
+              point: "tool.gate",
+              fn: () => {
+                gates++;
+                rt.abort();
+                return { decision: "allow" };
+              },
+            },
+          ],
+        }),
+      ],
+    });
+    await rt.send(say("go")).catch(() => {});
+    expect(gates).toBe(1);
+    expect(a.calls).toEqual([]);
+  });
+
+  test("构建请求期间被中断：不记 model.requested，也不调用模型", async () => {
+    const store = new MemoryLogStore();
+    const { provider, requests } = scripted([{ content: [text("hi")], stopReason: "end" }]);
+    let rt!: Runtime;
+    rt = await Runtime.create({
+      store,
+      provider,
+      plugins: [
+        plugin("p", {
+          hooks: [
+            {
+              kind: "transform",
+              point: "model.before",
+              fn: (req) => {
+                rt.abort();
+                return req;
+              },
+            },
+          ],
+        }),
+      ],
+    });
+    await rt.send(say("go")).catch(() => {});
+    expect(requests).toEqual([]);
+    expect((await readAll(store, rt.state.sessionId)).some((e) => e.type === "model.requested")).toBe(false);
+  });
+
   test("依次执行的工具中途被中断：后面的不再启动，未执行的补上错误结果", async () => {
     let rt!: Runtime;
     const a = recordingTool("a", { concurrency: "exclusive" });
@@ -1701,7 +1760,7 @@ describe("边界情况", () => {
 describe("取消信号（I-9）", () => {
   test("hook 开始时信号已经中断，hook 拿到的信号也是中断的", async () => {
     const seen: boolean[] = [];
-    const { provider } = scripted([{ content: [toolUse("t1", "echo", {}), toolUse("t2", "echo", {})], stopReason: "tool_use" }]);
+    const { provider } = scripted([{ content: [toolUse("t1", "echo", {})], stopReason: "tool_use" }]);
     let rt: Runtime;
     const p = plugin("p", {
       tools: [recordingTool("echo").tool],
@@ -1711,14 +1770,15 @@ describe("取消信号（I-9）", () => {
           point: "tool.before",
           fn: (c, ctx) => {
             seen.push(ctx.signal.aborted);
+            rt.abort();
             return c;
           },
         },
         {
           kind: "gate",
           point: "tool.gate",
-          fn: () => {
-            rt.abort();
+          fn: (_g, ctx) => {
+            seen.push(ctx.signal.aborted);
             return { decision: "allow" };
           },
         },

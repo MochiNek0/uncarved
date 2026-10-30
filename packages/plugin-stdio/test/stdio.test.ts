@@ -64,8 +64,8 @@ async function start(manifest: { hooks?: Array<{ kind: string; point: string }>;
   const p = await spawnPlugin({
     command: process.execPath,
     args: [path.join(fixtures, "plugin.ts")],
-    env: { FIXTURE_MANIFEST: JSON.stringify({ id: "fixture", version: "1.0.0", kernel: "^0.1", ...manifest, needs }) },
     ...extra,
+    env: { FIXTURE_MANIFEST: JSON.stringify({ id: "fixture", version: "1.0.0", kernel: "^0.1", ...manifest, needs }), ...extra.env },
   });
   running.push(p);
   return p;
@@ -172,6 +172,33 @@ test("单条消息超过上限：结束插件进程，宿主不会无限缓存",
   const err = await rt.send(say("hi")).catch((e) => e);
   expect(err.cause).toBeInstanceOf(PluginProcessError);
   expect((await p.exited).code).not.toBe(0);
+});
+
+test("插件不再读 stdin：待发数据超过上限时结束插件进程，宿主不会无限缓存", async () => {
+  const p = await start({ hooks: [hook("deaf", "transform", "context.build", { reads: ["messages"], timeoutMs: 500 })] }, { maxMessageBytes: 1024 });
+  const rt = await Runtime.create({ store: new MemoryLogStore(), provider: scripted([]).provider, plugins: [p] });
+  // 第一次调用让插件卡住；第二次的数据读不走，超时后的 $/cancel 发现前面的数据还堆着
+  await rt.send(say("hi")).catch(() => {});
+  await rt.send(say("x".repeat(4 * 1024 * 1024))).catch(() => {});
+  const exited = await p.exited;
+  expect(exited.code !== 0 || exited.signal !== null).toBe(true);
+});
+
+test("插件忽略 SIGTERM 和 shutdown：close() 最终用 SIGKILL 结束它，不会一直等", async () => {
+  const p = await start({ hooks: [] }, { env: { FIXTURE_STUBBORN: "1" } });
+  await p.close();
+  const exited = await p.exited;
+  expect(exited.code !== 0 || exited.signal !== null).toBe(true);
+}, 15_000);
+
+test.if(process.platform === "win32")("Windows：env 覆盖大小写不同的同名变量（PATH 与 Path）", async () => {
+  const p = await start({ hooks: [hook("env", "transform", "context.build", { reads: ["system"], writes: ["system"] })] }, {
+    env: { path: "from-override" },
+  });
+  const { provider, requests } = scripted([{ content: [text("ok")], stopReason: "end" }]);
+  const rt = await Runtime.create({ store: new MemoryLogStore(), provider, plugins: [p] });
+  await rt.send(say("hi"));
+  expect(requests[0]!.system.at(-1)!.text).toBe("from-override");
 });
 
 test("最后一条消息没有换行：stdout 关闭时仍然处理", async () => {

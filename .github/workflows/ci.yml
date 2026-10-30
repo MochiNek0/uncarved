@@ -24,10 +24,5 @@ jobs:
       - run: bun run typecheck
       - run: bun test
       - run: bun run build
-      # 发布产物在纯 Node 下能导入
-      - name: Import dist with Node
-        shell: bash
-        run: |
-          for p in packages/*; do
-            node --input-type=module -e "await import('./$p/dist/index.js')"
-          done
+      # 发布产物在纯 Node 下能导入、能跑
+      - run: bun run smoke:node

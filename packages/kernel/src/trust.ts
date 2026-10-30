@@ -5,7 +5,7 @@
 
 import { createHash } from "node:crypto";
 import { readdir, readFile, realpath } from "node:fs/promises";
-import { createRequire, isBuiltin } from "node:module";
+import { isBuiltin } from "node:module";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type { Plugin } from "./plugin.ts";
@@ -147,18 +147,30 @@ async function checkImports(root: string, files: string[]): Promise<void> {
       if (spec!.startsWith("file:")) target = fileURLToPath(spec!);
       else if (spec!.startsWith(".") || path.isAbsolute(spec!)) target = path.resolve(path.dirname(file), spec!);
       else {
-        // 包名按 Node 的规则解析（会解析符号链接），看它最终落在哪里
-        try {
-          target = createRequire(file).resolve(spec!);
-        } catch {
-          throw new UntrustedPlugin(root, `${rel}: cannot resolve ${JSON.stringify(spec)}`);
-        }
+        // 只需知道包落在哪个目录：exports 里的路径不能指出包目录，所以不必按导入条件解析到具体文件。
+        // 用 require 的规则解析会漏掉只声明了 import 条件的包（包括内核自己）
+        const found = await packageDir(path.dirname(file), spec!);
+        if (found === undefined) throw new UntrustedPlugin(root, `${rel}: cannot resolve ${JSON.stringify(spec)}`);
+        target = found;
         if (within(kernelDir, target)) continue;
       }
       if (!within(root, target) && !within(realRoot, target)) {
         throw new UntrustedPlugin(root, `${rel}: imports ${JSON.stringify(spec)} from outside the plugin directory`);
       }
     }
+  }
+}
+
+/** 按 Node 查找 node_modules 的规则找到包目录，解析符号链接后返回；找不到返回 undefined */
+async function packageDir(from: string, spec: string): Promise<string | undefined> {
+  const parts = spec.split("/");
+  const name = spec.startsWith("@") ? parts.slice(0, 2).join("/") : parts[0]!;
+  for (let dir = from; ; dir = path.dirname(dir)) {
+    if (path.basename(dir) !== "node_modules") {
+      const found = await realpath(path.join(dir, "node_modules", name)).catch(() => undefined);
+      if (found !== undefined) return found;
+    }
+    if (path.dirname(dir) === dir) return undefined;
   }
 }
 

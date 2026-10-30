@@ -375,3 +375,38 @@ test("用户消息里的图片和文档转成 input_image / input_file；无法�
     },
   ]);
 });
+
+test("流里的 error 事件按错误码判断能否重试", async () => {
+  const req = { system: [], tools: [], messages: [] };
+  const run = async (code: string) => {
+    const { fetchFn } = fakeServer([[created, { type: "error", code, message: "boom" }]]);
+    return openaiResponsesProvider({ baseURL: "https://example.test/v1", model: "m", fetch: fetchFn })
+      .complete(req, { signal: new AbortController().signal })
+      .catch((e) => e);
+  };
+  expect(await run("server_error")).toMatchObject({ retryable: true, message: expect.stringContaining("boom") });
+  expect(await run("invalid_prompt")).toMatchObject({ retryable: false });
+});
+
+test("服务端没有理会 stream: true，返回普通 JSON：不可重试", async () => {
+  const fetchFn = (async () => new Response('{"output":[]}', { status: 200, headers: { "content-type": "application/json" } })) as unknown as typeof fetch;
+  const err = await openaiResponsesProvider({ baseURL: "https://example.test/v1", model: "m", fetch: fetchFn })
+    .complete({ system: [], tools: [], messages: [] }, { signal: new AbortController().signal })
+    .catch((e) => e);
+  expect(err).toBeInstanceOf(ProviderError);
+  expect(err).toMatchObject({ retryable: false, message: expect.stringContaining("expected an event stream") });
+});
+
+test("其他 provider 的工具调用参数没能解析、input 是原始字符串时，原样回传", async () => {
+  const { fetchFn, bodies } = fakeServer([[completed()]]);
+  const model = { by: "model" as const, provider: "other", model: "x" };
+  await openaiResponsesProvider({ baseURL: "https://example.test/v1", model: "m", fetch: fetchFn }).complete(
+    {
+      system: [],
+      tools: [],
+      messages: [{ role: "assistant", content: [{ kind: "tool_use", id: "c1", name: "f", input: '{"a":', origin: model, trust: "trusted" }] }],
+    },
+    { signal: new AbortController().signal },
+  );
+  expect(bodies[0]!.input).toEqual([{ type: "function_call", call_id: "c1", name: "f", arguments: '{"a":' }]);
+});

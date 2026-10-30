@@ -32,8 +32,14 @@ await plugin.close();
 | `layer` | 默认 `"distro"`。为 `"project"` 时必须提供 `trust`，首次启动前先确认 |
 | `trust` | `{ trust, confirm, dir }`：信任存储、确认回调、需要计算内容哈希的目录 |
 | `initTimeoutMs` | 等待 `initialize` 回复的时间，默认 10 秒 |
-| `maxMessageBytes` | 单条消息上限，超过时结束插件进程，默认 64 MiB |
+| `maxMessageBytes` | 插件发来的单条消息上限，默认 64 MiB；同时也是发给插件、插件还没读走的数据上限（插件卡住不读 stdin 时数据会堆在宿主内存里）。超过时结束插件进程 |
 | `onStderr` | 插件的 stderr 输出，不属于协议 |
+
+### 进程管理
+
+- `close()` 先发 `shutdown` 并关闭 stdin，2 秒内没退出就发 SIGTERM，再过 2 秒还没退出就 SIGKILL。
+- 只结束直接启动的那个进程。插件自己再启动的子进程（包括经由 shell 脚本、`npx` 这类包装命令启动的情况）需要插件在 stdin 关闭或收到 SIGTERM 时自己清理。
+- **Windows**：不经过 shell 启动，所以 `npx`、`npm` 这类 `.cmd`、`.bat` 包装命令无法直接启动。请直接用解释器启动脚本，例如 `{ command: process.execPath, args: ["plugin.js"] }`、`{ command: "python", args: ["plugin.py"] }`。
 
 ## 协议
 

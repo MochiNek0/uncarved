@@ -295,3 +295,51 @@ test("用户消息里的图片转成 image_url；无法表达的图片、文档�
     { role: "user", content: "plain" },
   ]);
 });
+
+test("每一块都重复完整的工具名：不拼成重复的名字", async () => {
+  const { fetchFn } = fakeServer([
+    [
+      chunk({ tool_calls: [{ index: 0, id: "a", function: { name: "read", arguments: '{"n":' } }] }),
+      chunk({ tool_calls: [{ index: 0, id: "a", function: { name: "read", arguments: "1}" } }] }, "tool_calls"),
+    ],
+  ]);
+  const provider = openaiCompatProvider({ baseURL: "https://example.test/v1", model: "m", fetch: fetchFn });
+  const res = await provider.complete({ system: [], tools: [], messages: [] }, { signal: new AbortController().signal });
+  expect(res.content.map((b) => (b.kind === "tool_use" ? [b.name, b.input] : null))).toEqual([["read", { n: 1 }]]);
+});
+
+test("服务端没有理会 stream: true，返回普通 JSON 或网页：不可重试", async () => {
+  const req = { system: [], tools: [], messages: [] };
+  for (const [body, type] of [
+    ['{"choices":[]}', "application/json"],
+    ["<html>login</html>", "text/html; charset=utf-8"],
+  ]) {
+    const fetchFn = (async () => new Response(body, { status: 200, headers: { "content-type": type! } })) as unknown as typeof fetch;
+    const provider = openaiCompatProvider({ baseURL: "https://example.test/v1", model: "m", fetch: fetchFn });
+    const err = await provider.complete(req, { signal: new AbortController().signal }).catch((e) => e);
+    expect(err).toBeInstanceOf(ProviderError);
+    expect(err).toMatchObject({ retryable: false, message: expect.stringContaining("expected an event stream") });
+  }
+});
+
+test("只有思考块的 assistant 消息整条省略，不发内容为空的消息", async () => {
+  const { fetchFn, bodies } = fakeServer([[chunk({ content: "ok" }, "stop")]]);
+  const provider = openaiCompatProvider({ baseURL: "https://example.test/v1", model: "m", fetch: fetchFn });
+  const model = { by: "model" as const, provider: "other", model: "x" };
+  await provider.complete(
+    {
+      system: [],
+      tools: [],
+      messages: [
+        { role: "user", content: [{ kind: "text", text: "a", origin: { by: "user" }, trust: "trusted" }] },
+        { role: "assistant", content: [{ kind: "thinking", text: "hmm", origin: model, trust: "trusted" }] },
+        { role: "user", content: [{ kind: "text", text: "b", origin: { by: "user" }, trust: "trusted" }] },
+      ],
+    },
+    { signal: new AbortController().signal },
+  );
+  expect(bodies[0]!.messages).toEqual([
+    { role: "user", content: "a" },
+    { role: "user", content: "b" },
+  ]);
+});

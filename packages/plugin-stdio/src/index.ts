@@ -30,7 +30,10 @@ export interface SpawnOptions {
   trust?: TrustOptions & { dir: string };
   /** 等待 initialize 回复的时间，默认 10 秒 */
   initTimeoutMs?: number;
-  /** 插件发来的单条消息（一行）的上限，超过时结束插件进程。默认 64 MiB */
+  /**
+   * 插件发来的单条消息（一行）的上限，超过时结束插件进程。默认 64 MiB。
+   * 也是发给插件、插件还没读走的数据的上限：插件不读 stdin 时数据会堆在宿主内存里，超过时同样结束进程
+   */
   maxMessageBytes?: number;
   /** 插件进程的 stderr，不属于协议 */
   onStderr?: (text: string) => void;
@@ -69,7 +72,7 @@ export async function spawnPlugin(opts: SpawnOptions): Promise<StdioPlugin> {
 
   const child = spawn(opts.command, opts.args ?? [], {
     cwd: opts.cwd,
-    env: { ...process.env, ...opts.env },
+    env: mergeEnv(opts.env),
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
   });
@@ -107,9 +110,27 @@ export async function spawnPlugin(opts: SpawnOptions): Promise<StdioPlugin> {
     checkCompat(plugin);
     return (grant ? asProjectPlugin(plugin, grant) : plugin) as StdioPlugin;
   } catch (err) {
-    child.kill();
+    terminate(child);
     throw err;
   }
+}
+
+/** Windows 的环境变量名不区分大小写：覆盖 PATH 时要去掉 process.env 里写作 Path 的那一项，否则哪个生效取决于顺序 */
+function mergeEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  if (process.platform === "win32") {
+    const keys = new Set(Object.keys(extra).map((k) => k.toUpperCase()));
+    for (const k of Object.keys(env)) if (keys.has(k.toUpperCase())) delete env[k];
+  }
+  return { ...env, ...extra };
+}
+
+/** 先 SIGTERM，宽限期后还没退出就 SIGKILL：插件可能忽略 SIGTERM（Windows 上 kill 本来就是直接结束） */
+function terminate(child: ChildProcess): void {
+  child.kill();
+  setTimeout(() => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  }, SHUTDOWN_GRACE_MS).unref();
 }
 
 /** 启动规格（命令、参数、按键排序的环境变量、工作目录）与插件目录内容一起计算哈希 */
@@ -181,13 +202,18 @@ class Connection {
   readonly active = new Map<Id, HookContext>();
 
   #child: ChildProcess;
+  #maxBytes: number;
+  /** 管道写满（write 返回 false）后、drain 之前写入的字节数。不用 writableLength：Bun 上它一直是 0 */
+  #backlog = 0;
   #nextId = 1;
   #pending = new Map<Id, { resolve: (v: unknown) => void; reject: (e: unknown) => void }>();
   #dead: Error | undefined;
 
   constructor(child: ChildProcess, maxMessageBytes: number, onStderr?: (text: string) => void) {
     this.#child = child;
+    this.#maxBytes = maxMessageBytes;
     child.stdin!.on("error", () => {}); // 进程退出后写入失败，由 exit 统一处理
+    child.stdin!.on("drain", () => (this.#backlog = 0));
     child.stderr!.setEncoding("utf8");
     child.stderr!.on("data", (text: string) => onStderr?.(text));
 
@@ -221,7 +247,7 @@ class Connection {
           // 流已经不可信：结束进程，进行中的调用随 exit 一起失败
           overflowed = true;
           pending = [];
-          this.#child.kill();
+          terminate(this.#child);
           return;
         }
         pending.push(chunk.subarray(start, end));
@@ -247,6 +273,8 @@ class Connection {
     const result = new Promise<unknown>((resolve, reject) => {
       if (this.#dead) return reject(this.#dead);
       if (signal?.aborted) return reject(signal.reason);
+      // 先序列化：payload 无法序列化时直接失败，不留下等不到回复的调用
+      const line = JSON.stringify({ jsonrpc: "2.0", id, method, params } satisfies RpcMessage);
       const onAbort = () => {
         if (!this.#pending.delete(id)) return;
         this.#send({ jsonrpc: "2.0", method: "$/cancel", params: { id } });
@@ -263,7 +291,7 @@ class Connection {
           reject(e);
         },
       });
-      this.#send({ jsonrpc: "2.0", id, method, params });
+      this.#write(line);
     });
     return { id, result };
   }
@@ -272,14 +300,25 @@ class Connection {
     if (!this.#dead) {
       await this.request("shutdown", {}, AbortSignal.timeout(SHUTDOWN_GRACE_MS)).result.catch(() => {});
       this.#child.stdin!.end();
-      const timer = setTimeout(() => this.#child.kill(), SHUTDOWN_GRACE_MS);
+      const timer = setTimeout(() => terminate(this.#child), SHUTDOWN_GRACE_MS);
       await this.exited;
       clearTimeout(timer);
     }
   }
 
   #send(msg: RpcMessage): void {
-    if (!this.#dead) this.#child.stdin!.write(JSON.stringify(msg) + "\n");
+    this.#write(JSON.stringify(msg));
+  }
+
+  #write(line: string): void {
+    if (this.#dead) return;
+    // 之前写的还堆着没被读走：插件已经不读 stdin，结束它，进行中的调用随 exit 一起失败
+    if (this.#backlog > this.#maxBytes) {
+      terminate(this.#child);
+      return;
+    }
+    const data = line + "\n";
+    if (!this.#child.stdin!.write(data) || this.#backlog > 0) this.#backlog += Buffer.byteLength(data);
   }
 
   #receive(line: string): void {
@@ -291,7 +330,7 @@ class Connection {
     }
     if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
       // 不是 JSON-RPC 消息（包括 null、数字这类合法 JSON），流已经不可信：结束进程，进行中的调用随 exit 一起失败
-      this.#child.kill();
+      terminate(this.#child);
       return;
     }
     const msg = parsed as RpcMessage;

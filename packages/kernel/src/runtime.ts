@@ -372,7 +372,11 @@ export class Runtime {
       case "CallModel":
         return this.#callModel();
       case "DecideTools":
-        for (const id of effect.toolUseIds) await this.#decideTool(this.#call(id));
+        for (const id of effect.toolUseIds) {
+          // 中断后剩下的调用不再走 hook，否则中断要等每个关卡各自超时
+          this.#abort.signal.throwIfAborted();
+          await this.#decideTool(this.#call(id));
+        }
         return;
       case "RunTools":
         return this.#runTools(effect.toolUseIds.map((id) => this.#call(id)));
@@ -425,6 +429,7 @@ export class Runtime {
     if (cacheOrderBroken(request.system)) this.#notify({ type: "warning", code: "cache-order" });
     request = await this.#transform("model.before", request, (r) => unmodified(r.messages));
 
+    signal.throwIfAborted();
     const requestHash = createHash("sha256").update(JSON.stringify(request)).digest("hex");
     await this.#commit("model.requested", { requestHash }, RUNTIME);
 
