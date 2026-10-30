@@ -1,0 +1,19 @@
+{
+  "name": "@uncarved/coder",
+  "version": "0.1.0",
+  "description": "A coding agent harness built on the uncarved kernel",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "bin": {
+    "coder": "./src/main.ts"
+  },
+  "dependencies": {
+    "uncarved": "workspace:*",
+    "@uncarved/provider-anthropic": "workspace:*",
+    "@uncarved/provider-openai-compat": "workspace:*",
+    "@uncarved/provider-openai-responses": "workspace:*",
+    "@uncarved/store-jsonl": "workspace:*"
+  }
+}

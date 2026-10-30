@@ -13,5 +13,5 @@
     "skipLibCheck": true,
     "types": ["bun"]
   },
-  "include": ["packages/*/src", "packages/*/test", "examples"]
+  "include": ["packages/*/src", "packages/*/test", "apps/*/src", "apps/*/test", "examples"]
 }
