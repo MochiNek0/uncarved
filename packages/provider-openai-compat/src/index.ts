@@ -150,7 +150,8 @@ export function openaiCompatProvider(opts: OpenAICompatOptions): Provider {
       const origin: Origin = { by: "model", provider: PROVIDER_ID, model };
       const content: Block[] = [];
       if (reasoning) content.push({ kind: "thinking", text: reasoning, origin, trust: "trusted" });
-      if (text) content.push({ kind: "text", text, origin, trust: "trusted" });
+      // 有的模型在工具调用前只输出几个换行，这种文本没有内容，存下来只会在之后每次请求里重复发送
+      if (text.trim() || (text && !calls.some(Boolean))) content.push({ kind: "text", text, origin, trust: "trusted" });
       for (const c of calls.filter(Boolean)) {
         content.push({
           kind: "tool_use",
@@ -244,8 +245,7 @@ function fromAssistant(m: Message): ChatMessage[] {
           {
             id: b.id,
             type: "function" as const,
-            // 参数解析失败时 input 是原始字符串，原样回传，不再序列化一层
-            function: { name: b.name, arguments: rawArgs(b) ?? (typeof b.input === "string" ? b.input : JSON.stringify(b.input ?? {})) },
+            function: { name: b.name, arguments: argumentsOf(b) },
           },
         ]
       : [],
@@ -300,6 +300,23 @@ function omitted(kind: "image" | "document"): string {
 function rawArgs(b: Block): string | undefined {
   const ext = b.ext?.[PROVIDER_ID] as { arguments?: string } | undefined;
   return ext?.arguments;
+}
+
+/**
+ * 回传的参数字符串：优先用原始字符串，不重新序列化。
+ * 但部分服务端（例如基于 vLLM 的）会校验历史里每个工具调用的参数，不是合法 JSON 就拒绝整个请求，
+ * 而被输出上限截断或格式错误的调用（参数为空串或半截 JSON）会一直留在历史里，之后每次请求都失败。
+ * 这种调用当时就已经以错误结束，回传时换成能解析的对象，原文放在里面让模型知道自己发过什么；日志里的块不变
+ */
+function argumentsOf(b: Extract<Block, { kind: "tool_use" }>): string {
+  const raw = rawArgs(b) ?? (typeof b.input === "string" ? b.input : JSON.stringify(b.input ?? {}));
+  if (raw.trim() === "") return "{}";
+  try {
+    JSON.parse(raw);
+    return raw;
+  } catch {
+    return JSON.stringify({ unparsed_arguments: raw });
+  }
 }
 
 /** 解析失败时把原始字符串交给工具，由工具自己校验 */

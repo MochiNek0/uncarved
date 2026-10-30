@@ -231,16 +231,20 @@ function toBlocks(item: Item, origin: Origin): Block[] {
       const text = parts.map((p) => (p.type === "output_text" ? (p.text ?? "") : p.type === "refusal" ? (p.refusal ?? "") : "")).join("");
       return [{ ...base, kind: "text", text }];
     }
-    case "function_call":
+    case "function_call": {
+      // 部分兼容服务端不给 call_id；同一批里重复的 id 无法对应结果。生成的 id 也写进保存的 item，回传时和结果对得上
+      const id = item.call_id ? String(item.call_id) : `call_${crypto.randomUUID()}`;
       return [
         {
           ...base,
+          ext: { [PROVIDER_ID]: { item: { ...item, call_id: id } } },
           kind: "tool_use",
-          id: String(item.call_id),
+          id,
           name: String(item.name),
           input: parseArgs(String(item.arguments ?? "")),
         },
       ];
+    }
     default:
       // 内置工具调用等内核不认识的 item，原样保留，回传时原样发回
       return [{ ...base, kind: "opaque" }];
@@ -275,7 +279,9 @@ function fromAssistant(m: Message, store: boolean): Item[] {
     if (item) {
       // 不在服务端保存时，id 指向的 item 并不存在，只发内容。
       // function_call 例外：它的 id 只是 item 自身的标识（规范中可选），部分兼容服务端要求必填
-      if (store || item.type === "function_call") {
+      if (item.type === "function_call") {
+        out.push({ ...item, arguments: validArguments(String(item.arguments ?? "")) });
+      } else if (store) {
         out.push(item);
       } else {
         const { id: _id, ...rest } = item;
@@ -288,9 +294,9 @@ function fromAssistant(m: Message, store: boolean): Item[] {
     if (b.kind === "text") {
       out.push({ type: "message", role: "assistant", content: [{ type: "output_text", text: b.text }] });
     } else if (b.kind === "tool_use") {
-      // 参数解析失败时 input 是原始字符串，原样回传，不再序列化一层
+      // 参数解析失败时 input 是原始字符串，不再序列化一层
       const args = typeof b.input === "string" ? b.input : JSON.stringify(b.input ?? {});
-      out.push({ type: "function_call", call_id: b.id, name: b.name, arguments: args });
+      out.push({ type: "function_call", call_id: b.id, name: b.name, arguments: validArguments(args) });
     }
   }
   return out;
@@ -342,6 +348,21 @@ function omitted(kind: "image" | "document"): string {
 
 function ownItem(b: Block): Item | undefined {
   return (b.ext?.[PROVIDER_ID] as { item?: Item } | undefined)?.item;
+}
+
+/**
+ * 回传的参数字符串：能解析就原样用。部分兼容服务端（例如把请求转给 vLLM 的网关）会校验历史里每个调用的参数，
+ * 不是合法 JSON 就拒绝整个请求；而被输出上限截断的调用（半截 JSON）会一直留在历史里，之后每次请求都失败。
+ * 这种调用当时就已经以错误结束，换成能解析的对象，原文放在里面让模型知道自己发过什么；日志里的 item 不变
+ */
+function validArguments(raw: string): string {
+  if (raw.trim() === "") return "{}";
+  try {
+    JSON.parse(raw);
+    return raw;
+  } catch {
+    return JSON.stringify({ unparsed_arguments: raw });
+  }
 }
 
 /** 解析失败时把原始字符串交给工具，由工具自己校验 */

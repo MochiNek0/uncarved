@@ -125,22 +125,43 @@ test("ext 与构造参数：body、headers 按 默认值 < ext 合并，保留�
   ).rejects.toThrow('must not set "stream"');
 });
 
-test("其他 provider 解析失败的工具参数（原始字符串）原样回传，不再序列化一层；命中缓存的 token 计入 cacheReadTokens", async () => {
+test("工具参数优先按原始字符串回传；不是合法 JSON 的（截断、空串）换成能解析的对象；命中缓存的 token 计入 cacheReadTokens", async () => {
   const { fetchFn, bodies } = fakeServer([
     [chunk({ content: "ok" }, "stop"), JSON.stringify({ choices: [], usage: { prompt_tokens: 12, completion_tokens: 3, prompt_tokens_details: { cached_tokens: 8 } } })],
   ]);
   const provider = openaiCompatProvider({ baseURL: "https://example.test/v1", model: "m", fetch: fetchFn });
   const other = { by: "model" as const, provider: "openai-responses", model: "x" };
+  const own = { by: "model" as const, provider: "openai-compat", model: "m" };
   const res = await provider.complete(
     {
       system: [],
       tools: [],
-      messages: [{ role: "assistant", content: [{ kind: "tool_use", id: "c1", name: "echo", input: '{"x": ', origin: other, trust: "trusted" }] }],
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            // 原始字符串的空白保留，不重新序列化
+            { kind: "tool_use", id: "c1", name: "echo", input: { x: 1 }, origin: own, trust: "trusted", ext: { "openai-compat": { arguments: '{ "x":1 }' } } },
+            // 其他 provider 解析失败的参数（半截 JSON）
+            { kind: "tool_use", id: "c2", name: "echo", input: '{"x": ', origin: other, trust: "trusted" },
+            // 被输出上限截断、一个参数都没收到
+            { kind: "tool_use", id: "c3", name: "read", input: {}, origin: own, trust: "trusted", ext: { "openai-compat": { arguments: "" } } },
+          ],
+        },
+      ],
     },
     { signal: new AbortController().signal },
   );
   expect(bodies[0]!.messages).toEqual([
-    { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "echo", arguments: '{"x": ' } }] },
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [
+        { id: "c1", type: "function", function: { name: "echo", arguments: '{ "x":1 }' } },
+        { id: "c2", type: "function", function: { name: "echo", arguments: JSON.stringify({ unparsed_arguments: '{"x": ' }) } },
+        { id: "c3", type: "function", function: { name: "read", arguments: "{}" } },
+      ],
+    },
   ]);
   expect(res.usage).toEqual({ inputTokens: 12, outputTokens: 3, cacheReadTokens: 8 });
 });
@@ -368,4 +389,18 @@ test("只有思考块的 assistant 消息整条省略，不发内容为空的消
     { role: "user", content: "a" },
     { role: "user", content: "b" },
   ]);
+});
+
+test("工具调用前只有空白的文本不保留；没有工具调用时照样返回", async () => {
+  const { fetchFn } = fakeServer([
+    [
+      chunk({ content: "\n\n" }),
+      chunk({ tool_calls: [{ index: 0, id: "call_1", function: { name: "echo", arguments: "{}" } }] }, "tool_calls"),
+    ],
+    [chunk({ content: " " }, "stop")],
+  ]);
+  const provider = openaiCompatProvider({ baseURL: "https://example.test/v1", model: "fake-1", apiKey: "k", fetch: fetchFn });
+  const req = { system: [], messages: [], tools: [] };
+  expect((await provider.complete(req, { signal: new AbortController().signal })).content.map((b) => b.kind)).toEqual(["tool_use"]);
+  expect((await provider.complete(req, { signal: new AbortController().signal })).content).toMatchObject([{ kind: "text", text: " " }]);
 });

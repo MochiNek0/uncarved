@@ -170,8 +170,14 @@ function toParam(m: Message): MessageParam[] {
 }
 
 function toBlockParam(b: Block): ContentBlockParam[] {
-  const raw = b.ext?.[PROVIDER_ID];
-  if (raw) return [raw as ContentBlockParam];
+  const raw = b.ext?.[PROVIDER_ID] as ContentBlockParam | undefined;
+  if (raw) {
+    // 被输出上限截断的回复里可能有空的 text 块、还没收到签名的 thinking 块。原样回传会被拒绝，
+    // 而它们一直留在历史里，之后每次请求都失败。截断在思考阶段时同一条回复里不会有 tool_use，省略 thinking 不影响工具调用
+    if (raw.type === "text" && !raw.text.trim()) return [];
+    if (raw.type === "thinking" && !raw.signature) return [];
+    return [raw];
+  }
 
   switch (b.kind) {
     case "text":

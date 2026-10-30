@@ -273,6 +273,34 @@ test("流读取中出现的非 SDK 错误：转成可重试的 ProviderError", a
   expect(err).toMatchObject({ retryable: true, message: expect.stringContaining("terminated") });
 });
 
+test("被截断的回复里空的 text 块、没有签名的 thinking 块不回传；完整的照原样", async () => {
+  const { client, calls } = fakeClient({ model: "m", content: [], stop_reason: "end_turn", usage: { input_tokens: 0, output_tokens: 0 } });
+  const model = { by: "model" as const, provider: PROVIDER_ID, model: "m" };
+  const raw = (b: Record<string, unknown>, kind: "text" | "thinking", text: string): Block => ({ kind, text, origin: model, trust: "trusted", ext: { [PROVIDER_ID]: b } });
+  const signed = { type: "thinking", thinking: "done", signature: "sig" };
+  await anthropicProvider({ client }).complete(
+    {
+      system: [],
+      tools: [],
+      messages: [
+        { role: "user", content: [{ kind: "text", text: "hi", origin: user, trust: "trusted" }] },
+        { role: "assistant", content: [raw(signed, "thinking", "done"), raw({ type: "text", text: "ok" }, "text", "ok")] },
+        { role: "user", content: [{ kind: "text", text: "again", origin: user, trust: "trusted" }] },
+        { role: "assistant", content: [raw({ type: "thinking", thinking: "half", signature: "" }, "thinking", "half"), raw({ type: "text", text: "" }, "text", "")] },
+        { role: "user", content: [{ kind: "text", text: "continue", origin: user, trust: "trusted" }] },
+      ],
+    },
+    { signal: new AbortController().signal },
+  );
+  // 第二条 assistant 消息什么都不剩，整条省略
+  expect(calls[0]!.messages).toEqual([
+    { role: "user", content: [{ type: "text", text: "hi" }] },
+    { role: "assistant", content: [signed, { type: "text", text: "ok" }] },
+    { role: "user", content: [{ type: "text", text: "again" }] },
+    { role: "user", content: [{ type: "text", text: "continue" }] },
+  ]);
+});
+
 test("只有空白的 text 块也不发送：API 同样拒绝（例如工具只输出了换行）", async () => {
   const { client, calls } = fakeClient({ model: "m", content: [], stop_reason: "end_turn", usage: { input_tokens: 0, output_tokens: 0 } });
   const toolOrigin = { by: "tool" as const, name: "sh" };

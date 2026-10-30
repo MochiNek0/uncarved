@@ -397,7 +397,7 @@ test("服务端没有理会 stream: true，返回普通 JSON：不可重试", as
   expect(err).toMatchObject({ retryable: false, message: expect.stringContaining("expected an event stream") });
 });
 
-test("其他 provider 的工具调用参数没能解析、input 是原始字符串时，原样回传", async () => {
+test("其他 provider 的工具调用参数没能解析、input 是原始字符串时，包成能解析的对象回传", async () => {
   const { fetchFn, bodies } = fakeServer([[completed()]]);
   const model = { by: "model" as const, provider: "other", model: "x" };
   await openaiResponsesProvider({ baseURL: "https://example.test/v1", model: "m", fetch: fetchFn }).complete(
@@ -408,5 +408,28 @@ test("其他 provider 的工具调用参数没能解析、input 是原始字符�
     },
     { signal: new AbortController().signal },
   );
-  expect(bodies[0]!.input).toEqual([{ type: "function_call", call_id: "c1", name: "f", arguments: '{"a":' }]);
+  expect(bodies[0]!.input).toEqual([{ type: "function_call", call_id: "c1", name: "f", arguments: JSON.stringify({ unparsed_arguments: '{"a":' }) }]);
+});
+
+test("被截断的工具调用：参数是半截 JSON 时回传能解析的对象，日志里的 item 不变；没有 call_id 时生成一个", async () => {
+  const truncated = { type: "function_call", id: "fc_9", call_id: "call_9", name: "echo", arguments: '{"x": "ab', status: "incomplete" };
+  const noId = { type: "function_call", id: "fc_8", name: "echo", arguments: "", status: "completed" };
+  const incomplete = { type: "response.incomplete", response: { model: "fake-1", status: "incomplete", incomplete_details: { reason: "max_output_tokens" } } };
+  const { fetchFn, bodies } = fakeServer([[created, itemDone(0, noId), itemDone(1, truncated), incomplete], [completed()]]);
+  const provider = openaiResponsesProvider({ baseURL: "https://example.test/v1", model: "m", fetch: fetchFn });
+  const signal = new AbortController().signal;
+
+  const res = await provider.complete({ system: [], tools: [], messages: [] }, { signal });
+  expect(res.stopReason).toBe("max_tokens");
+  const [first, second] = res.content;
+  expect(first).toMatchObject({ kind: "tool_use", id: expect.stringMatching(/^call_/), input: {} });
+  expect(second).toMatchObject({ kind: "tool_use", id: "call_9", input: '{"x": "ab' });
+  expect((second!.ext![PROVIDER_ID] as { item: { arguments: string } }).item.arguments).toBe('{"x": "ab');
+
+  const id = (first as Extract<Block, { kind: "tool_use" }>).id;
+  await provider.complete({ system: [], tools: [], messages: [{ role: "assistant", content: res.content }] }, { signal });
+  expect(bodies[1]!.input).toEqual([
+    { ...noId, call_id: id, arguments: "{}" },
+    { ...truncated, arguments: JSON.stringify({ unparsed_arguments: '{"x": "ab' }) },
+  ]);
 });
