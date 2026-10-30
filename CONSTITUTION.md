@@ -1,6 +1,6 @@
 # Uncarved 内核宪法
 
-> 版本 0.8 · 草案 · 2026-10-30
+> 版本 0.9 · 草案 · 2026-10-30
 >
 > 未经雕琢的原木。内核只提供循环这块木料，不预设形状，由每个发行版去雕刻。
 
@@ -66,11 +66,13 @@ interface Event {
 | `tool.interrupted` | 工具已决定执行但没有结果，恢复时发现（见 4.5） |
 | `tool.completed` | 工具执行结果；如果工具启动了子会话，还要记录子会话的 ID 和最终 `seq` |
 | `derived.recorded` | 插件产生的派生数据，例如压缩摘要。因为它不确定，必须落盘才能重放 |
-| `turn.ended` / `session.ended` | 结束 |
+| `turn.ended` | 一轮结束，记录原因：正常结束、截断、拒绝、被关卡停止、被中断（`aborted`）、出错 |
+| `session.detached` | 宿主进程离开会话，会话仍可恢复（见 4.2） |
+| `session.ended` | 会话永久结束 |
 
-插件可以定义自己的事件类型，但必须使用带命名空间的名字（`<plugin-id>/<type>`）。
+插件可以定义自己的事件类型，但必须使用带命名空间的名字（`<plugin-id>/<type>`）。宿主写入的自定义事件同样必须带命名空间（见 4.8）。
 
-流式输出的增量（delta）**不记入日志**，只作为瞬时事件推送给订阅者。日志里只记录最终结果。
+流式输出的增量（delta）和工具的执行进度**不记入日志**，只作为瞬时事件推送给订阅者。日志里只记录最终结果。
 
 ### 3.3 内容块
 
@@ -87,6 +89,7 @@ interface Block {
 type Origin =
   | { by: "user" } | { by: "model"; provider: string; model: string }
   | { by: "tool"; name: string } | { by: "plugin"; id: string; source?: ContentSource } | { by: "runtime" }
+  | { by: "host" }                  // 宿主程序（发行版的 CLI、服务端等），见 4.8
 
 // 插件从某个配置层加载的内容（例如提示词文件）的出处
 interface ContentSource { layer: Layer; path: string; hash: string }
@@ -135,6 +138,8 @@ step(state: State, event: Event) => { state: State; effects: Effect[] }
 
 `AwaitInput` 期间，会话必须能完全序列化，然后释放进程。
 
+宿主进程离开一个仍要继续的会话时，应当调用 `detach`：运行时写入 `session.detached`，等它触发的 observe 及其写入完成（5.1）后返回，此后该运行时实例不再接受任何调用。`detach` 不改变会话状态，会话照常可以恢复。`session.ended` 只表示永久结束。
+
 ### 4.3 日志存储接口
 
 ```ts
@@ -163,7 +168,11 @@ input.received
 
 方括号是扩展点，见第五章。
 
-`tool.before` 必须在 `tool.gate` 之前执行：关卡判断的必须是**最终要执行的参数**，否则参数可以在批准之后被改写。
+`tool.before` 必须在 `tool.gate` 之前执行：关卡判断的必须是**最终要执行的参数**，否则参数可以在批准之后被改写。`tool.before` 只能修改参数，修改 `toolUseId` 或 `name` 视为该 hook 出错。
+
+`tool.gate` 除了最终参数，还必须收到被调用工具的声明（`name`、`description`、`inputSchema`、`effect`、`concurrency`、`idempotent`，见第六章），供权限插件判断。
+
+宿主中断（`abort`）导致本轮结束时，`turn.ended` 的原因必须是 `aborted`，不能与出错混在一起。
 
 ### 4.5 崩溃恢复
 
@@ -200,6 +209,16 @@ Provider 把模型请求翻译成某个模型接口的调用，它的实现不�
 2. Provider 可以包装另一个 Provider，用于路由、重试、限流、降级。包装者必须转发取消信号（I-9），并原样传递 `ext`。
 3. 日志只记录最终被使用的响应（I-5）。响应必须标明实际产生回复的 provider 和模型。
 4. 调用失败时应当抛出 `ProviderError`，并标明是否可以重试。
+5. 包装者重试或切换到另一个 Provider 之前，如果失败的那次调用已经推送过增量，必须先推送一个 `reset` 增量，表示此前本次调用的增量全部作废。
+
+### 4.8 宿主写入
+
+宿主（发行版的 CLI、服务端等）可以通过运行时向日志写入两类事件，来源记为 `{ by: "host" }`（I-8）：
+
+- 派生数据（`derived.recorded`），插件从 hook 上下文的 `derived` 读取，恢复会话后仍然存在
+- 带命名空间的自定义事件（`<ns>/<type>`）
+
+宿主写入与其他对外调用一样：运行时正在驱动循环时必须拒绝（避免在一轮中间改变插件看到的数据），返回前必须等待 observe 完成（5.1）。凡是会影响插件决策的宿主设置（例如权限模式），都应当这样写入日志，而不是只保存在宿主进程的内存里，否则恢复会话后无法重建（I-5）。
 
 ---
 
@@ -237,7 +256,7 @@ hook 通过上下文写日志（`record`/`emit`）的时机：
 | `context.project` | transform | 事件日志 → 消息列表（压缩、截断策略在这里） |
 | `model.before` | transform | 模型请求 → 模型请求 |
 | `model.after` | observe | 模型响应 |
-| `tool.gate` | gate | 工具调用 → 决策 |
+| `tool.gate` | gate | 工具调用（最终参数）＋工具声明 → 决策 |
 | `tool.before` | transform | 工具输入 → 工具输入 |
 | `tool.after` | transform | 工具结果 → 工具结果（截断、脱敏） |
 | `turn.continue` | gate | 当前状态 → 是否继续（`deny` = 停止） |
@@ -279,11 +298,14 @@ interface Tool {
   effect: "read" | "write" | "external"   // 供权限插件判断
   concurrency: "safe" | "exclusive"       // safe 的工具可以并发执行
   idempotent: boolean                     // 重复执行是否安全，决定崩溃后能否自动重试（见 4.5）
-  execute(input: unknown, ctx: { signal: AbortSignal; ... }): Promise<ToolResult>
+  execute(input: unknown, ctx: { signal: AbortSignal; progress(update: unknown): void; ... }): Promise<ToolResult>
 }
 ```
 
+除 `execute` 以外的部分称为工具的**声明**，会交给 `tool.gate`（4.4）。
+
 - 同一轮的多个工具调用：全部是 `safe` 时并发执行，否则按模型给出的顺序依次执行。
+- 工具可以通过 `ctx.progress` 推送执行进度（例如命令输出、子 Agent 的动作）。进度只推送给订阅者，不记入日志，格式由工具和宿主约定。
 - 工具结果默认是 `untrusted`。
 - 子 Agent 就是一个工具，内核不为它提供特殊支持。
 
@@ -380,6 +402,30 @@ interface Tool {
 | `session.ended` 之后是否拒绝写入？ | 拒绝，由纯核心保证：`ended` 阶段不接受任何事件 | 日志要有明确的结尾；`session.end` 的 observe 改为在 `session.ended` 之前执行，需要收尾写入的插件仍然可以写 | 5.1、3.2 |
 
 受影响的发行版：在 observe 里不 `await` 就调用 `record`/`emit`（hook 返回后才写入）的插件，写入会被拒绝；依赖 `session.end` 收到的状态处于 `ended` 阶段的插件，现在收到的是结束前的状态。这是 hook 接口的不兼容修改，0.x 草案阶段以 0.7 → 0.8 表示。
+
+已决问题（v0.9）：
+
+以下问题都来自在内核上实现编程 Agent 发行版（`apps/coder`）时遇到的缺口。
+
+| 问题 | 结论 | 理由 | 见 |
+|---|---|---|---|
+| 权限插件怎样知道工具的 `effect`、schema？ | `tool.gate` 的输入带上工具声明；进程外关卡可以读取 `tool` 字段 | 第六章说 `effect` 供权限插件判断，但关卡只收到名字和参数。发行版只能把所有插件的工具手动传给权限插件，进程外关卡则完全拿不到 | 4.4、第六章、5.5 |
+| `tool.before` 能否改 `toolUseId`、`name`？ | 不能，视为出错 | 原来关卡收到的是 `tool.before` 的完整输出，改了名字后关卡审的工具与实际执行的不同 | 4.4 |
+| 用户中断和出错怎样区分？ | `turn.ended` 增加原因 `aborted` | 宿主只能解析错误文字；中断是正常操作，不该被统计为失败 | 3.2、4.4 |
+| 长时间运行的工具怎样显示进度？ | `ToolContext.progress`，和模型增量一样只推送、不记日志 | 命令输出、子 Agent 的动作只能等工具结束才看得到。不需要新的扩展点：进度是给宿主看的，不影响流程 | 3.2、第六章 |
+| 重试后已推送的增量怎么办？ | 增量增加 `reset`，包装 Provider 重试前必须推送 | 否则界面上会出现失败那次的半截输出加上重试的完整输出 | 4.7 |
+| 宿主设置（权限模式、"总是允许"）存在哪里？ | 宿主可以写派生数据和带命名空间的事件，来源 `host`，只能在运行时空闲时写 | 原来只有插件能在 hook 执行期间写日志，宿主设置只能放在内存里，恢复会话后丢失，关卡决策也无法只凭日志解释 | 3.3、4.8 |
+| 宿主退出但会话还要继续，插件怎样收尾？ | 新增 `session.detached` 事件和 `detach()`；插件通过 `event` 观察它，并在此时写入 | `close()` 是永久结束，交互式宿主退出时不能调用，`session.end` 因此永远不会触发。用 `event` 观察新事件即可，不需要新的扩展点（11.3） | 3.2、4.2 |
+
+受影响的发行版：
+
+- 读取增量时没有判断 `kind` 就访问 `text` 的宿主，需要处理 `reset`（类型层面的不兼容）。
+- 自己实现工具执行器、构造 `ToolContext` 的代码需要提供 `progress`。
+- 对 `Origin`、`TurnEndReason` 做穷举判断的代码需要处理 `host`、`aborted`。
+- 在 `tool.before` 中改写工具名的插件会失败。
+- 关卡插件和包装 Provider 不需要修改；包装 Provider 应当补上 `reset`。
+
+日志格式只新增了事件类型和可选取值，旧日志仍可读取（8.3）。没有改动第二章不变量。0.x 草案阶段以 0.8 → 0.9 表示。
 
 ---
 
