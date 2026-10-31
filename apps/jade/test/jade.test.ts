@@ -294,6 +294,18 @@ describe("fs tools", () => {
     expect(Date.now() - t0).toBeLessThan(5000);
   }, 20_000);
 
+  test("bash keeps the start and end of large output and drops the middle", async () => {
+    const { cwd } = await workspace();
+    const tool = shellTool({ cwd });
+    // 约 2MB：开头一行 first，结尾一行 last
+    const r = await tool.execute({ command: "echo first; head -c 2000000 /dev/zero | tr '\\0' x; echo; echo last" }, ctx());
+    const text = r.content as string;
+    expect(text).toContain("<stdout>\nfirst\n");
+    expect(text).toEndWith("last\n</stdout>");
+    expect(text).toMatch(/… \(\d+ characters omitted\) …/);
+    expect(text.length).toBeLessThan(31_000);
+  }, 20_000);
+
   test("background shells return at once; bash_output reads new output; kill_shell stops them", async () => {
     const { cwd } = await workspace();
     const shell = shellTools({ cwd });
@@ -642,13 +654,13 @@ describe("jade session", () => {
     expect(hasProvider({})).toBe(false);
   });
 
-  test("JADE_EFFORT is checked against the provider", () => {
+  test("JADE_EFFORT is checked against the provider", async () => {
     expect(effortFromEnv({ ANTHROPIC_API_KEY: "k", JADE_EFFORT: "max" })).toBe("max");
     expect(effortFromEnv({ OPENAI_API_KEY: "k", JADE_EFFORT: "minimal" })).toBe("minimal");
     expect(effortFromEnv({ ANTHROPIC_API_KEY: "k" })).toBeUndefined();
     expect(() => effortFromEnv({ ANTHROPIC_API_KEY: "k", JADE_EFFORT: "minimal" })).toThrow("JADE_EFFORT must be one of");
     expect(() => effortFromEnv({ OPENAI_COMPAT_BASE_URL: "http://x", JADE_EFFORT: "high" })).toThrow("not supported");
-    expect(() => providerFromEnv({ OPENAI_API_KEY: "k", JADE_EFFORT: "turbo" })).toThrow("JADE_EFFORT");
+    await expect(providerFromEnv({ OPENAI_API_KEY: "k", JADE_EFFORT: "turbo" })).rejects.toThrow("JADE_EFFORT");
   });
 
   test("images and PDFs are estimated by kind, not by the size of their base64 data", () => {
@@ -670,11 +682,11 @@ describe("jade session", () => {
     expect(estimateTokens([media("document", 3_000_000)])).toBeGreaterThan(50_000);
   });
 
-  test("OPENAI_COMPAT_EXTRA_BODY must be a JSON object", () => {
+  test("OPENAI_COMPAT_EXTRA_BODY must be a JSON object", async () => {
     const env = { OPENAI_COMPAT_BASE_URL: "http://x", OPENAI_COMPAT_MODEL: "m" };
-    expect(providerFromEnv({ ...env, OPENAI_COMPAT_EXTRA_BODY: '{"enable_thinking":true}' }).id).toBe("openai-compat");
-    expect(() => providerFromEnv({ ...env, OPENAI_COMPAT_EXTRA_BODY: "enable_thinking" })).toThrow("must be a JSON object");
-    expect(() => providerFromEnv({ ...env, OPENAI_COMPAT_EXTRA_BODY: "[1]" })).toThrow("must be a JSON object");
+    expect((await providerFromEnv({ ...env, OPENAI_COMPAT_EXTRA_BODY: '{"enable_thinking":true}' })).id).toBe("openai-compat");
+    await expect(providerFromEnv({ ...env, OPENAI_COMPAT_EXTRA_BODY: "enable_thinking" })).rejects.toThrow("must be a JSON object");
+    await expect(providerFromEnv({ ...env, OPENAI_COMPAT_EXTRA_BODY: "[1]" })).rejects.toThrow("must be a JSON object");
   });
 
   test("old large tool output is cleared first, judged by the real usage of the previous request", async () => {

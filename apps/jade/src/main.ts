@@ -16,6 +16,7 @@ import {
   UntrustedPlugin,
   type Block,
   type Plugin,
+  type Provider,
   type UserInput,
 } from "uncarved";
 import { hasProvider, loadEnvFile } from "./config.ts";
@@ -34,7 +35,6 @@ import { bold, dim, green, plainScreen, red, yellow, type CommandInfo, type Scre
 import { configurator } from "./ui/configure.ts";
 import { clip, preview, shortPath, summarize } from "./ui/render.ts";
 import { transcript } from "./ui/transcript.ts";
-import { tuiScreen } from "./ui/tui.tsx";
 
 const HELP = `Usage: jade [options] [prompt]
 
@@ -167,8 +167,9 @@ const early: string[] = [];
 
 const inputs = new InputHistory(path.join(home, "history.jsonl"), cwd);
 
+// 终端界面依赖 ink 和 react，加载要几百毫秒，只在真的用到时才导入
 const screen: Screen = tui
-  ? tuiScreen({
+  ? (await import("./ui/tui.tsx")).tuiScreen({
       status: { cwd: shortPath(cwd), branch: await gitBranch(cwd), model: modelLabel(), mode: opts.mode ?? "ask" },
       version: VERSION,
       commands: COMMANDS,
@@ -196,8 +197,8 @@ const provider = switchable({
 const configure = configurator({
   screen,
   envFile,
-  apply: () => {
-    provider.set(retrying(providerFromEnv()));
+  apply: async () => {
+    provider.set(retrying(await providerFromEnv()));
     contextWindow = contextWindowFromEnv();
   },
   contextWindow: () => contextWindow,
@@ -212,14 +213,14 @@ if (!hasProvider()) {
   }
 } else {
   try {
-    provider.set(retrying(providerFromEnv()));
+    provider.set(retrying(await providerFromEnv()));
   } catch (err) {
     await screen.close();
     fail(errorText(err));
   }
 }
 
-function retrying(inner: ReturnType<typeof providerFromEnv>) {
+function retrying(inner: Provider) {
   return withRetry(inner, {
     onRetry: ({ attempt, delayMs, error }) => screen.log(yellow(`[retry ${attempt} in ${Math.round(delayMs / 1000)}s: ${error.message}]`)),
   });

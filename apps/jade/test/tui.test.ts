@@ -61,13 +61,13 @@ describe("input history", () => {
 });
 
 describe("model configuration", () => {
-  test("JADE_PROVIDER overrides the default order", () => {
+  test("JADE_PROVIDER overrides the default order", async () => {
     const env = { OPENAI_API_KEY: "k", OPENAI_COMPAT_BASE_URL: "http://x", OPENAI_COMPAT_MODEL: "m" };
     expect(providerKind(env)).toBe("openai");
     expect(providerKind({ ...env, JADE_PROVIDER: "openai-compat" })).toBe("openai-compat");
     expect(providerInfo({ ...env, JADE_PROVIDER: "openai-compat" })).toEqual({ kind: "openai-compat", model: "m", baseURL: "http://x" });
     expect(() => providerKind({ JADE_PROVIDER: "gemini" })).toThrow("JADE_PROVIDER");
-    expect(() => providerFromEnv({ ...env, JADE_MAX_TOKENS: "lots" })).toThrow("JADE_MAX_TOKENS");
+    await expect(providerFromEnv({ ...env, JADE_MAX_TOKENS: "lots" })).rejects.toThrow("JADE_MAX_TOKENS");
   });
 
   test("updateEnvFile replaces, appends and removes keys and keeps everything else", async () => {

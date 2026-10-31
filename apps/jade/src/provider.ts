@@ -1,8 +1,5 @@
 // Provider：按环境变量选择，外面包一层重试（4.7：重试是包装 Provider 的事）。
 
-import { anthropicProvider } from "@uncarved/provider-anthropic";
-import { openaiCompatProvider } from "@uncarved/provider-openai-compat";
-import { openaiResponsesProvider } from "@uncarved/provider-openai-responses";
 import { ProviderError, type Provider } from "uncarved";
 
 export interface RetryOptions {
@@ -125,13 +122,15 @@ export function providerInfo(env: Env = process.env): ProviderInfo {
  * - anthropic：Claude，ANTHROPIC_API_KEY，可选 ANTHROPIC_MODEL
  * JADE_MAX_TOKENS 是每次回复的输出上限。不设时 Claude 用 64000，其他服务用服务端默认值（有的只有 4096，思考很容易用完）
  * JADE_EFFORT 是思考的力度，见 effortFromEnv
+ * 只导入用到的那个服务的包：Anthropic 的 SDK 加载要一百多毫秒，拖慢启动
  */
-export function providerFromEnv(env: Env = process.env): Provider {
+export async function providerFromEnv(env: Env = process.env): Promise<Provider> {
   const kind = providerKind(env);
   const maxTokens = env.JADE_MAX_TOKENS ? positiveInt("JADE_MAX_TOKENS", env.JADE_MAX_TOKENS) : undefined;
   const effort = effortFromEnv(env);
   if (kind === "openai") {
     if (!env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is required for the openai provider");
+    const { openaiResponsesProvider } = await import("@uncarved/provider-openai-responses");
     return openaiResponsesProvider({
       baseURL: env.OPENAI_BASE_URL ?? "https://api.openai.com/v1",
       apiKey: env.OPENAI_API_KEY,
@@ -143,6 +142,7 @@ export function providerFromEnv(env: Env = process.env): Provider {
   if (kind === "openai-compat") {
     if (!env.OPENAI_COMPAT_BASE_URL) throw new Error("OPENAI_COMPAT_BASE_URL is required for the openai-compat provider");
     if (!env.OPENAI_COMPAT_MODEL) throw new Error("OPENAI_COMPAT_MODEL is required when OPENAI_COMPAT_BASE_URL is set");
+    const { openaiCompatProvider } = await import("@uncarved/provider-openai-compat");
     return openaiCompatProvider({
       baseURL: env.OPENAI_COMPAT_BASE_URL,
       apiKey: env.OPENAI_COMPAT_API_KEY,
@@ -151,6 +151,7 @@ export function providerFromEnv(env: Env = process.env): Provider {
       extraBody: env.OPENAI_COMPAT_EXTRA_BODY ? jsonObject("OPENAI_COMPAT_EXTRA_BODY", env.OPENAI_COMPAT_EXTRA_BODY) : undefined,
     });
   }
+  const { anthropicProvider } = await import("@uncarved/provider-anthropic");
   return anthropicProvider({ model: env.ANTHROPIC_MODEL, effort: (effort ?? "high") as "low" | "medium" | "high" | "xhigh" | "max", maxTokens });
 }
 

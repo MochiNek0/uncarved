@@ -1,9 +1,9 @@
 name: CI
 
+# 不在 push 时自动跑：三个系统一起跑太占资源，需要时在 Actions 页面手动触发
 on:
-  push:
-    branches: [main]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   test:

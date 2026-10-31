@@ -133,8 +133,8 @@ export function shellTools(opts: ShellOptions): ShellTools {
         ]);
         signal.throwIfAborted();
         const parts = [timedOut ? `Timed out after ${timeout}ms (killed)` : `Exit code ${code}`];
-        if (stdout) parts.push(`<stdout>\n${clip(stdout)}\n</stdout>`);
-        if (stderr) parts.push(`<stderr>\n${clip(stderr)}\n</stderr>`);
+        if (stdout) parts.push(`<stdout>\n${stdout}\n</stdout>`);
+        if (stderr) parts.push(`<stderr>\n${stderr}\n</stderr>`);
         return { content: parts.join("\n"), isError: timedOut || code !== 0 };
       } finally {
         clearTimeout(timer);
@@ -268,19 +268,37 @@ function killTree(shell: string, pid: number) {
   }
 }
 
-/** keep 为 false 时只推给 onChunk，不累积，返回空串 */
+/**
+ * 返回截好的输出：超过 MAX_OUTPUT_CHARS 时保留开头和结尾各一半，中间截掉。
+ * 边读边截，输出再多也只占几倍 MAX_OUTPUT_CHARS 的内存。keep 为 false 时只推给 onChunk，不累积，返回空串
+ */
 async function collect(stream: ReadableStream<Uint8Array>, onChunk: (text: string) => void, keep = true): Promise<string> {
+  const half = MAX_OUTPUT_CHARS / 2;
   const decoder = new TextDecoder();
-  let out = "";
+  let head = "";
+  let tail = "";
+  let total = 0;
+  const add = (text: string) => {
+    onChunk(text);
+    if (!keep) return;
+    total += text.length;
+    if (head.length < half) {
+      const n = half - head.length;
+      head += text.slice(0, n);
+      text = text.slice(n);
+    }
+    tail += text;
+    // 攒到两倍再截，不用每块都复制
+    if (tail.length > 2 * half) tail = tail.slice(-half);
+  };
   for await (const chunk of stream) {
     const text = decoder.decode(chunk, { stream: true });
-    if (!text) continue;
-    if (keep) out += text;
-    onChunk(text);
+    if (text) add(text);
   }
   const rest = decoder.decode();
-  if (rest) onChunk(rest);
-  return keep ? out + rest : "";
+  if (rest) add(rest);
+  if (total <= MAX_OUTPUT_CHARS) return (head + tail).trimEnd();
+  return `${head}\n… (${total - MAX_OUTPUT_CHARS} characters omitted) …\n${tail.slice(-half)}`.trimEnd();
 }
 
 /** 保留开头和结尾，中间截掉 */

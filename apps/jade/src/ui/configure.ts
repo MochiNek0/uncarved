@@ -9,7 +9,7 @@ export interface ConfigureOptions {
   screen: Screen;
   envFile: string;
   /** 按新的环境变量换上 provider、更新上下文窗口；配置不完整时抛出 */
-  apply(): void;
+  apply(): Promise<void>;
   /** 当前的上下文窗口（显示用） */
   contextWindow(): number;
   /** 配置成功后更新状态栏 */
@@ -42,7 +42,7 @@ export function configurator(opts: ConfigureOptions): Configure {
   async function applyConfig(updates: Record<string, string | undefined>): Promise<boolean> {
     await updateEnvFile(envFile, updates);
     try {
-      opts.apply();
+      await opts.apply();
     } catch (err) {
       screen.log(red(`Saved to ${shortPath(envFile)}, but the configuration is incomplete: ${errorText(err)}`));
       return false;
