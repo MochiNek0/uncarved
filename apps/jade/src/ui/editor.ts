@@ -82,6 +82,16 @@ export interface Layout {
   col: number;
 }
 
+/** 单个字符的显示宽度；每次按键都要把整段输入过一遍，stringWidth 较慢，ASCII 直接算，其余缓存 */
+const widths = new Map<string, number>();
+function charWidth(ch: string): number {
+  const c = ch.charCodeAt(0);
+  if (c >= 0x20 && c < 0x7f) return 1;
+  let w = widths.get(ch);
+  if (w === undefined) widths.set(ch, (w = stringWidth(ch)));
+  return w;
+}
+
 /** 按显示宽度折行（按字符折，不按词），并算出光标位置。width 至少为 2 */
 export function layout(value: string, cursor: number, width: number): Layout {
   width = Math.max(2, width);
@@ -102,7 +112,7 @@ export function layout(value: string, cursor: number, width: number): Layout {
       current = "";
       currentWidth = 0;
     } else {
-      const w = stringWidth(ch);
+      const w = charWidth(ch);
       if (currentWidth + w > width) {
         rows.push(current);
         current = "";

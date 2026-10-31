@@ -217,6 +217,30 @@ describe("terminal UI", () => {
     expect(calls.submit).toEqual(["你好 jade"]);
   });
 
+  test("applies every key that arrives in the same chunk", async () => {
+    const { calls, type } = setup();
+    await type("abcdef");
+    // 按住退格、界面忙时终端会把多个按键合成一块送来，每个都要生效
+    await type("\x7f\x7f\x7f");
+    await type("\x1b[D\x1b[Dz");
+    await type("\r");
+    expect(calls.submit).toEqual(["azbc"]);
+  });
+
+  test("moves the terminal cursor in the same frame as the arrow key", async () => {
+    const { type, raw } = setup();
+    // Ink 用 ESC[nG 把光标放到第 n 列
+    const column = () => Number([...raw().matchAll(/\x1b\[(\d+)G/g)].at(-1)?.[1]);
+    await type("abc");
+    const end = column();
+    await type("\x1b[D");
+    expect(column()).toBe(end - 1);
+    await type("\x1b[D");
+    expect(column()).toBe(end - 2);
+    await type("\x1b[C");
+    expect(column()).toBe(end - 1);
+  });
+
   test("typing / lists matching commands; arrows select and enter runs the selection", async () => {
     const { calls, type, output } = setup();
     await type("/mo");

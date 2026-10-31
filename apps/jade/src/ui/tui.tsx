@@ -15,7 +15,13 @@ import {
   type DOMElement,
   type Key,
 } from "ink";
-import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import {
+  useEffect,
+  useReducer,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import wrapAnsi from "wrap-ansi";
 import { mentionAt, mentionText, rankPaths } from "../mentions.ts";
 import { edit, empty, layout, type EditState } from "./editor.ts";
@@ -450,14 +456,15 @@ function App({
   });
 
   // 总高度要比终端少一行，否则 Ink 认为输出占满了屏幕，每帧清屏重画。
-  // 重画那一帧上下各垫一行空白：终端把顶上那行滚出去后，看到的和平时逐行一样，所以不会闪
+  // 重画那一帧上下各垫一行空白：终端把顶上那行滚出去后，看到的和平时逐行一样，所以不会闪。
+  // 只做纵向裁剪：每行都已按宽度折好或截断，横向裁剪会让 Ink 每帧对每一行再切一遍 ANSI 字符串
   return (
     <Box
       flexDirection="column"
       width={columns}
       height={repaint ? rows + 1 : Math.max(1, rows - 1)}
       paddingY={repaint ? 1 : 0}
-      overflow="hidden"
+      overflowY="hidden"
     >
       <Header status={state.status} version={version} />
       <Box
@@ -466,7 +473,7 @@ function App({
         flexGrow={1}
         flexShrink={1}
         flexBasis={0}
-        overflow="hidden"
+        overflowY="hidden"
         paddingX={1}
       >
         {shown.map((l, i) => (
@@ -538,7 +545,7 @@ function Header({ status, version }: { status: StatusInfo; version: string }) {
   return (
     <Box flexShrink={0} borderStyle="round" borderColor="cyan" paddingX={1}>
       <Bot />
-      <Box flexDirection="column" flexGrow={1} flexShrink={1} overflow="hidden">
+      <Box flexDirection="column" flexGrow={1} flexShrink={1}>
         <Text wrap="truncate-end">
           <Text color="cyan" bold>
             jade
@@ -627,6 +634,23 @@ function StatusBar({ status }: { status: StatusInfo }) {
 const tokens = (n: number) =>
   n >= 1000 ? `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k` : String(n);
 
+/**
+ * 同一块输入里的多个按键（按住退格、输入很快时终端会合并）由 Ink 连续交给处理函数，中间不重新渲染，
+ * 处理函数里读 useState 的值会是旧的，后面的按键就丢了。这里的值放在 ref 里同步更新：
+ * get() 总是最新的，set() 之后安排一次重画（同一块里的多次 set 合并成一次）
+ */
+function useLive<T>(initial: T): [get: () => T, set: (v: T) => void] {
+  const ref = useRef(initial);
+  const [, rerender] = useReducer((n: number) => n + 1, 0);
+  return [
+    () => ref.current,
+    (v: T) => {
+      ref.current = v;
+      rerender();
+    },
+  ];
+}
+
 /** 编辑按键的通用处理；返回编辑后的状态，不是编辑键时返回 undefined */
 function editKey(s: EditState, input: string, key: Key): EditState | undefined {
   if (key.leftArrow) return edit.left(s);
@@ -676,7 +700,7 @@ function EditableText({
   active: boolean;
 }) {
   const ref = useRef<DOMElement>(null);
-  // 只用来在布局变化后重新计算光标位置；它给的是相对父元素的坐标，光标要的是相对整个输出
+  // 只用来在布局变化后重画一次、重新计算光标位置；它给的是相对父元素的坐标，光标要的是相对整个输出
   const metrics = useBoxMetrics(ref);
   const { setCursorPosition } = useCursor();
   const shown = mask ? "•".repeat([...state.value].length) : state.value;
@@ -685,13 +709,16 @@ function EditableText({
     : state.cursor;
   const { rows, row, col } = layout(shown, cursor, width - prefix.length);
 
-  useEffect(() => {
-    if (!active || !metrics.hasMeasured || !ref.current)
-      return setCursorPosition(undefined);
-    const at = origin(ref.current);
-    setCursorPosition({ x: at.x + prefix.length + col, y: at.y + row });
-  });
-  useEffect(() => () => setCursorPosition(undefined), []);
+  // 光标位置要在渲染时设：useCursor 在这次提交时交给 Ink，跟这一帧一起画出来。
+  // 放在 useEffect 里会晚一帧，光标总是停在上一次按键的位置（只移动光标时最明显）。
+  // 这里用的是上一次的布局；输入框挪了位置时 useBoxMetrics 会再触发一次渲染来纠正
+  const at =
+    active && metrics.hasMeasured && ref.current
+      ? origin(ref.current)
+      : undefined;
+  setCursorPosition(
+    at && { x: at.x + prefix.length + col, y: at.y + row },
+  );
 
   return (
     <Box ref={ref} flexDirection="column">
@@ -741,34 +768,85 @@ function Prompt({
   /** 提交后对话区回到底部 */
   onSubmit(): void;
 }) {
-  const [state, setState] = useState<EditState>(empty);
-  const [selected, setSelected] = useState(0);
-  const [notice, setNotice] = useState<string>();
+  const [current, setState] = useLive<EditState>(empty);
+  const [getSelected, setSelected] = useLive(0);
+  const [getNotice, setNotice] = useLive<string | undefined>(undefined);
   const history = useRef<string[]>(initial);
   /** 正在看的历史条目；-1 表示当前输入 */
   const browsing = useRef(-1);
   const draft = useRef("");
   const lastCtrlC = useRef(0);
   const { columns } = useWindowSize();
+  // @ 引用补全用的路径；排好的结果按（路径表，查询）缓存，按键处理和渲染都要用时不重复排
+  const [getPaths, setPaths] = useLive<string[]>([]);
+  const ranked = useRef<{ paths: string[]; query: string; result: string[] }>(
+    undefined,
+  );
+  // Ctrl+R 搜索历史：结果新的在前，index 是选中的那条
+  const [getSearch, setSearch] = useLive<
+    { query: string; index: number } | undefined
+  >(undefined);
 
   const usageOf = (c: CommandInfo) => `/${c.name}${c.args ? ` ${c.args}` : ""}`;
   const column = Math.max(...commands.map((c) => usageOf(c).length)) + 2;
-  // 翻到的历史条目原样未改时不弹补全菜单，否则菜单会占住 ↑/↓，翻不过 /命令 这样的条目
-  const recalled =
-    browsing.current >= 0 &&
-    state.value ===
-      history.current[history.current.length - 1 - browsing.current];
-  const naming =
-    !recalled && state.value.startsWith("/") && !/\s/.test(state.value);
-  const matches = naming
-    ? commands.filter((c) => `/${c.name}`.startsWith(state.value))
-    : [];
-  const pick = matches[Math.min(selected, matches.length - 1)];
 
-  // @ 引用：光标处正在输入的路径和补全候选
-  const [paths, setPaths] = useState<string[]>([]);
-  const mention =
-    naming || recalled ? undefined : mentionAt(state.value, state.cursor);
+  /** 由最新的输入算出补全菜单和搜索结果；渲染和按键处理都用它 */
+  const derive = () => {
+    const state = current();
+    const selected = getSelected();
+    const search = getSearch();
+    // 翻到的历史条目原样未改时不弹补全菜单，否则菜单会占住 ↑/↓，翻不过 /命令 这样的条目
+    const recalled =
+      browsing.current >= 0 &&
+      state.value ===
+        history.current[history.current.length - 1 - browsing.current];
+    const naming =
+      !recalled && state.value.startsWith("/") && !/\s/.test(state.value);
+    const matches = naming
+      ? commands.filter((c) => `/${c.name}`.startsWith(state.value))
+      : [];
+    const pick = matches[Math.min(selected, matches.length - 1)];
+    // @ 引用：光标处正在输入的路径和补全候选
+    const mention =
+      naming || recalled ? undefined : mentionAt(state.value, state.cursor);
+    let found: string[] = [];
+    if (mention) {
+      const paths = getPaths();
+      const r = ranked.current;
+      found =
+        r && r.paths === paths && r.query === mention.query
+          ? r.result
+          : rankPaths(paths, mention.query, MENTION_ROWS);
+      ranked.current = { paths, query: mention.query, result: found };
+    }
+    const file = found[Math.min(selected, found.length - 1)];
+    const menu = matches.length || found.length;
+    const results = search
+      ? history.current
+          .toReversed()
+          .filter((h) => h.toLowerCase().includes(search.query.toLowerCase()))
+      : [];
+    const hit = search
+      ? Math.max(0, Math.min(search.index, results.length - 1))
+      : 0;
+    return {
+      state,
+      selected,
+      search,
+      matches,
+      pick,
+      mention,
+      found,
+      file,
+      menu,
+      results,
+      hit,
+    };
+  };
+  const { state, search, matches, pick, mention, found, file, results, hit } =
+    derive();
+  const notice = getNotice();
+
   const mentioning = mention !== undefined;
   // 每次开始输入一个新的 @ 引用时重新取一次：文件可能已经变了
   useEffect(() => {
@@ -782,20 +860,6 @@ function Prompt({
       live = false;
     };
   }, [mentioning]);
-  const found = mention ? rankPaths(paths, mention.query, MENTION_ROWS) : [];
-  const file = found[Math.min(selected, found.length - 1)];
-  const menu = matches.length || found.length;
-
-  // Ctrl+R 搜索历史：结果新的在前，index 是选中的那条
-  const [search, setSearch] = useState<{ query: string; index: number }>();
-  const results = search
-    ? history.current
-        .toReversed()
-        .filter((h) => h.toLowerCase().includes(search.query.toLowerCase()))
-    : [];
-  const hit = search
-    ? Math.max(0, Math.min(search.index, results.length - 1))
-    : 0;
   // 结果多时只显示选中项附近的几条
   const first = Math.max(
     0,
@@ -820,6 +884,7 @@ function Prompt({
   };
   /** 用选中的路径替换正在输入的 @ 引用；目录不加空格，接着补全里面的文件 */
   const complete = (p: string) => {
+    const { state, mention } = derive();
     const text = mentionText(p) + (p.endsWith("/") ? "" : " ");
     set({
       value:
@@ -840,12 +905,13 @@ function Prompt({
 
   usePaste(
     (text) => {
+      const search = getSearch();
       if (search)
         setSearch({
           query: search.query + text.replace(/\s+/g, " "),
           index: 0,
         });
-      else set(edit.insert(state, text.replace(/\r\n?/g, "\n")));
+      else set(edit.insert(current(), text.replace(/\r\n?/g, "\n")));
     },
     { isActive: active },
   );
@@ -856,6 +922,7 @@ function Prompt({
     input: string,
     key: Key,
   ) => {
+    const { results, hit } = derive();
     if (key.escape || (key.ctrl && (input === "c" || input === "g")))
       return setSearch(undefined);
     if (key.return || key.tab) {
@@ -883,7 +950,9 @@ function Prompt({
 
   useInput(
     (input, key) => {
+      const search = getSearch();
       if (search) return searchKey(search, input, key);
+      const state = current();
       if (key.ctrl && input === "r")
         return history.current.length
           ? setSearch({ query: "", index: 0 })
@@ -913,12 +982,14 @@ function Prompt({
         if (key.meta) return set(edit.insert(state, "\n"));
         if (state.value.slice(0, state.cursor).endsWith("\\"))
           return set(edit.insert(edit.backspace(state), "\n"));
+        const { pick, file } = derive();
         if (pick && state.value !== `/${pick.name}`)
           return submit(`/${pick.name}`);
         if (file) return complete(file);
         return submit(state.value.trim());
       }
       if (key.tab) {
+        const { pick, file } = derive();
         if (pick)
           set({
             value: `/${pick.name}${pick.args ? " " : ""}`,
@@ -928,6 +999,7 @@ function Prompt({
         return;
       }
       if (key.upArrow) {
+        const { menu, selected } = derive();
         if (menu) return setSelected((selected - 1 + menu) % menu);
         if (!edit.onFirstLine(state)) return setState(edit.up(state));
         if (browsing.current + 1 < history.current.length) {
@@ -937,6 +1009,7 @@ function Prompt({
         return;
       }
       if (key.downArrow) {
+        const { menu, selected } = derive();
         if (menu) return setSelected((selected + 1) % menu);
         if (!edit.onLastLine(state)) return setState(edit.down(state));
         if (browsing.current >= 0) recall(browsing.current - 1);
@@ -1063,7 +1136,8 @@ function SelectDialog({
 }: {
   dialog: Extract<Dialog, { kind: "select" }>;
 }) {
-  const [selected, setSelected] = useState(0);
+  const [getSelected, setSelected] = useLive(0);
+  const selected = getSelected();
   const n = dialog.choices.length;
   const { rows } = useWindowSize();
   // 预览（例如要写入的文件）过长时截断：整个界面高过终端时 Ink 会每帧清屏重画
@@ -1077,6 +1151,7 @@ function SelectDialog({
         ].join("\n")
       : dialog.body;
   useInput((input, key) => {
+    const selected = getSelected();
     if (key.upArrow || input === "k")
       return setSelected((selected - 1 + n) % n);
     if (key.downArrow || input === "j") return setSelected((selected + 1) % n);
@@ -1136,13 +1211,17 @@ function InputDialog({
   dialog: Extract<Dialog, { kind: "input" }>;
 }) {
   const initial = dialog.initial ?? "";
-  const [state, setState] = useState<EditState>({
+  const [current, setState] = useLive<EditState>({
     value: initial,
     cursor: initial.length,
   });
+  const state = current();
   const { columns } = useWindowSize();
-  usePaste((text) => setState(edit.insert(state, text.replace(/\r?\n/g, ""))));
+  usePaste((text) =>
+    setState(edit.insert(current(), text.replace(/\r?\n/g, ""))),
+  );
   useInput((input, key) => {
+    const state = current();
     if (key.return) return dialog.resolve(state.value.trim());
     if (key.escape || (key.ctrl && input === "c"))
       return dialog.resolve(undefined);
