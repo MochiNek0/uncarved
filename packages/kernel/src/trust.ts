@@ -93,9 +93,21 @@ export function asProjectPlugin(plugin: Plugin, grant: TrustGrant): Plugin {
 
 /**
  * 加载项目层插件：先对整个目录计算哈希，未确认过的内容先请求确认，通过后才 import。
- * 入口模块的默认导出必须是 Plugin，加载后 layer 固定为 "project"。
+ * 入口模块的默认导出是 Plugin，或者返回 Plugin 的工厂函数（用 context 调用一次）。加载后 layer 固定为 "project"。
  */
-export async function loadProjectPlugin(dir: string, opts: TrustOptions & { entry?: string }): Promise<Plugin> {
+export async function loadProjectPlugin(dir: string, opts: TrustOptions & { entry?: string; context?: unknown }): Promise<Plugin> {
+  return (await loadProjectPluginFactory(dir, opts))(opts.context);
+}
+
+/**
+ * 同 loadProjectPlugin，但返回一个工厂：宿主可以多次创建插件实例（例如每个会话一套），
+ * 每次都传入自己的 context。确认只发生一次，工厂创建的每个实例都算作已确认的项目层插件。
+ * 默认导出是 Plugin 对象时，工厂每次返回它的一份浅拷贝
+ */
+export async function loadProjectPluginFactory(
+  dir: string,
+  opts: TrustOptions & { entry?: string },
+): Promise<(context?: unknown) => Promise<Plugin>> {
   const root = path.resolve(dir);
   const { hash, files } = await hashDir(root);
   // 入口必须是哈希过的文件，否则 "../x.js" 这样的入口会导入从未确认过的代码
@@ -110,9 +122,24 @@ export async function loadProjectPlugin(dir: string, opts: TrustOptions & { entr
   if (prev !== undefined && prev !== hash) throw new UntrustedPlugin(root, "changed since it was imported; restart to load it");
   imported.set(root, hash);
 
-  const mod = (await import(pathToFileURL(path.join(root, entry)).href)) as { default?: Plugin };
-  if (!mod.default || typeof mod.default.id !== "string") throw new UntrustedPlugin(root, "default export is not a plugin");
-  return asProjectPlugin(mod.default, grant);
+  const mod = (await import(pathToFileURL(path.join(root, entry)).href)) as { default?: unknown };
+  const exported = mod.default;
+  if (typeof exported !== "function" && !isPluginLike(exported)) {
+    throw new UntrustedPlugin(root, "default export is neither a plugin nor a function returning one");
+  }
+  // 凭据当场用掉：之后由工厂直接标记它创建的实例，它们的代码就是刚才确认并导入的代码
+  if (!grants.delete(grant)) throw new UntrustedPlugin(root, "trust grant is not valid or already used");
+  return async (context?: unknown) => {
+    const made = typeof exported === "function" ? await (exported as (c: unknown) => unknown)(context) : exported;
+    if (!isPluginLike(made)) throw new UntrustedPlugin(root, "plugin factory did not return a plugin");
+    const p: Plugin = { ...made, layer: "project" };
+    confirmed.add(p);
+    return p;
+  };
+}
+
+function isPluginLike(v: unknown): v is Plugin {
+  return typeof v === "object" && v !== null && typeof (v as Plugin).id === "string";
 }
 
 const CODE_FILE = /\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/;

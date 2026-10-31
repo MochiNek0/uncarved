@@ -15,6 +15,7 @@ import {
   ToolCallModified,
   UnresolvedRef,
   checkCompat,
+  definePlugin,
   initialState,
   readAll,
   rebuild,
@@ -1847,5 +1848,26 @@ describe("取消信号（I-9）", () => {
     rt = await Runtime.create({ store: new MemoryLogStore(), provider, plugins: [p] });
     await rt.send(say("hi")).catch(() => {});
     expect(seen).toEqual([false, true]);
+  });
+});
+
+describe("definePlugin", () => {
+  test("fills in the kernel range and the capabilities its hooks use, keeping explicit needs and extra fields", () => {
+    const p = definePlugin({
+      id: "acme/x",
+      version: "1.0.0",
+      needs: ["log:emit"],
+      extra: 1,
+      hooks: [
+        { kind: "observe", point: "event", fn: () => {} },
+        { kind: "transform", point: "tool.after", fn: () => {} },
+        { kind: "observe", point: "event", fn: () => {} },
+      ],
+    });
+    expect(p.kernel).toBe("^0.1");
+    expect(p.needs!.sort()).toEqual(["log:emit", "observe:event", "transform:tool.after"]);
+    expect(p.extra).toBe(1);
+    expect(() => checkCompat(p)).not.toThrow();
+    expect(definePlugin({ id: "y", version: "1.0.0", kernel: "^0.1.0" }).kernel).toBe("^0.1.0");
   });
 });

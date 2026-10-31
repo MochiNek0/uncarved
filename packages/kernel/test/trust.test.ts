@@ -9,6 +9,8 @@ import {
   Runtime,
   UntrustedPlugin,
   loadProjectPlugin,
+  loadProjectPluginFactory,
+  type Plugin,
   type ConfirmTrust,
   type Provider,
 } from "../src/index.ts";
@@ -229,4 +231,35 @@ test("确认期间目录内容变了：拒绝加载，不执行改过的代码�
   };
   await expect(loadProjectPlugin(root, { trust, confirm })).rejects.toBeInstanceOf(UntrustedPlugin);
   expect(globalThis.__uncarvedTrustRuns).toBe(0);
+});
+
+test("默认导出可以是工厂函数：只确认一次，每次调用都得到新的、已确认的项目层实例", async () => {
+  const root = path.join(dir, "factory");
+  await mkdir(root, { recursive: true });
+  await writeFile(
+    path.join(root, "index.ts"),
+    `globalThis.__uncarvedTrustRuns = (globalThis.__uncarvedTrustRuns ?? 0) + 1;\n` +
+      `export default (ctx: { name: string }) => ({ id: "factory", version: "1.0.0", kernel: "^0.1", note: ctx.name });\n`,
+  );
+  const { confirm, asked } = recordingConfirm(true);
+  const make = await loadProjectPluginFactory(root, { trust: new MemoryTrustStore(), confirm });
+  const a = (await make({ name: "a" })) as Plugin & { note: string };
+  const b = (await make({ name: "b" })) as Plugin & { note: string };
+  expect(asked).toHaveLength(1);
+  expect(globalThis.__uncarvedTrustRuns).toBe(1);
+  expect([a.note, b.note, a.layer]).toEqual(["a", "b", "project"]);
+  expect(a).not.toBe(b);
+  await Runtime.create({ store: new MemoryLogStore(), provider, plugins: [a] });
+  await Runtime.create({ store: new MemoryLogStore(), provider, plugins: [b] });
+
+  const once = await loadProjectPlugin(root, { trust: new MemoryTrustStore(), confirm: async () => true, context: { name: "c" } });
+  expect((once as Plugin & { note: string }).note).toBe("c");
+});
+
+test("工厂返回的不是插件时拒绝", async () => {
+  const root = path.join(dir, "bad-factory");
+  await mkdir(root, { recursive: true });
+  await writeFile(path.join(root, "index.ts"), `export default () => 42;\n`);
+  const make = await loadProjectPluginFactory(root, { trust: new MemoryTrustStore(), confirm: async () => true });
+  await expect(make()).rejects.toBeInstanceOf(UntrustedPlugin);
 });

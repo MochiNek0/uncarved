@@ -38,6 +38,20 @@ export interface Plugin {
   hooks?: HookSpec[];
 }
 
+/** definePlugin 的输入：kernel、needs 可以省略 */
+export type PluginDraft = Omit<Plugin, "kernel" | "needs"> & { kernel?: string; needs?: string[] };
+
+/**
+ * 补上样板字段：kernel 缺省为当前内核的 ^ 范围（如 "^0.1"），needs 加上 hooks 用到的扩展点。
+ * log:record、log:emit 在调用时才用到，推不出来，用到时仍要写在 needs 里。其余字段（包括宿主自定义的字段）原样保留
+ */
+export function definePlugin<T extends PluginDraft>(draft: T): T & Plugin {
+  const [major, minor] = KERNEL_VERSION.split(".");
+  const needs = new Set(draft.needs ?? []);
+  for (const h of draft.hooks ?? []) needs.add(`${h.kind}:${h.point}`);
+  return { ...draft, kernel: draft.kernel ?? (major === "0" ? `^0.${minor}` : `^${major}`), needs: [...needs] };
+}
+
 export class PluginIncompatible extends Error {
   readonly plugin: string;
   constructor(plugin: string, detail: string) {
