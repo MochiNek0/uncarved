@@ -71,6 +71,24 @@ export const PROVIDER_KINDS: readonly ProviderKind[] = ["openai-compat", "openai
 
 type Env = Record<string, string | undefined>;
 
+/** JADE_EFFORT 可取的值；openai-compat 没有统一的字段，用 OPENAI_COMPAT_EXTRA_BODY 自己设 */
+export const EFFORTS: Record<ProviderKind, readonly string[] | undefined> = {
+  anthropic: ["low", "medium", "high", "xhigh", "max"],
+  openai: ["minimal", "low", "medium", "high"],
+  "openai-compat": undefined,
+};
+
+/** JADE_EFFORT；不设时 Claude 用 high，OpenAI 用服务端默认值 */
+export function effortFromEnv(env: Env = process.env): string | undefined {
+  const effort = env.JADE_EFFORT;
+  if (!effort) return undefined;
+  const kind = providerKind(env);
+  const allowed = EFFORTS[kind];
+  if (!allowed) throw new Error(`JADE_EFFORT is not supported for the ${kind} provider; set it in OPENAI_COMPAT_EXTRA_BODY instead`);
+  if (!allowed.includes(effort)) throw new Error(`JADE_EFFORT must be one of ${allowed.join(", ")} for the ${kind} provider, got ${JSON.stringify(effort)}`);
+  return effort;
+}
+
 /** JADE_PROVIDER 指定时用它；否则按 OPENAI_API_KEY、OPENAI_COMPAT_BASE_URL、ANTHROPIC_API_KEY 的顺序 */
 export function providerKind(env: Env = process.env): ProviderKind {
   const named = env.JADE_PROVIDER;
@@ -106,10 +124,12 @@ export function providerInfo(env: Env = process.env): ProviderInfo {
  *   可选 OPENAI_COMPAT_EXTRA_BODY（JSON 对象，合并进每次请求体，例如开启思考的 {"enable_thinking":true}）
  * - anthropic：Claude，ANTHROPIC_API_KEY，可选 ANTHROPIC_MODEL
  * JADE_MAX_TOKENS 是每次回复的输出上限。不设时 Claude 用 64000，其他服务用服务端默认值（有的只有 4096，思考很容易用完）
+ * JADE_EFFORT 是思考的力度，见 effortFromEnv
  */
 export function providerFromEnv(env: Env = process.env): Provider {
   const kind = providerKind(env);
   const maxTokens = env.JADE_MAX_TOKENS ? positiveInt("JADE_MAX_TOKENS", env.JADE_MAX_TOKENS) : undefined;
+  const effort = effortFromEnv(env);
   if (kind === "openai") {
     if (!env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is required for the openai provider");
     return openaiResponsesProvider({
@@ -117,6 +137,7 @@ export function providerFromEnv(env: Env = process.env): Provider {
       apiKey: env.OPENAI_API_KEY,
       model: env.OPENAI_MODEL ?? "gpt-5",
       maxTokens,
+      reasoning: effort ? { effort: effort as "minimal" | "low" | "medium" | "high" } : undefined,
     });
   }
   if (kind === "openai-compat") {
@@ -130,7 +151,7 @@ export function providerFromEnv(env: Env = process.env): Provider {
       extraBody: env.OPENAI_COMPAT_EXTRA_BODY ? jsonObject("OPENAI_COMPAT_EXTRA_BODY", env.OPENAI_COMPAT_EXTRA_BODY) : undefined,
     });
   }
-  return anthropicProvider({ model: env.ANTHROPIC_MODEL, effort: "high", maxTokens });
+  return anthropicProvider({ model: env.ANTHROPIC_MODEL, effort: (effort ?? "high") as "low" | "medium" | "high" | "xhigh" | "max", maxTokens });
 }
 
 /** 可以在会话中途换掉的 provider：/model 改配置后，压缩、子 Agent 等持有它的地方都跟着换 */

@@ -1,9 +1,11 @@
 // 权限插件：tool.before 把路径统一成绝对路径，tool.gate 按模式、工具的 effect、路径和规则决定。
 //
+// 带 url 参数的只读工具（web_fetch）也要问：网页里的提示注入可以让模型把读到的内容拼进 URL 发出去。
+//
 // 模式和"总是允许"的规则由宿主用 Runtime.record 写进日志（derived），关卡从 ctx.derived 读取：
 // 决定只依赖日志里的东西和调用本身，恢复会话后设置仍然有效。
 
-import { realpathSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import type { GatedToolCall, GateResult, Plugin } from "uncarved";
 import { validate } from "./schema.ts";
@@ -14,11 +16,26 @@ export type Mode = (typeof MODES)[number];
 /** derived 中保存设置的键 */
 export const POLICY_KEY = "jade/policy";
 
-/** 本会话内"总是允许"的规则。prefix、command 只用于 bash：prefix 匹配命令开头的整词，command 只匹配完全相同的命令 */
+/**
+ * 本会话内"总是允许"的规则。prefix、command 只用于 bash：prefix 匹配命令开头的整词，command 只匹配完全相同的命令。
+ * dir：允许这个目录（工作目录之外）里的路径；host：允许访问这个主机。
+ * 什么都不带的规则只对工作目录内的路径生效：在项目里允许了 write_file，不等于允许改 ~/.bashrc
+ */
 export interface AllowRule {
   tool: string;
   prefix?: string;
   command?: string;
+  dir?: string;
+  host?: string;
+}
+
+/** 显示用 */
+export function describeRule(r: AllowRule): string {
+  if (r.command !== undefined) return `${r.tool} "${r.command}"`;
+  if (r.prefix !== undefined) return `${r.tool} "${r.prefix}…"`;
+  if (r.dir !== undefined) return `${r.tool} in ${r.dir}`;
+  if (r.host !== undefined) return `${r.tool} from ${r.host}`;
+  return r.tool;
 }
 
 export interface PolicySettings {
@@ -31,13 +48,15 @@ export interface PolicyOptions {
   /** 日志里还没有设置时使用 */
   mode?: Mode;
   id?: string;
+  /** 日志之外也要遵守的规则，每次判断时取（子 Agent 用主会话的规则） */
+  rules?: () => AllowRule[];
 }
 
 export interface Policy {
   plugin: Plugin;
   /** 当前设置：日志里记录的，没有就是默认值 */
   settings(derived: Readonly<Record<string, unknown>>): PolicySettings;
-  /** 给"总是允许"一个默认规则：bash 取命令的前两个词，其他工具取工具名 */
+  /** 给"总是允许"一个默认规则：bash 取命令的前两个词，工作目录之外的路径取所在目录，URL 取主机，其他取工具名 */
   ruleFor(call: { name: string; input: unknown }): AllowRule;
   decide(call: GatedToolCall, settings: PolicySettings): GateResult;
 }
@@ -136,6 +155,14 @@ export function bashRule(command: string): AllowRule {
   return { tool: "bash", prefix: words.slice(0, n).join(" ") };
 }
 
+const hostOf = (url: string) => {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return undefined;
+  }
+};
+
 /** 真实路径：解析符号链接；路径还不存在时解析最近的已存在的上级目录 */
 function real(p: string): string {
   try {
@@ -149,12 +176,14 @@ function real(p: string): string {
 export function policy(opts: PolicyOptions): Policy {
   const id = opts.id ?? "jade/policy";
   const defaults: PolicySettings = { mode: opts.mode ?? "ask", rules: [] };
-  const inside = (p: string) => {
-    // 按真实路径比较：工作目录里指向外面的符号链接也算外面
-    const rel = path.relative(real(opts.cwd), real(path.resolve(opts.cwd, p)));
+  /** p 在 base 目录里 */
+  const within = (base: string, p: string) => {
+    // 按真实路径比较：目录里指向外面的符号链接也算外面
+    const rel = path.relative(real(base), real(path.resolve(opts.cwd, p)));
     // 只有 ".." 这一段才表示上级目录，名为 "..foo" 的目录仍在里面
     return rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
   };
+  const inside = (p: string) => within(opts.cwd, p);
   /** glob 的 pattern 是绝对路径或含 ".." 段时，匹配范围会超出 path */
   const globEscapes = (pattern: string) => path.isAbsolute(pattern) || pattern.split(/[\\/]/).includes("..");
   /** 以 "." 或 "[" 开头的通配段可能匹配到 ".."（取决于 bash 版本和选项），按越界处理 */
@@ -182,31 +211,51 @@ export function policy(opts: PolicyOptions): Policy {
       return structuredClone((derived[POLICY_KEY] as PolicySettings | undefined) ?? defaults);
     },
     ruleFor(call) {
-      if (call.name !== "bash") return { tool: call.name };
-      return bashRule(String((call.input as { command?: unknown }).command ?? ""));
+      if (call.name === "bash") return bashRule(String((call.input as { command?: unknown }).command ?? ""));
+      const input = call.input as { path?: unknown; url?: unknown } | null;
+      if (typeof input?.url === "string") {
+        const host = hostOf(input.url);
+        if (host) return { tool: call.name, host };
+      }
+      if (typeof input?.path === "string" && !inside(input.path)) {
+        const full = path.resolve(opts.cwd, input.path);
+        let isDir = false;
+        try {
+          isDir = statSync(full).isDirectory();
+        } catch {
+          // 还不存在的文件
+        }
+        return { tool: call.name, dir: isDir ? full : path.dirname(full) };
+      }
+      return { tool: call.name };
     },
     decide(call, { mode, rules }) {
       const { tool } = call;
       const problem = validate(tool.inputSchema, call.input);
       if (problem) return { decision: "deny", reason: `Invalid input for ${call.name}: ${problem}. Fix the arguments and try again.` };
 
-      const input = call.input as { path?: string; command?: string; pattern?: string };
+      const input = call.input as { path?: string; command?: string; pattern?: string; url?: string };
       const outside =
         (typeof input.path === "string" && !inside(input.path)) ||
         (call.name === "glob" && typeof input.pattern === "string" && globEscapes(input.pattern));
-      const ruled = rules.some(
-        (r) =>
-          r.tool === call.name &&
-          (r.command !== undefined
-            ? (input.command ?? "").trim() === r.command
-            : r.prefix === undefined || matchesPrefix(input.command ?? "", r.prefix)),
-      );
+      /** 会把参数发到网络上的只读工具 */
+      const network = typeof input.url === "string";
+      const covers = (r: AllowRule) => {
+        if (r.tool !== call.name) return false;
+        if (r.command !== undefined) return (input.command ?? "").trim() === r.command;
+        if (r.prefix !== undefined) return matchesPrefix(input.command ?? "", r.prefix);
+        // glob 的 pattern 越界时路径本身说明不了范围，目录规则不算
+        if (r.dir !== undefined) return typeof input.path === "string" && within(r.dir, input.path) && !(call.name === "glob" && globEscapes(input.pattern ?? ""));
+        if (r.host !== undefined) return network && hostOf(input.url!) === r.host;
+        return !outside;
+      };
+      const ruled = [...rules, ...(opts.rules?.() ?? [])].some(covers);
       // 只读命令也要和 read_file 一样：读工作目录之外的东西先问
       const safeBash = call.name === "bash" && isSafeCommand(input.command ?? "");
       const safeDecision = (): GateResult => ({ decision: argsOutside(input.command ?? "") ? "ask" : "allow" });
 
       if (tool.effect === "read") {
-        if (!outside || mode === "yolo" || ruled) return { decision: "allow" };
+        if (mode === "yolo" || ruled || (!outside && !network)) return { decision: "allow" };
         return { decision: "ask" };
       }
       if (mode === "readonly") {

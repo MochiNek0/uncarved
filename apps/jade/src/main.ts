@@ -15,34 +15,32 @@ import {
   Runtime,
   UntrustedPlugin,
   type Block,
-  type LogEvent,
-  type EventDataMap,
   type Plugin,
-  type TurnEndReason,
-  type Usage,
   type UserInput,
 } from "uncarved";
 import { hasProvider, loadEnvFile } from "./config.ts";
-import { createJade } from "./distro.ts";
-import { MODES, POLICY_KEY, type Mode, type PolicySettings } from "./plugins/policy.ts";
+import { createJade, type Jade } from "./distro.ts";
+import { describeRule, MODES, POLICY_KEY, type AllowRule, type Mode, type PolicySettings } from "./plugins/policy.ts";
 import { compactThreshold, contextWindowFromEnv } from "./context.ts";
+import { InputHistory } from "./history.ts";
+import { MEMORY_SCOPES, type MemoryScope } from "./memory.ts";
+import { attachMentions, mentionCandidates } from "./mentions.ts";
 import { providerFromEnv, providerInfo, switchable, withRetry } from "./provider.ts";
 import { SessionIndex } from "./sessions.ts";
 import { UNDO_KEY, type UndoState } from "./tools/checkpoint.ts";
 import { display } from "./tools/fs.ts";
-import type { ShellProgress } from "./tools/shell.ts";
-import type { TaskProgress } from "./tools/task.ts";
-import { renderTodos, type Todo } from "./tools/todo.ts";
-import { bold, cyan, dim, green, plainScreen, red, yellow, type CommandInfo, type Screen } from "./ui/screen.ts";
+import type { ApproveSubagent, SubagentApproval } from "./tools/task.ts";
+import { bold, dim, green, plainScreen, red, yellow, type CommandInfo, type Screen } from "./ui/screen.ts";
 import { configurator } from "./ui/configure.ts";
-import { clip, detailsOf, preview, shortPath, summarize } from "./ui/render.ts";
+import { clip, preview, shortPath, summarize } from "./ui/render.ts";
+import { transcript } from "./ui/transcript.ts";
 import { tuiScreen } from "./ui/tui.tsx";
 
 const HELP = `Usage: jade [options] [prompt]
 
   -p, --print <prompt>   run one prompt and exit
   -c, --continue         continue the most recent session in this directory
-  -r, --resume <id>      resume a session by id
+  -r, --resume [id]      resume a session by id, or pick one from a list
   -m, --mode <mode>      permission mode: ${MODES.join(" | ")} (default ask)
       --cwd <dir>        working directory (default: current directory)
   -h, --help
@@ -61,15 +59,16 @@ const COMMANDS: CommandInfo[] = [
   { name: "undo", about: "restore the file changed by the agent's most recent write_file/edit_file/multi_edit" },
   { name: "retry", about: "request the model again after a failed request, without sending another message" },
   { name: "usage", about: "token usage of this session, including sub-agents and compaction" },
-  { name: "sessions", about: "recent sessions in this directory" },
+  { name: "resume", args: "[id]", about: "pick a recent session in this directory and switch to it" },
+  { name: "memory", args: "[text]", about: "see and remove what jade remembers across sessions, or remember text" },
   { name: "rules", about: `"always allow" rules of this session` },
   { name: "hooks", about: "execution order of every extension point" },
   { name: "exit", about: "quit (the session stays resumable)" },
 ];
 /** 运行中也立即执行的命令（不碰运行时，或者只读） */
-const INSTANT = new Set(["help", "model", "usage", "sessions", "rules", "hooks", "exit", "quit"]);
+const INSTANT = new Set(["help", "model", "usage", "memory", "rules", "hooks", "exit", "quit"]);
 
-const KEYS = `Keys: enter send · \\ or alt+enter new line · ↑↓ history · esc interrupt · ctrl+c twice to exit
+const KEYS = `Keys: enter send · \\ or alt+enter new line · ↑↓ history · @ reference a file · esc interrupt · ctrl+c twice to exit
       mouse wheel or PgUp/PgDn scroll the conversation · ctrl+home/ctrl+end jump to the top/bottom · shift+drag selects text
 While jade is working you can keep typing: messages are queued and sent when the current turn ends.`;
 
@@ -97,7 +96,8 @@ for (let i = 0; i < argv.length; i++) {
     process.exit(0);
   } else if (a === "-p" || a === "--print") opts.print = value();
   else if (a === "-c" || a === "--continue") opts.cont = true;
-  else if (a === "-r" || a === "--resume") opts.resume = value();
+  // 不带 id 时从列表里选
+  else if (a === "-r" || a === "--resume") opts.resume = argv[i + 1] === undefined || argv[i + 1]!.startsWith("-") ? "" : argv[++i]!;
   else if (a === "-m" || a === "--mode") {
     const m = value();
     if (!(MODES as readonly string[]).includes(m)) fail(`unknown mode ${m}`);
@@ -112,7 +112,6 @@ function fail(msg: string): never {
   process.exit(2);
 }
 
-const textOf = (blocks: Block[]) => blocks.flatMap((b) => (b.kind === "text" ? [b.text] : [])).join("\n");
 const errorText = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
 async function gitBranch(dir: string): Promise<string | undefined> {
@@ -166,15 +165,23 @@ const modelLabel = () => (hasProvider() ? providerInfo().model || "(no model)" :
 let ready = false;
 const early: string[] = [];
 
+const inputs = new InputHistory(path.join(home, "history.jsonl"), cwd);
+
 const screen: Screen = tui
   ? tuiScreen({
       status: { cwd: shortPath(cwd), branch: await gitBranch(cwd), model: modelLabel(), mode: opts.mode ?? "ask" },
       version: VERSION,
       commands: COMMANDS,
+      history: await inputs.load(),
       handlers: {
-        submit: (text) => (ready ? onSubmit(text) : void early.push(text)),
+        submit: (text) => {
+          inputs.add(text).catch(() => {});
+          if (ready) onSubmit(text);
+          else early.push(text);
+        },
         interrupt: () => ready && interrupt(),
         exit: () => (ready ? void quit() : process.exit(130)),
+        files: () => mentionCandidates(cwd),
       },
     })
   : plainScreen({ interactive: Boolean(process.stdin.isTTY) });
@@ -224,9 +231,20 @@ const index = new SessionIndex(path.join(home, "index.jsonl"));
 
 const extraPlugins = await projectPlugins();
 /** 每个会话用一套新的插件实例：插件里有按会话记的状态（例如压缩、重复调用的计数） */
-const makeJade = (mode?: Mode) => createJade({ cwd, home, store, provider, mode, projectPlugins: extraPlugins, compactTokens: compactAt });
+const makeJade = (mode?: Mode) =>
+  createJade({
+    cwd,
+    home,
+    store,
+    provider,
+    mode,
+    projectPlugins: extraPlugins,
+    compactTokens: compactAt,
+    approveSubagent,
+    sharedRules: (): AllowRule[] => [...settings().rules, ...pendingRules],
+  });
 
-let jade = await makeJade(opts.mode);
+let jade: Jade = await makeJade(opts.mode);
 for (const w of jade.warnings) screen.log(yellow(`[warning] ${w}`));
 
 /** .jade/plugins/<name>/index.ts：项目层插件，首次加载（及内容变化后）要用户确认（7.1） */
@@ -264,6 +282,13 @@ async function projectPlugins(): Promise<Plugin[]> {
 }
 
 let resumeId = opts.resume;
+if (resumeId === "") {
+  if (!tui) {
+    await screen.close();
+    fail("--resume without an id needs a terminal to pick from; pass the id");
+  }
+  resumeId = await pickSession();
+} else if (resumeId) resumeId = await findSession(resumeId);
 if (opts.cont) {
   resumeId = (await index.list(cwd))[0]?.id;
   if (!resumeId) {
@@ -279,7 +304,7 @@ let rt = resumeId
 let sessionId = rt.state.sessionId;
 
 // 权限设置记在日志里（derived），关卡从那里读，恢复会话后仍然有效
-const settings = () => jade.policy.settings(rt.state.derived);
+const settings = (): PolicySettings => jade.policy.settings(rt.state.derived);
 const saveSettings = async (next: PolicySettings) => {
   await rt.record(POLICY_KEY, next);
   screen.status({ mode: next.mode });
@@ -287,225 +312,105 @@ const saveSettings = async (next: PolicySettings) => {
 
 // ---------- 渲染 ----------
 
-const usage: Required<Usage> = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
-const addUsage = (u?: Usage) => {
-  for (const k of Object.keys(usage) as (keyof Usage)[]) usage[k] += u?.[k] ?? 0;
-};
-/** 一个事件带来的用量：模型回复、压缩时的总结调用；子 Agent 的用量在它自己的日志里 */
-async function countUsage(e: LogEvent) {
-  if (e.type === "model.responded") addUsage((e as LogEvent<"model.responded">).data.usage);
-  else if (e.type === "jade/compact/compacted") addUsage((e.data as { usage?: Usage }).usage);
-  else if (e.type === "tool.completed") {
-    const child = (e as LogEvent<"tool.completed">).data.child;
-    if (child) for (const c of await readAll(store, child.sessionId)) await countUsage(c);
-  }
-}
-
-/** 上下文用量：最近一次回复的输入加输出，就是下一次请求的大致起点；以及这次输入的缓存命中率 */
-function showContext(u: Usage | undefined) {
-  if (u?.inputTokens === undefined) return;
-  screen.status({
-    context: { used: u.inputTokens + (u.outputTokens ?? 0), limit: contextWindow },
-    cache: u.cacheReadTokens !== undefined && u.inputTokens > 0 ? u.cacheReadTokens / u.inputTokens : undefined,
-  });
-}
+const view = transcript({ screen, cwd, store, contextWindow: () => contextWindow, canRetry: () => canRetry() });
+rt.subscribe(view.onNotice);
 
 const percent = (part: number, whole: number) => (whole > 0 ? `${Math.round((part / whole) * 100)}%` : "—");
 
-const toolNames = new Map<string, string>();
-/** 正在重新显示恢复的会话里已有的内容：只输出，不显示进行中的状态 */
-let replaying = false;
-const activity = (label: string) => {
-  if (!replaying) screen.busy(label);
-};
-/** 结果不用再显示的工具调用 */
-const quiet = new Set<string>();
-let streamed = false;
-/** 本轮已经以 turn.ended（error/aborted）结束并显示过原因，随后抛出的同一个错误不再重复显示 */
-let turnFailed = false;
-/** 最近一轮的结束原因 */
-let lastEnd: TurnEndReason | undefined;
-/** 每个工具已经显示了多少行进度输出 */
-const progressLines = new Map<string, number>();
-const MAX_PROGRESS_LINES = 20;
-/** 工具结果折叠起来的完整内容最多这么多行 */
-const MAX_DETAIL_LINES = 2000;
-
-rt.subscribe(onNotice);
-
-function onNotice(n: Parameters<Parameters<Runtime["subscribe"]>[0]>[0]) {
-  switch (n.type) {
-    case "delta":
-      if (n.delta.kind === "reset") {
-        // 已经输出的内容收不回来，标记一下
-        if (streamed) {
-          screen.endStream();
-          screen.log(yellow("[output above discarded; retrying]"));
-        }
-        streamed = false;
-        return;
-      }
-      streamed = true;
-      if (n.delta.kind === "thinking") {
-        screen.busy("Thinking");
-        screen.stream("thinking", n.delta.text);
-      } else {
-        screen.busy("Writing");
-        screen.stream("text", n.delta.text);
-      }
-      return;
-    case "hook-error":
-      screen.log(yellow(`[hook error] ${n.info.plugin} at ${n.info.point}: ${errorText(n.info.error)}`));
-      return;
-    case "warning":
-      screen.log(yellow(`[warning] ${n.code}`));
-      return;
-    case "awaiting":
-      return;
-    case "tool-progress":
-      return renderProgress(n.toolUseId, n.update as ShellProgress | TaskProgress);
-    case "event":
-      return renderEvent(n.event);
-  }
-}
-
-function renderProgress(toolUseId: string, p: ShellProgress | TaskProgress) {
-  if (p.kind === "task-start") return screen.log(dim(`  ↳ sub-agent: ${p.description}`));
-  if (p.kind === "task-tool") return screen.log(dim(`    ${p.decision === "deny" ? "✗" : "·"} ${p.name}(${summarize(cwd, p.name, p.input)})`));
-  const shown = progressLines.get(toolUseId) ?? 0;
-  if (shown > MAX_PROGRESS_LINES) return;
-  const lines = p.text.replace(/\n$/, "").split("\n");
-  const room = MAX_PROGRESS_LINES - shown;
-  progressLines.set(toolUseId, shown + Math.min(lines.length, room + 1));
-  for (const l of lines.slice(0, room)) screen.log(dim(`  │ ${clip(l, 200)}`));
-  if (lines.length > room) screen.log(dim("  │ …"));
-}
-
-function renderEvent(e: LogEvent) {
-  switch (e.type) {
-    case "model.requested":
-      activity("Waiting for the model");
-      return;
-    case "model.responded": {
-      const d = e.data as EventDataMap["model.responded"];
-      void countUsage(e);
-      showContext(d.usage);
-      for (const b of d.content) if (b.kind === "tool_use") toolNames.set(b.id, b.name);
-      // 不支持流式的 provider：直接打印最终文本
-      if (!streamed) {
-        const text = textOf(d.content).trim();
-        if (text) screen.log(text);
-      }
-      streamed = false;
-      screen.endStream();
-      return;
-    }
-    case "tool.decided": {
-      const d = e.data as EventDataMap["tool.decided"];
-      const name = toolNames.get(d.toolUseId) ?? "?";
-      if (d.decision === "ask") return;
-      const head = `${bold(name)}(${summarize(cwd, name, d.input)})`;
-      if (d.decision === "deny") screen.log(red(`✗ ${head}`) + dim(d.reason ? ` — ${clip(d.reason, 200)}` : ""));
-      else {
-        activity(`Running ${name}`);
-        if (name === "todo_write") {
-          // 清单本身就是参数：直接显示，结果不再显示
-          quiet.add(d.toolUseId);
-          screen.log(cyan("● ") + bold("Todos"));
-          screen.log(renderTodos((d.input as { todos?: Todo[] }).todos ?? []).replace(/^/gm, "  "));
-        } else if (d.decidedBy !== "user" || replaying) {
-          // 用户批准的调用在审批时已经显示过；重新显示历史时没有审批这一步
-          screen.log(cyan("● ") + head);
-        }
-      }
-      return;
-    }
-    case "tool.completed": {
-      const d = e.data as EventDataMap["tool.completed"];
-      void countUsage(e);
-      activity("Working");
-      if (quiet.delete(d.toolUseId) && !d.isError) return;
-      const text = textOf(d.content).trim();
-      const lines = text.split("\n");
-      // 摘要省略了内容时，把完整结果折叠在摘要下面，点击展开
-      const shown = d.isError ? 4 : 1;
-      const width = d.isError ? 200 : 160;
-      const hidden = lines.length > shown || lines.some((l) => l.length > width);
-      const details = hidden ? detailsOf(lines, d.isError ? red : (s) => s, MAX_DETAIL_LINES) : undefined;
-      if (d.isError) screen.log(red(`  ⎿ ${lines.slice(0, shown).map((l) => clip(l, width)).join("\n    ")}`), { details });
-      else screen.log(dim(`  ⎿ ${clip(lines[0] ?? "", width)}${lines.length > 1 ? ` (+${lines.length - 1} lines)` : ""}`), { details });
-      return;
-    }
-    case "tool.interrupted":
-      screen.log(yellow(`  ⎿ interrupted before finishing; not retried`));
-      return;
-    case "turn.ended": {
-      const d = e.data as EventDataMap["turn.ended"];
-      lastEnd = d.reason;
-      turnFailed = d.reason === "error" || d.reason === "aborted";
-      if (d.reason === "stopped") screen.log(yellow("[stopped: step budget for this turn used up; send a message to continue]"));
-      else if (d.reason === "aborted") screen.log(yellow("[interrupted]"));
-      else if (d.reason === "max_tokens") {
-        const limit = process.env.JADE_MAX_TOKENS ? `${process.env.JADE_MAX_TOKENS} tokens` : "the provider's default";
-        screen.log(yellow(`[reply cut off at the output limit (${limit}); raise it with /model if this keeps happening]`));
-      } else if (d.reason !== "end") screen.log(yellow(`[turn ended: ${d.reason}${d.error ? ` — ${d.error}` : ""}]`));
-      if (turnFailed && !replaying && canRetry()) screen.log(dim("[send /retry to request again without adding a message]"));
-      return;
-    }
-    case "jade/compact/compacted": {
-      const d = e.data as { from: number; upTo: number; before: number };
-      void countUsage(e);
-      screen.log(dim(`[compacted ${d.upTo - d.from} messages, ~${d.before} tokens before]`));
-      return;
-    }
-    case "jade/compact/trimmed": {
-      const d = e.data as { saved: number };
-      screen.log(dim(`[cleared old tool output, ~${d.saved} tokens]`));
-      return;
-    }
-  }
-}
-
 // ---------- 审批 ----------
+
+type Call = { toolUseId: string; name: string; input: unknown };
+
+/** 问用户是否允许一个调用；选了"总是允许"时交给 remember 记下规则 */
+async function ask(c: Call, who: string, remember: (rule: AllowRule) => Promise<void> | void): Promise<SubagentApproval> {
+  const head = `${c.name}(${summarize(cwd, c.name, c.input)})`;
+  if (!screen.interactive) {
+    screen.log(red(`✗ ${who}${head} denied: not running interactively`));
+    return { approved: false, reason: "The user is not available to approve this action." };
+  }
+  const rule = jade.policy.ruleFor(c);
+  const always = rule.command !== undefined ? "this exact command" : describeRule(rule);
+  const answer = await screen.select(
+    `Allow ${who}${head}?`,
+    [
+      { label: "Yes", value: "yes" as const },
+      { label: `Yes, and always allow ${always} in this session`, value: "always" as const },
+      { label: "No, and tell jade what to do instead", value: "no" as const },
+    ],
+    { body: preview(c) },
+  );
+  if (answer === "always") await remember(rule);
+  const approved = answer === "yes" || answer === "always";
+  const reason = approved
+    ? undefined
+    : (answer === "no" ? await screen.input("What should jade do instead? (optional)") : undefined) || "The user rejected this action.";
+  screen.log(approved ? green(`✓ ${who}${head}`) : red(`✗ ${who}${head}`) + dim(reason ? ` — ${clip(reason, 200)}` : ""));
+  return { approved, reason };
+}
 
 async function approvePending() {
   while (rt.state.phase === "awaiting") {
     for (const c of rt.state.batch.filter((x) => x.decision === "ask")) {
-      const head = `${c.name}(${summarize(cwd, c.name, c.input)})`;
-      if (!screen.interactive) {
-        screen.log(red(`✗ ${head} denied: not running interactively`));
-        await rt.send({ kind: "approval", toolUseId: c.toolUseId, approved: false, reason: "The user is not available to approve this action." });
-        continue;
-      }
-      const rule = jade.policy.ruleFor(c);
-      const always = rule.command ? "always allow this exact command" : rule.prefix ? `always allow "${rule.prefix}…"` : `always allow ${rule.tool}`;
-      const answer = await screen.select(
-        `Allow ${head}?`,
-        [
-          { label: "Yes", value: "yes" as const },
-          { label: `Yes, and ${always} in this session`, value: "always" as const },
-          { label: "No, and tell jade what to do instead", value: "no" as const },
-        ],
-        { body: preview(c) },
-      );
-      if (answer === "always") {
+      const answer = await ask(c, "", async (rule) => {
         const s = settings();
         await saveSettings({ ...s, rules: [...s.rules, rule] });
-      }
-      const approved = answer === "yes" || answer === "always";
-      const reason = approved
-        ? undefined
-        : (answer === "no" ? await screen.input("What should jade do instead? (optional)") : undefined) || "The user rejected this action.";
-      screen.log(approved ? green(`✓ ${head}`) : red(`✗ ${head}`) + dim(reason ? ` — ${clip(reason, 200)}` : ""));
-      await rt.send({ kind: "approval", toolUseId: c.toolUseId, approved, reason });
+      });
+      await rt.send({ kind: "approval", toolUseId: c.toolUseId, ...answer });
     }
   }
+}
+
+/**
+ * 子 Agent 审批时选了"总是允许"的规则：主会话这时正在执行 task 工具，日志写不进去，
+ * 先在这里生效（sharedRules），这一轮结束后再记进日志
+ */
+const pendingRules: AllowRule[] = [];
+/** 并行的子 Agent 一次只问一个 */
+let subagentAsking: Promise<unknown> = Promise.resolve();
+
+function approveSubagent(...[c, signal]: Parameters<ApproveSubagent>): Promise<SubagentApproval> {
+  const turn = subagentAsking.then(() => {
+    signal.throwIfAborted();
+    // 中断时不再等用户回答；对话框由用户自己关掉
+    return abortable(ask(c, "sub-agent ", (rule) => void pendingRules.push(rule)), signal);
+  });
+  subagentAsking = turn.catch(() => {});
+  return turn;
+}
+
+async function savePendingRules() {
+  if (pendingRules.length === 0) return;
+  const s = settings();
+  await saveSettings({ ...s, rules: [...s.rules, ...pendingRules.splice(0)] });
+}
+
+function abortable<T>(p: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const stop = () => reject(signal.reason);
+    signal.addEventListener("abort", stop, { once: true });
+    p.then(resolve, reject).finally(() => signal.removeEventListener("abort", stop));
+  });
 }
 
 // ---------- 运行 ----------
 
 /** 正在执行一轮对话（或一个需要独占运行时的命令） */
 let running = false;
+/** running 期间那段工作；退出时等它收尾 */
+let work: Promise<void> | undefined;
+
+/** 独占运行时执行 fn；同一时间只有一个 */
+async function occupy(fn: () => Promise<void>) {
+  running = true;
+  work = fn();
+  try {
+    await work;
+  } finally {
+    running = false;
+    work = undefined;
+    screen.busy(undefined);
+  }
+}
 
 function interrupt() {
   if (!running) return;
@@ -534,41 +439,87 @@ async function quit(code = 0) {
   if (quitting) return;
   quitting = true;
   if (running) rt.abort("exiting");
-  // 中断后等这一轮收尾，再写 session.detached
-  while (running) await new Promise((r) => setTimeout(r, 20));
+  // 中断后等这一轮收尾，再写 session.detached；pump 看到 quitting 就不再取排队的输入
+  await work?.catch(() => {});
   await leave();
   await closeScreen();
   process.exit(code);
 }
 
-/** /clear：离开当前会话（保持可恢复），换一套新的插件和运行时开始新会话，权限模式沿用 */
-async function newSession() {
+/**
+ * 换成另一个会话：/clear 开始新会话，/resume 恢复 id 指定的会话。当前会话保持可恢复；
+ * 新会话用一套新的插件和运行时，权限模式沿用（恢复的会话用它日志里的设置）。
+ * 恢复失败时留在当前会话
+ */
+async function switchSession(id?: string) {
   const mode = settings().mode;
+  const next = await makeJade(mode);
+  let nextRt: Runtime;
+  try {
+    nextRt = id
+      ? await Runtime.resume({ store, provider, plugins: next.plugins, sessionId: id })
+      : await Runtime.create({ store, provider, plugins: next.plugins });
+  } catch (err) {
+    next.shutdown();
+    return screen.log(red(`[error] could not resume ${id}: ${errorText(err)}`));
+  }
   await leave();
-  jade = await makeJade(mode);
-  rt = await Runtime.create({ store, provider, plugins: jade.plugins });
-  rt.subscribe(onNotice);
   const old = sessionId;
+  jade = next;
+  rt = nextRt;
+  rt.subscribe(view.onNotice);
   sessionId = rt.state.sessionId;
-  for (const k of Object.keys(usage) as (keyof Usage)[]) usage[k] = 0;
-  toolNames.clear();
-  quiet.clear();
-  progressLines.clear();
+  view.reset();
   notes.length = 0;
-  lastEnd = undefined;
+  pendingRules.length = 0;
   screen.clear();
-  screen.status({ session: sessionId, mode, context: undefined, cache: undefined });
-  screen.log(dim(`Started a new session. The previous one can be resumed with: jade --resume ${old}`));
+  screen.status({ session: sessionId, mode: settings().mode, context: undefined, cache: undefined });
+  if (!id) return screen.log(dim(`Started a new session. The previous one can be resumed with /resume or: jade --resume ${old}`));
+  if (!(await resumeSession())) {
+    screen.log(dim("Starting a new session instead."));
+    await switchSession();
+  }
 }
+
+/** 从这个目录最近的会话里选一个；取消或没有时返回 undefined */
+async function pickSession(current?: string): Promise<string | undefined> {
+  const all = (await index.list(cwd)).filter((s) => s.id !== current).slice(0, 50);
+  if (all.length === 0) {
+    screen.log(dim(`No other sessions in ${shortPath(cwd)}.`));
+    return undefined;
+  }
+  return screen.select(
+    "Resume which session?",
+    all.map((s) => ({ label: s.title || "(untitled)", value: s.id, hint: `${ago(s.at)} · ${s.id}` })),
+  );
+}
+
+/** 这个目录的会话里 id 等于 arg 或以它开头的唯一一个；都不是时原样返回，交给 Runtime.resume 去找 */
+async function findSession(arg: string): Promise<string> {
+  const hits = (await index.list(cwd)).filter((s) => s.id.startsWith(arg));
+  return hits.find((s) => s.id === arg)?.id ?? (hits.length === 1 ? hits[0]!.id : arg);
+}
+
+/** 显示用的相对时间 */
+function ago(iso: string): string {
+  const s = (Date.now() - Date.parse(iso)) / 1000;
+  if (!Number.isFinite(s)) return iso;
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)} h ago`;
+  if (s < 86400 * 7) return `${Math.floor(s / 86400)} d ago`;
+  return iso.slice(0, 10);
+}
+
 process.on("SIGINT", () => (running ? interrupt() : void quit(130)));
 
 async function guarded(fn: () => Promise<void>) {
-  turnFailed = false;
+  view.turnFailed = false;
   try {
     await fn();
     await approvePending();
   } catch (err) {
-    if (!turnFailed) screen.log(red(`[error] ${errorText(err)}`));
+    if (!view.turnFailed) screen.log(red(`[error] ${errorText(err)}`));
   } finally {
     screen.endStream();
   }
@@ -578,10 +529,21 @@ async function guarded(fn: () => Promise<void>) {
 const notes: string[] = [];
 const hostNote = (text: string): Block => ({ kind: "text", text: `[Note from jade] ${text}`, origin: { by: "host" }, trust: "trusted" });
 
+/** 本进程里已经记进会话索引的会话：每个会话每次运行只记一次，索引不随消息数增长 */
+const indexed = new Set<string>();
+
 async function say(text: string) {
-  await index.add({ id: sessionId, cwd, title: clip(text.replace(/\s+/g, " "), 80), at: new Date().toISOString() });
+  if (!indexed.has(sessionId)) {
+    indexed.add(sessionId);
+    await index.add({ id: sessionId, cwd, title: clip(text.replace(/\s+/g, " "), 80), at: new Date().toISOString() });
+  }
   const content: Block[] = notes.splice(0).map(hostNote);
   content.push({ kind: "text", text, origin: { by: "user" }, trust: "trusted" });
+  // @ 引用的文件和目录：内容随消息发出，模型不用再读一遍
+  const refs = await attachMentions(text, { cwd, tools: jade.tools, sessionId, signal: AbortSignal.timeout(30_000) });
+  for (const f of refs.failed) screen.log(yellow(`[@${f.path} not attached: ${clip(f.reason, 200)}]`));
+  if (refs.attached.length) screen.log(dim(`[attached ${refs.attached.map((p) => `@${p}`).join(", ")}]`));
+  content.push(...refs.blocks);
   await drive({ kind: "message", content });
 }
 
@@ -597,14 +559,15 @@ async function drive(input: UserInput) {
   // 计时从这次输入开始，不接着上一条排队消息的
   screen.busy(undefined);
   screen.busy("Working");
-  lastEnd = undefined;
+  view.lastEnd = undefined;
   await guarded(() => rt.send(input));
   // 回复被输出上限截断：让模型接着做，而不是把半截任务丢给用户
-  for (let i = 0; i < MAX_CONTINUES && lastEnd === "max_tokens"; i++) {
+  for (let i = 0; i < MAX_CONTINUES && view.lastEnd === "max_tokens"; i++) {
     screen.log(dim(`[asking the model to continue (${i + 1}/${MAX_CONTINUES})]`));
-    lastEnd = undefined;
+    view.lastEnd = undefined;
     await guarded(() => rt.send({ kind: "message", content: [hostNote(CONTINUE_NOTE)] }));
   }
+  await savePendingRules().catch((err) => screen.log(red(`[error] ${errorText(err)}`)));
 }
 
 /** 撤销本会话里还没撤销的最近一次文件写入 */
@@ -629,81 +592,70 @@ async function undo() {
 
 /** 恢复的会话里已有的内容：终端界面里重新显示对话，逐行输出时只统计用量 */
 async function replayHistory() {
-  const events = await readAll(store, sessionId);
-  if (!tui) {
-    for (const e of events) {
-      await countUsage(e);
-      if (e.type === "model.responded") showContext((e as LogEvent<"model.responded">).data.usage);
-    }
-    return;
-  }
-  replaying = true;
-  /** 等待用户审批的调用的参数，用户的决定记在之后的 input.received 里 */
-  const asked = new Map<string, unknown>();
-  try {
-    for (const e of events) {
-      if (e.type === "tool.decided") {
-        const d = e.data as EventDataMap["tool.decided"];
-        if (d.decision === "ask") asked.set(d.toolUseId, d.input);
-      }
-      if (e.type !== "input.received") {
-        renderEvent(e);
-        continue;
-      }
-      const d = e.data as EventDataMap["input.received"];
-      if (d.kind === "approval") {
-        const name = toolNames.get(d.toolUseId) ?? "?";
-        const head = `${bold(name)}(${summarize(cwd, name, asked.get(d.toolUseId))})`;
-        screen.log(d.approved ? green(`✓ ${head}`) : red(`✗ ${head}`) + dim(d.reason ? ` — ${clip(d.reason, 200)}` : ""));
-        continue;
-      }
-      if (d.kind === "retry") {
-        screen.log(dim("[retried]"));
-        continue;
-      }
-      if (d.kind !== "message") continue;
-      // 宿主附带的说明（例如自动续写）不是用户说的话
-      const text = d.content.flatMap((b) => (b.kind === "text" && b.origin.by === "user" ? [b.text] : [])).join("\n");
-      if (text) echo(text);
-    }
-  } finally {
-    replaying = false;
-  }
-  screen.log(dim("─".repeat(20) + " resumed " + "─".repeat(20)));
+  await view.replay(await readAll(store, sessionId), tui);
 }
 
-/** 恢复会话：先显示之前的对话，处理插件变化（4.6），再继续日志里没做完的工作 */
-async function resumeSession() {
+/** 恢复会话：先显示之前的对话，处理插件变化（4.6），再继续日志里没做完的工作。插件变化后不能继续时返回 false */
+async function resumeSession(): Promise<boolean> {
   await replayHistory();
   const held = rt.state.held;
   if (held) {
     screen.log(yellow(`Plugins changed since this session was last used: ${held.plugins.map((p) => `${p.id}@${p.version}`).join(", ")}`));
     if (held.resolution === "abort") {
       screen.log(red("A plugin requires this session to stop. Restore the previous plugins to continue."));
-      await screen.close();
-      process.exit(1);
+      return false;
     }
     const ok =
       (await screen.select("Continue with the new plugins? Pending tool calls will be re-checked.", [
         { label: "Yes, continue", value: true },
-        { label: "No, quit", value: false },
+        { label: "No", value: false },
       ])) ?? false;
     await guarded(() => rt.send({ kind: "plugins", approved: ok }));
-    if (!ok) {
-      await screen.close();
-      process.exit(1);
-    }
+    if (!ok) return false;
   }
-  running = true;
-  try {
-    await guarded(() => rt.recover());
-  } finally {
-    running = false;
-    screen.busy(undefined);
-  }
+  await guarded(() => rt.recover());
   // 命令行明确给了 --mode 时覆盖日志里的设置
   if (opts.mode && opts.mode !== settings().mode) await saveSettings({ ...settings(), mode: opts.mode });
   screen.log(dim(`Resumed ${sessionId} (${rt.state.messages.length} messages, mode ${settings().mode})`));
+  return true;
+}
+
+/** /memory：不带参数时列出记忆，可以删掉一条或新加一条；带参数时记下这段话 */
+async function manageMemory(text: string) {
+  const { memory } = jade;
+  if (!text) {
+    const entries = (await Promise.all(MEMORY_SCOPES.map(async (scope) => (await memory.list(scope)).map((t) => ({ scope, text: t }))))).flat();
+    const choice = await screen.select<{ scope: MemoryScope; text: string } | "add">(
+      entries.length ? "Memory: choose an entry to remove it, or add one" : "jade does not remember anything yet",
+      [{ label: "Add a memory…", value: "add" as const }, ...entries.map((e) => ({ label: e.text, value: e, hint: e.scope }))],
+      { body: dim(`user (all projects): ${memory.files.user}\nproject: ${memory.files.project}`) },
+    );
+    if (!choice) return;
+    if (choice !== "add") {
+      const ok = await screen.select(
+        `Remove this ${choice.scope} memory?`,
+        [
+          { label: "No", value: false },
+          { label: "Yes, remove it", value: true },
+        ],
+        { body: choice.text },
+      );
+      if (!ok) return;
+      await memory.remove(choice.scope, choice.text);
+      notes.push(`The user removed this ${choice.scope} memory, so stop following it: ${choice.text}`);
+      return screen.log(green(`Removed from ${choice.scope} memory: ${choice.text}`));
+    }
+    text = (await screen.input("What should jade remember?", { placeholder: "e.g. Reply in Chinese; run tests with bun test" })) ?? "";
+    if (!text) return;
+  }
+  const scope = await screen.select<MemoryScope>("Remember it for", [
+    { label: "All projects", value: "user", hint: "user memory" },
+    { label: "This project only", value: "project", hint: "project memory" },
+  ]);
+  if (!scope) return;
+  const added = await memory.add(scope, text);
+  if (added) notes.push(`The user saved a ${scope} memory; follow it from now on: ${text}`);
+  screen.log(added ? green(`Saved to ${scope} memory.`) : dim(`The ${scope} memory already has this.`));
 }
 
 // ---------- 命令 ----------
@@ -743,17 +695,22 @@ async function command(input: string): Promise<boolean> {
       await retry();
       break;
     case "clear":
-      await newSession();
+      await switchSession();
       break;
     case "compact":
       jade.compact.request();
       screen.log(dim("History will be compacted before the next request."));
       break;
-    case "sessions":
-      for (const s of (await index.list(cwd)).slice(0, 15)) {
-        screen.log(`${s.id === sessionId ? "*" : " "} ${s.id}  ${dim(s.at.slice(0, 16))}  ${s.title}`);
-      }
-      screen.log(dim("Resume one with: jade --resume <id>"));
+    case "resume":
+    case "sessions": {
+      const id = rest[0] ? await findSession(rest[0]) : await pickSession(sessionId);
+      if (!id) break;
+      if (id === sessionId) screen.log(dim("That is the current session."));
+      else await switchSession(id);
+      break;
+    }
+    case "memory":
+      await manageMemory(input.slice(1).replace(/^\S+\s*/, "").trim());
       break;
     case "hooks":
       for (const p of ["context.project", "context.build", "model.before", "model.after", "tool.before", "tool.gate", "tool.after", "turn.continue", "event", "session.start", "session.end"]) {
@@ -761,12 +718,12 @@ async function command(input: string): Promise<boolean> {
       }
       break;
     case "rules":
-      screen.log(settings().rules.length ? settings().rules.map((r) => `${r.tool}${r.command ? ` "${r.command}"` : r.prefix ? ` "${r.prefix}…"` : ""}`).join("\n") : dim("(none)"));
+      screen.log(settings().rules.length ? settings().rules.map(describeRule).join("\n") : dim("(none)"));
       break;
     case "usage":
       screen.log(
-        `input ${usage.inputTokens}  output ${usage.outputTokens}  cache read ${usage.cacheReadTokens}  cache write ${usage.cacheWriteTokens}  ` +
-          `cache hit ${percent(usage.cacheReadTokens, usage.inputTokens)}`,
+        `input ${view.usage.inputTokens}  output ${view.usage.outputTokens}  cache read ${view.usage.cacheReadTokens}  cache write ${view.usage.cacheWriteTokens}  ` +
+          `cache hit ${percent(view.usage.cacheReadTokens, view.usage.inputTokens)}`,
       );
       screen.log(
         dim(
@@ -796,8 +753,7 @@ const MODE_HINTS: Record<string, string> = {
 /** 等待执行的输入：运行中提交的消息和需要独占运行时的命令排在这里，按顺序执行 */
 const queue: string[] = [];
 
-/** 把用户的输入回显到输出里 */
-const echo = (text: string) => screen.log(text.startsWith("/") ? cyan(`› ${text}`) : `\n${bold(`› ${text.replace(/\n/g, "\n  ")}`)}`);
+const echo = view.echo;
 
 function onSubmit(text: string) {
   const name = text.startsWith("/") ? text.slice(1).split(/\s+/)[0]! : undefined;
@@ -814,32 +770,37 @@ function onSubmit(text: string) {
 
 async function pump() {
   if (running) return;
-  running = true;
-  try {
-    while (queue.length > 0) {
+  let exit = false;
+  await occupy(async () => {
+    while (queue.length > 0 && !quitting) {
       const text = queue.shift()!;
       screen.queued(queue);
       echo(text);
       if (text.startsWith("/")) {
         try {
           if (!(await command(text))) {
-            running = false;
-            return void quit();
+            exit = true;
+            return;
           }
         } catch (err) {
           screen.log(red(`[error] ${errorText(err)}`));
         }
       } else await say(text);
     }
-  } finally {
-    running = false;
-    screen.busy(undefined);
-  }
+  });
+  if (exit) await quit();
 }
 
 // ---------- 开始 ----------
 
-if (resumeId) await resumeSession();
+if (resumeId) {
+  let ok = false;
+  await occupy(async () => void (ok = await resumeSession()));
+  if (!ok) {
+    await screen.close();
+    process.exit(1);
+  }
+}
 else if (tui) screen.log(dim("Type / for commands, /model to configure the model, esc to interrupt."));
 else screen.log(dim(`jade · ${shortPath(cwd)} · ${modelLabel()} · mode ${settings().mode} · session ${sessionId}`));
 screen.status({ mode: settings().mode, session: sessionId });
@@ -850,11 +811,7 @@ if (tui) {
   ready = true;
   for (const text of [...(first ? [first] : []), ...early.splice(0)]) onSubmit(text);
 } else {
-  if (first) {
-    running = true;
-    await say(first);
-    running = false;
-  }
+  if (first) await occupy(() => say(first));
   await leave();
   await closeScreen();
 }

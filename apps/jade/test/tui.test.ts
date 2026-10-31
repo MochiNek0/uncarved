@@ -3,6 +3,7 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough, Writable } from "node:stream";
+import { InputHistory } from "../src/history.ts";
 import { parseEnv, providerFromEnv, providerInfo, providerKind, updateEnvFile } from "../src/index.ts";
 import { edit, layout } from "../src/ui/editor.ts";
 import type { Screen } from "../src/ui/screen.ts";
@@ -43,6 +44,22 @@ describe("editor", () => {
   });
 });
 
+describe("input history", () => {
+  test("keeps each directory's own inputs across sessions, latest copy of repeats", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "jade-history-"));
+    const file = path.join(dir, "history.jsonl");
+    const a = new InputHistory(file, path.join(dir, "a"));
+    const b = new InputHistory(file, path.join(dir, "b"));
+    expect(await a.load()).toEqual([]);
+    await a.add("one");
+    await b.add("elsewhere");
+    await a.add("two\nlines");
+    await a.add("one");
+    expect(await new InputHistory(file, path.join(dir, "a")).load()).toEqual(["two\nlines", "one"]);
+    expect(await b.load()).toEqual(["elsewhere"]);
+  });
+});
+
 describe("model configuration", () => {
   test("JADE_PROVIDER overrides the default order", () => {
     const env = { OPENAI_API_KEY: "k", OPENAI_COMPAT_BASE_URL: "http://x", OPENAI_COMPAT_MODEL: "m" };
@@ -73,7 +90,7 @@ describe("terminal UI", () => {
     screen = undefined;
   });
 
-  function setup() {
+  function setup(history?: string[]) {
     const stdin = Object.assign(new PassThrough(), { isTTY: true, setRawMode: () => {}, ref: () => {}, unref: () => {} });
     let out = "";
     const stdout = Object.assign(
@@ -90,6 +107,7 @@ describe("terminal UI", () => {
       submit: (t) => void calls.submit.push(t),
       interrupt: () => void calls.interrupt++,
       exit: () => void calls.exit++,
+      files: async () => ["src/", "src/main.ts", "src/ui/", "src/ui/tui.tsx", "docs/my notes.md"],
     };
     screen = tuiScreen({
       status: { cwd: "~/proj", branch: "main", model: "test-model", mode: "ask", session: "s-123" },
@@ -100,6 +118,7 @@ describe("terminal UI", () => {
         { name: "model", about: "configure the model" },
       ],
       handlers,
+      history,
       io: { stdin: stdin as unknown as NodeJS.ReadStream, stdout: stdout as unknown as NodeJS.WriteStream },
     });
     const type = async (s: string) => {
@@ -137,6 +156,57 @@ describe("terminal UI", () => {
     // 文字和回车合在一块到达
     await type("fast typing\r");
     expect(calls.submit).toEqual(["/model", "/mode yolo", "fast typing"]);
+  });
+
+  test("typing @ lists matching paths; enter or tab inserts the selection", async () => {
+    const { calls, type, output } = setup();
+    await type("fix @tu");
+    expect(output()).toContain("src/ui/tui.tsx");
+    await type("\r");
+    await type("now\r");
+    expect(calls.submit).toEqual(["fix @src/ui/tui.tsx now"]);
+    // 目录补全后接着补里面的文件；含空格的路径加引号
+    await type("@src/u");
+    await type("\t");
+    await type("\x1b[B");
+    await type("\t");
+    await type("and @notes");
+    await type("\t");
+    await type("\r");
+    expect(calls.submit.at(-1)).toBe('@src/ui/tui.tsx and @"docs/my notes.md"');
+  });
+
+  test("up recalls earlier input, including history from previous sessions", async () => {
+    const { calls, type } = setup(["old one", "old two"]);
+    await type("new");
+    await type("\r");
+    await type("\x1b[A");
+    await type("\x1b[A");
+    await type("\r");
+    expect(calls.submit).toEqual(["new", "old two"]);
+  });
+
+  test("ctrl+r searches the history and puts the pick in the input to edit", async () => {
+    const { calls, type, output } = setup(["fix the login bug", "run the tests", "fix the build"]);
+    await type("\x12");
+    await type("fix");
+    expect(output()).toContain("fix the build");
+    expect(output()).toContain("fix the login bug");
+    // 再按 Ctrl+R 换到更早的一条，回车放进输入框，接着改再发送
+    await type("\x12");
+    await type("\r");
+    expect(calls.submit).toEqual([]);
+    await type(" again\r");
+    expect(calls.submit).toEqual(["fix the login bug again"]);
+    // Esc 退出搜索，输入框里原来的内容不变
+    await type("draft");
+    await type("\x12");
+    await type("zzz");
+    expect(output()).toContain("no match");
+    await type("\x1b");
+    await sleep(50);
+    await type("\r");
+    expect(calls.submit.at(-1)).toBe("draft");
   });
 
   test("select and input dialogs take the keyboard and return the answer", async () => {

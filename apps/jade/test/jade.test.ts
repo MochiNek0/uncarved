@@ -12,6 +12,7 @@ import {
   type LogEvent,
   type EventDataMap,
   type LogStore,
+  type Message,
   type ModelRequest,
   type ModelResponse,
   type Provider,
@@ -23,6 +24,7 @@ import {
   contextWindowFromEnv,
   createJade,
   DERIVED_KEY,
+  effortFromEnv,
   estimateTokens,
   fsTools,
   hasProvider,
@@ -37,6 +39,11 @@ import {
   POLICY_KEY,
   providerFromEnv,
   SessionIndex,
+  Memory,
+  attachMentions,
+  mentionAt,
+  parseMentions,
+  rankPaths,
   policy,
   prompts,
   shellTool,
@@ -322,6 +329,22 @@ describe("fs tools", () => {
     );
     expect(r.content).toBe("Todo list updated:\n[x] read\n[~] edit\n[ ] test");
   });
+
+  test("seen hashes are appended once per change and survive a new process", async () => {
+    const { home } = await workspace();
+    const dir = path.join(home, "checkpoints");
+    const first = new Checkpoints(dir);
+    await first.markSeen("s1", "/a.ts", "h1");
+    await first.markSeen("s1", "/a.ts", "h1");
+    await first.markSeen("s1", "/a.ts", "h2");
+    await first.markSeen("s1", "/b.ts", "h3");
+    expect((await readFile(path.join(dir, "s1", "seen.jsonl"), "utf8")).trim().split("\n")).toHaveLength(3);
+    const second = new Checkpoints(dir);
+    expect(await second.seenHash("s1", "/a.ts")).toBe("h2");
+    expect(await second.seenHash("s1", "/b.ts")).toBe("h3");
+    expect(await second.seenHash("s1", "/c.ts")).toBeUndefined();
+    expect(await second.seenHash("s2", "/a.ts")).toBeUndefined();
+  });
 });
 
 // ---------- 权限 ----------
@@ -384,6 +407,41 @@ describe("policy", () => {
     const push = { mode: "ask" as const, rules: [bashRule("git push origin main")] };
     expect(p.decide(gated("bash", { command: "git push origin dev" }), push).decision).toBe("allow");
     expect(p.decide(gated("bash", { command: "git push --force origin main" }), push).decision).toBe("ask");
+  });
+
+  test("always-allow rules for files stay inside the working directory unless they name a directory", () => {
+    const p = policy({ cwd });
+    const write = (file: string) => gated("write_file", { path: file, content: "" });
+    const plain = { mode: "ask" as const, rules: [p.ruleFor(write(inside))] };
+    expect(plain.rules).toEqual([{ tool: "write_file" }]);
+    expect(p.decide(write(inside), plain).decision).toBe("allow");
+    // 在项目里允许了 write_file，不等于允许改工作目录之外的文件
+    expect(p.decide(write(outside), plain).decision).toBe("ask");
+    expect(p.decide(gated("read_file", { path: outside }), { mode: "ask", rules: [{ tool: "read_file" }] }).decision).toBe("ask");
+
+    const elsewhere = path.resolve("/tmp/notes/a.md");
+    const dir = { mode: "ask" as const, rules: [p.ruleFor(write(elsewhere))] };
+    expect(dir.rules).toEqual([{ tool: "write_file", dir: path.dirname(elsewhere) }]);
+    expect(p.decide(write(path.resolve("/tmp/notes/b.md")), dir).decision).toBe("allow");
+    expect(p.decide(write(path.resolve("/tmp/other.md")), dir).decision).toBe("ask");
+    expect(p.decide(write(outside), dir).decision).toBe("ask");
+  });
+
+  test("web_fetch asks per host, even in read-only mode", () => {
+    const web = webTools({ env: {} }).tools;
+    const p = policy({ cwd });
+    const fetchCall = (url: string) => ({ toolUseId: "t", name: "web_fetch", input: { url }, tool: web.find((t) => t.name === "web_fetch")! });
+    const docs = fetchCall("https://docs.example.com/a?q=1");
+    expect(p.decide(docs, { mode: "ask", rules: [] }).decision).toBe("ask");
+    expect(p.decide(docs, { mode: "readonly", rules: [] }).decision).toBe("ask");
+    expect(p.decide(docs, { mode: "yolo", rules: [] }).decision).toBe("allow");
+    const rules = [p.ruleFor(docs)];
+    expect(rules).toEqual([{ tool: "web_fetch", host: "docs.example.com" }]);
+    expect(p.decide(fetchCall("https://DOCS.example.com/b"), { mode: "ask", rules }).decision).toBe("allow");
+    expect(p.decide(fetchCall("https://evil.example.net/?d=secret"), { mode: "ask", rules }).decision).toBe("ask");
+    // 子 Agent 的策略用主会话的规则
+    const shared = policy({ cwd, mode: "readonly", rules: () => rules });
+    expect(shared.decide(docs, shared.settings({})).decision).toBe("allow");
   });
 
   test("safe commands exclude arguments that write files or run programs", () => {
@@ -584,6 +642,34 @@ describe("jade session", () => {
     expect(hasProvider({})).toBe(false);
   });
 
+  test("JADE_EFFORT is checked against the provider", () => {
+    expect(effortFromEnv({ ANTHROPIC_API_KEY: "k", JADE_EFFORT: "max" })).toBe("max");
+    expect(effortFromEnv({ OPENAI_API_KEY: "k", JADE_EFFORT: "minimal" })).toBe("minimal");
+    expect(effortFromEnv({ ANTHROPIC_API_KEY: "k" })).toBeUndefined();
+    expect(() => effortFromEnv({ ANTHROPIC_API_KEY: "k", JADE_EFFORT: "minimal" })).toThrow("JADE_EFFORT must be one of");
+    expect(() => effortFromEnv({ OPENAI_COMPAT_BASE_URL: "http://x", JADE_EFFORT: "high" })).toThrow("not supported");
+    expect(() => providerFromEnv({ OPENAI_API_KEY: "k", JADE_EFFORT: "turbo" })).toThrow("JADE_EFFORT");
+  });
+
+  test("images and PDFs are estimated by kind, not by the size of their base64 data", () => {
+    const media = (kind: "image" | "document", bytes: number): Message => ({
+      role: "user",
+      content: [
+        {
+          kind: "tool_result",
+          toolUseId: "t",
+          isError: false,
+          content: [{ kind, source: { type: "base64", media_type: "x", data: "A".repeat((bytes * 4) / 3) }, origin: { by: "tool", name: "read_file" }, trust: "untrusted" }],
+          origin: { by: "runtime" },
+          trust: "untrusted",
+        } as Block,
+      ],
+    });
+    // 500KB 的截图按字符数会被估成十几万 token
+    expect(estimateTokens([media("image", 500_000)])).toBeLessThan(2_000);
+    expect(estimateTokens([media("document", 3_000_000)])).toBeGreaterThan(50_000);
+  });
+
   test("OPENAI_COMPAT_EXTRA_BODY must be a JSON object", () => {
     const env = { OPENAI_COMPAT_BASE_URL: "http://x", OPENAI_COMPAT_MODEL: "m" };
     expect(providerFromEnv({ ...env, OPENAI_COMPAT_EXTRA_BODY: '{"enable_thinking":true}' }).id).toBe("openai-compat");
@@ -660,6 +746,42 @@ describe("jade session", () => {
     expect(child.at(-1)!.seq).toBe(d.child!.seq);
     // 子 Agent 只有只读工具，提示词是子 Agent 的
     expect(requests[1]!.tools.map((t) => t.name).sort()).toEqual(["glob", "grep", "list_dir", "read_file", "web_fetch"]);
+  });
+
+  test("sub-agent calls that need approval are passed to the host", async () => {
+    const asked: string[] = [];
+    const fetchImpl = (async () => new Response("hello from docs", { headers: { "content-type": "text/plain" } })) as unknown as typeof fetch;
+    const subagent = (approveSubagent?: JadeOptions["approveSubagent"]) =>
+      setup(
+        [
+          call(use("u1", "task", { description: "read docs", prompt: "read the docs" })),
+          call(use("c1", "web_fetch", { url: "https://docs.example.com/" })),
+          reply("the docs say hello"),
+          reply("done"),
+        ],
+        { fetch: fetchImpl, lookup: async () => ["93.184.215.14"], approveSubagent },
+      );
+    const childResult = async (store: LogStore, id: string) => {
+      const [completed] = await events(store, id, "tool.completed");
+      const child = (completed!.data as EventDataMap["tool.completed"]).child!;
+      const [fetched] = await events(store, child.sessionId, "tool.completed");
+      return (fetched!.data as EventDataMap["tool.completed"]).content;
+    };
+
+    const approved = await subagent(async (c) => {
+      asked.push(c.name);
+      return { approved: true };
+    });
+    await approved.rt.send(msg("go"));
+    expect(asked).toEqual(["web_fetch"]);
+    expect(JSON.stringify(await childResult(approved.store, approved.rt.state.sessionId))).toContain("hello from docs");
+
+    // 没有宿主可以问时拒绝，子 Agent 照常结束
+    const nobody = await subagent();
+    await nobody.rt.send(msg("go"));
+    expect(nobody.rt.state.phase).toBe("idle");
+    // 请求顺序：主会话、子 Agent、子 Agent（带着被拒绝的结果）、主会话
+    expect(JSON.stringify(nobody.requests[2]!.messages)).toContain("Nobody can approve");
   });
 
   test("permission settings live in the log and survive resume", async () => {
@@ -770,5 +892,73 @@ describe("context window", () => {
     expect(compactThreshold(200_000, { ANTHROPIC_API_KEY: "k" })).toBe(136_000);
     expect(compactThreshold(200_000, { ...env, JADE_MAX_TOKENS: "8000" })).toBe(160_000);
     expect(compactThreshold(32_768, { ...env, JADE_MAX_TOKENS: "32000" })).toBe(16_384);
+  });
+});
+
+describe("memory", () => {
+  test("entries are added once, removed by exact text or a unique part, and kept per project", async () => {
+    const { home, cwd } = await workspace();
+    const m = new Memory(home, cwd);
+    expect(await m.add("user", "Reply  in\nChinese")).toBe(true);
+    expect(await m.add("user", "Reply in Chinese")).toBe(false);
+    await m.add("user", "Prefer bun over npm");
+    expect(await m.list("user")).toEqual(["Reply in Chinese", "Prefer bun over npm"]);
+    expect(await readFile(m.files.user, "utf8")).toBe("- Reply in Chinese\n- Prefer bun over npm\n");
+    await expect(m.remove("user", "e")).rejects.toThrow("2 user memories contain");
+    expect(await m.remove("user", "bun")).toBe("Prefer bun over npm");
+    expect(await m.remove("user", "nothing")).toBeUndefined();
+
+    await m.add("project", "Tests run with bun test");
+    expect(await new Memory(home, path.join(cwd, "other")).list("project")).toEqual([]);
+    expect(await new Memory(home, cwd).list("project")).toEqual(["Tests run with bun test"]);
+  });
+
+  test("memories reach the system prompt of the next session; the model saves them with the memory tool", async () => {
+    const { rt, home, cwd, requests } = await setup([
+      call(use("u1", "memory", { action: "add", scope: "user", text: "The user likes short answers" })),
+      reply("noted"),
+    ], { mode: "yolo" });
+    await rt.send(msg("remember that I like short answers"));
+    expect(requests[0]!.system.map((s) => s.text).join("\n")).not.toContain("# Memory");
+    expect(await new Memory(home, cwd).list("user")).toEqual(["The user likes short answers"]);
+
+    const s = scripted([reply("ok")]);
+    const jade = await createJade({ cwd, home, store: new MemoryLogStore(), provider: s.provider, env: {} });
+    const next = await Runtime.create({ store: new MemoryLogStore(), provider: s.provider, plugins: jade.plugins });
+    await next.send(msg("hi"));
+    const memory = s.requests[0]!.system.find((x) => x.text.startsWith("# Memory"));
+    expect(memory?.text).toContain("- The user likes short answers");
+  });
+});
+
+describe("@ mentions", () => {
+  test("parsing, the mention at the cursor, and ranking", () => {
+    expect(parseMentions('see @src/a.ts, @"my file.md" and @src/a.ts. mail a@b.c')).toEqual(["src/a.ts", "my file.md"]);
+    expect(mentionAt("look at @src/ma", 15)).toEqual({ start: 8, query: "src/ma" });
+    expect(mentionAt("@", 1)).toEqual({ start: 0, query: "" });
+    expect(mentionAt("a@b", 3)).toBeUndefined();
+    expect(mentionAt("@done now", 9)).toBeUndefined();
+    const paths = ["src/", "src/main.ts", "src/ui/", "src/ui/main-menu.ts", "test/domain.ts", "README.md"];
+    expect(rankPaths(paths, "main", 10)).toEqual(["src/main.ts", "src/ui/main-menu.ts", "test/domain.ts"]);
+    expect(rankPaths(paths, "src/u", 2)).toEqual(["src/ui/", "src/ui/main-menu.ts"]);
+    expect(rankPaths(paths, "smm", 10)).toEqual(["src/ui/main-menu.ts"]);
+    expect(rankPaths(paths, "", 10)).toEqual(["src/", "README.md"]);
+  });
+
+  test("referenced files are attached as read_file shows them and count as read", async () => {
+    const { jade, cwd, rt, requests } = await setup([
+      call(use("u1", "edit_file", { path: "a.txt", old_string: "one", new_string: "uno" })),
+      reply("done"),
+    ], { mode: "yolo" });
+    await writeFile(path.join(cwd, "a.txt"), "one\ntwo\n");
+    await mkdir(path.join(cwd, "dir"));
+    const text = "change @a.txt and look at @dir, not @missing";
+    const refs = await attachMentions(text, { cwd, tools: jade.tools, sessionId: rt.state.sessionId, signal: new AbortController().signal });
+    expect(refs.attached).toEqual(["a.txt", "dir"]);
+    expect(refs.blocks.map((b) => (b.kind === "text" ? b.text : b.kind)).join("\n")).toContain("1\tone\n2\ttwo");
+    await rt.send({ kind: "message", content: [...msg(text).content, ...refs.blocks] });
+    const result = requests[1]!.messages.at(-1)!.content[0]!;
+    expect(result.kind === "tool_result" && result.isError).toBe(false);
+    expect(await readFile(path.join(cwd, "a.txt"), "utf8")).toBe("uno\ntwo\n");
   });
 });

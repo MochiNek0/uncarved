@@ -1,7 +1,7 @@
-// /model：选服务、填地址和密钥、选模型、改输出上限和上下文窗口。配置写进 $JADE_HOME/.env。
+// /model：选服务、填地址和密钥、选模型、改输出上限、思考力度和上下文窗口。配置写进 $JADE_HOME/.env。
 
 import { hasProvider, updateEnvFile } from "../config.ts";
-import { listModels, providerInfo, type ProviderKind } from "../provider.ts";
+import { EFFORTS, listModels, providerInfo, type ProviderKind } from "../provider.ts";
 import { shortPath } from "./render.ts";
 import { green, red, type Screen } from "./screen.ts";
 
@@ -112,10 +112,14 @@ export function configurator(opts: ConfigureOptions): Configure {
   async function configureModel(arg: string | undefined) {
     const info = providerInfo();
     if (arg) return void (await applyConfig({ [MODEL_KEY[info.kind]]: arg }));
+    const efforts = EFFORTS[info.kind];
     const action = await screen.select(`Model: ${info.model} (${info.kind})`, [
       { label: "Switch model", value: "model" as const, hint: `current: ${info.model}` },
       { label: "Change service, base URL or API key", value: "provider" as const, hint: info.baseURL },
       { label: "Output limit per reply", value: "max" as const, hint: process.env.JADE_MAX_TOKENS ? `${process.env.JADE_MAX_TOKENS} tokens` : "service default" },
+      ...(efforts
+        ? [{ label: "Reasoning effort", value: "effort" as const, hint: process.env.JADE_EFFORT ?? (info.kind === "anthropic" ? "high (default)" : "service default") }]
+        : []),
       {
         label: "Context window",
         value: "window" as const,
@@ -129,6 +133,13 @@ export function configurator(opts: ConfigureOptions): Configure {
     else if (action === "max") {
       const max = await screen.input("Output limit per reply in tokens (empty for the service default)", { initial: process.env.JADE_MAX_TOKENS ?? "32000" });
       if (max !== undefined) await applyConfig({ JADE_MAX_TOKENS: max || undefined });
+    } else if (action === "effort" && efforts) {
+      const DEFAULT = "\0default";
+      const effort = await screen.select("Reasoning effort", [
+        ...efforts.map((e) => ({ label: e, value: e, hint: e === process.env.JADE_EFFORT ? "current" : undefined })),
+        { label: "Default", value: DEFAULT, hint: info.kind === "anthropic" ? "high" : "service default" },
+      ]);
+      if (effort !== undefined) await applyConfig({ JADE_EFFORT: effort === DEFAULT ? undefined : effort });
     } else if (action === "window") {
       const n = await screen.input("Context window in tokens (empty for the default 256000)", { initial: process.env.JADE_CONTEXT_WINDOW ?? "" });
       if (n !== undefined) await applyConfig({ JADE_CONTEXT_WINDOW: n || undefined });

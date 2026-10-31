@@ -11,6 +11,7 @@ import { readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { ContentSource, Layer, Plugin, SystemSegment, Trust } from "uncarved";
+import type { Memory } from "../memory.ts";
 
 export interface PromptsOptions {
   cwd: string;
@@ -24,6 +25,8 @@ export interface PromptsOptions {
   shell?: string | null;
   /** 提供的 web 工具名（web_fetch、web_search） */
   web?: string[];
+  /** 跨会话的记忆，会话开始时读一次；子 Agent 不用 */
+  memory?: Memory;
 }
 
 /** 同一目录里按顺序找，用第一个存在的 */
@@ -78,7 +81,7 @@ export async function prompts(opts: PromptsOptions): Promise<Plugin> {
   if (opts.role !== "subagent") {
     const user = await instructions(opts.home, opts.home, "user");
     if (user) system.push(segment(`# User instructions (${user.source.path})\n\n${user.text}`, "trusted", user.source));
-    const root = (await git(opts.cwd, ["rev-parse", "--show-toplevel"])) ?? opts.cwd;
+    const root = await repoRoot(opts.cwd);
     for (const dir of ancestry(path.resolve(root), opts.cwd)) {
       const project = await instructions(root, dir, "project");
       if (!project) continue;
@@ -90,6 +93,8 @@ export async function prompts(opts: PromptsOptions): Promise<Plugin> {
         ),
       );
     }
+    const memory = await opts.memory?.prompt();
+    if (memory) system.push(segment(memory, "trusted"));
   }
 
   return {
@@ -146,6 +151,11 @@ async function environment(opts: PromptsOptions): Promise<string> {
     lines.push("- Not a git repository");
   }
   return lines.join("\n");
+}
+
+/** git 仓库的根目录；不在仓库里时是 cwd 本身 */
+export async function repoRoot(cwd: string): Promise<string> {
+  return (await git(cwd, ["rev-parse", "--show-toplevel"])) ?? cwd;
 }
 
 async function git(cwd: string, args: string[]): Promise<string | undefined> {

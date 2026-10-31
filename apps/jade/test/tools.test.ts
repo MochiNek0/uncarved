@@ -117,6 +117,10 @@ test("read_file returns a PDF as a document block", async () => {
 
 // ---------- web ----------
 
+/** 不真的解析域名：测试不依赖网络 */
+const PUBLIC_IP = "93.184.215.14";
+const publicLookup = async () => [PUBLIC_IP];
+
 /** 按 URL 返回预设响应的 fetch，记录请求过的地址 */
 function fakeFetch(routes: Record<string, () => Response>) {
   const seen: string[] = [];
@@ -142,7 +146,7 @@ describe("web_fetch", () => {
           `<h1>Title</h1><p>Hello <a href="/next">next page</a> &lt;3</p><ul><li>one<li>two</ul><pre>  indented\n    code</pre></body></html>`,
       ),
     });
-    const { tools } = webTools({ env: {}, fetch: impl });
+    const { tools } = webTools({ env: {}, fetch: impl, lookup: publicLookup });
     const r = await exec(tools, "web_fetch", { url: "https://example.com/doc" });
     expect(r.isError).toBe(false);
     expect(r.text).toBe(
@@ -152,7 +156,7 @@ describe("web_fetch", () => {
 
   test("pages long content with offset, without downloading again", async () => {
     const { impl, seen } = fakeFetch({ "https://example.com/big.txt": () => new Response("x".repeat(45_000), { headers: { "content-type": "text/plain" } }) });
-    const { tools } = webTools({ env: {}, fetch: impl });
+    const { tools } = webTools({ env: {}, fetch: impl, lookup: publicLookup });
     const first = await exec(tools, "web_fetch", { url: "https://example.com/big.txt" });
     expect(first.text).toEndWith("(showing characters 0-30000 of 45000; continue with offset 30000)");
     const second = await exec(tools, "web_fetch", { url: "https://example.com/big.txt", offset: 30_000 });
@@ -164,7 +168,7 @@ describe("web_fetch", () => {
     const { impl, seen } = fakeFetch({
       "https://example.com/go": () => new Response(null, { status: 302, headers: { location: "http://127.0.0.1:8080/admin" } }),
     });
-    const { tools } = webTools({ env: {}, fetch: impl });
+    const { tools } = webTools({ env: {}, fetch: impl, lookup: publicLookup });
     expect((await exec(tools, "web_fetch", { url: "http://localhost:3000" })).isError).toBe(true);
     expect((await exec(tools, "web_fetch", { url: "file:///etc/passwd" })).isError).toBe(true);
     const r = await exec(tools, "web_fetch", { url: "https://example.com/go" });
@@ -177,12 +181,26 @@ describe("web_fetch", () => {
     const { impl } = fakeFetch({
       "https://example.com/paper.pdf": () => new Response("%PDF-1.4", { headers: { "content-type": "application/pdf" } }),
     });
-    const { tools } = webTools({ env: {}, fetch: impl });
+    const { tools } = webTools({ env: {}, fetch: impl, lookup: publicLookup });
     const missing = await exec(tools, "web_fetch", { url: "https://example.com/missing" });
     expect(missing.isError).toBe(true);
     expect(missing.text).toStartWith("HTTP 404");
     const pdf = await exec(tools, "web_fetch", { url: "https://example.com/paper.pdf" });
     expect(pdf.blocks[0]).toMatchObject({ kind: "document", source: { media_type: "application/pdf" } });
+  });
+
+  test("refuses host names that resolve to local addresses", async () => {
+    const { impl, seen } = fakeFetch({
+      "https://example.com/go": () => new Response(null, { status: 302, headers: { location: "http://127.0.0.1.nip.io/admin" } }),
+    });
+    const lookup = async (host: string) => (host.endsWith("nip.io") ? ["127.0.0.1"] : [PUBLIC_IP]);
+    const { tools } = webTools({ env: {}, fetch: impl, lookup });
+    const direct = await exec(tools, "web_fetch", { url: "http://127.0.0.1.nip.io/admin" });
+    expect(direct.isError).toBe(true);
+    expect(direct.text).toContain("resolves to 127.0.0.1");
+    const redirected = await exec(tools, "web_fetch", { url: "https://example.com/go" });
+    expect(redirected.text).toContain("redirects to http://127.0.0.1.nip.io/admin, which is refused");
+    expect(seen).toEqual(["https://example.com/go"]);
   });
 
   test("private host detection", () => {

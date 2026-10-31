@@ -56,11 +56,32 @@ const TRIM_TARGET = 0.6;
 /** 中日韩文字和全角符号：大约一个字一个 token，不能按 4 个字符一个算 */
 const WIDE = /[　-鿿가-힯豈-﫿＀-￯]/g;
 
-/** 粗略估算：英文和代码 4 个字符约 1 个 token，中日韩文字每个字约 1 个 token */
+/** 一张图片大约的 token 数（服务端会把大图缩小，所以和文件大小关系不大） */
+const IMAGE_TOKENS = 1600;
+/** PDF 每页既有文字也有页面图像，按文件大小粗略折算：约 30 字节一个 token，至少按一张图片算 */
+const PDF_BYTES_PER_TOKEN = 30;
+
+/** 图片、PDF 块的 token 数；它们的 base64 数据不能按字符数估算，否则一张截图就会被估成十几万 token */
+function mediaTokens(b: { kind: string; source?: unknown }): number {
+  if (b.kind === "image") return IMAGE_TOKENS;
+  const data = (b.source as { data?: unknown } | undefined)?.data;
+  const bytes = typeof data === "string" ? (data.length * 3) / 4 : 0;
+  return Math.max(IMAGE_TOKENS, Math.ceil(bytes / PDF_BYTES_PER_TOKEN));
+}
+
+/** 粗略估算：英文和代码 4 个字符约 1 个 token，中日韩文字每个字约 1 个 token，图片和 PDF 单独估算 */
 export function estimateTokens(messages: Message[]): number {
-  const text = JSON.stringify(messages);
+  let media = 0;
+  const text = JSON.stringify(messages, (_key, value: unknown) => {
+    const b = value as { kind?: unknown } | null;
+    if (typeof b === "object" && b !== null && (b.kind === "image" || b.kind === "document")) {
+      media += mediaTokens(b as { kind: string; source?: unknown });
+      return undefined;
+    }
+    return value;
+  });
   const wide = text.match(WIDE)?.length ?? 0;
-  return Math.ceil((text.length - wide) / 4 + wide);
+  return Math.ceil((text.length - wide) / 4 + wide) + media;
 }
 
 const total = (u: Usage | undefined) => (u?.inputTokens === undefined ? undefined : u.inputTokens + (u.outputTokens ?? 0));
@@ -208,9 +229,12 @@ export function compactor(opts: CompactOptions): Compactor {
  */
 function cutPoint(messages: Message[], from: number, keep: number): number | undefined {
   let best: number | undefined;
+  // 从后往前累加，每条消息只估算一次
+  let size = 0;
   for (let k = messages.length - 1; k > from; k--) {
+    size += estimateTokens([messages[k]!]);
     if (messages[k]!.role !== "assistant") continue;
-    if (best !== undefined && estimateTokens(messages.slice(k)) > keep) break;
+    if (best !== undefined && size > keep) break;
     best = k;
   }
   return best;

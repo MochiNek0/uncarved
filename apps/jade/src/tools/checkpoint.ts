@@ -4,7 +4,7 @@
 // 哪些修改已经撤销由宿主用 Runtime.record 记在日志里（UNDO_KEY），恢复会话后仍然有效。
 
 import { createHash } from "node:crypto";
-import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 /** derived 中保存已撤销的 toolUseId 的键 */
@@ -31,6 +31,8 @@ export const sha256 = (s: string) => createHash("sha256").update(s).digest("hex"
 
 export class Checkpoints {
   readonly #dir: string;
+  /** 会话 → 文件 → markSeen 记下的 sha256；第一次用到时从 seen.jsonl 读入 */
+  readonly #seen = new Map<string, Promise<Map<string, string>>>();
 
   constructor(dir: string) {
     this.#dir = dir;
@@ -66,22 +68,52 @@ export class Checkpoints {
 
   /**
    * 记下本会话读过或写过的文件当时内容的 sha256。fs 工具在内存里也记一份，
-   * 这里的是给恢复的会话用的：之前的进程里读过、写过的文件，内容没变就不用再读一遍
+   * 这里的是给恢复的会话用的：之前的进程里读过、写过的文件，内容没变就不用再读一遍。
+   * 追加到每个会话一个的 seen.jsonl，后面的记录覆盖前面的；内容没变的重复读取不再写
    */
   async markSeen(sessionId: string, file: string, hash: string): Promise<void> {
-    const dir = path.join(this.#dir, safe(sessionId), "seen");
+    const seen = await this.#seenOf(sessionId);
+    if (seen.get(file) === hash) return;
+    seen.set(file, hash);
+    const dir = path.join(this.#dir, safe(sessionId));
     await mkdir(dir, { recursive: true });
-    await writeFile(path.join(dir, `${sha256(file)}.json`), JSON.stringify({ path: file, hash }));
+    await appendFile(path.join(dir, "seen.jsonl"), JSON.stringify({ path: file, hash }) + "\n");
   }
 
   /** markSeen 记下的 sha256；没有记录返回 undefined */
   async seenHash(sessionId: string, file: string): Promise<string | undefined> {
+    const hash = (await this.#seenOf(sessionId)).get(file);
+    if (hash !== undefined) return hash;
+    // 旧版本每个文件一个 seen/<sha256(path)>.json
     try {
       const rec = JSON.parse(await readFile(path.join(this.#dir, safe(sessionId), "seen", `${sha256(file)}.json`), "utf8")) as { path: string; hash: string };
       return rec.path === file ? rec.hash : undefined;
     } catch {
       return undefined;
     }
+  }
+
+  #seenOf(sessionId: string): Promise<Map<string, string>> {
+    let seen = this.#seen.get(sessionId);
+    if (!seen) {
+      seen = readFile(path.join(this.#dir, safe(sessionId), "seen.jsonl"), "utf8").then(
+        (text) => {
+          const map = new Map<string, string>();
+          for (const line of text.split("\n")) {
+            try {
+              const rec = JSON.parse(line) as { path: string; hash: string };
+              map.set(rec.path, rec.hash);
+            } catch {
+              // 空行或写到一半的一行
+            }
+          }
+          return map;
+        },
+        () => new Map<string, string>(),
+      );
+      this.#seen.set(sessionId, seen);
+    }
+    return seen;
   }
 
   /** 文件现在的内容是否还是这次写入的结果 */

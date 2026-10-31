@@ -6,6 +6,7 @@ import { writeSync } from "node:fs";
 import { Box, render, Text, useBoxMetrics, useCursor, useInput, usePaste, useWindowSize, type DOMElement, type Key } from "ink";
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import wrapAnsi from "wrap-ansi";
+import { mentionAt, mentionText, rankPaths } from "../mentions.ts";
 import { edit, empty, layout, type EditState } from "./editor.ts";
 import { dim, type Choice, type CommandInfo, type Screen, type StatusInfo } from "./screen.ts";
 
@@ -16,6 +17,8 @@ export interface TuiHandlers {
   interrupt(): void;
   /** 空闲时连按两次 Ctrl+C */
   exit(): void;
+  /** 输入 @ 时补全用的路径（目录以 / 结尾）；每次开始输入一个新的 @ 引用时取一次 */
+  files?(): Promise<string[]>;
 }
 
 type Dialog =
@@ -163,6 +166,8 @@ export interface TuiOptions {
   version: string;
   commands: CommandInfo[];
   handlers: TuiHandlers;
+  /** 之前提交过的输入（旧的在前），↑/↓ 和 Ctrl+R 用 */
+  history?: string[];
   /** 测试时替换终端 */
   io?: { stdin: NodeJS.ReadStream; stdout: NodeJS.WriteStream };
 }
@@ -200,7 +205,7 @@ export function tuiScreen(opts: TuiOptions): Screen {
   // 切到备用屏幕后光标还停在原来的位置（不少终端不会自动归位），Ink 从那里往下画第一帧会让屏幕滚动，
   // 之后每帧只重写变化的行，整个界面就错位了。所以先自己切过去、清屏、把光标移到左上角
   stdout.write("\x1b[?1049h\x1b[2J\x1b[H");
-  const instance = render(<App store={store} version={opts.version} commands={opts.commands} handlers={opts.handlers} />, {
+  const instance = render(<App store={store} version={opts.version} commands={opts.commands} handlers={opts.handlers} history={opts.history ?? []} />, {
     exitOnCtrlC: false,
     alternateScreen: true,
     // 全屏每帧只重写变化的行
@@ -280,7 +285,13 @@ export function tuiScreen(opts: TuiOptions): Screen {
 const MOUSE = /^\[<(\d+);\d+;(\d+)([Mm])$/;
 const WHEEL_LINES = 3;
 
-function App({ store, version, commands, handlers }: { store: Store; version: string; commands: CommandInfo[]; handlers: TuiHandlers }) {
+function App({ store, version, commands, handlers, history }: {
+  store: Store;
+  version: string;
+  commands: CommandInfo[];
+  handlers: TuiHandlers;
+  history: string[];
+}) {
   const state = useSyncExternalStore(store.subscribe, store.get);
   const dialog = state.dialogs[0];
   const { columns, rows } = useWindowSize();
@@ -302,7 +313,23 @@ function App({ store, version, commands, handlers }: { store: Store; version: st
   const shown = [...done.slice(start, Math.min(end, done.length)), ...live.slice(Math.max(0, start - done.length), Math.max(0, end - done.length))];
   const page = Math.max(1, view - 2);
 
+  // Ink 增量渲染只用相对光标移动，第一帧起点一旦偏了（启动时终端尺寸还没稳定、窗口缩放、别的输出插进来），
+  // 之后每帧都会画错行。启动后、尺寸变化后和按 Ctrl+L 时让一帧比终端高，Ink 会清屏从左上角整帧重画（包在同步输出里），下一帧再恢复
+  const [redraws, setRedraws] = useState(0);
+  const [repaint, setRepaint] = useState(false);
+  useEffect(() => {
+    const t = setTimeout(() => setRepaint(true), 100);
+    return () => clearTimeout(t);
+  }, [columns, rows, redraws]);
+  useEffect(() => {
+    if (!repaint) return;
+    // 要比 Ink 的帧间隔长，否则这一帧会被合并掉
+    const t = setTimeout(() => setRepaint(false), 50);
+    return () => clearTimeout(t);
+  }, [repaint]);
+
   useInput((input, key) => {
+    if (key.ctrl && input === "l") return setRedraws((n) => n + 1);
     const mouse = MOUSE.exec(input);
     if (mouse) {
       const button = Number(mouse[1]) & ~0b11100;
@@ -323,9 +350,10 @@ function App({ store, version, commands, handlers }: { store: Store; version: st
     else if (key.ctrl && key.end) store.scrollBy(-max, max);
   });
 
-  // 总高度要比终端少一行，否则 Ink 认为输出占满了屏幕，每帧清屏重画
+  // 总高度要比终端少一行，否则 Ink 认为输出占满了屏幕，每帧清屏重画。
+  // 重画那一帧上下各垫一行空白：终端把顶上那行滚出去后，看到的和平时逐行一样，所以不会闪
   return (
-    <Box flexDirection="column" width={columns} height={Math.max(1, rows - 1)} overflow="hidden">
+    <Box flexDirection="column" width={columns} height={repaint ? rows + 1 : Math.max(1, rows - 1)} paddingY={repaint ? 1 : 0} overflow="hidden">
       <Header status={state.status} version={version} />
       <Box ref={ref} flexDirection="column" flexGrow={1} flexShrink={1} flexBasis={0} overflow="hidden" paddingX={1}>
         {shown.map((l, i) => (
@@ -354,7 +382,7 @@ function App({ store, version, commands, handlers }: { store: Store; version: st
             <InputDialog key={dialogKey(dialog)} dialog={dialog} />
           )
         ) : null}
-        <Prompt commands={commands} handlers={handlers} busy={Boolean(state.busy)} active={!dialog} onSubmit={() => store.scrollBy(-max, max)} />
+        <Prompt commands={commands} handlers={handlers} history={history} busy={Boolean(state.busy)} active={!dialog} onSubmit={() => store.scrollBy(-max, max)} />
         <StatusBar status={state.status} />
       </Box>
     </Box>
@@ -506,9 +534,10 @@ function origin(node: DOMElement): { x: number; y: number } {
   return { x, y };
 }
 
-function Prompt({ commands, handlers, busy, active, onSubmit }: {
+function Prompt({ commands, handlers, history: initial, busy, active, onSubmit }: {
   commands: CommandInfo[];
   handlers: TuiHandlers;
+  history: string[];
   busy: boolean;
   active: boolean;
   /** 提交后对话区回到底部 */
@@ -517,7 +546,7 @@ function Prompt({ commands, handlers, busy, active, onSubmit }: {
   const [state, setState] = useState<EditState>(empty);
   const [selected, setSelected] = useState(0);
   const [notice, setNotice] = useState<string>();
-  const history = useRef<string[]>([]);
+  const history = useRef<string[]>(initial);
   /** 正在看的历史条目；-1 表示当前输入 */
   const browsing = useRef(-1);
   const draft = useRef("");
@@ -529,6 +558,30 @@ function Prompt({ commands, handlers, busy, active, onSubmit }: {
   const naming = state.value.startsWith("/") && !/\s/.test(state.value);
   const matches = naming ? commands.filter((c) => `/${c.name}`.startsWith(state.value)) : [];
   const pick = matches[Math.min(selected, matches.length - 1)];
+
+  // @ 引用：光标处正在输入的路径和补全候选
+  const [paths, setPaths] = useState<string[]>([]);
+  const mention = naming ? undefined : mentionAt(state.value, state.cursor);
+  const mentioning = mention !== undefined;
+  // 每次开始输入一个新的 @ 引用时重新取一次：文件可能已经变了
+  useEffect(() => {
+    if (!mentioning || !handlers.files) return;
+    let live = true;
+    handlers.files().then((p) => void (live && setPaths(p)), () => {});
+    return () => {
+      live = false;
+    };
+  }, [mentioning]);
+  const found = mention ? rankPaths(paths, mention.query, MENTION_ROWS) : [];
+  const file = found[Math.min(selected, found.length - 1)];
+  const menu = matches.length || found.length;
+
+  // Ctrl+R 搜索历史：结果新的在前，index 是选中的那条
+  const [search, setSearch] = useState<{ query: string; index: number }>();
+  const results = search ? history.current.toReversed().filter((h) => h.toLowerCase().includes(search.query.toLowerCase())) : [];
+  const hit = search ? Math.max(0, Math.min(search.index, results.length - 1)) : 0;
+  // 结果多时只显示选中项附近的几条
+  const first = Math.max(0, Math.min(hit - Math.floor(MENTION_ROWS / 2), results.length - MENTION_ROWS));
 
   const set = (s: EditState) => {
     setState(s);
@@ -543,15 +596,46 @@ function Prompt({ commands, handlers, busy, active, onSubmit }: {
     onSubmit();
     handlers.submit(text);
   };
+  /** 用选中的路径替换正在输入的 @ 引用；目录不加空格，接着补全里面的文件 */
+  const complete = (p: string) => {
+    const text = mentionText(p) + (p.endsWith("/") ? "" : " ");
+    set({ value: state.value.slice(0, mention!.start) + text + state.value.slice(state.cursor), cursor: mention!.start + text.length });
+  };
   const recall = (i: number) => {
     browsing.current = i;
     const value = i === -1 ? draft.current : history.current[history.current.length - 1 - i]!;
     set({ value, cursor: value.length });
   };
 
-  usePaste((text) => set(edit.insert(state, text.replace(/\r\n?/g, "\n"))), { isActive: active });
+  usePaste((text) => {
+    if (search) setSearch({ query: search.query + text.replace(/\s+/g, " "), index: 0 });
+    else set(edit.insert(state, text.replace(/\r\n?/g, "\n")));
+  }, { isActive: active });
+
+  /** 搜索时的按键：上下（或再按 Ctrl+R）换一条，回车/Tab 放进输入框接着改，Esc 退出 */
+  const searchKey = (s: { query: string; index: number }, input: string, key: Key) => {
+    if (key.escape || (key.ctrl && (input === "c" || input === "g"))) return setSearch(undefined);
+    if (key.return || key.tab) {
+      setSearch(undefined);
+      const picked = results[hit];
+      if (picked !== undefined) {
+        browsing.current = -1;
+        set({ value: picked, cursor: picked.length });
+      }
+      return;
+    }
+    if (key.upArrow || (key.ctrl && input === "r")) return setSearch({ ...s, index: Math.min(hit + 1, Math.max(0, results.length - 1)) });
+    if (key.downArrow) return setSearch({ ...s, index: Math.max(0, hit - 1) });
+    if (key.backspace || key.delete) return setSearch({ query: [...s.query].slice(0, -1).join(""), index: 0 });
+    if (key.ctrl && input === "u") return setSearch({ query: "", index: 0 });
+    if (key.ctrl || key.meta || MOUSE.test(input)) return;
+    const text = input.replace(/[\x00-\x1f\x7f]/g, "");
+    if (text) setSearch({ query: s.query + text, index: 0 });
+  };
 
   useInput((input, key) => {
+    if (search) return searchKey(search, input, key);
+    if (key.ctrl && input === "r") return history.current.length ? setSearch({ query: "", index: 0 }) : undefined;
     if (key.ctrl && input === "c") {
       if (busy) return handlers.interrupt();
       if (state.value) return set(empty);
@@ -572,14 +656,16 @@ function Prompt({ commands, handlers, busy, active, onSubmit }: {
       if (key.meta) return set(edit.insert(state, "\n"));
       if (state.value.slice(0, state.cursor).endsWith("\\")) return set(edit.insert(edit.backspace(state), "\n"));
       if (pick && state.value !== `/${pick.name}`) return submit(`/${pick.name}`);
+      if (file) return complete(file);
       return submit(state.value.trim());
     }
     if (key.tab) {
       if (pick) set({ value: `/${pick.name}${pick.args ? " " : ""}`, cursor: pick.name.length + 1 + (pick.args ? 1 : 0) });
+      else if (file) complete(file);
       return;
     }
     if (key.upArrow) {
-      if (matches.length) return setSelected((selected - 1 + matches.length) % matches.length);
+      if (menu) return setSelected((selected - 1 + menu) % menu);
       if (!edit.onFirstLine(state)) return setState(edit.up(state));
       if (browsing.current + 1 < history.current.length) {
         if (browsing.current === -1) draft.current = state.value;
@@ -588,7 +674,7 @@ function Prompt({ commands, handlers, busy, active, onSubmit }: {
       return;
     }
     if (key.downArrow) {
-      if (matches.length) return setSelected((selected + 1) % matches.length);
+      if (menu) return setSelected((selected + 1) % menu);
       if (!edit.onLastLine(state)) return setState(edit.down(state));
       if (browsing.current >= 0) recall(browsing.current - 1);
       return;
@@ -601,15 +687,42 @@ function Prompt({ commands, handlers, busy, active, onSubmit }: {
   return (
     <Box flexDirection="column" marginTop={1} display={active ? "flex" : "none"}>
       <Box borderStyle="round" borderColor={busy ? "gray" : "cyan"} paddingX={1}>
-        <EditableText
-          state={state}
-          width={Math.max(10, columns - 5)}
-          prefix="› "
-          placeholder={busy ? "Type to queue a message · esc to interrupt" : "Message jade · / for commands"}
-          active={active}
-        />
+        {search ? (
+          <EditableText
+            state={{ value: search.query, cursor: search.query.length }}
+            width={Math.max(10, columns - 5)}
+            prefix="search history› "
+            placeholder="type to filter"
+            active={active}
+          />
+        ) : (
+          <EditableText
+            state={state}
+            width={Math.max(10, columns - 5)}
+            prefix="› "
+            placeholder={busy ? "Type to queue a message · esc to interrupt" : "Message jade · / commands · @ files · ↑ or ctrl+r for history"}
+            active={active}
+          />
+        )}
       </Box>
-      {matches.length ? (
+      {search ? (
+        <Box flexDirection="column" paddingX={2}>
+          {results.length ? (
+            results.slice(first, first + MENTION_ROWS).map((h, i) => {
+              const on = first + i === hit;
+              return (
+                <Text key={first + i} wrap="truncate-end" color={on ? "cyan" : undefined} bold={on}>
+                  {on ? "❯ " : "  "}
+                  {h.replace(/\s*\n\s*/g, " ⏎ ")}
+                </Text>
+              );
+            })
+          ) : (
+            <Text dimColor>  no match</Text>
+          )}
+          <Text dimColor>  ↑↓ or ctrl+r select · enter/tab put in the input · esc cancel</Text>
+        </Box>
+      ) : matches.length ? (
         <Box flexDirection="column" paddingX={2}>
           {matches.map((c) => {
             const on = c === pick;
@@ -625,12 +738,28 @@ function Prompt({ commands, handlers, busy, active, onSubmit }: {
           })}
           <Text dimColor>  ↑↓ select · enter run · tab complete</Text>
         </Box>
+      ) : found.length ? (
+        <Box flexDirection="column" paddingX={2}>
+          {found.map((p) => {
+            const on = p === file;
+            return (
+              <Text key={p} wrap="truncate-middle" color={on ? "cyan" : p.endsWith("/") ? "blue" : undefined} bold={on}>
+                {on ? "❯ " : "  "}
+                {p}
+              </Text>
+            );
+          })}
+          <Text dimColor>  ↑↓ select · enter/tab insert the path · the file's content is sent with the message</Text>
+        </Box>
       ) : notice ? (
         <Text color="yellow">  {notice}</Text>
       ) : null}
     </Box>
   );
 }
+
+/** @ 补全最多显示几项 */
+const MENTION_ROWS = 8;
 
 /** 选择框一次最多显示几项 */
 const VISIBLE = 10;

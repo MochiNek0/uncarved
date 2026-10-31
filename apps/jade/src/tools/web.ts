@@ -1,9 +1,13 @@
 // 网络工具：web_fetch 读取网页，web_search 搜索（目前只支持 Tavily）。
 //
-// 两个工具都是 effect "read"，不需要用户批准；返回的内容由内核标为 untrusted。
+// 两个工具都是 effect "read"；web_fetch 带 url 参数，policy 插件会按主机要用户批准（URL 本身就能把数据带出去）。
+// 返回的内容由内核标为 untrusted。
 // web_fetch 拒绝 localhost 和内网地址：网页里的提示注入不能借它去访问本机的服务。
+// 主机名要先解析，解析出的地址也要检查，否则 127.0.0.1.nip.io 这类域名就能绕过。
+// 检查和 fetch 各自解析一次，DNS 重绑定仍有很小的窗口；要彻底杜绝需要按解析出的 IP 连接。
 // web_search 只在配置了搜索服务时提供，否则模型每次调用都会失败。
 
+import { lookup as dnsLookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import type { Block, Tool } from "uncarved";
 
@@ -25,7 +29,11 @@ export interface WebOptions {
   env?: Record<string, string | undefined>;
   /** 测试用 */
   fetch?: typeof fetch;
+  /** 主机名解析出的地址；测试用 */
+  lookup?: (hostname: string) => Promise<string[]>;
 }
+
+const defaultLookup = async (hostname: string) => (await dnsLookup(hostname, { all: true })).map((a) => a.address);
 
 export interface WebTools {
   /** web_fetch，以及配置了搜索服务时的 web_search */
@@ -35,7 +43,7 @@ export interface WebTools {
 export function webTools(opts: WebOptions = {}): WebTools {
   const env = opts.env ?? process.env;
   const fetchImpl = opts.fetch ?? fetch;
-  const tools = [webFetchTool(fetchImpl)];
+  const tools = [webFetchTool(fetchImpl, opts.lookup ?? defaultLookup)];
   const search = searchBackend(env, fetchImpl);
   if (search) tools.push(webSearchTool(search));
   return { tools };
@@ -51,7 +59,9 @@ interface Page {
   text: string;
 }
 
-function webFetchTool(fetchImpl: typeof fetch): Tool {
+type Lookup = (hostname: string) => Promise<string[]>;
+
+function webFetchTool(fetchImpl: typeof fetch, lookup: Lookup): Tool {
   const cache = new Map<string, Page>();
   return {
     name: "web_fetch",
@@ -87,7 +97,7 @@ function webFetchTool(fetchImpl: typeof fetch): Tool {
       for (const [k, p] of cache) if (Date.now() - p.at > CACHE_MS) cache.delete(k);
       let page = cache.get(target.href);
       if (!page) {
-        const res = await download(fetchImpl, target, signal);
+        const res = await download(fetchImpl, lookup, target, signal);
         if ("content" in res) return res;
         page = res;
         if (cache.size >= MAX_CACHE) cache.delete(cache.keys().next().value!);
@@ -130,11 +140,27 @@ export function isPrivateHost(hostname: string): boolean {
 }
 
 /** 下载并转换；出错时返回给模型的结果 */
-async function download(fetchImpl: typeof fetch, target: URL, signal: AbortSignal): Promise<Page | { content: string | Block[]; isError?: boolean }> {
+/** 主机名解析到内网地址时的拒绝原因。解析失败时放行，让 fetch 自己报错 */
+async function resolvesPrivate(lookup: Lookup, url: URL): Promise<string | undefined> {
+  const host = url.hostname.replace(/^\[|\]$/g, "");
+  if (isIP(host)) return undefined;
+  let addresses: string[];
+  try {
+    addresses = await lookup(host);
+  } catch {
+    return undefined;
+  }
+  const bad = addresses.find(isPrivateHost);
+  return bad ? `${url.hostname} resolves to ${bad}, a local or private address; web_fetch only reads public pages` : undefined;
+}
+
+async function download(fetchImpl: typeof fetch, lookup: Lookup, target: URL, signal: AbortSignal): Promise<Page | { content: string | Block[]; isError?: boolean }> {
   let url = target;
   let res: Response;
   // 手动跟随重定向，每一跳都检查地址：公网页面不能把请求转到内网
   for (let hops = 0; ; hops++) {
+    const resolved = await resolvesPrivate(lookup, url);
+    if (resolved) return { content: url === target ? resolved : `${target.href} redirects to ${url.href}, which is refused: ${resolved}`, isError: true };
     res = await fetchImpl(url, {
       redirect: "manual",
       headers: { "user-agent": USER_AGENT, accept: "text/html,application/xhtml+xml,text/plain,application/json,*/*;q=0.8" },

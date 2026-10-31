@@ -24,6 +24,7 @@ export function summarize(cwd: string, name: string, input: unknown): string {
   if (name === "todo_write") return `${Array.isArray(i.todos) ? i.todos.length : 0} items`;
   if (name === "web_fetch") return clip(String(i.url ?? ""), 120);
   if (name === "web_search") return clip(String(i.query ?? ""), 120);
+  if (name === "memory") return `${i.action} ${i.scope}: ${clip(String(i.text ?? ""), 120)}`;
   const where = typeof i.path === "string" ? display(cwd, i.path) : "";
   if (name === "multi_edit") return `${where}, ${Array.isArray(i.edits) ? i.edits.length : 0} edits`;
   if (name === "grep" || name === "glob") return `${i.pattern}${where && where !== "." ? ` in ${where}` : ""}`;
@@ -44,6 +45,7 @@ export function preview(c: PendingCall): string {
   if (c.name === "multi_edit" && Array.isArray(i.edits)) return (i.edits as Record<string, unknown>[]).map(diff).join(dim("\n  ⋯\n"));
   if (c.name === "write_file") return lines(String(i.content ?? ""), "+", green, 20);
   if (c.name === "bash") return lines(String(i.command ?? ""), "$", (s) => s);
+  if (c.name === "memory") return `${i.action === "remove" ? red("- ") : green("+ ")}${String(i.text ?? "")}`;
   return dim(clip(JSON.stringify(c.input, null, 2), 2000));
 }
 

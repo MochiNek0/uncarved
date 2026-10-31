@@ -1,5 +1,5 @@
 // task 工具：启动一个只读的子 Agent。子 Agent 是一个普通会话，用日志引用和父会话关联（3.4、第六章）。
-// 子 Agent 调用的工具通过 ctx.progress 推给宿主显示。
+// 子 Agent 调用的工具通过 ctx.progress 推给宿主显示；需要用户批准的调用（例如 web_fetch）交给宿主的 approve。
 
 import { Runtime, type EventDataMap, type LogStore, type Plugin, type Provider, type Tool } from "uncarved";
 
@@ -8,12 +8,24 @@ export type TaskProgress =
   | { kind: "task-start"; sessionId: string; description: string }
   | { kind: "task-tool"; name: string; input: unknown; decision: string };
 
+/** 子 Agent 的调用要用户批准时，宿主给出的回答 */
+export interface SubagentApproval {
+  approved: boolean;
+  reason?: string;
+}
+
+export type ApproveSubagent = (call: { toolUseId: string; name: string; input: unknown }, signal: AbortSignal) => Promise<SubagentApproval>;
+
 export interface TaskOptions {
   store: LogStore;
   provider: Provider;
   /** 每个子会话一套新的插件实例 */
   plugins: () => Plugin[];
+  /** 不给时一律拒绝 */
+  approve?: ApproveSubagent;
 }
+
+const NOBODY: SubagentApproval = { approved: false, reason: "Nobody can approve this action for a sub-agent. Report what you need instead." };
 
 export function taskTool(opts: TaskOptions): Tool {
   return {
@@ -65,13 +77,20 @@ export function taskTool(opts: TaskOptions): Tool {
           kind: "message",
           content: [{ kind: "text", text: prompt, origin: { by: "runtime" }, trust: "trusted" }],
         });
+        while (child.state.phase === "awaiting") {
+          for (const c of child.state.batch.filter((x) => x.decision === "ask")) {
+            const answer = opts.approve ? await opts.approve(c, ctx.signal) : NOBODY;
+            await child.send({ kind: "approval", toolUseId: c.toolUseId, approved: answer.approved, reason: answer.reason });
+          }
+        }
       } catch (err) {
         failure = err;
       } finally {
         ctx.signal.removeEventListener("abort", forward);
+        // 中断时也结束子会话，不留下没有结尾的日志
+        await child.close().catch(() => {});
       }
       if (ctx.signal.aborted) throw failure ?? ctx.signal.reason;
-      await child.close();
 
       const ref = { sessionId, seq: child.state.lastSeq };
       const last = child.state.messages.findLast((m) => m.role === "assistant");
