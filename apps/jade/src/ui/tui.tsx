@@ -3,12 +3,29 @@
 // 运行中也能输入：提交的内容由宿主决定立即执行还是排队。
 
 import { writeSync } from "node:fs";
-import { Box, render, Text, useBoxMetrics, useCursor, useInput, usePaste, useWindowSize, type DOMElement, type Key } from "ink";
+import {
+  Box,
+  render,
+  Text,
+  useBoxMetrics,
+  useCursor,
+  useInput,
+  usePaste,
+  useWindowSize,
+  type DOMElement,
+  type Key,
+} from "ink";
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import wrapAnsi from "wrap-ansi";
 import { mentionAt, mentionText, rankPaths } from "../mentions.ts";
 import { edit, empty, layout, type EditState } from "./editor.ts";
-import { dim, type Choice, type CommandInfo, type Screen, type StatusInfo } from "./screen.ts";
+import {
+  dim,
+  type Choice,
+  type CommandInfo,
+  type Screen,
+  type StatusInfo,
+} from "./screen.ts";
 
 export interface TuiHandlers {
   /** 用户在输入框里提交了一行（消息或命令） */
@@ -22,8 +39,21 @@ export interface TuiHandlers {
 }
 
 type Dialog =
-  | { kind: "select"; title: string; body?: string; choices: Choice<unknown>[]; resolve(v: unknown): void }
-  | { kind: "input"; title: string; initial?: string; mask?: boolean; placeholder?: string; resolve(v: string | undefined): void };
+  | {
+      kind: "select";
+      title: string;
+      body?: string;
+      choices: Choice<unknown>[];
+      resolve(v: unknown): void;
+    }
+  | {
+      kind: "input";
+      title: string;
+      initial?: string;
+      mask?: boolean;
+      placeholder?: string;
+      resolve(v: string | undefined): void;
+    };
 
 interface UiState {
   /** 对话内容变化时递增，让界面重画 */
@@ -41,7 +71,8 @@ interface UiState {
 const MAX_LINES = 10_000;
 
 /** 按显示宽度折行，保留颜色；每一项是屏幕上的一行 */
-const wrap = (text: string, width: number) => wrapAnsi(text, width, { hard: true, trim: false }).split("\n");
+const wrap = (text: string, width: number) =>
+  wrapAnsi(text, width, { hard: true, trim: false }).split("\n");
 
 /** 对话里的一项：普通的一行，或者带折叠内容的一段（点击展开、收起） */
 interface Line {
@@ -105,7 +136,10 @@ class Store {
     const before = this.#wrapped.length;
     if (this.#width) for (const l of lines) this.#push(l);
     // 往上翻看时新内容不能把正在看的地方顶走
-    const scroll = this.state.scroll > 0 ? this.state.scroll + this.#wrapped.length - before : 0;
+    const scroll =
+      this.state.scroll > 0
+        ? this.state.scroll + this.#wrapped.length - before
+        : 0;
     this.update({ version: this.state.version + 1, scroll });
   }
 
@@ -142,15 +176,27 @@ class Store {
     const rows = wrapLine(line, this.#width);
     this.#wrapped.splice(first, count, ...rows);
     this.#owners.splice(first, count, ...rows.map(() => line));
-    const end = Math.max(start + view, line.fold.open ? Math.min(first + rows.length, first + view) : 0);
-    this.update({ version: this.state.version + 1, scroll: Math.max(0, this.#wrapped.length - end) }, true);
+    const end = Math.max(
+      start + view,
+      line.fold.open ? Math.min(first + rows.length, first + view) : 0,
+    );
+    this.update(
+      {
+        version: this.state.version + 1,
+        scroll: Math.max(0, this.#wrapped.length - end),
+      },
+      true,
+    );
   }
 
   clear() {
     this.#lines = [];
     this.#wrapped = [];
     this.#owners = [];
-    this.update({ version: this.state.version + 1, live: undefined, scroll: 0 }, true);
+    this.update(
+      { version: this.state.version + 1, live: undefined, scroll: 0 },
+      true,
+    );
   }
 
   /** 往上（正数）或往下滚 n 行，不超过 max */
@@ -180,7 +226,8 @@ export function tuiScreen(opts: TuiOptions): Screen {
   const stdout = opts.io?.stdout ?? process.stdout;
   const store = new Store(opts.status);
 
-  const styled = (kind: "text" | "thinking", lines: string[]) => (kind === "thinking" ? lines.map((l) => (l ? dim(l) : l)) : lines);
+  const styled = (kind: "text" | "thinking", lines: string[]) =>
+    kind === "thinking" ? lines.map((l) => (l ? dim(l) : l)) : lines;
 
   /** 把流式块里已经完整的行移进 Static，只把最后不完整的一行留在底部 */
   const flushLive = (all = false) => {
@@ -190,28 +237,47 @@ export function tuiScreen(opts: TuiOptions): Screen {
     const rest = all ? "" : lines.pop()!;
     if (all && lines.at(-1) === "") lines.pop();
     store.append(styled(live.kind, lines));
-    store.update({ live: rest || !all ? { kind: live.kind, text: rest } : undefined });
+    store.update({
+      live: rest || !all ? { kind: live.kind, text: rest } : undefined,
+    });
   };
 
   const ask = <T,>(dialog: Dialog) =>
     new Promise<T>((resolve) => {
-      const d = { ...dialog, resolve: (v: unknown) => {
-        store.update({ dialogs: store.state.dialogs.filter((x) => x !== d) }, true);
-        resolve(v as T);
-      } } as Dialog;
+      const d = {
+        ...dialog,
+        resolve: (v: unknown) => {
+          store.update(
+            { dialogs: store.state.dialogs.filter((x) => x !== d) },
+            true,
+          );
+          resolve(v as T);
+        },
+      } as Dialog;
       store.update({ dialogs: [...store.state.dialogs, d] }, true);
     });
 
   // 切到备用屏幕后光标还停在原来的位置（不少终端不会自动归位），Ink 从那里往下画第一帧会让屏幕滚动，
   // 之后每帧只重写变化的行，整个界面就错位了。所以先自己切过去、清屏、把光标移到左上角
   stdout.write("\x1b[?1049h\x1b[2J\x1b[H");
-  const instance = render(<App store={store} version={opts.version} commands={opts.commands} handlers={opts.handlers} history={opts.history ?? []} />, {
-    exitOnCtrlC: false,
-    alternateScreen: true,
-    // 全屏每帧只重写变化的行
-    incrementalRendering: true,
-    ...(opts.io ? { ...opts.io, interactive: true, patchConsole: false } : {}),
-  });
+  const instance = render(
+    <App
+      store={store}
+      version={opts.version}
+      commands={opts.commands}
+      handlers={opts.handlers}
+      history={opts.history ?? []}
+    />,
+    {
+      exitOnCtrlC: false,
+      alternateScreen: true,
+      // 全屏每帧只重写变化的行
+      incrementalRendering: true,
+      ...(opts.io
+        ? { ...opts.io, interactive: true, patchConsole: false }
+        : {}),
+    },
+  );
   stdout.write(MOUSE_ON);
   // 没走 close 就退出（process.exit）时也要把终端还原，否则会留在备用屏幕、鼠标上报也开着
   const restore = () => {
@@ -239,7 +305,9 @@ export function tuiScreen(opts: TuiOptions): Screen {
         else text = text.replace(/^\n+/, "");
         if (!text) return;
       }
-      store.update({ live: { kind, text: (store.state.live?.text ?? "") + text } });
+      store.update({
+        live: { kind, text: (store.state.live?.text ?? "") + text },
+      });
       if (text.includes("\n")) flushLive();
     },
     endStream() {
@@ -249,7 +317,8 @@ export function tuiScreen(opts: TuiOptions): Screen {
     busy(label) {
       const current = store.state.busy;
       if (label === undefined) store.update({ busy: undefined });
-      else store.update({ busy: { label, since: current?.since ?? Date.now() } });
+      else
+        store.update({ busy: { label, since: current?.since ?? Date.now() } });
     },
     status(info) {
       store.update({ status: { ...store.state.status, ...info } });
@@ -258,8 +327,20 @@ export function tuiScreen(opts: TuiOptions): Screen {
       store.update({ queued: [...items] });
     },
     select: <T,>(title: string, choices: Choice<T>[], o?: { body?: string }) =>
-      ask<T | undefined>({ kind: "select", title, body: o?.body, choices: choices as Choice<unknown>[], resolve: () => {} }),
-    input: (title, o) => ask<string | undefined>({ kind: "input", title, ...o, resolve: () => {} }),
+      ask<T | undefined>({
+        kind: "select",
+        title,
+        body: o?.body,
+        choices: choices as Choice<unknown>[],
+        resolve: () => {},
+      }),
+    input: (title, o) =>
+      ask<string | undefined>({
+        kind: "input",
+        title,
+        ...o,
+        resolve: () => {},
+      }),
     clear() {
       store.clear();
     },
@@ -285,7 +366,13 @@ export function tuiScreen(opts: TuiOptions): Screen {
 const MOUSE = /^\[<(\d+);\d+;(\d+)([Mm])$/;
 const WHEEL_LINES = 3;
 
-function App({ store, version, commands, handlers, history }: {
+function App({
+  store,
+  version,
+  commands,
+  handlers,
+  history,
+}: {
   store: Store;
   version: string;
   commands: CommandInfo[];
@@ -301,7 +388,12 @@ function App({ store, version, commands, handlers, history }: {
   const { height, top } = useBoxMetrics(ref);
   const width = Math.max(10, columns - 2);
   const done = store.lines(width);
-  const live = state.live?.text ? wrap(state.live.kind === "thinking" ? dim(state.live.text) : state.live.text, width) : [];
+  const live = state.live?.text
+    ? wrap(
+        state.live.kind === "thinking" ? dim(state.live.text) : state.live.text,
+        width,
+      )
+    : [];
   const total = done.length + live.length;
   // 往上翻看时最后一行用来提示
   const scrolled = state.scroll > 0 && total > height;
@@ -310,7 +402,13 @@ function App({ store, version, commands, handlers, history }: {
   const scroll = Math.min(state.scroll, max);
   const end = total - scroll;
   const start = Math.max(0, end - view);
-  const shown = [...done.slice(start, Math.min(end, done.length)), ...live.slice(Math.max(0, start - done.length), Math.max(0, end - done.length))];
+  const shown = [
+    ...done.slice(start, Math.min(end, done.length)),
+    ...live.slice(
+      Math.max(0, start - done.length),
+      Math.max(0, end - done.length),
+    ),
+  ];
   const page = Math.max(1, view - 2);
 
   // Ink 增量渲染只用相对光标移动，第一帧起点一旦偏了（启动时终端尺寸还没稳定、窗口缩放、别的输出插进来），
@@ -338,7 +436,8 @@ function App({ store, version, commands, handlers, history }: {
       else if (button === 0 && mouse[3] === "M") {
         // 点在对话区里已经完成的输出上：展开或收起那一项
         const i = Number(mouse[2]) - 1 - top;
-        if (i >= 0 && i < shown.length && start + i < done.length) store.toggle(start + i, start, view);
+        if (i >= 0 && i < shown.length && start + i < done.length)
+          store.toggle(start + i, start, view);
       }
       return;
     }
@@ -353,9 +452,23 @@ function App({ store, version, commands, handlers, history }: {
   // 总高度要比终端少一行，否则 Ink 认为输出占满了屏幕，每帧清屏重画。
   // 重画那一帧上下各垫一行空白：终端把顶上那行滚出去后，看到的和平时逐行一样，所以不会闪
   return (
-    <Box flexDirection="column" width={columns} height={repaint ? rows + 1 : Math.max(1, rows - 1)} paddingY={repaint ? 1 : 0} overflow="hidden">
+    <Box
+      flexDirection="column"
+      width={columns}
+      height={repaint ? rows + 1 : Math.max(1, rows - 1)}
+      paddingY={repaint ? 1 : 0}
+      overflow="hidden"
+    >
       <Header status={state.status} version={version} />
-      <Box ref={ref} flexDirection="column" flexGrow={1} flexShrink={1} flexBasis={0} overflow="hidden" paddingX={1}>
+      <Box
+        ref={ref}
+        flexDirection="column"
+        flexGrow={1}
+        flexShrink={1}
+        flexBasis={0}
+        overflow="hidden"
+        paddingX={1}
+      >
         {shown.map((l, i) => (
           <Text key={i} wrap="truncate-end">
             {l || " "}
@@ -368,7 +481,9 @@ function App({ store, version, commands, handlers, history }: {
         ) : null}
       </Box>
       <Box flexDirection="column" flexShrink={0}>
-        {state.busy && !dialog ? <Spinner label={state.busy.label} since={state.busy.since} /> : null}
+        {state.busy && !dialog ? (
+          <Spinner label={state.busy.label} since={state.busy.since} />
+        ) : null}
         {state.queued.map((q, i) => (
           <Text key={i} dimColor wrap="truncate-end">
             {"  ↳ queued: "}
@@ -382,29 +497,69 @@ function App({ store, version, commands, handlers, history }: {
             <InputDialog key={dialogKey(dialog)} dialog={dialog} />
           )
         ) : null}
-        <Prompt commands={commands} handlers={handlers} history={history} busy={Boolean(state.busy)} active={!dialog} onSubmit={() => store.scrollBy(-max, max)} />
+        <Prompt
+          commands={commands}
+          handlers={handlers}
+          history={history}
+          busy={Boolean(state.busy)}
+          active={!dialog}
+          onSubmit={() => store.scrollBy(-max, max)}
+        />
         <StatusBar status={state.status} />
       </Box>
     </Box>
   );
 }
 
+const JADE = "#00a86b";
+const SHINE = "#b6f2d4";
+
+/**
+ * 标题左边的吉祥物：一个玉做的团子，用半格字符画的像素图，三行高，正好和右边三行文字并排。
+ * 每个字符上下两个像素；眼睛是玉上挖空的两格，左上角一点高光让它看起来像玉
+ */
+function Bot() {
+  return (
+    <Box flexDirection="column" flexShrink={0} marginRight={2}>
+      <Text color={JADE}>
+        {" ▄"}
+        <Text color={SHINE} backgroundColor={JADE}>
+          ▄
+        </Text>
+        {"████▄"}
+      </Text>
+      <Text color={JADE}>██ ███ ██</Text>
+      <Text color={JADE}>▀███████▀</Text>
+    </Box>
+  );
+}
+
 function Header({ status, version }: { status: StatusInfo; version: string }) {
   return (
-    <Box flexDirection="column" flexShrink={0} borderStyle="round" borderColor="cyan" paddingX={1}>
-      <Text wrap="truncate-end">
-        <Text color="cyan" bold>
-          ◆ jade
+    <Box flexShrink={0} borderStyle="round" borderColor="cyan" paddingX={1}>
+      <Bot />
+      <Box flexDirection="column" flexGrow={1} flexShrink={1} overflow="hidden">
+        <Text wrap="truncate-end">
+          <Text color="cyan" bold>
+            jade
+          </Text>
+          <Text dimColor> v{version}</Text>
+          {status.session ? (
+            <Text dimColor>{`  ·  session ${status.session}`}</Text>
+          ) : null}
         </Text>
-        <Text dimColor> v{version}</Text>
-        {status.session ? <Text dimColor>{`  ·  session ${status.session}`}</Text> : null}
-      </Text>
-      <Text wrap="truncate-end">
-        <Text color="cyan">{status.model}</Text>
-        <Text dimColor> · </Text>
-        <Text>{status.cwd}</Text>
-        {status.branch ? <Text color="magenta"> ({status.branch})</Text> : null}
-      </Text>
+        <Text wrap="truncate-end">
+          <Text color="cyan">{status.model}</Text>
+          <Text dimColor> · </Text>
+          <Text>{status.cwd}</Text>
+          {status.branch ? (
+            <Text color="magenta"> ({status.branch})</Text>
+          ) : null}
+        </Text>
+        <Text dimColor wrap="truncate-end">
+          /help for commands · @ to attach files
+        </Text>
+      </Box>
     </Box>
   );
 }
@@ -429,9 +584,7 @@ function Spinner({ label, since }: { label: string; since: number }) {
     <Box marginTop={1}>
       <Text color="cyan">{FRAMES[Math.floor(now / 100) % FRAMES.length]} </Text>
       <Text>{label}… </Text>
-      <Text dimColor>
-        ({seconds}s · esc to interrupt)
-      </Text>
+      <Text dimColor>({seconds}s · esc to interrupt)</Text>
     </Box>
   );
 }
@@ -439,7 +592,14 @@ function Spinner({ label, since }: { label: string; since: number }) {
 function StatusBar({ status }: { status: StatusInfo }) {
   const ctx = status.context;
   const pct = ctx ? Math.round((ctx.used / ctx.limit) * 100) : 0;
-  const modeColor = status.mode === "yolo" ? "red" : status.mode === "auto-edit" ? "yellow" : status.mode === "readonly" ? "blue" : "green";
+  const modeColor =
+    status.mode === "yolo"
+      ? "red"
+      : status.mode === "auto-edit"
+        ? "yellow"
+        : status.mode === "readonly"
+          ? "blue"
+          : "green";
   return (
     <Box paddingX={1}>
       <Text wrap="truncate-end">
@@ -452,14 +612,20 @@ function StatusBar({ status }: { status: StatusInfo }) {
         ) : (
           <Text dimColor>ctx —</Text>
         )}
-        {status.cache !== undefined && <Text dimColor> · cache {Math.round(status.cache * 100)}%</Text>}
-        <Text dimColor> · PgUp/PgDn scroll · click ▸ to expand · shift+drag to select</Text>
+        {status.cache !== undefined && (
+          <Text dimColor> · cache {Math.round(status.cache * 100)}%</Text>
+        )}
+        <Text dimColor>
+          {" "}
+          · PgUp/PgDn scroll · click ▸ to expand · shift+drag to select
+        </Text>
       </Text>
     </Box>
   );
 }
 
-const tokens = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k` : String(n));
+const tokens = (n: number) =>
+  n >= 1000 ? `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k` : String(n);
 
 /** 编辑按键的通用处理；返回编辑后的状态，不是编辑键时返回 undefined */
 function editKey(s: EditState, input: string, key: Key): EditState | undefined {
@@ -472,16 +638,36 @@ function editKey(s: EditState, input: string, key: Key): EditState | undefined {
   if (key.ctrl && input === "w") return edit.deleteWord(s);
   if (key.ctrl && input === "u") return edit.killBefore(s);
   if (key.ctrl && input === "k") return edit.killAfter(s);
-  if (key.ctrl || key.meta || key.escape || key.return || key.tab || key.upArrow || key.downArrow || key.pageUp || key.pageDown) return undefined;
+  if (
+    key.ctrl ||
+    key.meta ||
+    key.escape ||
+    key.return ||
+    key.tab ||
+    key.upArrow ||
+    key.downArrow ||
+    key.pageUp ||
+    key.pageDown
+  )
+    return undefined;
   // 鼠标事件由 App 处理
   if (MOUSE.test(input)) return undefined;
   // 其余是普通输入；快速输入时一次可能有多个字符
-  const text = input.replace(/\r\n?/g, "\n").replace(/[\x00-\x09\x0b-\x1f\x7f]/g, "");
+  const text = input
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\x00-\x09\x0b-\x1f\x7f]/g, "");
   return text ? edit.insert(s, text) : undefined;
 }
 
 /** 渲染可编辑文本并把终端光标放到输入位置（输入法的候选框跟着它） */
-function EditableText({ state, width, prefix, mask, placeholder, active }: {
+function EditableText({
+  state,
+  width,
+  prefix,
+  mask,
+  placeholder,
+  active,
+}: {
   state: EditState;
   width: number;
   prefix: string;
@@ -494,11 +680,14 @@ function EditableText({ state, width, prefix, mask, placeholder, active }: {
   const metrics = useBoxMetrics(ref);
   const { setCursorPosition } = useCursor();
   const shown = mask ? "•".repeat([...state.value].length) : state.value;
-  const cursor = mask ? [...state.value.slice(0, state.cursor)].length : state.cursor;
+  const cursor = mask
+    ? [...state.value.slice(0, state.cursor)].length
+    : state.cursor;
   const { rows, row, col } = layout(shown, cursor, width - prefix.length);
 
   useEffect(() => {
-    if (!active || !metrics.hasMeasured || !ref.current) return setCursorPosition(undefined);
+    if (!active || !metrics.hasMeasured || !ref.current)
+      return setCursorPosition(undefined);
     const at = origin(ref.current);
     setCursorPosition({ x: at.x + prefix.length + col, y: at.y + row });
   });
@@ -514,7 +703,9 @@ function EditableText({ state, width, prefix, mask, placeholder, active }: {
       ) : (
         rows.map((r, i) => (
           <Text key={i} wrap="truncate-end">
-            <Text color="cyan">{i === 0 ? prefix : " ".repeat(prefix.length)}</Text>
+            <Text color="cyan">
+              {i === 0 ? prefix : " ".repeat(prefix.length)}
+            </Text>
             {r}
           </Text>
         ))
@@ -534,7 +725,14 @@ function origin(node: DOMElement): { x: number; y: number } {
   return { x, y };
 }
 
-function Prompt({ commands, handlers, history: initial, busy, active, onSubmit }: {
+function Prompt({
+  commands,
+  handlers,
+  history: initial,
+  busy,
+  active,
+  onSubmit,
+}: {
   commands: CommandInfo[];
   handlers: TuiHandlers;
   history: string[];
@@ -556,20 +754,30 @@ function Prompt({ commands, handlers, history: initial, busy, active, onSubmit }
   const usageOf = (c: CommandInfo) => `/${c.name}${c.args ? ` ${c.args}` : ""}`;
   const column = Math.max(...commands.map((c) => usageOf(c).length)) + 2;
   // 翻到的历史条目原样未改时不弹补全菜单，否则菜单会占住 ↑/↓，翻不过 /命令 这样的条目
-  const recalled = browsing.current >= 0 && state.value === history.current[history.current.length - 1 - browsing.current];
-  const naming = !recalled && state.value.startsWith("/") && !/\s/.test(state.value);
-  const matches = naming ? commands.filter((c) => `/${c.name}`.startsWith(state.value)) : [];
+  const recalled =
+    browsing.current >= 0 &&
+    state.value ===
+      history.current[history.current.length - 1 - browsing.current];
+  const naming =
+    !recalled && state.value.startsWith("/") && !/\s/.test(state.value);
+  const matches = naming
+    ? commands.filter((c) => `/${c.name}`.startsWith(state.value))
+    : [];
   const pick = matches[Math.min(selected, matches.length - 1)];
 
   // @ 引用：光标处正在输入的路径和补全候选
   const [paths, setPaths] = useState<string[]>([]);
-  const mention = naming || recalled ? undefined : mentionAt(state.value, state.cursor);
+  const mention =
+    naming || recalled ? undefined : mentionAt(state.value, state.cursor);
   const mentioning = mention !== undefined;
   // 每次开始输入一个新的 @ 引用时重新取一次：文件可能已经变了
   useEffect(() => {
     if (!mentioning || !handlers.files) return;
     let live = true;
-    handlers.files().then((p) => void (live && setPaths(p)), () => {});
+    handlers.files().then(
+      (p) => void (live && setPaths(p)),
+      () => {},
+    );
     return () => {
       live = false;
     };
@@ -580,10 +788,19 @@ function Prompt({ commands, handlers, history: initial, busy, active, onSubmit }
 
   // Ctrl+R 搜索历史：结果新的在前，index 是选中的那条
   const [search, setSearch] = useState<{ query: string; index: number }>();
-  const results = search ? history.current.toReversed().filter((h) => h.toLowerCase().includes(search.query.toLowerCase())) : [];
-  const hit = search ? Math.max(0, Math.min(search.index, results.length - 1)) : 0;
+  const results = search
+    ? history.current
+        .toReversed()
+        .filter((h) => h.toLowerCase().includes(search.query.toLowerCase()))
+    : [];
+  const hit = search
+    ? Math.max(0, Math.min(search.index, results.length - 1))
+    : 0;
   // 结果多时只显示选中项附近的几条
-  const first = Math.max(0, Math.min(hit - Math.floor(MENTION_ROWS / 2), results.length - MENTION_ROWS));
+  const first = Math.max(
+    0,
+    Math.min(hit - Math.floor(MENTION_ROWS / 2), results.length - MENTION_ROWS),
+  );
 
   const set = (s: EditState) => {
     setState(s);
@@ -592,7 +809,10 @@ function Prompt({ commands, handlers, history: initial, busy, active, onSubmit }
   };
   const submit = (text: string) => {
     if (!text.trim()) return;
-    history.current = [...history.current.filter((h) => h !== text), text].slice(-100);
+    history.current = [
+      ...history.current.filter((h) => h !== text),
+      text,
+    ].slice(-100);
     browsing.current = -1;
     set(empty);
     onSubmit();
@@ -601,22 +821,43 @@ function Prompt({ commands, handlers, history: initial, busy, active, onSubmit }
   /** 用选中的路径替换正在输入的 @ 引用；目录不加空格，接着补全里面的文件 */
   const complete = (p: string) => {
     const text = mentionText(p) + (p.endsWith("/") ? "" : " ");
-    set({ value: state.value.slice(0, mention!.start) + text + state.value.slice(state.cursor), cursor: mention!.start + text.length });
+    set({
+      value:
+        state.value.slice(0, mention!.start) +
+        text +
+        state.value.slice(state.cursor),
+      cursor: mention!.start + text.length,
+    });
   };
   const recall = (i: number) => {
     browsing.current = i;
-    const value = i === -1 ? draft.current : history.current[history.current.length - 1 - i]!;
+    const value =
+      i === -1
+        ? draft.current
+        : history.current[history.current.length - 1 - i]!;
     set({ value, cursor: value.length });
   };
 
-  usePaste((text) => {
-    if (search) setSearch({ query: search.query + text.replace(/\s+/g, " "), index: 0 });
-    else set(edit.insert(state, text.replace(/\r\n?/g, "\n")));
-  }, { isActive: active });
+  usePaste(
+    (text) => {
+      if (search)
+        setSearch({
+          query: search.query + text.replace(/\s+/g, " "),
+          index: 0,
+        });
+      else set(edit.insert(state, text.replace(/\r\n?/g, "\n")));
+    },
+    { isActive: active },
+  );
 
   /** 搜索时的按键：上下（或再按 Ctrl+R）换一条，回车/Tab 放进输入框接着改，Esc 退出 */
-  const searchKey = (s: { query: string; index: number }, input: string, key: Key) => {
-    if (key.escape || (key.ctrl && (input === "c" || input === "g"))) return setSearch(undefined);
+  const searchKey = (
+    s: { query: string; index: number },
+    input: string,
+    key: Key,
+  ) => {
+    if (key.escape || (key.ctrl && (input === "c" || input === "g")))
+      return setSearch(undefined);
     if (key.return || key.tab) {
       setSearch(undefined);
       const picked = results[hit];
@@ -626,69 +867,99 @@ function Prompt({ commands, handlers, history: initial, busy, active, onSubmit }
       }
       return;
     }
-    if (key.upArrow || (key.ctrl && input === "r")) return setSearch({ ...s, index: Math.min(hit + 1, Math.max(0, results.length - 1)) });
+    if (key.upArrow || (key.ctrl && input === "r"))
+      return setSearch({
+        ...s,
+        index: Math.min(hit + 1, Math.max(0, results.length - 1)),
+      });
     if (key.downArrow) return setSearch({ ...s, index: Math.max(0, hit - 1) });
-    if (key.backspace || key.delete) return setSearch({ query: [...s.query].slice(0, -1).join(""), index: 0 });
+    if (key.backspace || key.delete)
+      return setSearch({ query: [...s.query].slice(0, -1).join(""), index: 0 });
     if (key.ctrl && input === "u") return setSearch({ query: "", index: 0 });
     if (key.ctrl || key.meta || MOUSE.test(input)) return;
     const text = input.replace(/[\x00-\x1f\x7f]/g, "");
     if (text) setSearch({ query: s.query + text, index: 0 });
   };
 
-  useInput((input, key) => {
-    if (search) return searchKey(search, input, key);
-    if (key.ctrl && input === "r") return history.current.length ? setSearch({ query: "", index: 0 }) : undefined;
-    if (key.ctrl && input === "c") {
-      if (busy) return handlers.interrupt();
-      if (state.value) return set(empty);
-      if (Date.now() - lastCtrlC.current < 2000) return handlers.exit();
-      lastCtrlC.current = Date.now();
-      return setNotice("Press Ctrl+C again to exit");
-    }
-    if (key.escape) {
-      if (busy) return handlers.interrupt();
-      return set(empty);
-    }
-    // 文字和回车在同一块里到达（输入很快时终端可能合并）：插入文字后发送
-    if (!key.ctrl && !key.meta && input.length > 1 && input.indexOf("\r") === input.length - 1) {
-      return submit(edit.insert(state, input.slice(0, -1)).value.trim());
-    }
-    if (key.return) {
-      // 行尾的 \ 加回车换行；Alt+Enter 也换行
-      if (key.meta) return set(edit.insert(state, "\n"));
-      if (state.value.slice(0, state.cursor).endsWith("\\")) return set(edit.insert(edit.backspace(state), "\n"));
-      if (pick && state.value !== `/${pick.name}`) return submit(`/${pick.name}`);
-      if (file) return complete(file);
-      return submit(state.value.trim());
-    }
-    if (key.tab) {
-      if (pick) set({ value: `/${pick.name}${pick.args ? " " : ""}`, cursor: pick.name.length + 1 + (pick.args ? 1 : 0) });
-      else if (file) complete(file);
-      return;
-    }
-    if (key.upArrow) {
-      if (menu) return setSelected((selected - 1 + menu) % menu);
-      if (!edit.onFirstLine(state)) return setState(edit.up(state));
-      if (browsing.current + 1 < history.current.length) {
-        if (browsing.current === -1) draft.current = state.value;
-        recall(browsing.current + 1);
+  useInput(
+    (input, key) => {
+      if (search) return searchKey(search, input, key);
+      if (key.ctrl && input === "r")
+        return history.current.length
+          ? setSearch({ query: "", index: 0 })
+          : undefined;
+      if (key.ctrl && input === "c") {
+        if (busy) return handlers.interrupt();
+        if (state.value) return set(empty);
+        if (Date.now() - lastCtrlC.current < 2000) return handlers.exit();
+        lastCtrlC.current = Date.now();
+        return setNotice("Press Ctrl+C again to exit");
       }
-      return;
-    }
-    if (key.downArrow) {
-      if (menu) return setSelected((selected + 1) % menu);
-      if (!edit.onLastLine(state)) return setState(edit.down(state));
-      if (browsing.current >= 0) recall(browsing.current - 1);
-      return;
-    }
-    const next = editKey(state, input, key);
-    if (next) set(next);
-  }, { isActive: active });
+      if (key.escape) {
+        if (busy) return handlers.interrupt();
+        return set(empty);
+      }
+      // 文字和回车在同一块里到达（输入很快时终端可能合并）：插入文字后发送
+      if (
+        !key.ctrl &&
+        !key.meta &&
+        input.length > 1 &&
+        input.indexOf("\r") === input.length - 1
+      ) {
+        return submit(edit.insert(state, input.slice(0, -1)).value.trim());
+      }
+      if (key.return) {
+        // 行尾的 \ 加回车换行；Alt+Enter 也换行
+        if (key.meta) return set(edit.insert(state, "\n"));
+        if (state.value.slice(0, state.cursor).endsWith("\\"))
+          return set(edit.insert(edit.backspace(state), "\n"));
+        if (pick && state.value !== `/${pick.name}`)
+          return submit(`/${pick.name}`);
+        if (file) return complete(file);
+        return submit(state.value.trim());
+      }
+      if (key.tab) {
+        if (pick)
+          set({
+            value: `/${pick.name}${pick.args ? " " : ""}`,
+            cursor: pick.name.length + 1 + (pick.args ? 1 : 0),
+          });
+        else if (file) complete(file);
+        return;
+      }
+      if (key.upArrow) {
+        if (menu) return setSelected((selected - 1 + menu) % menu);
+        if (!edit.onFirstLine(state)) return setState(edit.up(state));
+        if (browsing.current + 1 < history.current.length) {
+          if (browsing.current === -1) draft.current = state.value;
+          recall(browsing.current + 1);
+        }
+        return;
+      }
+      if (key.downArrow) {
+        if (menu) return setSelected((selected + 1) % menu);
+        if (!edit.onLastLine(state)) return setState(edit.down(state));
+        if (browsing.current >= 0) recall(browsing.current - 1);
+        return;
+      }
+      const next = editKey(state, input, key);
+      if (next) set(next);
+    },
+    { isActive: active },
+  );
 
   // 对话框打开时隐藏但不卸载，输入到一半的内容和历史都保留
   return (
-    <Box flexDirection="column" marginTop={1} display={active ? "flex" : "none"}>
-      <Box borderStyle="round" borderColor={busy ? "gray" : "cyan"} paddingX={1}>
+    <Box
+      flexDirection="column"
+      marginTop={1}
+      display={active ? "flex" : "none"}
+    >
+      <Box
+        borderStyle="round"
+        borderColor={busy ? "gray" : "cyan"}
+        paddingX={1}
+      >
         {search ? (
           <EditableText
             state={{ value: search.query, cursor: search.query.length }}
@@ -702,7 +973,11 @@ function Prompt({ commands, handlers, history: initial, busy, active, onSubmit }
             state={state}
             width={Math.max(10, columns - 5)}
             prefix="› "
-            placeholder={busy ? "Type to queue a message · esc to interrupt" : "Message jade · / commands · @ files · ↑ or ctrl+r for history"}
+            placeholder={
+              busy
+                ? "Type to queue a message · esc to interrupt"
+                : "Message jade · / commands · @ files · ↑ or ctrl+r for history"
+            }
             active={active}
           />
         )}
@@ -713,16 +988,24 @@ function Prompt({ commands, handlers, history: initial, busy, active, onSubmit }
             results.slice(first, first + MENTION_ROWS).map((h, i) => {
               const on = first + i === hit;
               return (
-                <Text key={first + i} wrap="truncate-end" color={on ? "cyan" : undefined} bold={on}>
+                <Text
+                  key={first + i}
+                  wrap="truncate-end"
+                  color={on ? "cyan" : undefined}
+                  bold={on}
+                >
                   {on ? "❯ " : "  "}
                   {h.replace(/\s*\n\s*/g, " ⏎ ")}
                 </Text>
               );
             })
           ) : (
-            <Text dimColor>  no match</Text>
+            <Text dimColor> no match</Text>
           )}
-          <Text dimColor>  ↑↓ or ctrl+r select · enter/tab put in the input · esc cancel</Text>
+          <Text dimColor>
+            {" "}
+            ↑↓ or ctrl+r select · enter/tab put in the input · esc cancel
+          </Text>
         </Box>
       ) : matches.length ? (
         <Box flexDirection="column" paddingX={2}>
@@ -738,23 +1021,32 @@ function Prompt({ commands, handlers, history: initial, busy, active, onSubmit }
               </Text>
             );
           })}
-          <Text dimColor>  ↑↓ select · enter run · tab complete</Text>
+          <Text dimColor> ↑↓ select · enter run · tab complete</Text>
         </Box>
       ) : found.length ? (
         <Box flexDirection="column" paddingX={2}>
           {found.map((p) => {
             const on = p === file;
             return (
-              <Text key={p} wrap="truncate-middle" color={on ? "cyan" : p.endsWith("/") ? "blue" : undefined} bold={on}>
+              <Text
+                key={p}
+                wrap="truncate-middle"
+                color={on ? "cyan" : p.endsWith("/") ? "blue" : undefined}
+                bold={on}
+              >
                 {on ? "❯ " : "  "}
                 {p}
               </Text>
             );
           })}
-          <Text dimColor>  ↑↓ select · enter/tab insert the path · the file's content is sent with the message</Text>
+          <Text dimColor>
+            {" "}
+            ↑↓ select · enter/tab insert the path · the file's content is sent
+            with the message
+          </Text>
         </Box>
       ) : notice ? (
-        <Text color="yellow">  {notice}</Text>
+        <Text color="yellow"> {notice}</Text>
       ) : null}
     </Box>
   );
@@ -766,66 +1058,114 @@ const MENTION_ROWS = 8;
 /** 选择框一次最多显示几项 */
 const VISIBLE = 10;
 
-function SelectDialog({ dialog }: { dialog: Extract<Dialog, { kind: "select" }> }) {
+function SelectDialog({
+  dialog,
+}: {
+  dialog: Extract<Dialog, { kind: "select" }>;
+}) {
   const [selected, setSelected] = useState(0);
   const n = dialog.choices.length;
   const { rows } = useWindowSize();
   // 预览（例如要写入的文件）过长时截断：整个界面高过终端时 Ink 会每帧清屏重画
   const lines = dialog.body?.split("\n") ?? [];
   const room = Math.max(3, rows - Math.min(n, VISIBLE) - 16);
-  const body = lines.length > room ? [...lines.slice(0, room), dim(`… ${lines.length - room} more lines`)].join("\n") : dialog.body;
+  const body =
+    lines.length > room
+      ? [
+          ...lines.slice(0, room),
+          dim(`… ${lines.length - room} more lines`),
+        ].join("\n")
+      : dialog.body;
   useInput((input, key) => {
-    if (key.upArrow || input === "k") return setSelected((selected - 1 + n) % n);
+    if (key.upArrow || input === "k")
+      return setSelected((selected - 1 + n) % n);
     if (key.downArrow || input === "j") return setSelected((selected + 1) % n);
     if (key.return) return dialog.resolve(dialog.choices[selected]!.value);
-    if (key.escape || (key.ctrl && input === "c")) return dialog.resolve(undefined);
+    if (key.escape || (key.ctrl && input === "c"))
+      return dialog.resolve(undefined);
     if (key.pageDown) return setSelected(Math.min(n - 1, selected + VISIBLE));
     if (key.pageUp) return setSelected(Math.max(0, selected - VISIBLE));
     const digit = Number(input);
-    if (Number.isInteger(digit) && digit >= 1 && digit <= Math.min(n, 9)) dialog.resolve(dialog.choices[digit - 1]!.value);
+    if (Number.isInteger(digit) && digit >= 1 && digit <= Math.min(n, 9))
+      dialog.resolve(dialog.choices[digit - 1]!.value);
   });
   // 选项多时只显示选中项附近的一段
-  const start = Math.max(0, Math.min(selected - Math.floor(VISIBLE / 2), n - VISIBLE));
+  const start = Math.max(
+    0,
+    Math.min(selected - Math.floor(VISIBLE / 2), n - VISIBLE),
+  );
   return (
-    <Box flexDirection="column" borderStyle="round" borderColor="yellow" paddingX={1} marginTop={1}>
+    <Box
+      flexDirection="column"
+      borderStyle="round"
+      borderColor="yellow"
+      paddingX={1}
+      marginTop={1}
+    >
       <Text bold>{dialog.title}</Text>
       {body ? <Text>{body}</Text> : null}
       <Box flexDirection="column" marginTop={1}>
-        {start > 0 ? <Text dimColor>  ↑ {start} more</Text> : null}
+        {start > 0 ? <Text dimColor> ↑ {start} more</Text> : null}
         {dialog.choices.slice(start, start + VISIBLE).map((c, j) => {
           const i = start + j;
           return (
             <Text key={i} wrap="truncate-end">
-              <Text color={i === selected ? "cyan" : undefined} bold={i === selected}>
+              <Text
+                color={i === selected ? "cyan" : undefined}
+                bold={i === selected}
+              >
                 {i === selected ? "❯ " : "  "}
                 {i + 1}. {c.label}
               </Text>
-              {c.hint ? <Text dimColor>  {c.hint}</Text> : null}
+              {c.hint ? <Text dimColor> {c.hint}</Text> : null}
             </Text>
           );
         })}
-        {start + VISIBLE < n ? <Text dimColor>  ↓ {n - start - VISIBLE} more</Text> : null}
+        {start + VISIBLE < n ? (
+          <Text dimColor> ↓ {n - start - VISIBLE} more</Text>
+        ) : null}
       </Box>
       <Text dimColor>↑↓ select · enter confirm · esc cancel</Text>
     </Box>
   );
 }
 
-function InputDialog({ dialog }: { dialog: Extract<Dialog, { kind: "input" }> }) {
+function InputDialog({
+  dialog,
+}: {
+  dialog: Extract<Dialog, { kind: "input" }>;
+}) {
   const initial = dialog.initial ?? "";
-  const [state, setState] = useState<EditState>({ value: initial, cursor: initial.length });
+  const [state, setState] = useState<EditState>({
+    value: initial,
+    cursor: initial.length,
+  });
   const { columns } = useWindowSize();
   usePaste((text) => setState(edit.insert(state, text.replace(/\r?\n/g, ""))));
   useInput((input, key) => {
     if (key.return) return dialog.resolve(state.value.trim());
-    if (key.escape || (key.ctrl && input === "c")) return dialog.resolve(undefined);
+    if (key.escape || (key.ctrl && input === "c"))
+      return dialog.resolve(undefined);
     const next = editKey(state, input, key);
     if (next) setState(next);
   });
   return (
-    <Box flexDirection="column" borderStyle="round" borderColor="yellow" paddingX={1} marginTop={1}>
+    <Box
+      flexDirection="column"
+      borderStyle="round"
+      borderColor="yellow"
+      paddingX={1}
+      marginTop={1}
+    >
       <Text bold>{dialog.title}</Text>
-      <EditableText state={state} width={Math.max(10, columns - 6)} prefix="› " mask={dialog.mask} placeholder={dialog.placeholder} active />
+      <EditableText
+        state={state}
+        width={Math.max(10, columns - 6)}
+        prefix="› "
+        mask={dialog.mask}
+        placeholder={dialog.placeholder}
+        active
+      />
       <Text dimColor>enter confirm · esc cancel</Text>
     </Box>
   );

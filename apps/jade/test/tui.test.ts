@@ -4,13 +4,20 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { InputHistory } from "../src/history.ts";
-import { parseEnv, providerFromEnv, providerInfo, providerKind, updateEnvFile } from "../src/index.ts";
+import {
+  parseEnv,
+  providerFromEnv,
+  providerInfo,
+  providerKind,
+  updateEnvFile,
+} from "../src/index.ts";
 import { edit, layout } from "../src/ui/editor.ts";
 import type { Screen } from "../src/ui/screen.ts";
 import { tuiScreen, type TuiHandlers } from "../src/ui/tui.tsx";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-const strip = (s: string) => s.replace(/\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[78]/g, "");
+const strip = (s: string) =>
+  s.replace(/\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[78]/g, "");
 
 describe("editor", () => {
   test("edits by code point and keeps surrogate pairs intact", () => {
@@ -20,8 +27,13 @@ describe("editor", () => {
     expect(s.cursor).toBe(3);
     s = edit.backspace(s);
     expect(s).toEqual({ value: "a中", cursor: 1 });
-    expect(edit.deleteWord({ value: "git status --short", cursor: 18 })).toEqual({ value: "git status ", cursor: 11 });
-    expect(edit.deleteWord({ value: "git status  ", cursor: 12 })).toEqual({ value: "git ", cursor: 4 });
+    expect(
+      edit.deleteWord({ value: "git status --short", cursor: 18 }),
+    ).toEqual({ value: "git status ", cursor: 11 });
+    expect(edit.deleteWord({ value: "git status  ", cursor: 12 })).toEqual({
+      value: "git ",
+      cursor: 4,
+    });
   });
 
   test("moves between lines and to line ends", () => {
@@ -29,7 +41,9 @@ describe("editor", () => {
     expect(edit.home(s).cursor).toBe(6);
     expect(edit.end(s).cursor).toBe(17);
     expect(edit.up(s).cursor).toBe(3);
-    expect(edit.down({ value: "first\nsecond line", cursor: 2 }).cursor).toBe(8);
+    expect(edit.down({ value: "first\nsecond line", cursor: 2 }).cursor).toBe(
+      8,
+    );
     expect(edit.onFirstLine(s)).toBe(false);
     expect(edit.onLastLine(s)).toBe(true);
     expect(edit.killBefore(s)).toEqual({ value: "first\nond line", cursor: 6 });
@@ -37,9 +51,21 @@ describe("editor", () => {
 
   test("wraps by display width and locates the cursor", () => {
     // 中文占两列
-    expect(layout("中文abc", 2, 4)).toEqual({ rows: ["中文", "abc"], row: 1, col: 0 });
-    expect(layout("ab\ncd", 5, 10)).toEqual({ rows: ["ab", "cd"], row: 1, col: 2 });
-    expect(layout("abcd", 4, 4)).toEqual({ rows: ["abcd", ""], row: 1, col: 0 });
+    expect(layout("中文abc", 2, 4)).toEqual({
+      rows: ["中文", "abc"],
+      row: 1,
+      col: 0,
+    });
+    expect(layout("ab\ncd", 5, 10)).toEqual({
+      rows: ["ab", "cd"],
+      row: 1,
+      col: 2,
+    });
+    expect(layout("abcd", 4, 4)).toEqual({
+      rows: ["abcd", ""],
+      row: 1,
+      col: 0,
+    });
     expect(layout("", 0, 4)).toEqual({ rows: [""], row: 0, col: 0 });
   });
 });
@@ -55,19 +81,36 @@ describe("input history", () => {
     await b.add("elsewhere");
     await a.add("two\nlines");
     await a.add("one");
-    expect(await new InputHistory(file, path.join(dir, "a")).load()).toEqual(["two\nlines", "one"]);
+    expect(await new InputHistory(file, path.join(dir, "a")).load()).toEqual([
+      "two\nlines",
+      "one",
+    ]);
     expect(await b.load()).toEqual(["elsewhere"]);
   });
 });
 
 describe("model configuration", () => {
   test("JADE_PROVIDER overrides the default order", async () => {
-    const env = { OPENAI_API_KEY: "k", OPENAI_COMPAT_BASE_URL: "http://x", OPENAI_COMPAT_MODEL: "m" };
+    const env = {
+      OPENAI_API_KEY: "k",
+      OPENAI_COMPAT_BASE_URL: "http://x",
+      OPENAI_COMPAT_MODEL: "m",
+    };
     expect(providerKind(env)).toBe("openai");
-    expect(providerKind({ ...env, JADE_PROVIDER: "openai-compat" })).toBe("openai-compat");
-    expect(providerInfo({ ...env, JADE_PROVIDER: "openai-compat" })).toEqual({ kind: "openai-compat", model: "m", baseURL: "http://x" });
-    expect(() => providerKind({ JADE_PROVIDER: "gemini" })).toThrow("JADE_PROVIDER");
-    await expect(providerFromEnv({ ...env, JADE_MAX_TOKENS: "lots" })).rejects.toThrow("JADE_MAX_TOKENS");
+    expect(providerKind({ ...env, JADE_PROVIDER: "openai-compat" })).toBe(
+      "openai-compat",
+    );
+    expect(providerInfo({ ...env, JADE_PROVIDER: "openai-compat" })).toEqual({
+      kind: "openai-compat",
+      model: "m",
+      baseURL: "http://x",
+    });
+    expect(() => providerKind({ JADE_PROVIDER: "gemini" })).toThrow(
+      "JADE_PROVIDER",
+    );
+    await expect(
+      providerFromEnv({ ...env, JADE_MAX_TOKENS: "lots" }),
+    ).rejects.toThrow("JADE_MAX_TOKENS");
   });
 
   test("updateEnvFile replaces, appends and removes keys and keeps everything else", async () => {
@@ -75,10 +118,18 @@ describe("model configuration", () => {
     const file = path.join(dir, ".env");
     await writeFile(file, "# comment\nA=1\nB=2\nA=3\nC=keep\n");
     const env: Record<string, string | undefined> = { B: "2" };
-    await updateEnvFile(file, { A: "new", B: undefined, D: 'has space "and quotes"' }, env);
+    await updateEnvFile(
+      file,
+      { A: "new", B: undefined, D: 'has space "and quotes"' },
+      env,
+    );
     const text = await readFile(file, "utf8");
     expect(text).toBe('# comment\nA=new\nC=keep\nD="has space "and quotes""\n');
-    expect(parseEnv(text)).toEqual({ A: "new", C: "keep", D: 'has space "and quotes"' });
+    expect(parseEnv(text)).toEqual({
+      A: "new",
+      C: "keep",
+      D: 'has space "and quotes"',
+    });
     expect(env).toEqual({ A: "new", D: 'has space "and quotes"' });
   });
 });
@@ -91,7 +142,12 @@ describe("terminal UI", () => {
   });
 
   function setup(history?: string[]) {
-    const stdin = Object.assign(new PassThrough(), { isTTY: true, setRawMode: () => {}, ref: () => {}, unref: () => {} });
+    const stdin = Object.assign(new PassThrough(), {
+      isTTY: true,
+      setRawMode: () => {},
+      ref: () => {},
+      unref: () => {},
+    });
     let out = "";
     const stdout = Object.assign(
       new Writable({
@@ -107,10 +163,22 @@ describe("terminal UI", () => {
       submit: (t) => void calls.submit.push(t),
       interrupt: () => void calls.interrupt++,
       exit: () => void calls.exit++,
-      files: async () => ["src/", "src/main.ts", "src/ui/", "src/ui/tui.tsx", "docs/my notes.md"],
+      files: async () => [
+        "src/",
+        "src/main.ts",
+        "src/ui/",
+        "src/ui/tui.tsx",
+        "docs/my notes.md",
+      ],
     };
     screen = tuiScreen({
-      status: { cwd: "~/proj", branch: "main", model: "test-model", mode: "ask", session: "s-123" },
+      status: {
+        cwd: "~/proj",
+        branch: "main",
+        model: "test-model",
+        mode: "ask",
+        session: "s-123",
+      },
       version: "9.9.9",
       commands: [
         { name: "help", about: "list the commands" },
@@ -119,13 +187,23 @@ describe("terminal UI", () => {
       ],
       handlers,
       history,
-      io: { stdin: stdin as unknown as NodeJS.ReadStream, stdout: stdout as unknown as NodeJS.WriteStream },
+      io: {
+        stdin: stdin as unknown as NodeJS.ReadStream,
+        stdout: stdout as unknown as NodeJS.WriteStream,
+      },
     });
     const type = async (s: string) => {
       stdin.write(s);
       await sleep(80);
     };
-    return { screen, calls, type, output: () => strip(out), raw: () => out, clear: () => void (out = "") };
+    return {
+      screen,
+      calls,
+      type,
+      output: () => strip(out),
+      raw: () => out,
+      clear: () => void (out = ""),
+    };
   }
 
   test("shows the status bar and submits typed messages", async () => {
@@ -203,7 +281,11 @@ describe("terminal UI", () => {
   });
 
   test("ctrl+r searches the history and puts the pick in the input to edit", async () => {
-    const { calls, type, output } = setup(["fix the login bug", "run the tests", "fix the build"]);
+    const { calls, type, output } = setup([
+      "fix the login bug",
+      "run the tests",
+      "fix the build",
+    ]);
     await type("\x12");
     await type("fix");
     expect(output()).toContain("fix the build");
@@ -299,7 +381,7 @@ describe("terminal UI", () => {
     // 第一帧之前先清屏并把光标移到左上角，否则从原来的光标位置画起，整个界面错位
     expect(raw().startsWith("\x1b[?1049h\x1b[2J\x1b[H")).toBe(true);
     const out = output();
-    expect(out).toContain("◆ jade v9.9.9");
+    expect(out).toContain("jade v9.9.9");
     expect(out).toContain("session s-123");
     expect(out).toContain("test-model · ~/proj (main)");
   });
@@ -335,24 +417,26 @@ describe("terminal UI", () => {
   test("clicking a folded line expands and collapses its details", async () => {
     const { screen, type, output, clear } = setup();
     screen.log("first");
-    screen.log("  ⎿ summary (+2 lines)", { details: "    hidden-1\n    hidden-2" });
+    screen.log("  ⎿ summary (+2 lines)", {
+      details: "    hidden-1\n    hidden-2",
+    });
     screen.log("after");
     await sleep(80);
     expect(output()).toContain("summary (+2 lines) ▸");
     expect(output()).not.toContain("hidden-1");
-    // 标题占 4 行（边框和两行文字），对话区第 2 行在屏幕第 6 行
+    // 标题占 5 行（边框和三行：机器人与文字并排），对话区第 2 行在屏幕第 7 行
     clear();
-    await type("\x1b[<0;5;6M");
-    await type("\x1b[<0;5;6m");
+    await type("\x1b[<0;5;7M");
+    await type("\x1b[<0;5;7m");
     expect(output()).toContain("hidden-1");
     expect(output()).toContain("▾");
     // 点击展开的内容也能收起；点普通的行没有反应
     clear();
-    await type("\x1b[<0;5;7M");
+    await type("\x1b[<0;5;8M");
     expect(output()).not.toContain("hidden-1");
     expect(output()).toContain("▸");
     clear();
-    await type("\x1b[<0;5;5M");
+    await type("\x1b[<0;5;6M");
     expect(output()).not.toContain("hidden-1");
   });
 
