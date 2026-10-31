@@ -22,7 +22,10 @@ import {
   Checkpoints,
   compactThreshold,
   contextWindowFromEnv,
+  contextWindowInfo,
   createJade,
+  isContextOverflow,
+  type Mode,
   DERIVED_KEY,
   effortFromEnv,
   estimateTokens,
@@ -365,7 +368,7 @@ describe("policy", () => {
   const cwd = path.resolve("/work");
   const tools = [...fsTools(cwd), shellTool({ cwd })];
   const gated = (name: string, input: unknown) => ({ toolUseId: "t", name, input, tool: tools.find((t) => t.name === name)! });
-  const decide = (mode: "ask" | "auto-edit" | "yolo" | "readonly", name: string, input: unknown) =>
+  const decide = (mode: Mode, name: string, input: unknown) =>
     policy({ cwd }).decide(gated(name, input), { mode, rules: [] }).decision;
   const inside = path.join(cwd, "a.ts");
   const outside = path.resolve("/etc/passwd");
@@ -381,6 +384,12 @@ describe("policy", () => {
     expect(decide("ask", "bash", { command: "git status" })).toBe("allow");
     expect(decide("ask", "bash", { command: "bun test" })).toBe("ask");
     expect(decide("readonly", "bash", { command: "git log -5" })).toBe("allow");
+    expect(decide("plan", "write_file", { path: inside, content: "" })).toBe("deny");
+    expect(decide("plan", "bash", { command: "bun test" })).toBe("deny");
+    expect(decide("plan", "bash", { command: "git log -5" })).toBe("allow");
+    expect(decide("plan", "read_file", { path: inside })).toBe("allow");
+    const reason = policy({ cwd }).decide(gated("edit_file", { path: inside, old_string: "a", new_string: "b" }), { mode: "plan", rules: [] });
+    expect(reason.decision === "deny" && reason.reason).toContain("plan mode");
   });
 
   test("safe commands reject shell metacharacters", () => {
@@ -719,7 +728,7 @@ describe("jade session", () => {
     await rt.send(msg("first"));
     await rt.send(msg("second"));
 
-    jade.compact.request();
+    jade.compact!.request();
     script.push(reply("SUMMARY"), reply("C"));
     await rt.send(msg("third"));
 
@@ -894,10 +903,27 @@ describe("withRetry", () => {
 describe("context window", () => {
   const env = { OPENAI_COMPAT_BASE_URL: "http://x/v1", OPENAI_COMPAT_MODEL: "m" };
 
-  test("JADE_CONTEXT_WINDOW, 256000 by default", () => {
-    expect(contextWindowFromEnv(env)).toBe(256_000);
+  test("JADE_CONTEXT_WINDOW, else known models, else 128000", () => {
+    expect(contextWindowFromEnv(env)).toBe(128_000);
+    expect(contextWindowInfo(env).source).toBe("default");
+    expect(contextWindowInfo({ ANTHROPIC_API_KEY: "k" })).toEqual({ tokens: 200_000, source: "model" });
+    expect(contextWindowFromEnv({ ...env, OPENAI_COMPAT_MODEL: "deepseek-ai/DeepSeek-V3" })).toBe(128_000);
+    expect(contextWindowFromEnv({ ...env, OPENAI_COMPAT_MODEL: "google/gemini-2.5-pro" })).toBe(1_000_000);
+    expect(contextWindowFromEnv({ OPENAI_API_KEY: "k", OPENAI_MODEL: "gpt-5" })).toBe(272_000);
+    expect(contextWindowFromEnv({ OPENAI_API_KEY: "k", OPENAI_MODEL: "o3" })).toBe(200_000);
+    expect(contextWindowInfo({ ANTHROPIC_API_KEY: "k", JADE_CONTEXT_WINDOW: "1000000" })).toEqual({ tokens: 1_000_000, source: "env" });
     expect(contextWindowFromEnv({ ...env, JADE_CONTEXT_WINDOW: "1000000" })).toBe(1_000_000);
     expect(() => contextWindowFromEnv({ ...env, JADE_CONTEXT_WINDOW: "200k" })).toThrow("JADE_CONTEXT_WINDOW");
+  });
+
+  test("recognizes context overflow errors", () => {
+    expect(isContextOverflow("prompt is too long: 210000 tokens > 200000 maximum")).toBe(true);
+    expect(isContextOverflow("This model's maximum context length is 128000 tokens. However, your messages resulted in 130000 tokens.")).toBe(true);
+    expect(isContextOverflow("400 context_length_exceeded")).toBe(true);
+    expect(isContextOverflow("Your input exceeds the context window of this model.")).toBe(true);
+    expect(isContextOverflow("Rate limit reached: too many tokens per minute")).toBe(false);
+    expect(isContextOverflow("invalid api key")).toBe(false);
+    expect(isContextOverflow(undefined)).toBe(false);
   });
 
   test("compaction threshold leaves room for the reply", () => {

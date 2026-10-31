@@ -141,7 +141,7 @@ export function configurator(opts: ConfigureOptions): Configure {
       ]);
       if (effort !== undefined) await applyConfig({ JADE_EFFORT: effort === DEFAULT ? undefined : effort });
     } else if (action === "window") {
-      const n = await screen.input("Context window in tokens (empty for the default 256000)", { initial: process.env.JADE_CONTEXT_WINDOW ?? "" });
+      const n = await screen.input("Context window in tokens (empty to infer it from the model name, or 128000 if unknown)", { initial: process.env.JADE_CONTEXT_WINDOW ?? "" });
       if (n !== undefined) await applyConfig({ JADE_CONTEXT_WINDOW: n || undefined });
     }
   }

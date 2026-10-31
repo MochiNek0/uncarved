@@ -42,6 +42,8 @@ export interface TuiHandlers {
   exit(): void;
   /** 输入 @ 时补全用的路径（目录以 / 结尾）；每次开始输入一个新的 @ 引用时取一次 */
   files?(): Promise<string[]>;
+  /** Shift+Tab：切换到下一个权限模式 */
+  cycleMode?(): void;
 }
 
 type Dialog =
@@ -599,6 +601,8 @@ function Spinner({ label, since }: { label: string; since: number }) {
 function StatusBar({ status }: { status: StatusInfo }) {
   const ctx = status.context;
   const pct = ctx ? Math.round((ctx.used / ctx.limit) * 100) : 0;
+  /** 离自动压缩还有多远：到阈值的 85% 起变黄 */
+  const nearCompact = ctx?.compactAt ? ctx.used >= ctx.compactAt * 0.85 : pct >= 80;
   const modeColor =
     status.mode === "yolo"
       ? "red"
@@ -606,21 +610,30 @@ function StatusBar({ status }: { status: StatusInfo }) {
         ? "yellow"
         : status.mode === "readonly"
           ? "blue"
-          : "green";
+          : status.mode === "plan"
+            ? "magenta"
+            : "green";
   return (
     <Box paddingX={1}>
       <Text wrap="truncate-end">
         <Text color={modeColor}>{status.mode}</Text>
-        <Text dimColor> · </Text>
+        <Text dimColor> (shift+tab) · </Text>
         {ctx ? (
-          <Text color={pct >= 80 ? "yellow" : undefined} dimColor={pct < 80}>
+          <Text color={nearCompact ? "yellow" : undefined} dimColor={!nearCompact}>
             ctx {tokens(ctx.used)}/{tokens(ctx.limit)} ({pct}%)
+            {ctx.compactAt ? `, compacts at ${tokens(ctx.compactAt)}` : ""}
           </Text>
         ) : (
           <Text dimColor>ctx —</Text>
         )}
         {status.cache !== undefined && (
           <Text dimColor> · cache {Math.round(status.cache * 100)}%</Text>
+        )}
+        {status.spent && (
+          <Text dimColor>
+            {" "}
+            · session {tokens(status.spent.input)} in / {tokens(status.spent.output)} out
+          </Text>
         )}
         <Text dimColor>
           {" "}
@@ -632,7 +645,11 @@ function StatusBar({ status }: { status: StatusInfo }) {
 }
 
 const tokens = (n: number) =>
-  n >= 1000 ? `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k` : String(n);
+  n >= 1_000_000
+    ? `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M`
+    : n >= 1000
+      ? `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k`
+      : String(n);
 
 /**
  * 同一块输入里的多个按键（按住退格、输入很快时终端会合并）由 Ink 连续交给处理函数，中间不重新渲染，
@@ -988,6 +1005,7 @@ function Prompt({
         if (file) return complete(file);
         return submit(state.value.trim());
       }
+      if (key.tab && key.shift) return handlers.cycleMode?.();
       if (key.tab) {
         const { pick, file } = derive();
         if (pick)

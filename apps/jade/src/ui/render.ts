@@ -1,10 +1,12 @@
 // 宿主显示用的纯函数：工具调用的一行摘要、审批时的预览、折叠的工具结果。不依赖运行时和界面状态。
 
+import { readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { PendingCall } from "uncarved";
-import { display } from "../tools/fs.ts";
-import { dim, green, red } from "./screen.ts";
+import { applyEditsToText, display, type Edit } from "../tools/fs.ts";
+import { renderDiff } from "./diff.ts";
+import { dim, green, red, yellow } from "./screen.ts";
 
 export const clip = (s: string, n: number) => (s.length > n ? s.slice(0, n) + "…" : s);
 
@@ -31,8 +33,11 @@ export function summarize(cwd: string, name: string, input: unknown): string {
   return where || clip(JSON.stringify(input), 120);
 }
 
-/** 审批时显示的内容：修改显示成 diff，命令显示命令本身 */
-export function preview(c: PendingCall): string {
+/**
+ * 审批时显示的内容：修改显示成带行号和上下文的 diff（读出文件、按工具的规则算出修改后的内容），
+ * 命令显示命令本身。文件读不了、替换不成立时退回到只显示参数里的新旧文本
+ */
+export async function preview(c: PendingCall, cwd: string): Promise<string> {
   const i = (c.input ?? {}) as Record<string, unknown>;
   const lines = (s: string, mark: string, color: (s: string) => string, max = 30) => {
     const all = s.split("\n");
@@ -40,10 +45,22 @@ export function preview(c: PendingCall): string {
     if (all.length > max) shown.push(dim(`  … ${all.length - max} more lines`));
     return shown.join("\n");
   };
-  const diff = (e: Record<string, unknown>) => `${lines(String(e.old_string ?? ""), "-", red)}\n${lines(String(e.new_string ?? ""), "+", green)}`;
-  if (c.name === "edit_file") return diff(i);
-  if (c.name === "multi_edit" && Array.isArray(i.edits)) return (i.edits as Record<string, unknown>[]).map(diff).join(dim("\n  ⋯\n"));
-  if (c.name === "write_file") return lines(String(i.content ?? ""), "+", green, 20);
+  const raw = (e: Record<string, unknown>) => `${lines(String(e.old_string ?? ""), "-", red)}\n${lines(String(e.new_string ?? ""), "+", green)}`;
+  const file = typeof i.path === "string" ? path.resolve(cwd, i.path) : undefined;
+  const current = file ? await readFile(file, "utf8").catch(() => undefined) : undefined;
+  if (c.name === "edit_file" || (c.name === "multi_edit" && Array.isArray(i.edits))) {
+    const edits = (c.name === "edit_file" ? [i] : i.edits) as unknown as Edit[];
+    const fallback = () => edits.map((e) => raw(e as unknown as Record<string, unknown>)).join(dim("\n  ⋯\n"));
+    if (current === undefined) return fallback();
+    const r = applyEditsToText(current, edits, display(cwd, file!));
+    if (typeof r === "string") return `${fallback()}\n${yellow(`  (this edit will fail: ${clip(r, 200)})`)}`;
+    return renderDiff(current, r.text);
+  }
+  if (c.name === "write_file") {
+    const content = String(i.content ?? "");
+    if (current !== undefined) return `${dim("  overwrites the existing file:")}\n${renderDiff(current, content)}`;
+    return lines(content, "+", green, 20);
+  }
   if (c.name === "bash") return lines(String(i.command ?? ""), "$", (s) => s);
   if (c.name === "memory") return `${i.action === "remove" ? red("- ") : green("+ ")}${String(i.text ?? "")}`;
   return dim(clip(JSON.stringify(c.input, null, 2), 2000));

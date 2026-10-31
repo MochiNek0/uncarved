@@ -12,7 +12,6 @@ import { readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { ContentSource, Layer, Plugin, SystemSegment, Trust } from "uncarved";
-import type { Memory } from "../memory.ts";
 
 export interface PromptsOptions {
   cwd: string;
@@ -26,8 +25,10 @@ export interface PromptsOptions {
   shell?: string | null;
   /** 提供的 web 工具名（web_fetch、web_search） */
   web?: string[];
-  /** 跨会话的记忆，会话开始时读一次；子 Agent 不用 */
-  memory?: Memory;
+  /** 编辑后会自动运行项目的检查（见 checks 插件） */
+  checks?: boolean;
+  /** 本会话实际有的工具；给了时，提示词里不提没有的工具（task、todo_write） */
+  tools?: ReadonlySet<string>;
 }
 
 /** 同一目录里按顺序找，用第一个存在的 */
@@ -57,6 +58,10 @@ const VERIFY = "- After changing code, verify it the way the project does (tests
 /** 找不到 shell 时没有 bash 工具，替换掉上面那条 */
 const NO_SHELL =
   "- There is no shell in this session (no bash tool), so you cannot run commands. After changing code, tell the user which commands would verify it.";
+/** 有编辑后检查时加在 VERIFY 后面 */
+const CHECKS =
+  "- After you edit files, jade may run the project's checks (type checker, linter) and append what they report to the result of your last edit in that response. " +
+  "Fix problems they report in the files you changed before moving on; problems that predate your work are not yours to fix unless the user asks.";
 if (!MAIN.includes(VERIFY)) throw new Error("prompts: VERIFY is out of sync with MAIN");
 
 const SUBAGENT = `You are a read-only research sub-agent for a coding agent. You have read_file, list_dir, glob and grep.
@@ -73,7 +78,21 @@ export async function prompts(opts: PromptsOptions): Promise<Plugin> {
     trust,
   });
 
-  const main = opts.shell === null ? MAIN.replace(VERIFY, NO_SHELL) : MAIN;
+  let main = opts.shell === null ? MAIN.replace(VERIFY, NO_SHELL) : opts.checks ? MAIN.replace(VERIFY, `${VERIFY}\n${CHECKS}`) : MAIN;
+  if (opts.tools) {
+    const missing = [
+      ["task", "the task tool"],
+      ["todo_write", "todo_write"],
+    ].filter(([name]) => !opts.tools!.has(name!));
+    // 没有 task：删掉 "Use the task tool" 那一条，另一条里去掉提到它的半句；没有 todo_write：删掉提到它的那一条
+    for (const [name, words] of missing) {
+      main = main
+        .split("\n")
+        .filter((l) => !(name === "task" ? l.startsWith("- Use the task tool") : l.includes(words!)))
+        .map((l) => (name === "task" ? l.replace(", and prefer the task tool for research that needs several pages", "") : l))
+        .join("\n");
+    }
+  }
   const web = opts.web?.length ? opts.web.join(" and ") : undefined;
   const sub = web ? SUBAGENT.replace("list_dir, glob and grep.", `list_dir, glob, grep, ${web}.`) : SUBAGENT;
   const system: SystemSegment[] = [segment(opts.role === "subagent" ? sub : main, "trusted")];
@@ -82,8 +101,8 @@ export async function prompts(opts: PromptsOptions): Promise<Plugin> {
   if (opts.role !== "subagent") {
     const user = await instructions(opts.home, opts.home, "user");
     if (user) system.push(segment(`# User instructions (${user.source.path})\n\n${user.text}`, "trusted", user.source));
-    const root = real(await repoRoot(opts.cwd));
-    for (const dir of ancestry(root, real(opts.cwd))) {
+    const root = realPath(await repoRoot(opts.cwd));
+    for (const dir of ancestry(root, realPath(opts.cwd))) {
       const project = await instructions(root, dir, "project");
       if (!project) continue;
       system.push(
@@ -94,13 +113,12 @@ export async function prompts(opts: PromptsOptions): Promise<Plugin> {
         ),
       );
     }
-    const memory = await opts.memory?.prompt();
-    if (memory) system.push(segment(memory, "trusted"));
   }
 
   return {
     id,
-    version: "0.2.0",
+    // 0.3.0：记忆、skill 列表、MCP 说明移到各自的插件（jade/memory、jade/skills、jade/mcp）
+    version: "0.3.0",
     kernel: "^0.1",
     needs: ["transform:context.build"],
     hooks: [{ kind: "transform", point: "context.build", fn: (req) => ({ ...req, system: [...system, ...req.system] }) }],
@@ -128,7 +146,7 @@ async function instructions(root: string, dir: string, layer: Layer) {
  * 解析符号链接和 Windows 短文件名后的绝对路径。git 给出的仓库根目录是解析过的，
  * 工作目录可能不是（macOS 的 /var → /private/var，Windows 的 RUNNER~1），不统一就算不出相对路径
  */
-function real(p: string): string {
+export function realPath(p: string): string {
   try {
     return realpathSync.native(p);
   } catch {

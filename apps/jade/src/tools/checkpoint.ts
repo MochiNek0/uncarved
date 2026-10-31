@@ -6,6 +6,7 @@
 import { createHash } from "node:crypto";
 import { appendFile, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
+import type { Message } from "uncarved";
 
 /** derived 中保存已撤销的 toolUseId 的键 */
 export const UNDO_KEY = "jade/undo";
@@ -133,6 +134,30 @@ export class Checkpoints {
       await writeFile(cp.path, cp.before);
     }
   }
+}
+
+/**
+ * 最近一轮还有没撤销的修改的快照（最新的在前）。一轮从一条用户消息开始；
+ * 只有工具结果、或者只有宿主说明（例如自动续写的提示）的消息不算新的一轮。没有可撤销的返回空数组
+ */
+export function lastTurnChanges(messages: readonly Message[], checkpoints: readonly Checkpoint[], undone: ReadonlySet<string>): Checkpoint[] {
+  const pending = checkpoints.filter((c) => !undone.has(c.toolUseId));
+  if (pending.length === 0) return [];
+  let ids = new Set<string>();
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]!;
+    if (m.role === "assistant") {
+      for (const b of m.content) if (b.kind === "tool_use") ids.add(b.id);
+      continue;
+    }
+    const startsTurn = m.content.some((b) => b.kind !== "tool_result" && b.origin.by !== "host");
+    if (!startsTurn) continue;
+    const hits = pending.filter((c) => ids.has(c.toolUseId));
+    if (hits.length > 0) return hits;
+    ids = new Set();
+  }
+  // 找不到对应的消息（不应该发生）：退回到只撤销最近的一次写入
+  return pending.slice(0, 1);
 }
 
 /** 会话和工具调用的 id 用作文件名 */

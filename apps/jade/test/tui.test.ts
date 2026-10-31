@@ -158,11 +158,12 @@ describe("terminal UI", () => {
       }),
       { isTTY: true, columns: 100, rows: 40 },
     );
-    const calls = { submit: [] as string[], interrupt: 0, exit: 0 };
+    const calls = { submit: [] as string[], interrupt: 0, exit: 0, cycle: 0 };
     const handlers: TuiHandlers = {
       submit: (t) => void calls.submit.push(t),
       interrupt: () => void calls.interrupt++,
       exit: () => void calls.exit++,
+      cycleMode: () => void calls.cycle++,
       files: async () => [
         "src/",
         "src/main.ts",
@@ -383,6 +384,25 @@ describe("terminal UI", () => {
     expect(calls.exit).toBe(0);
     await type("\x03");
     expect(calls.exit).toBe(1);
+  });
+
+  test("shift+tab cycles the mode; the status bar shows context, compaction and session usage", async () => {
+    const { screen, calls, type, output } = setup();
+    await type("ab");
+    await type("\x1b[Z");
+    expect(calls.cycle).toBe(1);
+    screen.status({
+      mode: "plan",
+      context: { used: 50_000, limit: 200_000, compactAt: 136_000 },
+      spent: { input: 1_250_000, output: 40_000 },
+    });
+    await sleep(80);
+    expect(output()).toContain("plan (shift+tab)");
+    expect(output()).toContain("ctx 50k/200k (25%), compacts at 136k");
+    expect(output()).toContain("session 1.3M in / 40k out");
+    // shift+tab 不改输入框
+    await type("\r");
+    expect(calls.submit).toEqual(["ab"]);
   });
 
   test("streamed output and logs are printed above the input", async () => {

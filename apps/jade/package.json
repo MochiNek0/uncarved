@@ -1,8 +1,20 @@
 {
   "name": "@uncarved/jade",
-  "private": true,
   "version": "0.1.0",
   "description": "A coding agent harness built on the uncarved kernel",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MochiNek0/uncarved.git",
+    "directory": "apps/jade"
+  },
+  "keywords": [
+    "agent",
+    "coding-agent",
+    "cli",
+    "llm",
+    "uncarved"
+  ],
   "type": "module",
   "exports": {
     ".": "./src/index.ts"
@@ -10,7 +22,20 @@
   "bin": {
     "jade": "./src/main.ts"
   },
+  "files": [
+    "src"
+  ],
+  "engines": {
+    "bun": ">=1.3.9"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "prepublishOnly": "node ../../scripts/require-bun-publish.mjs"
+  },
   "dependencies": {
+    "@uncarved/plugin-stdio": "workspace:*",
     "@uncarved/provider-anthropic": "workspace:*",
     "@uncarved/provider-openai-compat": "workspace:*",
     "@uncarved/provider-openai-responses": "workspace:*",

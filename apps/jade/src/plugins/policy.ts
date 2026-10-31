@@ -10,7 +10,7 @@ import path from "node:path";
 import type { GatedToolCall, GateResult, Plugin } from "uncarved";
 import { validate } from "./schema.ts";
 
-export const MODES = ["ask", "auto-edit", "yolo", "readonly"] as const;
+export const MODES = ["ask", "auto-edit", "plan", "yolo", "readonly"] as const;
 export type Mode = (typeof MODES)[number];
 
 /** derived 中保存设置的键 */
@@ -50,6 +50,8 @@ export interface PolicyOptions {
   id?: string;
   /** 日志之外也要遵守的规则，每次判断时取（子 Agent 用主会话的规则） */
   rules?: () => AllowRule[];
+  /** 工作目录之外也可以直接读取的目录（skill 的目录），只影响只读工具 */
+  readRoots?: string[];
 }
 
 export interface Policy {
@@ -255,14 +257,21 @@ export function policy(opts: PolicyOptions): Policy {
       const safeDecision = (): GateResult => ({ decision: argsOutside(input.command ?? "") ? "ask" : "allow" });
 
       if (tool.effect === "read") {
-        if (mode === "yolo" || ruled || (!outside && !network)) return { decision: "allow" };
+        const readable =
+          !outside ||
+          (typeof input.path === "string" && call.name !== "glob" && (opts.readRoots ?? []).some((r) => within(r, input.path!)));
+        if (mode === "yolo" || ruled || (readable && !network)) return { decision: "allow" };
         return { decision: "ask" };
       }
-      if (mode === "readonly") {
+      // plan：和 readonly 一样不改任何东西，只是拒绝的理由告诉模型先给出计划
+      if (mode === "readonly" || mode === "plan") {
         if (safeBash) return safeDecision();
         return {
           decision: "deny",
-          reason: `The session is in read-only mode, so ${call.name} is not allowed. Describe the change instead of making it.`,
+          reason:
+            mode === "plan"
+              ? `The session is in plan mode, so ${call.name} is not allowed yet. Finish investigating, then present your plan and wait for the user to approve it.`
+              : `The session is in read-only mode, so ${call.name} is not allowed. Describe the change instead of making it.`,
         };
       }
       if (mode === "yolo" || ruled) return { decision: "allow" };

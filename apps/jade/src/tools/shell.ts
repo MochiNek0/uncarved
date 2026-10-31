@@ -29,7 +29,19 @@ export interface ShellTools {
   unavailable?: string;
   /** 杀掉所有还在运行的后台进程 */
   shutdown(): void;
+  /** 宿主和插件自己执行一条命令（不经过模型和审批），找不到 shell 时为 undefined */
+  run?: RunCommand;
 }
+
+export interface RunResult {
+  /** 超时被杀掉时为 null */
+  code: number | null;
+  /** stdout 和 stderr 合在一起，超长时保留首尾 */
+  output: string;
+  timedOut: boolean;
+}
+
+export type RunCommand = (command: string, opts: { cwd?: string; timeoutMs: number; signal?: AbortSignal }) => Promise<RunResult>;
 
 /** 只要 bash 工具时用（测试） */
 export function shellTool(opts: ShellOptions): Tool {
@@ -61,9 +73,9 @@ export function shellTools(opts: ShellOptions): ShellTools {
   const background = new Map<string, Background>();
   let nextId = 1;
 
-  const spawn = (command: string) =>
+  const spawn = (command: string, cwd = opts.cwd) =>
     Bun.spawn([executable, "-c", command], {
-      cwd: opts.cwd,
+      cwd,
       stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",
@@ -199,9 +211,30 @@ export function shellTools(opts: ShellOptions): ShellTools {
     },
   };
 
+  const run: RunCommand = async (command, { cwd, timeoutMs, signal }) => {
+    signal?.throwIfAborted();
+    const proc = spawn(command, cwd);
+    let timedOut = false;
+    const kill = () => killTree(executable, proc.pid);
+    const timer = setTimeout(() => {
+      timedOut = true;
+      kill();
+    }, timeoutMs);
+    signal?.addEventListener("abort", kill, { once: true });
+    try {
+      const [stdout, stderr, code] = await Promise.all([collect(proc.stdout, () => {}), collect(proc.stderr, () => {}), proc.exited]);
+      signal?.throwIfAborted();
+      return { code: timedOut ? null : code, output: [stdout, stderr].filter(Boolean).join("\n"), timedOut };
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", kill);
+    }
+  };
+
   return {
     tools: [bash, bashOutput, killShell],
     executable,
+    run,
     shutdown() {
       for (const bg of background.values()) if (bg.exitCode === undefined) killTree(executable, bg.proc.pid);
     },

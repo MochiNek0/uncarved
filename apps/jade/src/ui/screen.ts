@@ -18,7 +18,9 @@ export interface StatusInfo {
   mode: string;
   session?: string;
   /** 上一次请求的上下文用量，limit 是模型的上下文窗口 */
-  context?: { used: number; limit: number };
+  context?: { used: number; limit: number; /** 超过这个 token 数会自动压缩 */ compactAt?: number };
+  /** 本会话累计的用量（含子 Agent 和压缩） */
+  spent?: { input: number; output: number };
   /** 上一次请求的输入中命中缓存的比例（0–1）；服务不报告缓存用量时为 undefined */
   cache?: number;
 }

@@ -22,6 +22,7 @@
         "jade": "./src/main.ts",
       },
       "dependencies": {
+        "@uncarved/plugin-stdio": "workspace:*",
         "@uncarved/provider-anthropic": "workspace:*",
         "@uncarved/provider-openai-compat": "workspace:*",
         "@uncarved/provider-openai-responses": "workspace:*",

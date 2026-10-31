@@ -323,10 +323,21 @@ export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
   return [readFileTool, writeFileTool, editFileTool, multiEditTool, listDirTool, globTool, grepTool(cwd, { rg: opts.rg })];
 }
 
-interface Edit {
+export interface Edit {
   old_string: string;
   new_string: string;
   replace_all?: boolean;
+}
+
+/** 按 edit_file / multi_edit 的规则把 edits 依次应用到 text 上；失败时返回原因。审批预览用它算出修改后的内容 */
+export function applyEditsToText(text: string, edits: Edit[], shown: string): string | { text: string } {
+  let next = text;
+  for (const [i, e] of edits.entries()) {
+    const r = replaceIn(next, e, shown);
+    if (typeof r === "string") return edits.length > 1 ? `edit ${i + 1} of ${edits.length}: ${r}` : r;
+    next = r.text;
+  }
+  return { text: next };
 }
 
 /** 在 text 上做一次替换；失败时返回原因 */

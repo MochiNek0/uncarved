@@ -19,6 +19,8 @@ export interface TranscriptOptions {
   store: LogStore;
   /** 模型的上下文窗口（状态栏显示用） */
   contextWindow(): number;
+  /** 自动压缩的阈值（状态栏显示用） */
+  compactAt?(): number;
   /** 上一轮失败后能否用 /retry 重新请求 */
   canRetry(): boolean;
 }
@@ -33,6 +35,8 @@ export interface Transcript {
   readonly usage: Readonly<Required<Usage>>;
   /** 最近一轮的结束原因；宿主开始新一轮前清掉 */
   lastEnd: TurnEndReason | undefined;
+  /** 最近一轮以错误结束时的错误信息 */
+  lastError: string | undefined;
   /** 本轮已经以 turn.ended（error/aborted）结束并显示过原因，随后抛出的同一个错误不再重复显示 */
   turnFailed: boolean;
   /** 开始新会话时清空 */
@@ -52,6 +56,7 @@ export function transcript(opts: TranscriptOptions): Transcript {
   const usage: Required<Usage> = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
   const addUsage = (u?: Usage) => {
     for (const k of Object.keys(usage) as (keyof Usage)[]) usage[k] += u?.[k] ?? 0;
+    if (u) screen.status({ spent: { input: usage.inputTokens, output: usage.outputTokens } });
   };
   /** 一个事件带来的用量：模型回复、压缩时的总结调用；子 Agent 的用量在它自己的日志里 */
   async function countUsage(e: LogEvent) {
@@ -70,7 +75,7 @@ export function transcript(opts: TranscriptOptions): Transcript {
     if (u?.inputTokens === undefined) return;
     if (u.cacheReadTokens !== undefined) reportsCache = true;
     screen.status({
-      context: { used: u.inputTokens + (u.outputTokens ?? 0), limit: opts.contextWindow() },
+      context: { used: u.inputTokens + (u.outputTokens ?? 0), limit: opts.contextWindow(), compactAt: opts.compactAt?.() },
       cache: reportsCache && u.inputTokens > 0 ? (u.cacheReadTokens ?? 0) / u.inputTokens : undefined,
     });
   }
@@ -90,6 +95,7 @@ export function transcript(opts: TranscriptOptions): Transcript {
   const self: Transcript = {
     usage,
     lastEnd: undefined,
+    lastError: undefined,
     turnFailed: false,
     onNotice,
     replay,
@@ -141,12 +147,15 @@ export function transcript(opts: TranscriptOptions): Transcript {
   }
 
   function renderProgress(toolUseId: string, p: ShellProgress | TaskProgress) {
+    if (typeof p !== "object" || p === null) return;
     if (p.kind === "task-start") return screen.log(dim(`  ↳ sub-agent: ${p.description}`));
     if (p.kind === "task-tool") {
       // 要用户批准的调用在审批时显示
       if (p.decision === "ask") return;
       return screen.log(dim(`    ${p.decision === "deny" ? "✗" : "·"} ${p.name}(${summarize(cwd, p.name, p.input)})`));
     }
+    // 第三方工具的进度格式 jade 不认识，不显示
+    if (typeof (p as { text?: unknown }).text !== "string") return;
     const shown = progressLines.get(toolUseId) ?? 0;
     if (shown > MAX_PROGRESS_LINES) return;
     const lines = p.text.replace(/\n$/, "").split("\n");
@@ -217,6 +226,7 @@ export function transcript(opts: TranscriptOptions): Transcript {
       case "turn.ended": {
         const d = e.data as EventDataMap["turn.ended"];
         self.lastEnd = d.reason;
+        self.lastError = d.error;
         self.turnFailed = d.reason === "error" || d.reason === "aborted";
         if (d.reason === "stopped") screen.log(yellow("[stopped: step budget for this turn used up; send a message to continue]"));
         else if (d.reason === "aborted") screen.log(yellow("[interrupted]"));
@@ -233,12 +243,41 @@ export function transcript(opts: TranscriptOptions): Transcript {
         screen.log(dim(`[compacted ${d.upTo - d.from} messages, ~${d.before} tokens before]`));
         return;
       }
+      case "jade/checks/checked": {
+        const d = e.data as { summary: { name: string; problems: number; others?: number; failed?: string }[]; report: string };
+        const bad = d.summary.filter((s) => s.problems > 0 || s.others || s.failed);
+        const details = d.report ? detailsOf(d.report.split("\n").slice(1), (s) => s, MAX_DETAIL_LINES) : undefined;
+        if (bad.length === 0) {
+          screen.log(dim(`  ✓ checks passed: ${d.summary.map((s) => s.name).join(", ")}`), { details });
+        } else {
+          const what = bad.map((s) =>
+            s.failed
+              ? `${s.name} ${s.failed}`
+              : `${s.name}: ${[s.problems > 0 ? `${s.problems} problem${s.problems > 1 ? "s" : ""} in changed files` : "", s.others ? `${s.others} new elsewhere` : ""]
+                  .filter(Boolean)
+                  .join(", ")}`,
+          );
+          screen.log(yellow(`  ⚠ checks: ${what.join("; ")}`), { details });
+        }
+        return;
+      }
       case "jade/compact/trimmed": {
         const d = e.data as { saved: number };
         screen.log(dim(`[cleared old tool output, ~${d.saved} tokens]`));
         return;
       }
+      default:
+        return renderPluginNotice(e);
     }
+  }
+
+  /** 插件用 ctx.emit("notice", { text, level? }) 写入的提示，显示成 [插件 id] 文本 */
+  function renderPluginNotice(e: LogEvent) {
+    if (e.origin.by !== "plugin" || !e.type.endsWith("/notice")) return;
+    const d = e.data as { text?: unknown; level?: unknown } | null;
+    if (typeof d?.text !== "string" || !d.text) return;
+    const line = `[${e.origin.id}] ${clip(d.text, 2000)}`;
+    screen.log(d.level === "warning" ? yellow(line) : dim(line));
   }
 
   async function replay(events: LogEvent[], show: boolean) {
