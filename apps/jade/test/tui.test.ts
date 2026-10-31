@@ -186,6 +186,22 @@ describe("terminal UI", () => {
     expect(calls.submit).toEqual(["new", "old two"]);
   });
 
+  test("up and down move past /commands and @ mentions in the history instead of their menus", async () => {
+    const { calls, type } = setup(["oldest", "/mo", "fix @src/u", "newest"]);
+    for (let i = 0; i < 4; i++) await type("\x1b[A");
+    await type("\r");
+    expect(calls.submit).toEqual(["oldest"]);
+    for (let i = 0; i < 4; i++) await type("\x1b[A");
+    await type("\x1b[B");
+    await type("\r");
+    expect(calls.submit).toEqual(["oldest", "fix @src/u"]);
+    // 改动翻出来的命令后，菜单照常出现
+    for (let i = 0; i < 4; i++) await type("\x1b[A");
+    await type("d");
+    await type("\r");
+    expect(calls.submit.at(-1)).toBe("/mode");
+  });
+
   test("ctrl+r searches the history and puts the pick in the input to edit", async () => {
     const { calls, type, output } = setup(["fix the login bug", "run the tests", "fix the build"]);
     await type("\x12");

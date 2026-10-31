@@ -404,7 +404,8 @@ async function* filterAsync<T>(items: Iterable<T>, keep: (item: T) => Promise<bo
 
 async function* walk(dir: string, signal: AbortSignal): AsyncIterable<string> {
   signal.throwIfAborted();
-  const entries = await readdir(dir, { withFileTypes: true });
+  // readdir 的顺序随文件系统而定（APFS 不排序），按名字排好，结果在各平台一致
+  const entries = (await readdir(dir, { withFileTypes: true })).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   for (const e of entries) {
     const full = path.join(dir, e.name);
     if (e.isDirectory()) {

@@ -555,13 +555,15 @@ function Prompt({ commands, handlers, history: initial, busy, active, onSubmit }
 
   const usageOf = (c: CommandInfo) => `/${c.name}${c.args ? ` ${c.args}` : ""}`;
   const column = Math.max(...commands.map((c) => usageOf(c).length)) + 2;
-  const naming = state.value.startsWith("/") && !/\s/.test(state.value);
+  // 翻到的历史条目原样未改时不弹补全菜单，否则菜单会占住 ↑/↓，翻不过 /命令 这样的条目
+  const recalled = browsing.current >= 0 && state.value === history.current[history.current.length - 1 - browsing.current];
+  const naming = !recalled && state.value.startsWith("/") && !/\s/.test(state.value);
   const matches = naming ? commands.filter((c) => `/${c.name}`.startsWith(state.value)) : [];
   const pick = matches[Math.min(selected, matches.length - 1)];
 
   // @ 引用：光标处正在输入的路径和补全候选
   const [paths, setPaths] = useState<string[]>([]);
-  const mention = naming ? undefined : mentionAt(state.value, state.cursor);
+  const mention = naming || recalled ? undefined : mentionAt(state.value, state.cursor);
   const mentioning = mention !== undefined;
   // 每次开始输入一个新的 @ 引用时重新取一次：文件可能已经变了
   useEffect(() => {

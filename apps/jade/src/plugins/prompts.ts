@@ -7,6 +7,7 @@
 // 项目层从仓库根目录到工作目录逐级查找，上级的在前，离工作目录近的在后。
 
 import { createHash } from "node:crypto";
+import { realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -81,8 +82,8 @@ export async function prompts(opts: PromptsOptions): Promise<Plugin> {
   if (opts.role !== "subagent") {
     const user = await instructions(opts.home, opts.home, "user");
     if (user) system.push(segment(`# User instructions (${user.source.path})\n\n${user.text}`, "trusted", user.source));
-    const root = await repoRoot(opts.cwd);
-    for (const dir of ancestry(path.resolve(root), opts.cwd)) {
+    const root = real(await repoRoot(opts.cwd));
+    for (const dir of ancestry(root, real(opts.cwd))) {
       const project = await instructions(root, dir, "project");
       if (!project) continue;
       system.push(
@@ -121,6 +122,18 @@ async function instructions(root: string, dir: string, layer: Layer) {
     return { text: text.trim(), source: { layer, path: rel, hash } satisfies ContentSource };
   }
   return undefined;
+}
+
+/**
+ * 解析符号链接和 Windows 短文件名后的绝对路径。git 给出的仓库根目录是解析过的，
+ * 工作目录可能不是（macOS 的 /var → /private/var，Windows 的 RUNNER~1），不统一就算不出相对路径
+ */
+function real(p: string): string {
+  try {
+    return realpathSync.native(p);
+  } catch {
+    return path.resolve(p);
+  }
 }
 
 /** 从 root 到 dir 的每一级目录（含两端）；dir 不在 root 里时只有 dir */
