@@ -3,7 +3,7 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { ProviderError, type Block, type Message, type Provider, type Tool, type ToolContext } from "uncarved";
-import { estimateTokens, fsTools, htmlToMarkdown, isPrivateHost, nearMiss, webTools, withRetry } from "../src/index.ts";
+import { estimateTokens, fsTools, htmlToMarkdown, isPrivateHost, isRateLimit, nearMiss, RateGate, RETRY_DELAYS_MS, rpmFromEnv, webTools, withRetry } from "../src/index.ts";
 
 // ---------- 辅助 ----------
 
@@ -270,9 +270,77 @@ test("withRetry adds jitter to the backoff unless the server says when to retry"
       return { model: "m", content: [], stopReason: "end" };
     },
   };
-  await withRetry(inner, { baseDelayMs: 10, random: () => 0, onRetry: (i) => delays.push(i.delayMs) }).complete(
+  await withRetry(inner, { delaysMs: [10, 20], random: () => 0, onRetry: (i) => delays.push(i.delayMs) }).complete(
     { system: [], messages: [], tools: [] },
     { signal: new AbortController().signal },
   );
-  expect(delays).toEqual([5, 7]);
+  expect(delays).toEqual([8, 7]);
+});
+
+test("withRetry waits longer each time, up to 9 retries and at most 3 minutes", async () => {
+  expect(RETRY_DELAYS_MS.length).toBe(9);
+  expect(Math.max(...RETRY_DELAYS_MS)).toBe(180_000);
+  expect(RETRY_DELAYS_MS.every((d, i) => i === 0 || d > RETRY_DELAYS_MS[i - 1]!)).toBe(true);
+  const delays: number[] = [];
+  let calls = 0;
+  const inner: Provider = {
+    id: "inner",
+    async complete() {
+      calls++;
+      throw new ProviderError("HTTP 429", { retryable: true, status: 429, retryAfterMs: calls === 1 ? 600_000 : undefined });
+    },
+  };
+  const scaled = RETRY_DELAYS_MS.map((d) => d / 10_000);
+  await expect(
+    withRetry(inner, { delaysMs: scaled, maxDelayMs: 15, random: () => 1, onRetry: (i) => delays.push(i.delayMs) }).complete(
+      { system: [], messages: [], tools: [] },
+      { signal: new AbortController().signal },
+    ),
+  ).rejects.toThrow("429");
+  // 第一次和最后一次都不超过上限；中间按计划递增
+  expect(calls).toBe(10);
+  expect(delays).toEqual([15, ...scaled.slice(1).map((d) => Math.round(Math.min(d, 15)))]);
+});
+
+test("RateGate spaces requests by the limit and pauses everyone after a 429", async () => {
+  let now = 0;
+  const waits: number[] = [];
+  const learned: number[] = [];
+  const gate = new RateGate({ now: () => now, onWait: (ms) => waits.push(ms), onLearn: (n) => learned.push(n) });
+  const signal = new AbortController().signal;
+  // 没有上限时不等
+  for (let i = 0; i < 4; i++) await gate.acquire(signal);
+  expect(waits).toEqual([]);
+  // 一分钟里发了 4 个后被限流：推出每分钟 3 个，暂停期间谁都不发
+  gate.limited(1);
+  expect(learned).toEqual([3]);
+  expect(gate.rpm).toBe(3);
+  now = 60_000;
+  const t = gate.acquire(signal);
+  await t;
+  expect(waits).toEqual([]);
+  // 下一个要隔 20 秒；排在它后面的被取消时立即返回
+  const slow = new AbortController();
+  const next = gate.acquire(slow.signal);
+  await new Promise((r) => setTimeout(r, 5));
+  expect(waits[0]).toBe(20_000);
+  const ac = new AbortController();
+  const queued = gate.acquire(ac.signal);
+  ac.abort(new Error("stop"));
+  await expect(queued).rejects.toThrow("stop");
+  slow.abort(new Error("slow"));
+  await expect(next).rejects.toThrow("slow");
+  // 设了 JADE_RPM 时不改
+  const fixed = new RateGate({ rpm: 30, now: () => now });
+  for (let i = 0; i < 4; i++) {
+    await fixed.acquire(signal);
+    now += 2_000;
+  }
+  fixed.limited(1);
+  expect(fixed.rpm).toBe(30);
+  expect(isRateLimit(new ProviderError("stream error: Rate limit exceeded: free-models-per-min", { retryable: true }))).toBe(true);
+  expect(isRateLimit(new ProviderError("HTTP 429: slow down", { retryable: true }))).toBe(true);
+  expect(isRateLimit(new ProviderError("HTTP 500: oops (id 14290)", { retryable: true, status: 500 }))).toBe(false);
+  expect(rpmFromEnv({ JADE_RPM: "20" })).toBe(20);
+  expect(() => rpmFromEnv({ JADE_RPM: "fast" })).toThrow("JADE_RPM");
 });

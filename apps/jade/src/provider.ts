@@ -3,28 +3,42 @@
 import { ProviderError, type Provider } from "uncarved";
 import { parseTokens } from "./config.ts";
 
+/** 默认的重试等待：一次比一次久，最长 3 分钟 */
+export const RETRY_DELAYS_MS = [2, 5, 10, 20, 30, 45, 60, 120, 180].map((s) => s * 1000);
+const MAX_RETRY_DELAY_MS = 180_000;
+
 export interface RetryOptions {
-  /** 最多重试几次，默认 4 */
+  /** 最多重试几次，默认 RETRY_DELAYS_MS 的长度（9 次） */
   retries?: number;
-  /** 首次等待，之后每次翻倍，默认 1000ms；上游给了 retryAfterMs 时以它为准 */
-  baseDelayMs?: number;
+  /** 第 n 次重试前等多久；次数超过数组长度时用最后一项。上游给了 retryAfterMs 时以它为准 */
+  delaysMs?: number[];
+  /** 任何一次等待的上限，默认 3 分钟 */
   maxDelayMs?: number;
   /** 退避时间的随机数，默认 Math.random；测试用 */
   random?: () => number;
+  /** 所有请求共用的限速：每次请求前排队，遇到 429 时一起暂停 */
+  gate?: RateGate;
+  /** 每次真正发出请求前（排完队、等完重试之后）通知宿主 */
+  onRequest?: (attempt: number) => void;
   /** 每次重试前通知宿主（显示用） */
-  onRetry?: (info: { attempt: number; delayMs: number; error: ProviderError }) => void;
+  onRetry?: (info: { attempt: number; retries: number; delayMs: number; error: ProviderError }) => void;
 }
 
+/** 是不是被限流了（429，或者错误信息里这么说） */
+export const isRateLimit = (err: ProviderError) => err.status === 429 || /\b429\b|rate.?limit|too many requests/i.test(err.message);
+
 export function withRetry(inner: Provider, opts: RetryOptions = {}): Provider {
-  const retries = opts.retries ?? 4;
-  const base = opts.baseDelayMs ?? 1000;
-  const max = opts.maxDelayMs ?? 60_000;
+  const delays = opts.delaysMs ?? RETRY_DELAYS_MS;
+  const retries = opts.retries ?? delays.length;
+  const max = opts.maxDelayMs ?? MAX_RETRY_DELAY_MS;
   const random = opts.random ?? Math.random;
   return {
     id: `retry(${inner.id})`,
     async complete(request, options) {
       for (let attempt = 1; ; attempt++) {
         let streamed = false;
+        await opts.gate?.acquire(options.signal);
+        opts.onRequest?.(attempt);
         try {
           const res = await inner.complete(request, {
             ...options,
@@ -37,16 +51,107 @@ export function withRetry(inner: Provider, opts: RetryOptions = {}): Provider {
           return { ...res, provider: res.provider ?? inner.id };
         } catch (err) {
           if (!(err instanceof ProviderError) || !err.retryable || attempt > retries || options.signal.aborted) throw err;
-          // 没有 retryAfterMs 时随机取后一半，并行的子 Agent 同时遇到 429 时不会同时重试
-          const delayMs = Math.min(err.retryAfterMs ?? base * 2 ** (attempt - 1) * (0.5 + 0.5 * random()), max);
+          // 没有 retryAfterMs 时在计划的时间上随机缩短最多 20%，并行的子 Agent 同时遇到 429 时不会同时重试
+          const planned = delays[Math.min(attempt, delays.length) - 1] ?? 1000;
+          const delayMs = Math.round(Math.min(err.retryAfterMs ?? planned * (0.8 + 0.2 * random()), max));
+          // 限流时所有共用这个 gate 的请求（子 Agent、压缩）一起等，不再各自去撞
+          if (isRateLimit(err)) opts.gate?.limited(delayMs);
           // 失败的这次已经推送过增量的，先让订阅者作废它们（4.7）
           if (streamed) options.onDelta?.({ kind: "reset" });
-          opts.onRetry?.({ attempt, delayMs, error: err });
+          opts.onRetry?.({ attempt, retries, delayMs, error: err });
           await sleep(delayMs, options.signal);
         }
       }
     },
   };
+}
+
+export interface RateGateOptions {
+  /** 每分钟最多发几个请求（JADE_RPM）；不设时不主动限速，被限流后按当时的请求数推一个 */
+  rpm?: number;
+  now?: () => number;
+  /** 要等一段时间才能发下一个请求时通知宿主（显示用） */
+  onWait?: (ms: number) => void;
+  /** 被限流后推出了每分钟的请求数上限时通知宿主 */
+  onLearn?: (rpm: number) => void;
+}
+
+/**
+ * 同一个服务的所有请求共用的限速。免费模型常常按每分钟请求数限流，主 Agent、并行的子 Agent、压缩各自重试会一起撞上去。
+ * - 有上限（JADE_RPM，或者被限流后推出来的）时，相邻两个请求至少间隔 60s / 上限，平均分布在一分钟里
+ * - 收到 429 后，所有请求都等到重试时间之后再发
+ */
+export class RateGate {
+  #rpm: number | undefined;
+  readonly #explicit: boolean;
+  #sent: number[] = [];
+  #until = 0;
+  #queue: Promise<void> = Promise.resolve();
+  readonly #now: () => number;
+  readonly #opts: RateGateOptions;
+
+  constructor(opts: RateGateOptions = {}) {
+    this.#opts = opts;
+    this.#rpm = opts.rpm;
+    this.#explicit = opts.rpm !== undefined;
+    this.#now = opts.now ?? Date.now;
+  }
+
+  /** 当前的每分钟请求数上限；undefined 表示不限 */
+  get rpm(): number | undefined {
+    return this.#rpm;
+  }
+
+  /** 等到可以发下一个请求，并记下这个请求。排队的请求按先来后到 */
+  acquire(signal: AbortSignal): Promise<void> {
+    const turn = this.#queue.then(async () => {
+      signal.throwIfAborted();
+      for (let wait = this.#delay(); wait > 0; wait = this.#delay()) {
+        this.#opts.onWait?.(wait);
+        await sleep(wait, signal);
+      }
+      this.#sent.push(this.#now());
+    });
+    this.#queue = turn.catch(() => {});
+    // 排队时被取消的也要立即返回（I-9）；轮到它时看到已取消，不会记成发出了请求
+    return new Promise((resolve, reject) => {
+      const stop = () => reject(signal.reason);
+      if (signal.aborted) return stop();
+      signal.addEventListener("abort", stop, { once: true });
+      turn.then(resolve, reject).finally(() => signal.removeEventListener("abort", stop));
+    });
+  }
+
+  /**
+   * 被限流了：ms 内不再发请求。没设上限时，按最近一分钟发出的请求数推一个上限（比它少一个）；
+   * 一分钟里只发了一两个请求就被限流，多半是服务端繁忙，不是请求太多，不推
+   */
+  limited(ms: number) {
+    const now = this.#now();
+    this.#until = Math.max(this.#until, now + ms);
+    if (this.#explicit) return;
+    const recent = this.#recent(now);
+    if (recent < 3) return;
+    const next = recent - 1;
+    if (this.#rpm === undefined || next < this.#rpm) {
+      this.#rpm = next;
+      this.#opts.onLearn?.(next);
+    }
+  }
+
+  #recent(now: number): number {
+    this.#sent = this.#sent.filter((t) => now - t < 60_000);
+    return this.#sent.length;
+  }
+
+  #delay(): number {
+    const now = this.#now();
+    this.#recent(now);
+    let wait = this.#until - now;
+    const last = this.#sent.at(-1);
+    if (this.#rpm !== undefined && last !== undefined) wait = Math.max(wait, last + 60_000 / this.#rpm - now);
+    return Math.ceil(wait);
+  }
 }
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
@@ -75,6 +180,15 @@ export const EFFORTS: Record<ProviderKind, readonly string[] | undefined> = {
   openai: ["minimal", "low", "medium", "high"],
   "openai-compat": undefined,
 };
+
+/** JADE_RPM：每分钟最多发几个模型请求（免费模型常按这个限流）；不设时不主动限速 */
+export function rpmFromEnv(env: Env = process.env): number | undefined {
+  const text = env.JADE_RPM?.trim();
+  if (!text) return undefined;
+  const n = Number(text);
+  if (!Number.isFinite(n) || n <= 0) throw new Error(`JADE_RPM must be a positive number of requests per minute, got ${JSON.stringify(text)}`);
+  return n;
+}
 
 /** JADE_EFFORT；不设时 Claude 用 high，OpenAI 用服务端默认值 */
 export function effortFromEnv(env: Env = process.env): string | undefined {
@@ -123,12 +237,15 @@ export function providerInfo(env: Env = process.env): ProviderInfo {
  * - anthropic：Claude，ANTHROPIC_API_KEY，可选 ANTHROPIC_MODEL
  * JADE_MAX_TOKENS 是每次回复的输出上限。不设时 Claude 用 64000，其他服务用服务端默认值（有的只有 4096，思考很容易用完）
  * JADE_EFFORT 是思考的力度，见 effortFromEnv
+ * JADE_RPM 是每分钟最多发几个请求，见 rpmFromEnv（限速在 withRetry 的 gate 里做）
  * 只导入用到的那个服务的包：Anthropic 的 SDK 加载要一百多毫秒，拖慢启动
  */
 export async function providerFromEnv(env: Env = process.env): Promise<Provider> {
   const kind = providerKind(env);
   const maxTokens = env.JADE_MAX_TOKENS ? parseTokens("JADE_MAX_TOKENS", env.JADE_MAX_TOKENS) : undefined;
   const effort = effortFromEnv(env);
+  // 写错时在这里就报错，不等到第一次请求
+  rpmFromEnv(env);
   if (kind === "openai") {
     if (!env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is required for the openai provider");
     const { openaiResponsesProvider } = await import("@uncarved/provider-openai-responses");
