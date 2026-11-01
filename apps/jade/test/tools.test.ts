@@ -3,7 +3,7 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { ProviderError, type Block, type Message, type Provider, type Tool, type ToolContext } from "uncarved";
-import { estimateTokens, fsTools, htmlToMarkdown, isPrivateHost, isRateLimit, nearMiss, RateGate, RETRY_DELAYS_MS, rpmFromEnv, webTools, withRetry } from "../src/index.ts";
+import { estimateTokens, fsTools, htmlToMarkdown, isConcurrencyLimit, isPrivateHost, isRateLimit, nearMiss, RateGate, RETRY_DELAYS_MS, rpmFromEnv, webTools, withRetry } from "../src/index.ts";
 
 // ---------- 辅助 ----------
 
@@ -341,6 +341,20 @@ test("RateGate spaces requests by the limit and pauses everyone after a 429", as
   expect(isRateLimit(new ProviderError("stream error: Rate limit exceeded: free-models-per-min", { retryable: true }))).toBe(true);
   expect(isRateLimit(new ProviderError("HTTP 429: slow down", { retryable: true }))).toBe(true);
   expect(isRateLimit(new ProviderError("HTTP 500: oops (id 14290)", { retryable: true, status: 500 }))).toBe(false);
+  // 并发数限流：一起暂停，但不推每分钟的上限
+  const busyWaits: number[] = [];
+  const busy = new RateGate({ now: () => now, onWait: (ms) => busyWaits.push(ms) });
+  for (let i = 0; i < 10; i++) await busy.acquire(signal);
+  const concurrency = new ProviderError("HTTP 429: Model is at its concurrency limit (32); please retry later", { retryable: true, status: 429 });
+  expect(isConcurrencyLimit(concurrency)).toBe(true);
+  busy.limited(5_000, { learn: !isConcurrencyLimit(concurrency) });
+  expect(busy.rpm).toBeUndefined();
+  const stopBusy = new AbortController();
+  const paused = busy.acquire(stopBusy.signal);
+  await new Promise((r) => setTimeout(r, 5));
+  expect(busyWaits).toEqual([5_000]);
+  stopBusy.abort(new Error("done"));
+  await expect(paused).rejects.toThrow("done");
   expect(rpmFromEnv({ JADE_RPM: "20" })).toBe(20);
   expect(() => rpmFromEnv({ JADE_RPM: "fast" })).toThrow("JADE_RPM");
 });

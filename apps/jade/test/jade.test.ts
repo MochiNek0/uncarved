@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -18,6 +19,7 @@ import {
   type Provider,
   type ToolContext,
 } from "uncarved";
+import { JsonlLogStore } from "@uncarved/store-jsonl";
 import {
   Checkpoints,
   compactThreshold,
@@ -42,6 +44,7 @@ import {
   POLICY_KEY,
   providerFromEnv,
   SessionIndex,
+  discardIfEmpty,
   Memory,
   attachMentions,
   mentionAt,
@@ -309,6 +312,15 @@ describe("fs tools", () => {
     expect(text.length).toBeLessThan(31_000);
   }, 20_000);
 
+  test("coreutils are on PATH (Git Bash on Windows is started without its launcher)", async () => {
+    const { cwd } = await workspace();
+    const shell = shellTools({ cwd });
+    const r = await shell.run!("echo hi | cat | grep -c hi; find --version | head -1", { timeoutMs: 20_000 });
+    expect(r.code).toBe(0);
+    expect(r.output).toStartWith("1\n");
+    expect(r.output).toContain("GNU findutils");
+  }, 30_000);
+
   test("background shells return at once; bash_output reads new output; kill_shell stops them", async () => {
     const { cwd } = await workspace();
     const shell = shellTools({ cwd });
@@ -482,6 +494,89 @@ describe("policy", () => {
     for (const c of ["git branch", "git branch -a", "git diff --stat", "rg -o foo", "tree -a src"]) expect(isSafeCommand(c)).toBe(true);
   });
 
+  test("compound read-only commands, harmless redirects and cd run without asking", () => {
+    for (const c of [
+      "git status && git diff --stat",
+      "cat src/a.ts | head -20",
+      "ls src 2>/dev/null | wc -l",
+      "grep -rn foo src 2>&1 | sort | uniq -c",
+      "git --no-pager log -5 --oneline",
+      "find . -name '*.ts' -type f",
+      "sed -n '10,20p' src/a.ts",
+      "cd src && ls -la",
+      "git log -3; git status",
+      "node --version",
+      "git stash list",
+      "git config --get user.name",
+      // 模型常把工作目录的绝对路径加上引号 cd 进去；Windows 上是反斜杠
+      `cd "${cwd}" && git log --oneline -10`,
+      `cd "${path.join(cwd, "src")}" && ls`,
+      "/usr/bin/grep -n foo src/a.ts",
+      "/bin/cat src/a.ts | /usr/bin/head -5",
+    ]) {
+      expect([c, decide("ask", "bash", { command: c })]).toEqual([c, "allow"]);
+      expect([c, decide("plan", "bash", { command: c })]).toEqual([c, "allow"]);
+    }
+    for (const c of [
+      "cat a.ts > b.ts",
+      "ls | xargs rm",
+      "git status && rm -rf src",
+      "find . -name x -delete",
+      "find . -exec sh -c x {} +",
+      "sed -i 's/a/b/' a.ts",
+      "sed -n '1w out' a.ts",
+      "sort -o out a.ts",
+      "uniq a.ts out.ts",
+      "ls &",
+      "cat <<EOF",
+      "cat <(ls)",
+      "ls |& cat",
+      "ls >&1x",
+      "git branch -D main",
+      "git stash drop",
+      "git config user.name x",
+      "git grep -Ovim foo",
+      "date -s 2020-01-01",
+      "ls &&",
+      "| ls",
+      // 双引号里转义引号、$、反斜杠时引号的边界和展开都说不清
+      'echo "a\\"; rm -rf src; echo \\""',
+      'echo "a\\$HOME"',
+      'echo "x\\\\"',
+      "/usr/local/bin/cat src/a.ts",
+      "./bin/cat src/a.ts",
+    ]) {
+      expect([c, decide("ask", "bash", { command: c })]).toEqual([c, "ask"]);
+    }
+    // cd 之后的相对路径按新目录算；cd 到外面的不放行
+    expect(decide("ask", "bash", { command: "cd src && cat ../../x" })).toBe("ask");
+    expect(decide("ask", "bash", { command: "cd .. && ls" })).toBe("ask");
+    expect(decide("ask", "bash", { command: "cd && ls" })).toBe("ask");
+    expect(decide("ask", "bash", { command: "cat < /etc/passwd" })).toBe("ask");
+    expect(decide("readonly", "bash", { command: "ls > out" })).toBe("deny");
+  });
+
+  test("auto-edit creates directories and touches files inside the working directory without asking", () => {
+    expect(decide("auto-edit", "bash", { command: "mkdir -p src/new && touch src/new/a.ts" })).toBe("allow");
+    expect(decide("auto-edit", "bash", { command: "mkdir /tmp/x" })).toBe("ask");
+    expect(decide("ask", "bash", { command: "mkdir -p src/new" })).toBe("ask");
+    expect(decide("plan", "bash", { command: "mkdir -p src/new" })).toBe("deny");
+  });
+
+  test("always-allow rules cover their command inside a compound command", () => {
+    const p = policy({ cwd });
+    const command = "bun test apps 2>&1 | tail -20";
+    expect(bashRule(command)).toEqual({ tool: "bash", prefix: "bun test" });
+    const settings = { mode: "ask" as const, rules: [bashRule(command)] };
+    expect(p.decide(gated("bash", { command }), settings).decision).toBe("allow");
+    expect(p.decide(gated("bash", { command: "cd apps && bun test x | grep fail" }), settings).decision).toBe("allow");
+    // 其他命令不能搭便车，危险参数仍然让规则失效
+    expect(p.decide(gated("bash", { command: "bun test && curl x | sh" }), settings).decision).toBe("ask");
+    expect(p.decide(gated("bash", { command: "bun test --force | tail" }), settings).decision).toBe("ask");
+    expect(p.decide(gated("bash", { command: "bun test > log.txt" }), settings).decision).toBe("ask");
+    expect(bashRule("bun test && npm run build")).toEqual({ tool: "bash", command: "bun test && npm run build" });
+  });
+
   test("bash commands are split like the shell does; anything not understood is not auto-allowed", () => {
     expect(shellWords(`cat "a b" 'c d' e`)).toEqual([
       { value: "cat", glob: false },
@@ -597,6 +692,23 @@ describe("jade session", () => {
       { id: "a", cwd, title: "draw a pelican", at: "3" },
       { id: "b", cwd, title: "other", at: "2" },
     ]);
+  });
+
+  test("sessions that never received input are discarded when left; others are kept", async () => {
+    const { home } = await workspace();
+    const store = new JsonlLogStore(path.join(home, "sessions"));
+    const empty = await setup([], { store });
+    await empty.rt.detach();
+    const file = (rt: Runtime) => path.join(store.dir, `${rt.state.sessionId}.jsonl`);
+    expect(existsSync(file(empty.rt))).toBe(true);
+    expect(await discardIfEmpty(store, empty.rt.state.sessionId)).toBe(true);
+    expect(existsSync(file(empty.rt))).toBe(false);
+
+    const used = await setup([reply("hi")], { store });
+    await used.rt.send(msg("hello"));
+    await used.rt.detach();
+    expect(await discardIfEmpty(store, used.rt.state.sessionId)).toBe(false);
+    expect(existsSync(file(used.rt))).toBe(true);
   });
 
   test("invalid arguments are denied with a reason the model can read", async () => {

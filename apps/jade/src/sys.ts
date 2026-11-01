@@ -26,6 +26,8 @@ export interface SpawnOptions {
   stderr?: Stdio;
   /** POSIX 上自成进程组，便于连同子进程一起杀掉 */
   detached?: boolean;
+  /** 子进程的环境变量，默认继承 process.env */
+  env?: NodeJS.ProcessEnv;
 }
 
 const EMPTY: AsyncIterable<Uint8Array> = { async *[Symbol.asyncIterator]() {} };
@@ -39,6 +41,7 @@ export function spawn(cmd: string[], opts: SpawnOptions = {}): Promise<Proc> {
     cwd: opts.cwd,
     stdio: ["ignore", opts.stdout ?? "pipe", opts.stderr ?? "pipe"],
     detached: opts.detached ?? false,
+    env: opts.env,
     // Windows 上不弹出控制台窗口
     windowsHide: true,
   });
@@ -68,8 +71,8 @@ export async function run(cmd: string[], opts: { cwd?: string } = {}): Promise<{
 }
 
 /** 同步运行，忽略输出和错误；用于退出前的清理 */
-export function runSync(cmd: string[]): void {
-  nodeSpawnSync(cmd[0]!, cmd.slice(1), { stdio: "ignore", windowsHide: true });
+export function runSync(cmd: string[], opts: { env?: NodeJS.ProcessEnv } = {}): void {
+  nodeSpawnSync(cmd[0]!, cmd.slice(1), { stdio: "ignore", windowsHide: true, env: opts.env });
 }
 
 export async function text(stream: AsyncIterable<Uint8Array>): Promise<string> {

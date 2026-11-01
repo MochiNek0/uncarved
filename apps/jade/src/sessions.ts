@@ -1,8 +1,9 @@
 // 会话索引：LogStore 接口只有 append/read，没有"列出会话"，由发行版自己记一份。
 // 只记顶层会话；子 Agent 的会话通过日志里的 child 引用找到。
 
-import { appendFile, mkdir, readFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rm } from "node:fs/promises";
 import path from "node:path";
+import { readAll, type LogStore } from "uncarved";
 
 export interface SessionEntry {
   id: string;
@@ -45,4 +46,16 @@ export class SessionIndex {
     }
     return [...latest.values()].filter((e) => !cwd || path.resolve(e.cwd) === path.resolve(cwd)).reverse();
   }
+}
+
+/**
+ * 会话从来没收到过输入（打开 jade 什么都没说就退出、/clear 后马上又 /clear）时删掉它的日志，
+ * 否则每次启动都留下一个只有 session.started 和 session.detached 的文件。只认 JsonlLogStore 的布局：dir/<id>.jsonl。
+ * 返回是否删掉了
+ */
+export async function discardIfEmpty(store: LogStore & { dir: string }, sessionId: string): Promise<boolean> {
+  const events = await readAll(store, sessionId);
+  if (events.some((e) => e.type === "input.received")) return false;
+  await rm(path.join(store.dir, `${sessionId}.jsonl`), { force: true });
+  return true;
 }

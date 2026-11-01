@@ -70,12 +70,14 @@ export function shellTools(opts: ShellOptions): ShellTools {
     return { tools: [], unavailable: `${shell} was not found, so the bash tool is disabled; ${hint}`, shutdown() {} };
   }
   const executable = found;
+  const env = shellEnv(executable);
   const background = new Map<string, Background>();
   let nextId = 1;
 
   const spawn = (command: string, cwd = opts.cwd) =>
     spawnProc([executable, "-c", command], {
       cwd,
+      env,
       // 自成进程组，超时/中断时能连同子进程一起杀掉
       detached: process.platform !== "win32",
     });
@@ -130,9 +132,9 @@ export function shellTools(opts: ShellOptions): ShellTools {
       let timedOut = false;
       const timer = setTimeout(() => {
         timedOut = true;
-        killTree(executable, proc.pid);
+        killTree(executable, env, proc.pid);
       }, timeout);
-      const kill = () => killTree(executable, proc.pid);
+      const kill = () => killTree(executable, env, proc.pid);
       signal.addEventListener("abort", kill, { once: true });
       try {
         const [stdout, stderr, code] = await Promise.all([
@@ -201,7 +203,7 @@ export function shellTools(opts: ShellOptions): ShellTools {
       const bg = find(id);
       if (!bg) return unknown(id);
       if (bg.exitCode === undefined) {
-        killTree(executable, bg.proc.pid);
+        killTree(executable, env, bg.proc.pid);
         await bg.proc.exited;
       }
       return { content: `${id} stopped (${status(bg)})` };
@@ -212,7 +214,7 @@ export function shellTools(opts: ShellOptions): ShellTools {
     signal?.throwIfAborted();
     const proc = await spawn(command, cwd);
     let timedOut = false;
-    const kill = () => killTree(executable, proc.pid);
+    const kill = () => killTree(executable, env, proc.pid);
     const timer = setTimeout(() => {
       timedOut = true;
       kill();
@@ -233,7 +235,7 @@ export function shellTools(opts: ShellOptions): ShellTools {
     executable,
     run,
     shutdown() {
-      for (const bg of background.values()) if (bg.exitCode === undefined) killTree(executable, bg.proc.pid);
+      for (const bg of background.values()) if (bg.exitCode === undefined) killTree(executable, env, bg.proc.pid);
     },
   };
 }
@@ -279,16 +281,32 @@ export function findShell(shell: string): string | undefined {
 }
 
 /**
+ * 直接执行 Git 的 usr\bin\bash.exe 时没有经过 bin\bash.exe 启动器，启动器会把 /usr/bin、/mingw64/bin 加进 PATH；
+ * 不补上的话 PATH 里只有 Windows 的目录，cat、grep、head、sed 都找不到，find 还会变成 Windows 的 find.exe。
+ * 不是 Git Bash 时返回 undefined，继承当前环境
+ */
+export function shellEnv(executable: string, env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv | undefined {
+  if (process.platform !== "win32") return undefined;
+  const m = /^(.*\\Git)\\usr\\bin\\(bash|sh)\.exe$/i.exec(executable);
+  if (!m) return undefined;
+  const root = m[1]!;
+  // Windows 的环境变量名不分大小写，展开成普通对象后要沿用原来的键名（通常是 Path），否则会同时出现 Path 和 PATH
+  const key = Object.keys(env).find((k) => k.toUpperCase() === "PATH") ?? "PATH";
+  const dirs = [path.join(root, "usr", "bin"), path.join(root, "mingw64", "bin")];
+  return { ...env, [key]: [...dirs, env[key]].filter(Boolean).join(path.delimiter) };
+}
+
+/**
  * 只杀 shell 本身不够：它启动的子进程还占着 stdout/stderr 管道，读取会一直等到它们退出。
  * POSIX 上杀整个进程组。Windows 上 Git Bash（msys）模拟 fork，Windows 进程树里看不到父子关系，
  * 要先在 msys 里按 WINPID 找到 shell 的 msys PID（它也是进程组号）杀掉整组；taskkill /T 兜底非 msys 的 shell
  */
-function killTree(shell: string, pid: number) {
+function killTree(shell: string, env: NodeJS.ProcessEnv | undefined, pid: number) {
   try {
     if (process.platform !== "win32") return process.kill(-pid, "SIGKILL");
     const script = `for d in /proc/[0-9]*; do [ "$(cat "$d/winpid" 2>/dev/null)" = "${pid}" ] && kill -9 -- "-\${d#/proc/}"; done`;
     try {
-      runSync([shell, "-c", script]);
+      runSync([shell, "-c", script], { env });
     } catch {
       // 不是 msys/cygwin 的 shell
     }

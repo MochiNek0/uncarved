@@ -35,7 +35,7 @@ import { InputHistory } from "./history.ts";
 import { attachMentions, mentionCandidates } from "./mentions.ts";
 import { repoRoot } from "./plugins/prompts.ts";
 import { isRateLimit, providerFromEnv, providerInfo, RateGate, rpmFromEnv, switchable, withRetry } from "./provider.ts";
-import { SessionIndex } from "./sessions.ts";
+import { discardIfEmpty, SessionIndex } from "./sessions.ts";
 import { lastTurnChanges, UNDO_KEY, type Checkpoint, type UndoState } from "./tools/checkpoint.ts";
 import { display } from "./tools/fs.ts";
 import type { ApproveSubagent, SubagentApproval } from "./tools/task.ts";
@@ -787,13 +787,18 @@ function interrupt() {
   }
 }
 
-/** 离开会话但保留它：写入 session.detached，插件的收尾写入完成后再退出（4.2） */
-async function leave() {
+/**
+ * 离开会话但保留它：写入 session.detached，插件的收尾写入完成后再退出（4.2）。
+ * 没收到过输入的会话没什么可恢复的，删掉它的日志；返回会话是否保留了下来
+ */
+async function leave(): Promise<boolean> {
   jade.shutdown();
   try {
     await rt.detach();
+    return !(await discardIfEmpty(store, sessionId));
   } catch (err) {
     screen.log(red(`[error] ${errorText(err)}`));
+    return true;
   }
 }
 
@@ -834,7 +839,7 @@ async function switchSession(id?: string) {
     next.shutdown();
     return screen.log(red(`[error] could not resume ${id}: ${errorText(err)}`));
   }
-  await leave();
+  const kept = await leave();
   const old = sessionId;
   jade = next;
   rt = nextRt;
@@ -846,7 +851,7 @@ async function switchSession(id?: string) {
   pendingRules.length = 0;
   screen.clear();
   screen.status({ session: sessionId, mode: settings().mode, context: undefined, cache: undefined, spent: undefined, speed: undefined });
-  if (!id) return screen.log(dim(`Started a new session. The previous one can be resumed with /resume or: jade --resume ${old}`));
+  if (!id) return screen.log(dim(kept ? `Started a new session. The previous one can be resumed with /resume or: jade --resume ${old}` : "Started a new session."));
   if (!(await resumeSession())) {
     screen.log(dim("Starting a new session instead."));
     await switchSession();
@@ -1166,7 +1171,7 @@ async function command(input: string): Promise<boolean> {
 
 const MODE_HINTS: Record<string, string> = {
   ask: "ask before edits and commands",
-  "auto-edit": "edit files without asking; ask before commands",
+  "auto-edit": "edit files (and mkdir/touch) without asking; ask before other commands",
   yolo: "never ask",
   readonly: "read only, no edits or commands",
   plan: "research read-only and propose a plan; edits start after you approve it",

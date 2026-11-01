@@ -68,17 +68,108 @@ export interface Policy {
   decide(call: GatedToolCall, settings: PolicySettings): GateResult;
 }
 
-/** 只读且没有重定向、管道、命令替换的命令直接放行 */
-const SAFE_COMMANDS = [
-  /^(ls|pwd|cat|head|tail|wc|echo|which|whoami|date|tree|file|stat|du|df)(\s|$)/,
-  /^git\s+(status|diff|log|show|rev-parse|remote\s+-v|blame|ls-files)(\s|$)/,
-  // 带参数的 git branch 可能删除、重命名、创建分支，只放行列出分支的形式
-  /^git\s+branch(\s+(-a|-r|-v|-vv|--all|--remotes|--list|--show-current))*$/,
-  /^(rg|grep)\s/,
-  /^(node|bun|python3?|go|cargo|rustc|tsc)\s+(--version|-v|-V)$/,
-];
 /** 白名单命令里会写文件或执行其他程序的参数 */
-const UNSAFE_ARGS = [/\s--(output|pre|pre-glob|ext-diff|textconv)(=|\s|$)/, /^tree\s(.*\s)?-[a-zA-Z]*o/];
+const UNSAFE_ARGS = [/\s--(output|pre|pre-glob|ext-diff|textconv|open-files-in-pager)(=|\s|$)/];
+
+/** 不管参数是什么都只读的命令（路径另外检查） */
+const READ_ANY = new Set(
+  (
+    "ls pwd cat head tail wc echo printf which whoami file stat du df basename dirname realpath readlink " +
+    "cut tr nl column comm diff cmp md5sum sha1sum sha256sum sha512sum cksum od hexdump strings tac rev fold expand paste join " +
+    "uname id groups true false seq printenv grep egrep fgrep rg jq type"
+  ).split(" "),
+);
+/** 带 --version 之类的参数时只读的命令 */
+const VERSIONED = new Set(
+  "node bun deno python python3 pip pip3 go cargo rustc tsc npm pnpm yarn npx java javac gcc g++ clang make cmake git ruby php dotnet uv".split(" "),
+);
+const VERSION_ARGS = new Set(["--version", "-v", "-V", "version"]);
+/** 只读的 git 子命令；其余的（branch、tag、stash……）要看参数 */
+const GIT_READ = new Set(
+  (
+    "status diff log show blame annotate ls-files shortlog describe rev-parse rev-list merge-base name-rev " +
+    "cat-file ls-tree for-each-ref show-ref count-objects check-ignore grep whatchanged show-branch"
+  ).split(" "),
+);
+/** find 里会删除、写文件或执行程序的表达式 */
+const FIND_UNSAFE = /^-(exec|execdir|ok|okdir|delete|fprint|fprint0|fprintf|fls)$/;
+/** sed -n 只打印行号范围的脚本：10p、10,20p、$p */
+const SED_PRINT = /^(\d+|\$)(,(\d+|\$))?p$/;
+
+const positional = (args: string[]) => args.filter((a) => !a.startsWith("-"));
+const onlyFlags = (args: string[], allowed: string[]) => args.every((a) => allowed.includes(a));
+
+function gitKind(args: string[]): CommandKind | undefined {
+  let i = 0;
+  while (args[i] === "--no-pager") i++;
+  const sub = args[i];
+  const rest = args.slice(i + 1);
+  if (sub === undefined) return undefined;
+  if (VERSION_ARGS.has(sub) && rest.length === 0) return "read";
+  if (GIT_READ.has(sub)) return sub === "grep" && rest.some((a) => /^-[a-zA-Z]*O/.test(a)) ? undefined : "read";
+  // 带参数的 branch、tag 可能删除、重命名、创建，只放行列出的形式
+  if (sub === "branch") return onlyFlags(rest, ["-a", "-r", "-v", "-vv", "--all", "--remotes", "--list", "--show-current"]) ? "read" : undefined;
+  if (sub === "tag") return onlyFlags(rest, ["-l", "--list", "-n"]) ? "read" : undefined;
+  if (sub === "remote") return onlyFlags(rest, ["-v", "--verbose"]) ? "read" : undefined;
+  if (sub === "stash" || sub === "worktree") return rest[0] === "list" || (sub === "stash" && rest[0] === "show") ? "read" : undefined;
+  if (sub === "submodule") return rest[0] === "status" ? "read" : undefined;
+  if (sub === "reflog") return rest.length === 0 || rest[0] === "show" || /^-/.test(rest[0]!) ? "read" : undefined;
+  if (sub === "config") return rest.length > 0 && ["--get", "--get-all", "--get-regexp", "--list", "-l"].includes(rest[0]!) ? "read" : undefined;
+  return undefined;
+}
+
+type CommandKind = "read" | "edit";
+
+/**
+ * 一条简单命令（已分好词）的性质：read 只读；edit 只在工作目录里建目录、碰文件，auto-edit 模式下和改文件一样不问；
+ * undefined 表示不认识或可能有副作用
+ */
+export function commandKind(words: string[]): CommandKind | undefined {
+  const [first, ...args] = words;
+  if (first === undefined) return undefined;
+  // /usr/bin/grep、/bin/cat 就是 grep、cat；别的目录下的同名程序不认
+  const name = first.replace(/^\/(usr\/)?bin\/(?=[^/]+$)/, "");
+  if (UNSAFE_ARGS.some((re) => re.test(` ${args.join(" ")} `))) return undefined;
+  if (name === "git") return gitKind(args);
+  if (VERSIONED.has(name) && args.length === 1 && VERSION_ARGS.has(args[0]!)) return "read";
+  if (READ_ANY.has(name)) {
+    // file -C 会编译并写出 magic 文件
+    if (name === "file" && args.some((a) => /^-[a-zA-Z]*C/.test(a))) return undefined;
+    return "read";
+  }
+  switch (name) {
+    case "tree":
+      return args.some((a) => /^-[a-zA-Z]*o/.test(a)) ? undefined : "read";
+    case "date":
+      return args.some((a) => /^(-[a-zA-Z]*s|--set)/.test(a)) ? undefined : "read";
+    case "hostname":
+      return args.length === 0 ? "read" : undefined;
+    case "sort":
+      return args.some((a) => /^(-[a-zA-Z]*o|--compress-program)/.test(a)) ? undefined : "read";
+    // 第二个位置参数是输出文件
+    case "uniq":
+    case "xxd":
+      return positional(args).length <= 1 ? "read" : undefined;
+    case "find":
+      return args.some((a) => FIND_UNSAFE.test(a)) ? undefined : "read";
+    case "sed": {
+      // 只认 sed -n '10,20p' 文件……：sed 脚本里的 w、e 命令能写文件、执行程序，不去分析
+      const i = args.findIndex((a) => !a.startsWith("-"));
+      const flags = i < 0 ? args : args.slice(0, i);
+      if (i < 0 || !flags.some((f) => ["-n", "--quiet", "--silent"].includes(f))) return undefined;
+      if (!onlyFlags(flags, ["-n", "--quiet", "--silent", "-E", "-r"]) || !SED_PRINT.test(args[i]!)) return undefined;
+      return args.slice(i + 1).some((a) => a.startsWith("-")) ? undefined : "read";
+    }
+    case "npm":
+    case "pnpm":
+    case "yarn":
+      return ["ls", "list", "why"].includes(args[0] ?? "") ? "read" : undefined;
+    case "mkdir":
+    case "touch":
+      return args.length > 0 ? "edit" : undefined;
+  }
+  return undefined;
+}
 
 /** shell 分词后的一个词。glob：含未加引号的通配符，shell 会展开它 */
 interface Word {
@@ -86,21 +177,77 @@ interface Word {
   glob: boolean;
 }
 
+/** 控制符（&& || | ;）、重定向（> <，目标是下一个词）、文件描述符复制（2>&1，无害） */
+type Token = Word | { op: "&&" | "||" | "|" | ";" | ">" | "<" | "dup" };
+
+/** 词结束的位置：空白或操作符 */
+const BOUNDARY = /[\s;&|<>]/;
+
 /**
- * 只认最简单的 shell 语法：空白分隔的词、单引号、不含展开的双引号、未加引号的通配符。
- * 其余一切（重定向、管道、命令替换、变量、花括号展开、转义、注释……）返回 undefined，调用方一律按"不安全"处理，
+ * 只认简单的 shell 语法：空白分隔的词、单引号、不含展开的双引号、未加引号的通配符、
+ * 控制符 && || | ; 和换行、重定向 > >> < &> 和 2>&1。
+ * 其余一切（命令替换、变量、花括号展开、转义、注释、后台 &、here-doc……）返回 undefined，调用方一律按"不安全"处理，
  * 这样判断用的词和 shell 实际看到的参数一致
  */
-export function shellWords(command: string): Word[] | undefined {
-  const words: Word[] = [];
+function tokenize(command: string): Token[] | undefined {
+  const out: Token[] = [];
   let cur: Word | undefined;
+  const flush = () => {
+    if (cur) out.push(cur);
+    cur = undefined;
+  };
   const s = command.trim();
   for (let i = 0; i < s.length; ) {
     const ch = s[i]!;
     if (ch === " " || ch === "\t") {
-      if (cur) words.push(cur);
-      cur = undefined;
+      flush();
       i++;
+      continue;
+    }
+    if (ch === "\n" || ch === ";") {
+      flush();
+      out.push({ op: ";" });
+      i++;
+      continue;
+    }
+    if (ch === "|") {
+      flush();
+      if (s[i + 1] === "&") return undefined;
+      const two = s[i + 1] === "|";
+      out.push({ op: two ? "||" : "|" });
+      i += two ? 2 : 1;
+      continue;
+    }
+    if (ch === "&") {
+      flush();
+      if (s[i + 1] === "&") {
+        out.push({ op: "&&" });
+        i += 2;
+        continue;
+      }
+      // &> 和 &>>：stdout、stderr 一起重定向
+      if (s[i + 1] !== ">") return undefined;
+      i += s[i + 2] === ">" ? 3 : 2;
+      if (s[i] === "(" || s[i] === "&") return undefined;
+      out.push({ op: ">" });
+      continue;
+    }
+    if (ch === ">" || ch === "<") {
+      // 紧挨在前面的一位数字是文件描述符（2>），其他的词先结束
+      if (cur && /^\d$/.test(cur.value)) cur = undefined;
+      else flush();
+      i++;
+      if (ch === "<" && (s[i] === "<" || s[i] === "(" || s[i] === ">" || s[i] === "&")) return undefined;
+      if (ch === ">" && (s[i] === ">" || s[i] === "|")) i++;
+      if (s[i] === "(") return undefined;
+      if (ch === ">" && s[i] === "&") {
+        const m = /^(\d|-)/.exec(s.slice(i + 1));
+        if (!m || (s[i + 1 + m[0].length] !== undefined && !BOUNDARY.test(s[i + 1 + m[0].length]!))) return undefined;
+        i += 1 + m[0].length;
+        out.push({ op: "dup" });
+        continue;
+      }
+      out.push({ op: ch });
       continue;
     }
     cur ??= { value: "", glob: false };
@@ -108,27 +255,72 @@ export function shellWords(command: string): Word[] | undefined {
       const end = s.indexOf(ch, i + 1);
       if (end < 0) return undefined;
       const inner = s.slice(i + 1, end);
-      if (ch === '"' && /[$`\\!]/.test(inner)) return undefined;
+      // 双引号里的反斜杠只在 $ ` " \ 和换行前面是转义，其他时候原样保留（Windows 路径 "D:\a\b"）；
+      // 末尾的反斜杠转义的是这个引号，引号其实没有结束
+      if (ch === '"' && (/[$`!]/.test(inner) || /\\([$`"\\\n]|$)/.test(inner))) return undefined;
       cur.value += inner;
       i = end + 1;
       continue;
     }
-    if (/[;&|<>`$()\n\r\\{}!#]/.test(ch)) return undefined;
+    if (/[`$()\r\\{}!#]/.test(ch)) return undefined;
     if (/[*?[\]]/.test(ch)) cur.glob = true;
     cur.value += ch;
     i++;
   }
-  if (cur) words.push(cur);
-  return words;
+  flush();
+  return out;
+}
+
+const isWord = (t: Token | undefined): t is Word => t !== undefined && "value" in t;
+
+/** 不含任何操作符的命令分成词；含操作符或分不了词时返回 undefined */
+export function shellWords(command: string): Word[] | undefined {
+  const tokens = tokenize(command);
+  if (!tokens || !tokens.every(isWord)) return undefined;
+  return tokens;
+}
+
+/** 复合命令里的一条简单命令。inputs、outputs：重定向的目标 */
+export interface SimpleCommand {
+  words: Word[];
+  inputs: Word[];
+  outputs: Word[];
+}
+
+/** 把命令按 && || | ; 拆成简单命令；有空命令或分不了词时返回 undefined */
+export function shellCommands(command: string): SimpleCommand[] | undefined {
+  const tokens = tokenize(command);
+  if (!tokens) return undefined;
+  const cmds: SimpleCommand[] = [];
+  let cur: SimpleCommand = { words: [], inputs: [], outputs: [] };
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i]!;
+    if (isWord(t)) cur.words.push(t);
+    else if (t.op === "dup") continue;
+    else if (t.op === ">" || t.op === "<") {
+      const target = tokens[++i];
+      if (!isWord(target)) return undefined;
+      (t.op === ">" ? cur.outputs : cur.inputs).push(target);
+    } else {
+      if (cur.words.length === 0) return undefined;
+      cmds.push(cur);
+      cur = { words: [], inputs: [], outputs: [] };
+    }
+  }
+  if (cur.words.length > 0) cmds.push(cur);
+  // 结尾可以是 ;（或换行），不能是 && || |
+  else if (!(tokens.length > 0 && (tokens.at(-1) as { op?: string }).op === ";")) return undefined;
+  return cmds.length > 0 ? cmds : undefined;
 }
 
 const joined = (words: Word[]) => words.map((w) => w.value).join(" ");
+/** 输出只能丢进 /dev/null：其他重定向会写文件 */
+const quietOutputs = (c: SimpleCommand) => c.outputs.every((w) => !w.glob && w.value === "/dev/null");
 
+/** 每条简单命令都只读（或是 cd），重定向只丢弃输出。不看路径 */
 export function isSafeCommand(command: string): boolean {
-  const words = shellWords(command);
-  if (!words || words.length === 0) return false;
-  const c = joined(words);
-  return SAFE_COMMANDS.some((re) => re.test(c)) && !UNSAFE_ARGS.some((re) => re.test(c));
+  const cmds = shellCommands(command);
+  return !!cmds && cmds.every((c) => quietOutputs(c) && (c.words[0]!.value === "cd" || commandKind(c.words.map((w) => w.value)) === "read"));
 }
 
 /** 这些命令的第二个词后面跟的是要执行的东西（脚本名、子命令），前缀要带上第三个词 */
@@ -142,7 +334,10 @@ const DANGEROUS_ARGS = /^(-f|--force|--force-with-lease|--hard|-D|--delete|--no-
  */
 function matchesPrefix(command: string, prefix: string): boolean {
   const words = shellWords(command);
-  if (!words) return false;
+  return !!words && prefixCovers(words, prefix);
+}
+
+function prefixCovers(words: Word[], prefix: string): boolean {
   const c = joined(words);
   if (c !== prefix && !c.startsWith(prefix + " ")) return false;
   const extra = words.slice(prefix.split(" ").length);
@@ -156,7 +351,11 @@ function matchesPrefix(command: string, prefix: string): boolean {
  */
 export function bashRule(command: string): AllowRule {
   const exact = { tool: "bash", command: command.trim() };
-  const words = shellWords(command)?.map((w) => w.value);
+  // 复合命令里只有一条不是只读命令（"bun test 2>&1 | tail -20"）时，规则取它；关卡对复合命令逐条判断
+  const cmds = shellCommands(command);
+  const unsafe = cmds?.filter((c) => c.words[0]!.value !== "cd" && commandKind(c.words.map((w) => w.value)) !== "read");
+  if (!cmds || !unsafe || unsafe.length !== 1 || !cmds.every(quietOutputs) || unsafe[0]!.inputs.length > 0) return exact;
+  const words = unsafe[0]!.words.map((w) => w.value);
   if (!words || words.length < 2 || words[1]!.startsWith("-") || words.some((w) => DANGEROUS_ARGS.test(w))) return exact;
   const n = RUNNERS.test(words.slice(0, 2).join(" ")) && words.length >= 3 && !words[2]!.startsWith("-") ? 3 : 2;
   return { tool: "bash", prefix: words.slice(0, n).join(" ") };
@@ -195,23 +394,55 @@ export function policy(opts: PolicyOptions): Policy {
   const globEscapes = (pattern: string) => path.isAbsolute(pattern) || pattern.split(/[\\/]/).includes("..");
   /** 以 "." 或 "[" 开头的通配段可能匹配到 ".."（取决于 bash 版本和选项），按越界处理 */
   const mayMatchParent = (value: string) => value.split(/[\\/]/).some((seg) => /^[.[]/.test(seg) && /[*?[]/.test(seg));
+  /** 相对 base 目录的路径 p 指向工作目录之外 */
+  const pathOutside = (base: string, p: string, glob: boolean) =>
+    p.startsWith("~") || !inside(path.resolve(base, p)) || (glob && mayMatchParent(p));
   /**
-   * 命令参数里有指向工作目录之外的路径。选项也要看：--opt=path 的值，以及粘在短选项后面的值（-f/etc/x）。
-   * 分不了词的命令按越界处理
+   * 命令参数里有指向工作目录之外的路径。选项也要看：--opt=path 的值，以及粘在短选项后面的值（-f/etc/x）
    */
-  const argsOutside = (command: string) => {
-    const words = shellWords(command);
-    if (!words) return true;
-    return words.slice(1).some((w) => {
+  const argsOutside = (base: string, words: Word[]) =>
+    words.slice(1).some((w) => {
       const v = w.value;
       const candidates = !v.startsWith("-")
         ? [v]
         : [v.includes("=") ? v.slice(v.indexOf("=") + 1) : "", !v.startsWith("--") && v.length > 2 ? v.slice(2) : ""];
-      return candidates.some(
-        (c) => c !== "" && (c.startsWith("~") || !inside(c) || (w.glob && mayMatchParent(c))),
-      );
+      return candidates.some((c) => c !== "" && pathOutside(base, c, w.glob));
     });
+  /**
+   * 判断一条 bash 命令能不能不问就执行。复合命令（&& || | ;）要求每条简单命令都满足：
+   * 只读命令；edits 时还可以是建目录、碰文件的命令；ruled 时还可以是"总是允许"的规则覆盖的命令。
+   * 输出重定向只能是 /dev/null。cd 到工作目录里的目录后，后面的相对路径按新目录算。
+   * 返回 inside（可以放行）、outside（认识，但碰到了工作目录之外的路径，先问）、undefined（不认识）
+   */
+  const classifyBash = (
+    command: string,
+    { edits, ruled }: { edits: boolean; ruled?: (words: Word[]) => boolean },
+  ): "inside" | "outside" | undefined => {
+    const cmds = shellCommands(command);
+    if (!cmds) return undefined;
+    let base = opts.cwd;
+    let outside = false;
+    for (const c of cmds) {
+      if (!quietOutputs(c) || c.words[0]!.glob) return undefined;
+      if (c.inputs.some((w) => w.value !== "/dev/null" && pathOutside(base, w.value, w.glob))) outside = true;
+      if (c.words[0]!.value === "cd") {
+        const target = c.words[1];
+        // 不带参数的 cd 回到 home；cd 到外面以后，后面的相对路径都说不清了
+        if (!target || c.words.length > 2 || target.glob || target.value.startsWith("-") || pathOutside(base, target.value, false)) return undefined;
+        base = path.resolve(base, target.value);
+        continue;
+      }
+      // 规则覆盖的命令和原来的前缀规则一样不看路径
+      if (ruled?.(c.words)) continue;
+      const kind = commandKind(c.words.map((w) => w.value));
+      if (!kind || (kind === "edit" && !edits)) return undefined;
+      if (argsOutside(base, c.words)) outside = true;
+    }
+    return outside ? "outside" : "inside";
   };
+  /** 把 classifyBash 的结果变成决定 */
+  const bashGate = (r: "inside" | "outside" | undefined): GateResult | undefined =>
+    r === undefined ? undefined : { decision: r === "outside" ? "ask" : "allow" };
 
   const self: Policy = {
     settings(derived) {
@@ -258,10 +489,17 @@ export function policy(opts: PolicyOptions): Policy {
         if (r.host !== undefined) return network && hostOf(input.url!) === r.host;
         return !outside;
       };
-      const ruled = [...rules, ...(opts.rules?.() ?? [])].some(covers);
-      // 只读命令也要和 read_file 一样：读工作目录之外的东西先问
-      const safeBash = call.name === "bash" && isSafeCommand(input.command ?? "");
-      const safeDecision = (): GateResult => ({ decision: argsOutside(input.command ?? "") ? "ask" : "allow" });
+      const allRules = [...rules, ...(opts.rules?.() ?? [])];
+      const ruled = allRules.some(covers);
+      /** 复合命令里的一条简单命令被 bash 规则覆盖 */
+      const ruledWords = (words: Word[]) =>
+        allRules.some(
+          (r) =>
+            r.tool === "bash" &&
+            ((r.command !== undefined && joined(words) === r.command) || (r.prefix !== undefined && prefixCovers(words, r.prefix))),
+        );
+      const isBash = call.name === "bash";
+      const command = input.command ?? "";
 
       if (tool.effect === "read") {
         const readable =
@@ -272,7 +510,9 @@ export function policy(opts: PolicyOptions): Policy {
       }
       // plan：和 readonly 一样不改任何东西，只是拒绝的理由告诉模型先给出计划
       if (mode === "readonly" || mode === "plan") {
-        if (safeBash) return safeDecision();
+        // 只读命令也要和 read_file 一样：读工作目录之外的东西先问
+        const gate = isBash ? bashGate(classifyBash(command, { edits: false })) : undefined;
+        if (gate) return gate;
         return {
           decision: "deny",
           reason:
@@ -284,8 +524,8 @@ export function policy(opts: PolicyOptions): Policy {
       if (mode === "yolo" || ruled) return { decision: "allow" };
       if (tool.effect === "write") return { decision: mode === "auto-edit" && !outside ? "allow" : "ask" };
       // external
-      if (safeBash) return safeDecision();
-      return { decision: "ask" };
+      const gate = isBash ? bashGate(classifyBash(command, { edits: mode === "auto-edit", ruled: ruledWords })) : undefined;
+      return gate ?? { decision: "ask" };
     },
     plugin: {
       id,
