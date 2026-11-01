@@ -171,6 +171,8 @@ async function environment(opts: PromptsOptions): Promise<string> {
     `- Working directory: ${opts.cwd}`,
     `- Platform: ${process.platform} (${os.release()})`,
     ...(opts.shell ? [`- Shell for the bash tool: ${opts.shell} (POSIX syntax, also on Windows)`] : []),
+    // 模型常用 xdg-open、open 打开文件，Git Bash 里没有；start 是 Git 自带的 /usr/bin/start
+    ...(opts.shell && process.platform === "win32" ? ['- To open a file or URL for the user, run: start "" <path-or-url> (xdg-open and open do not exist)'] : []),
     ...(opts.role !== "subagent" ? [`- Web tools: ${opts.web?.length ? opts.web.join(", ") : "none (web_search needs TAVILY_API_KEY)"}`] : []),
     `- Today: ${opts.today ?? new Date().toISOString().slice(0, 10)}`,
   ];

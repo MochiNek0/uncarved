@@ -64,7 +64,8 @@ jade plugin <命令>         # 安装、更新、卸载、停用插件，见下�
 
 会话里输入 `/` 可以看到全部命令，常用的有 `/model`、`/mode`、`/undo`、`/compact`、`/resume`、`/memory`。`@` 引用文件，`esc` 中断，连按两次 `ctrl+c` 退出。jade 工作时可以继续输入，消息会排队，当前这一轮结束后发送。
 
-- **权限模式**：`ask`（默认，改动和命令先问）、`auto-edit`（直接改文件，命令先问）、`plan`（只读调研并给出计划，你批准后切到 `auto-edit` 或 `ask` 开始执行）、`yolo`、`readonly`。`shift+tab` 在 ask → auto-edit → plan 之间切换。
+- **权限模式**：`ask`（默认，改动和命令先问）、`auto-edit`（直接改文件，`mkdir`、`touch` 也不问，其他命令先问）、`plan`（只读调研并给出计划，你批准后切到 `auto-edit` 或 `ask` 开始执行）、`yolo`、`readonly`。`shift+tab` 在 ask → auto-edit → plan 之间切换。
+- **自动放行的命令**：只读命令（`ls`、`cat`、`grep`/`rg`、`find`（不带 `-exec`/`-delete`）、`sed -n '10,20p'`、`git status/diff/log/show/…`、`--version` 等）在所有模式下（包括 plan、readonly）都不问，包括用 `&&`、`||`、`|`、`;` 连起来的命令、`2>&1`、`>/dev/null` 和 `cd 子目录 && …`。碰到工作目录之外的路径、写文件的重定向或不认识的语法时照常先问。"总是允许"某条命令后，它出现在复合命令里（`bun test 2>&1 | tail -20`）也不再问。
 - **审批**：修改文件时显示带行号和上下文的 diff；`write_file` 覆盖已有文件时显示和原内容的差异。
 - **撤销**：`/undo` 恢复上一轮里改过的所有文件，再执行一次继续往前撤销。
 - **上下文**：不设 `JADE_CONTEXT_WINDOW` 时按模型名推断窗口，认不出的按 128000 算；请求因为超长被拒时会自动压缩历史再重试一次。状态栏显示上下文用量、自动压缩的阈值、输出速度（tok/s）和本会话累计的 token。
