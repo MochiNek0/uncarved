@@ -13,6 +13,7 @@ import path from "node:path";
 import type { Block, Tool } from "uncarved";
 import { sha256, type Checkpoints } from "./checkpoint.ts";
 import { grepTool } from "./grep.ts";
+import { globMatcher, run } from "../sys.ts";
 
 const MAX_LINES = 2000;
 const MAX_LINE_CHARS = 2000;
@@ -300,11 +301,11 @@ export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
       const root = at(p);
       const out: string[] = [];
       let more = false;
-      const glob = new Bun.Glob(pattern);
+      const match = globMatcher(pattern);
       const tracked = await gitFiles(root);
       const candidates = tracked
-        ? filterAsync(tracked, async (rel) => glob.match(rel) && Boolean((await statOrUndefined(path.join(root, rel)))?.isFile()))
-        : glob.scan({ cwd: root, onlyFiles: true });
+        ? filterAsync(tracked, async (rel) => match(rel) && Boolean((await statOrUndefined(path.join(root, rel)))?.isFile()))
+        : scanGlob(root, match, signal);
       for await (const rel of candidates) {
         signal.throwIfAborted();
         if (rel.split(/[\\/]/).some((seg) => SKIP_DIRS.has(seg))) continue;
@@ -388,13 +389,7 @@ export const statOrUndefined = (full: string) => stat(full).catch(() => undefine
  */
 async function gitFiles(root: string): Promise<string[] | undefined> {
   try {
-    const proc = Bun.spawn(["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"], {
-      cwd: root,
-      stdin: "ignore",
-      stdout: "pipe",
-      stderr: "ignore",
-    });
-    const [out, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    const { code, stdout: out } = await run(["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"], { cwd: root });
     if (code !== 0) return undefined;
     // 合并冲突中的文件会出现多次
     return [...new Set(out.split("\0").filter(Boolean))];
@@ -407,6 +402,15 @@ export async function listFiles(root: string, signal: AbortSignal): Promise<Iter
   const tracked = await gitFiles(root);
   if (!tracked) return walk(root, signal);
   return tracked.filter((rel) => !rel.split("/").some((seg) => SKIP_DIRS.has(seg))).map((rel) => path.join(root, rel));
+}
+
+/** 不在 git 仓库里时的 glob：遍历目录，跳过隐藏文件和目录（和原先 Bun.Glob#scan 的默认行为一致），产出相对路径 */
+async function* scanGlob(root: string, match: (rel: string) => boolean, signal: AbortSignal): AsyncIterable<string> {
+  for await (const full of walk(root, signal)) {
+    const rel = path.relative(root, full).split(path.sep).join("/");
+    if (rel.split("/").some((seg) => seg.startsWith("."))) continue;
+    if (match(rel)) yield rel;
+  }
 }
 
 async function* filterAsync<T>(items: Iterable<T>, keep: (item: T) => Promise<boolean>): AsyncIterable<T> {

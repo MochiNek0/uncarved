@@ -5,8 +5,8 @@
 
 import { existsSync } from "node:fs";
 import path from "node:path";
-import type { Subprocess } from "bun";
 import type { Tool } from "uncarved";
+import { runSync, spawn as spawnProc, which, type Proc } from "../sys.ts";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_TIMEOUT_MS = 600_000;
@@ -53,7 +53,7 @@ export function shellTool(opts: ShellOptions): Tool {
 interface Background {
   id: string;
   command: string;
-  proc: Subprocess<"ignore", "pipe", "pipe">;
+  proc: Proc;
   /** 还没被 bash_output 读走的输出 */
   unread: string;
   /** 因超出缓存而丢弃的字符数，下次读取时告诉模型 */
@@ -74,18 +74,15 @@ export function shellTools(opts: ShellOptions): ShellTools {
   let nextId = 1;
 
   const spawn = (command: string, cwd = opts.cwd) =>
-    Bun.spawn([executable, "-c", command], {
+    spawnProc([executable, "-c", command], {
       cwd,
-      stdin: "ignore",
-      stdout: "pipe",
-      stderr: "pipe",
       // 自成进程组，超时/中断时能连同子进程一起杀掉
       detached: process.platform !== "win32",
     });
 
-  function startBackground(command: string): string {
+  async function startBackground(command: string): Promise<string> {
     const id = `bg${nextId++}`;
-    const bg: Background = { id, command, proc: spawn(command), unread: "", dropped: 0 };
+    const bg: Background = { id, command, proc: await spawn(command), unread: "", dropped: 0 };
     const append = (text: string) => {
       bg.unread += text;
       if (bg.unread.length > MAX_BUFFER_CHARS) {
@@ -125,11 +122,11 @@ export function shellTools(opts: ShellOptions): ShellTools {
     async execute(input, { signal, progress }) {
       const { command, timeout_ms, run_in_background } = input as { command: string; timeout_ms?: number; run_in_background?: boolean };
       if (run_in_background) {
-        const id = startBackground(command);
+        const id = await startBackground(command);
         return { content: `Started background shell ${id}. Read its output with bash_output, stop it with kill_shell.` };
       }
       const timeout = Math.min(Math.max(timeout_ms ?? DEFAULT_TIMEOUT_MS, 1000), MAX_TIMEOUT_MS);
-      const proc = spawn(command);
+      const proc = await spawn(command);
       let timedOut = false;
       const timer = setTimeout(() => {
         timedOut = true;
@@ -213,7 +210,7 @@ export function shellTools(opts: ShellOptions): ShellTools {
 
   const run: RunCommand = async (command, { cwd, timeoutMs, signal }) => {
     signal?.throwIfAborted();
-    const proc = spawn(command, cwd);
+    const proc = await spawn(command, cwd);
     let timedOut = false;
     const kill = () => killTree(executable, proc.pid);
     const timer = setTimeout(() => {
@@ -258,7 +255,7 @@ export interface ShellProgress {
  * Git Bash 优先于 PATH 里别的 bash（例如 System32\bash.exe 是 WSL 的启动器，看不到 Windows 路径）
  */
 export function findShell(shell: string): string | undefined {
-  const found = Bun.which(shell) ?? undefined;
+  const found = which(shell);
   if (process.platform !== "win32") return found;
   const name = /^(bash|sh)(\.exe)?$/i.exec(shell)?.[1]?.toLowerCase();
   if (!name) return found;
@@ -269,7 +266,7 @@ export function findShell(shell: string): string | undefined {
   const m = /^(.*\\Git)\\(usr\\)?bin\\(bash|sh)\.exe$/i.exec(found ?? "");
   if (m) return inGit(m[1]!) ?? found;
   // git.exe 在 Git\cmd、Git\bin 或 Git\mingw64\bin 下
-  const git = Bun.which("git");
+  const git = which("git");
   const roots = git ? [path.dirname(path.dirname(git)), path.dirname(path.dirname(path.dirname(git)))] : [];
   for (const base of [process.env.ProgramFiles, process.env["ProgramFiles(x86)"], process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, "Programs")]) {
     if (base) roots.push(path.join(base, "Git"));
@@ -291,11 +288,11 @@ function killTree(shell: string, pid: number) {
     if (process.platform !== "win32") return process.kill(-pid, "SIGKILL");
     const script = `for d in /proc/[0-9]*; do [ "$(cat "$d/winpid" 2>/dev/null)" = "${pid}" ] && kill -9 -- "-\${d#/proc/}"; done`;
     try {
-      Bun.spawnSync([shell, "-c", script], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+      runSync([shell, "-c", script]);
     } catch {
       // 不是 msys/cygwin 的 shell
     }
-    Bun.spawnSync(["taskkill", "/T", "/F", "/PID", String(pid)], { stdout: "ignore", stderr: "ignore" });
+    runSync(["taskkill", "/T", "/F", "/PID", String(pid)]);
   } catch {
     // 已经退出
   }
@@ -305,7 +302,7 @@ function killTree(shell: string, pid: number) {
  * 返回截好的输出：超过 MAX_OUTPUT_CHARS 时保留开头和结尾各一半，中间截掉。
  * 边读边截，输出再多也只占几倍 MAX_OUTPUT_CHARS 的内存。keep 为 false 时只推给 onChunk，不累积，返回空串
  */
-async function collect(stream: ReadableStream<Uint8Array>, onChunk: (text: string) => void, keep = true): Promise<string> {
+async function collect(stream: AsyncIterable<Uint8Array>, onChunk: (text: string) => void, keep = true): Promise<string> {
   const half = MAX_OUTPUT_CHARS / 2;
   const decoder = new TextDecoder();
   let head = "";

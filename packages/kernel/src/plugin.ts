@@ -5,7 +5,7 @@ import { checkRemoteHook, isRemote } from "./remote.ts";
 import type { PluginManifestEntry, ResumePolicy, Tool } from "./types.ts";
 
 /** 与 package.json 的 version 保持一致，插件用 semver 的 ^ 范围声明兼容的内核版本 */
-export const KERNEL_VERSION = "0.1.0";
+export const KERNEL_VERSION = "0.1.1";
 
 /** 内核提供的能力：每个扩展点一项（`<种类>:<扩展点>`），外加插件写入日志的能力 */
 export const CAPABILITIES: ReadonlySet<string> = new Set([

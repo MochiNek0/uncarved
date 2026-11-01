@@ -28,18 +28,20 @@
         "@uncarved/provider-openai-responses": "workspace:*",
         "@uncarved/store-jsonl": "workspace:*",
         "ink": "7.1.1",
+        "picomatch": "^4.0.3",
         "react": "^19.2.0",
         "string-width": "^8.2.0",
         "uncarved": "workspace:*",
         "wrap-ansi": "^10.0.2",
       },
       "devDependencies": {
+        "@types/picomatch": "^4.0.2",
         "@types/react": "^19.2.0",
       },
     },
     "packages/kernel": {
       "name": "uncarved",
-      "version": "0.1.0",
+      "version": "0.1.1",
     },
     "packages/plugin-stdio": {
       "name": "@uncarved/plugin-stdio",
@@ -50,7 +52,7 @@
     },
     "packages/provider-anthropic": {
       "name": "@uncarved/provider-anthropic",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "dependencies": {
         "@anthropic-ai/sdk": "^1.3.0",
       },
@@ -60,14 +62,14 @@
     },
     "packages/provider-openai-compat": {
       "name": "@uncarved/provider-openai-compat",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "peerDependencies": {
         "uncarved": "workspace:^",
       },
     },
     "packages/provider-openai-responses": {
       "name": "@uncarved/provider-openai-responses",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "peerDependencies": {
         "uncarved": "workspace:^",
       },
@@ -94,6 +96,8 @@
     "@types/bun": ["@types/bun@1.4.4", "https://registry.npmmirror.com/@types/bun/-/bun-1.4.4.tgz", { "dependencies": { "bun-types": "1.4.4" } }, "sha512-9wkRDXUXK124pEnAutE6n/l18j+i9GC5IAHK8TmX/2nlySETmky0OU6yL5U8pW1AoKh++AN9auDCr647BfurjQ=="],
 
     "@types/node": ["@types/node@26.6.6", "https://registry.npmmirror.com/@types/node/-/node-26.6.6.tgz", { "dependencies": { "undici-types": "~8.9.0" } }, "sha512-MzQj+8Kx3XI40OmUAE6Qoh58ZMNstNNMwn2nfd3qWsfe7nDNSqJNzes4njhz6AHwrSHOffSLwXU6yb474Q4aog=="],
+
+    "@types/picomatch": ["@types/picomatch@4.0.3", "https://registry.npmmirror.com/@types/picomatch/-/picomatch-4.0.3.tgz", {}, "sha512-iG0T6+nYJ9FAPmx9SsUlnwcq1ZVRuCXcVEvWnntoPlrOpwtSTKNDC9uVAxTsC3PUvJ+99n4RpAcNgBbHX3JSnQ=="],
 
     "@types/react": ["@types/react@19.3.0", "https://registry.npmmirror.com/@types/react/-/react-19.3.0.tgz", { "dependencies": { "csstype": "^3.2.2" } }, "sha512-N0rFCuH9YoxG9/m61l9MfpJKfmLOVU0em7ipIz6TRgSSkvReLB9vL85GB+yr8Bs5leqpvg96JSwF4ZS1s4viQg=="],
 
@@ -198,6 +202,8 @@
     "onetime": ["onetime@5.1.2", "https://registry.npmmirror.com/onetime/-/onetime-5.1.2.tgz", { "dependencies": { "mimic-fn": "^2.1.0" } }, "sha512-kbpaSSGJTWdAY5KPVeMOKXSrPtr8C8C7wodJbcsd51jRnmD+GZu8Y0VoU6Dm5Z4vWr0Ig/1NKuWRKf7j5aaYSg=="],
 
     "patch-console": ["patch-console@2.0.0", "https://registry.npmmirror.com/patch-console/-/patch-console-2.0.0.tgz", {}, "sha512-0YNdUceMdaQwoKce1gatDScmMo5pu/tfABfnzEqeG0gtTmd7mh/WcwgUjtAeOU7N8nFFlbQBnFK2gXW5fGvmMA=="],
+
+    "picomatch": ["picomatch@4.0.7", "https://registry.npmmirror.com/picomatch/-/picomatch-4.0.7.tgz", {}, "sha512-qcJu88Q2IWqJsDD529JKMdwGm/dvInW4HvQnRwiH9JtihJvzGOscDtHE3x1pBKeUOTysQ8kVmLnJ2kJu7yhcGA=="],
 
     "react": ["react@19.3.1", "https://registry.npmmirror.com/react/-/react-19.3.1.tgz", {}, "sha512-QNhWdt7nrgVWWQG58QuGsAR3jv3Hbe4mb4vz7w2csnHavciZJgda1CPNaldF6eVxv90ud3jUXpKlHL69gO38yw=="],
 

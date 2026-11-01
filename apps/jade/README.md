@@ -4,13 +4,21 @@
 
 ## 安装
 
-**需要 [Bun](https://bun.sh) 1.3.9 或更高版本**，不支持在纯 Node 下运行。
+需要 **Node.js 22.18** 或更高版本，或者 [Bun](https://bun.sh) 1.3.9 或更高版本。
 
 ```sh
-bun add -g @uncarved/jade
+npm install -g @uncarved/jade
 # 或者不安装直接运行
+npx @uncarved/jade
+
+# 用 Bun
+bun add -g @uncarved/jade
 bunx @uncarved/jade
 ```
+
+只装了 Bun、没装 Node 时，用 `bunx --bun @uncarved/jade` 运行（`jade` 命令的启动脚本默认找 `node`）。这种方式下 Bun 会自动读取当前目录的 `.env`，里面如果有模型相关的变量，会覆盖 `~/.jade/.env` 里的配置。
+
+Windows 上 `bash` 工具需要 [Git for Windows](https://git-scm.com/download/win)，没装时这个工具不可用，其他功能照常。
 
 可选：装了 [ripgrep](https://github.com/BurntSushi/ripgrep)（`rg`）时搜索更快，没有时自动改用内置搜索。
 

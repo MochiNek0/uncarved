@@ -7,13 +7,14 @@
 // 先下载到插件目录里的 .staging-* 临时目录（以 . 开头，发现插件时会跳过），检查确实是插件、装好依赖之后再改名就位，
 // 失败时不会留下装了一半的插件。安装记录在插件目录的 .installed.json 里，jade plugin update 按记录重新下载。
 //
-// 安装不执行插件的代码；插件的 package.json 有 dependencies 时用 bun install --production 安装依赖。
+// 安装不执行插件的代码；插件的 package.json 有 dependencies 时安装依赖（Bun 下用 bun，Node 下用 npm，都不运行安装脚本）。
 
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { cp, lstat, mkdir, readdir, readFile, rename, rm, rmdir, stat, symlink, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { inspectPlugin, type PluginInfo } from "./loader.ts";
+import { npmCommand } from "../sys.ts";
 
 export type SourceKind = "git" | "npm" | "local";
 
@@ -265,7 +266,8 @@ async function fetchInto(source: PluginSource, staging: string, subdir: string |
     await mkdir(work);
     await writeFile(path.join(work, "package.json"), JSON.stringify({ name: "jade-plugin-download", private: true }));
     log?.(`downloading ${source.location}`);
-    await run(process.execPath, ["add", "--ignore-scripts", source.location], work);
+    const pm = packageManager();
+    await run(pm.cmd, [...pm.prefix, ...pm.add(source.location)], work);
     const deps = Object.keys((JSON.parse(await readFile(path.join(work, "package.json"), "utf8")).dependencies ?? {}) as Record<string, string>);
     if (deps.length !== 1) throw new Error(`could not tell which package ${source.location} installed`);
     root = path.join(staging, "package");
@@ -297,7 +299,8 @@ async function installDependencies(dir: string, log?: (text: string) => void) {
   }
   if (!pkg.dependencies || Object.keys(pkg.dependencies).length === 0) return;
   log?.("installing dependencies");
-  await run(process.execPath, ["install", "--production"], dir);
+  const pm = packageManager();
+  await run(pm.cmd, [...pm.prefix, ...pm.install], dir);
 }
 
 function inSubdir(root: string, subdir: string): string {
@@ -347,13 +350,33 @@ async function removeDir(p: string) {
 
 const now = () => new Date().toISOString();
 
+interface PackageManager {
+  cmd: string;
+  /** 放在子命令前面的参数（npm 的 CLI 脚本路径） */
+  prefix: string[];
+  add(spec: string): string[];
+  install: string[];
+}
+
+/** 跑在 Bun 下用 bun 自己；跑在 Node 下用 npm（Windows 上的 npm.cmd 不能直接执行，用 node 运行 npm 的 CLI 脚本） */
+function packageManager(): PackageManager {
+  if (process.versions.bun) {
+    return { cmd: process.execPath, prefix: [], add: (spec) => ["add", "--ignore-scripts", spec], install: ["install", "--production"] };
+  }
+  const npm = npmCommand();
+  if (!npm) throw new Error("npm was not found; it is needed to install plugins from npm or plugins with dependencies");
+  const quiet = ["--ignore-scripts", "--no-audit", "--no-fund", "--loglevel=error"];
+  return { cmd: npm[0]!, prefix: npm.slice(1), add: (spec) => ["install", ...quiet, spec], install: ["install", "--omit=dev", ...quiet] };
+}
+
 function run(cmd: string, args: string[], cwd: string): Promise<string> {
   return new Promise((resolve, reject) => {
     execFile(cmd, args, { cwd, windowsHide: true, maxBuffer: 16 * 1024 * 1024, env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } }, (err, stdout, stderr) => {
       if (err) {
         const detail = `${stderr || stdout}`.trim().split(/\r?\n/).slice(-6).join("\n");
         const missing = (err as NodeJS.ErrnoException).code === "ENOENT";
-        reject(new Error(missing ? `${cmd} is not installed or not on PATH` : `${path.basename(cmd)} ${args[0]} failed${detail ? `:\n${detail}` : ""}`));
+        const name = args[0]?.endsWith(".js") ? `npm ${args[1]}` : `${path.basename(cmd)} ${args[0]}`;
+        reject(new Error(missing ? `${cmd} is not installed or not on PATH` : `${name} failed${detail ? `:\n${detail}` : ""}`));
       } else resolve(stdout);
     });
   });

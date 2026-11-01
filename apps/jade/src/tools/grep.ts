@@ -8,6 +8,7 @@ import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import type { Tool } from "uncarved";
 import { display, listFiles, statOrUndefined } from "./fs.ts";
+import { globMatcher, spawn, text, type Proc } from "../sys.ts";
 
 const MAX_MATCHES = 200;
 const MAX_FILES = 500;
@@ -167,9 +168,9 @@ async function ripgrep(rg: string, s: Search): Promise<Found | undefined | "miss
   if (s.context > 0) args.push("--context", String(s.context));
   if (s.include) args.push("--glob", s.include);
   args.push("--regexp", s.pattern, "--", s.root);
-  let proc;
+  let proc: Proc;
   try {
-    proc = Bun.spawn([rg, ...args], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+    proc = await spawn([rg, ...args]);
   } catch {
     return "missing";
   }
@@ -179,7 +180,7 @@ async function ripgrep(rg: string, s: Search): Promise<Found | undefined | "miss
   let matches = 0;
   let stopped = false;
   try {
-    const stderr = new Response(proc.stderr).text();
+    const stderr = text(proc.stderr);
     const decoder = new TextDecoder();
     let buf = "";
     const handle = (line: string) => {
@@ -231,7 +232,7 @@ async function ripgrep(rg: string, s: Search): Promise<Found | undefined | "miss
 // ---------- JS ----------
 
 async function jsGrep(s: Search): Promise<Found> {
-  const filter = s.include ? new Bun.Glob(s.include) : undefined;
+  const filter = s.include ? globMatcher(s.include) : undefined;
   const files: FileHits[] = [];
   let matches = 0;
   const single = (await stat(s.root)).isFile();
@@ -239,7 +240,7 @@ async function jsGrep(s: Search): Promise<Found> {
   const sorted = Array.isArray(candidates) ? [...candidates].sort() : candidates;
   for await (const file of sorted) {
     s.signal.throwIfAborted();
-    if (filter && !single && !filter.match(path.relative(s.root, file).split(path.sep).join("/"))) continue;
+    if (filter && !single && !filter(path.relative(s.root, file).split(path.sep).join("/"))) continue;
     // git 列出的文件可能已在工作区删除
     const info = await statOrUndefined(file);
     if (!info?.isFile() || info.size > MAX_FILE_BYTES) continue;

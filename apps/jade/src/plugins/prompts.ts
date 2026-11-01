@@ -12,6 +12,7 @@ import { readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { ContentSource, Layer, Plugin, SystemSegment, Trust } from "uncarved";
+import { run } from "../sys.ts";
 
 export interface PromptsOptions {
   cwd: string;
@@ -191,9 +192,8 @@ export async function repoRoot(cwd: string): Promise<string> {
 
 async function git(cwd: string, args: string[]): Promise<string | undefined> {
   try {
-    const proc = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "ignore" });
-    const [out, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
-    return code === 0 ? out.trim() : undefined;
+    const { code, stdout } = await run(["git", ...args], { cwd });
+    return code === 0 ? stdout.trim() : undefined;
   } catch {
     return undefined;
   }

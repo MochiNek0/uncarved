@@ -1,6 +1,6 @@
 {
   "name": "@uncarved/provider-anthropic",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Anthropic Claude Messages API provider for uncarved",
   "license": "MIT",
   "repository": {

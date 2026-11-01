@@ -17,22 +17,29 @@
   ],
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "bun": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
   },
   "bin": {
-    "jade": "./src/main.ts"
+    "jade": "./bin/jade.js"
   },
   "files": [
+    "bin",
+    "dist",
     "src"
   ],
   "engines": {
-    "bun": ">=1.3.9"
+    "node": ">=22.18"
   },
   "publishConfig": {
     "access": "public"
   },
   "scripts": {
-    "prepublishOnly": "node ../../scripts/require-bun-publish.mjs"
+    "build": "tsc -p tsconfig.build.json",
+    "prepublishOnly": "node ../../scripts/require-bun-publish.mjs && bun run build"
   },
   "dependencies": {
     "@uncarved/plugin-stdio": "workspace:*",
@@ -41,12 +48,14 @@
     "@uncarved/provider-openai-responses": "workspace:*",
     "@uncarved/store-jsonl": "workspace:*",
     "ink": "7.1.1",
+    "picomatch": "^4.0.3",
     "react": "^19.2.0",
     "string-width": "^8.2.0",
-    "wrap-ansi": "^10.0.2",
-    "uncarved": "workspace:*"
+    "uncarved": "workspace:*",
+    "wrap-ansi": "^10.0.2"
   },
   "devDependencies": {
+    "@types/picomatch": "^4.0.2",
     "@types/react": "^19.2.0"
   }
 }

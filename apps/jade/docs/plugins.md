@@ -81,7 +81,8 @@ jade plugin enable <名字|内置插件 id>
 ```
 
 - 安装时先下载到临时目录，确认是插件（有代码入口、`plugin.json` 或者 skills/命令/MCP 配置）之后才放到位，失败不会留下半个插件。
-- 插件的 `package.json` 有 `dependencies` 时，安装后会在插件目录里运行 `bun install --production`。
+- 插件的 `package.json` 有 `dependencies` 时，安装后会在插件目录里安装依赖：jade 跑在 Bun 下时用 `bun install --production`，跑在 Node 下时用 `npm install --omit=dev`。两种都不运行安装脚本。
+- jade 跑在 Node 下时，`.ts` 入口靠 Node 自带的类型擦除加载：只支持能直接擦掉的类型语法（不支持 `enum`、`namespace`、参数属性），相对导入要写完整扩展名（`./util.ts`）。想在两种运行时下都能用，用 `.js` 或者只写这类语法。
 - 目录名依次取 `--name`、`plugin.json` 的 `name`、`.claude-plugin/plugin.json` 的 `name`、`package.json` 的 `name`（去掉作用域）、来源的最后一段。
 - 安装记录在插件目录的 `.installed.json` 里。直接复制进去的插件也能用，只是 `update` 不管它。
 - 自己用 `--project` 装的进程内插件不会在启动时再问一遍；别人拉取仓库后第一次加载时仍要确认。

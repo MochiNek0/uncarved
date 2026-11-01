@@ -15,9 +15,10 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { Block, Tool } from "uncarved";
 import { projectDirs } from "./commands.ts";
+import { VERSION } from "./sys.ts";
 
 export const PROTOCOL_VERSION = "2025-06-18";
-const CLIENT_INFO = { name: "jade", version: "0.1.0" };
+const CLIENT_INFO = { name: "jade", version: VERSION };
 /** 一次工具调用结果里文本的上限，超过时保留开头 */
 const MAX_RESULT_CHARS = 60_000;
 const STDERR_LINES = 20;

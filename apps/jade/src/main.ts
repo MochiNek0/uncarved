@@ -43,6 +43,7 @@ import { bold, dim, green, plainScreen, red, yellow, type CommandInfo, type Scre
 import { configurator } from "./ui/configure.ts";
 import { clip, preview, shortPath, summarize } from "./ui/render.ts";
 import { transcript } from "./ui/transcript.ts";
+import { run, VERSION } from "./sys.ts";
 
 const HELP = `Usage: jade [options] [prompt]
        jade plugin <list|add|update|remove|enable|disable>   (jade plugin --help)
@@ -52,6 +53,7 @@ const HELP = `Usage: jade [options] [prompt]
   -r, --resume [id]      resume a session by id, or pick one from a list
   -m, --mode <mode>      permission mode: ${MODES.join(" | ")} (default ask)
       --cwd <dir>        working directory (default: current directory)
+  -v, --version
   -h, --help
 
 Type / in the session for commands; /model configures the model.
@@ -81,8 +83,6 @@ const BUILTIN_PLUGIN_COMMANDS = ["memory", "checks", "mcp", "skills", "compact"]
 const KEYS = `Keys: enter send · \\ or alt+enter new line · ↑↓ history · @ reference a file · esc interrupt · shift+tab cycle ask/auto-edit/plan · ctrl+c twice to exit
       mouse wheel or PgUp/PgDn scroll the conversation · ctrl+home/ctrl+end jump to the top/bottom · shift+drag selects text
 While jade is working you can keep typing: messages are queued and sent when the current turn ends.`;
-
-const VERSION: string = (await Bun.file(new URL("../package.json", import.meta.url)).json()).version;
 
 /** 回复被输出上限截断后，自动让模型接着做的次数（每条用户消息） */
 const MAX_CONTINUES = 3;
@@ -115,6 +115,9 @@ for (let i = 0; i < argv.length; i++) {
   if (a === "-h" || a === "--help") {
     console.log(HELP);
     process.exit(0);
+  } else if (a === "-v" || a === "--version") {
+    console.log(VERSION);
+    process.exit(0);
   } else if (a === "-p" || a === "--print") opts.print = value();
   else if (a === "-c" || a === "--continue") opts.cont = true;
   // 不带 id 时从列表里选
@@ -146,9 +149,8 @@ const errorText = (err: unknown) => (err instanceof Error ? err.message : String
 
 async function gitBranch(dir: string): Promise<string | undefined> {
   try {
-    const proc = Bun.spawn(["git", "rev-parse", "--abbrev-ref", "HEAD"], { cwd: dir, stdout: "pipe", stderr: "ignore" });
-    const [out, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
-    return code === 0 ? out.trim() : undefined;
+    const { code, stdout } = await run(["git", "rev-parse", "--abbrev-ref", "HEAD"], { cwd: dir });
+    return code === 0 ? stdout.trim() : undefined;
   } catch {
     return undefined;
   }

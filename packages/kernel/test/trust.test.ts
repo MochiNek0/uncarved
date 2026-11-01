@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import {
+  KERNEL_VERSION,
   MemoryLogStore,
   MemoryTrustStore,
   Runtime,
@@ -215,7 +216,7 @@ test("从内核自身导入是允许的：那是宿主已经在运行的代码",
     await mkdir(root, { recursive: true });
     await writeFile(path.join(root, "index.ts"), `import { KERNEL_VERSION } from "uncarved";\nexport default { id: "k", version: "1.0.0", kernel: "^" + KERNEL_VERSION };`);
     const loaded = await loadProjectPlugin(root, { trust: new MemoryTrustStore(), confirm: async () => true });
-    expect(loaded.kernel).toBe("^0.1.0");
+    expect(loaded.kernel).toBe(`^${KERNEL_VERSION}`);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
