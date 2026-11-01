@@ -1,6 +1,6 @@
 {
   "name": "@uncarved/jade",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A coding agent harness built on the uncarved kernel",
   "license": "MIT",
   "repository": {
