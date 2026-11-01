@@ -913,7 +913,8 @@ describe("context window", () => {
     expect(contextWindowFromEnv({ OPENAI_API_KEY: "k", OPENAI_MODEL: "o3" })).toBe(200_000);
     expect(contextWindowInfo({ ANTHROPIC_API_KEY: "k", JADE_CONTEXT_WINDOW: "1000000" })).toEqual({ tokens: 1_000_000, source: "env" });
     expect(contextWindowFromEnv({ ...env, JADE_CONTEXT_WINDOW: "1000000" })).toBe(1_000_000);
-    expect(() => contextWindowFromEnv({ ...env, JADE_CONTEXT_WINDOW: "200k" })).toThrow("JADE_CONTEXT_WINDOW");
+    expect(contextWindowFromEnv({ ...env, JADE_CONTEXT_WINDOW: "200k" })).toBe(200_000);
+    expect(() => contextWindowFromEnv({ ...env, JADE_CONTEXT_WINDOW: "huge" })).toThrow("JADE_CONTEXT_WINDOW");
   });
 
   test("recognizes context overflow errors", () => {

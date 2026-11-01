@@ -26,7 +26,7 @@ import { readPluginSettings } from "./plugins/install.ts";
 import { PLUGIN_HELP, pluginCli, UsageError } from "./plugin-cli.ts";
 import { describeServer, loadMcpConfig, McpClient, mcpTrustHash } from "./mcp.ts";
 import { loadSkills } from "./skills.ts";
-import { hasProvider, loadEnvFile } from "./config.ts";
+import { hasProvider, loadEnvFile, parseTokens } from "./config.ts";
 import { createJade, type Jade } from "./distro.ts";
 import { describeRule, MODES, POLICY_KEY, type AllowRule, type Mode, type PolicySettings } from "./plugins/policy.ts";
 import { compactThreshold, contextWindowFromEnv, contextWindowInfo, isContextOverflow } from "./context.ts";
@@ -63,7 +63,7 @@ Instructions are read from AGENTS.md (or CLAUDE.md) in $JADE_HOME and from the r
 /** 会话里的命令：/help、输入 / 时的菜单都从这里取 */
 const COMMANDS: CommandInfo[] = [
   { name: "help", about: "list the commands and keys" },
-  { name: "model", args: "[name]", about: "switch the model, or configure the provider, API key and output limit" },
+  { name: "model", args: "[name]", about: "switch between saved models, or add one and configure its provider, API key and output limit" },
   { name: "mode", args: `[${MODES.join("|")}]`, about: "show or change the permission mode" },
   { name: "clear", about: "start a new session (the current one stays resumable)" },
   { name: "undo", about: "restore every file the agent changed in its last turn (run again to go further back)" },
@@ -176,10 +176,12 @@ if (!hasProvider() && !tui) {
   process.exit(2);
 }
 
-const compactTokens = process.env.JADE_COMPACT_TOKENS ? Number(process.env.JADE_COMPACT_TOKENS) : undefined;
-// NaN 会让"是否超过阈值"永远为假，每次请求都压缩
-if (compactTokens !== undefined && !(Number.isInteger(compactTokens) && compactTokens > 0)) {
-  fail(`JADE_COMPACT_TOKENS must be a positive integer, got ${JSON.stringify(process.env.JADE_COMPACT_TOKENS)}`);
+// 写错时直接报错：NaN 会让"是否超过阈值"永远为假，每次请求都压缩
+let compactTokens: number | undefined;
+try {
+  compactTokens = process.env.JADE_COMPACT_TOKENS ? parseTokens("JADE_COMPACT_TOKENS", process.env.JADE_COMPACT_TOKENS) : undefined;
+} catch (err) {
+  fail(errorText(err));
 }
 /** 模型的上下文窗口：JADE_CONTEXT_WINDOW，/model 改配置后更新 */
 let contextWindow = 0;
@@ -254,6 +256,7 @@ const provider = switchable({
 const configure = configurator({
   screen,
   envFile,
+  modelsFile: path.join(home, "models.json"),
   apply: async () => {
     provider.set(retrying(await providerFromEnv()));
     contextWindow = contextWindowFromEnv();
@@ -502,7 +505,8 @@ async function ask(c: Call, who: string, remember: (rule: AllowRule) => Promise<
   const reason = approved
     ? undefined
     : (answer === "no" ? await screen.input("What should jade do instead? (optional)") : undefined) || "The user rejected this action.";
-  screen.log(approved ? green(`✓ ${who}${head}`) : red(`✗ ${who}${head}`) + dim(reason ? ` — ${clip(reason, 200)}` : ""));
+  // 主 Agent 的调用的结果之后接在这一行后面
+  screen.log(approved ? green(`✓ ${who}${head}`) : red(`✗ ${who}${head}`) + dim(reason ? ` — ${clip(reason, 200)}` : ""), { id: c.toolUseId });
   return { approved, reason };
 }
 

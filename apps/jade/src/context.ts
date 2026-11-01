@@ -3,9 +3,19 @@
 // 窗口优先取 JADE_CONTEXT_WINDOW；不设时按模型名在一张小表里找（只收录确定的、取偏小的值），
 // 找不到用 128000。估小了只是压缩得早一些；估大了请求会因为超长被拒，宿主看到这种错误会先压缩再重试一次。
 
+import { parseTokens } from "./config.ts";
 import { providerInfo } from "./provider.ts";
 
 type Env = Record<string, string | undefined>;
+
+/** 写错的 JADE_MAX_TOKENS 在创建 provider 时报错，这里当作没设 */
+function tokensOrZero(text: string): number {
+  try {
+    return parseTokens("JADE_MAX_TOKENS", text);
+  } catch {
+    return 0;
+  }
+}
 
 /** 认不出模型时的窗口 */
 export const DEFAULT_CONTEXT_WINDOW = 128_000;
@@ -26,11 +36,7 @@ export type WindowSource = "env" | "model" | "default";
 
 /** 上下文窗口和它的来源 */
 export function contextWindowInfo(env: Env = process.env): { tokens: number; source: WindowSource } {
-  if (env.JADE_CONTEXT_WINDOW) {
-    const n = Number(env.JADE_CONTEXT_WINDOW);
-    if (!Number.isInteger(n) || n <= 0) throw new Error(`JADE_CONTEXT_WINDOW must be a positive integer, got ${JSON.stringify(env.JADE_CONTEXT_WINDOW)}`);
-    return { tokens: n, source: "env" };
-  }
+  if (env.JADE_CONTEXT_WINDOW) return { tokens: parseTokens("JADE_CONTEXT_WINDOW", env.JADE_CONTEXT_WINDOW), source: "env" };
   const model = providerInfo(env).model;
   const known = KNOWN_WINDOWS.find(([re]) => re.test(model));
   return known ? { tokens: known[1], source: "model" } : { tokens: DEFAULT_CONTEXT_WINDOW, source: "default" };
@@ -45,7 +51,7 @@ export function contextWindowFromEnv(env: Env = process.env): number {
  * 但不低于窗口的一半
  */
 export function compactThreshold(window: number, env: Env = process.env): number {
-  const output = env.JADE_MAX_TOKENS ? Number(env.JADE_MAX_TOKENS) || 0 : providerInfo(env).kind === "anthropic" ? 64_000 : 0;
+  const output = env.JADE_MAX_TOKENS ? tokensOrZero(env.JADE_MAX_TOKENS) : providerInfo(env).kind === "anthropic" ? 64_000 : 0;
   return Math.max(Math.floor(window * 0.5), Math.min(Math.floor(window * 0.8), window - output));
 }
 

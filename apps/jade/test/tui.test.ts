@@ -6,11 +6,13 @@ import { PassThrough, Writable } from "node:stream";
 import { InputHistory } from "../src/history.ts";
 import {
   parseEnv,
+  parseTokens,
   providerFromEnv,
   providerInfo,
   providerKind,
   updateEnvFile,
 } from "../src/index.ts";
+import { configurator } from "../src/ui/configure.ts";
 import { edit, layout } from "../src/ui/editor.ts";
 import type { Screen } from "../src/ui/screen.ts";
 import { tuiScreen, type TuiHandlers } from "../src/ui/tui.tsx";
@@ -111,6 +113,94 @@ describe("model configuration", () => {
     await expect(
       providerFromEnv({ ...env, JADE_MAX_TOKENS: "lots" }),
     ).rejects.toThrow("JADE_MAX_TOKENS");
+  });
+
+  test("/model groups models by service, keeps each model's own settings and switches back", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "jade-models-"));
+    const envFile = path.join(dir, ".env");
+    const modelsFile = path.join(dir, "models.json");
+    const keys = ["JADE_PROVIDER", "OPENAI_COMPAT_BASE_URL", "OPENAI_COMPAT_API_KEY", "OPENAI_COMPAT_MODEL", "JADE_MAX_TOKENS", "JADE_EFFORT", "JADE_CONTEXT_WINDOW", "OPENAI_COMPAT_EXTRA_BODY"];
+    const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+    try {
+      for (const k of keys) delete process.env[k];
+      await updateEnvFile(envFile, {
+        JADE_PROVIDER: "openai-compat",
+        OPENAI_COMPAT_BASE_URL: "http://a/v1",
+        OPENAI_COMPAT_API_KEY: "ka",
+        OPENAI_COMPAT_MODEL: "alpha",
+        JADE_MAX_TOKENS: "32K",
+        JADE_CONTEXT_WINDOW: "1M",
+      });
+      const answers: unknown[] = [];
+      const inputs: (string | undefined)[] = [];
+      const screen = {
+        log: () => {},
+        select: async (_t: string, choices: { label: string; value: unknown }[]) => {
+          const want = answers.shift();
+          return typeof want === "function" ? (want as (c: typeof choices) => unknown)(choices) : want;
+        },
+        input: async () => inputs.shift(),
+      } as unknown as Screen;
+      const pickLabel = (label: string) => (c: { label: string; value: unknown }[]) => c.find((x) => x.label === label)!.value;
+      const configure = configurator({ screen, envFile, modelsFile, apply: async () => {}, contextWindow: () => 1, onApplied: () => {} });
+      // 同一个服务加一个模型：沿用输出上限，不沿用上下文窗口
+      await configure.model("beta");
+      expect(process.env.OPENAI_COMPAT_MODEL).toBe("beta");
+      expect(process.env.JADE_MAX_TOKENS).toBe("32K");
+      expect(process.env.JADE_CONTEXT_WINDOW).toBeUndefined();
+      // 另一个服务：选服务、地址、密钥（服务列不出模型，手动输入名字）；已经设了输出上限，沿用
+      answers.push("openai-compat");
+      inputs.push("http://127.0.0.1:9/v1", "kb", "gamma");
+      answers.unshift(pickLabel("Add a service, or change the base URL or API key"));
+      await configure.model(undefined);
+      expect(process.env.OPENAI_COMPAT_BASE_URL).toBe("http://127.0.0.1:9/v1");
+      expect(process.env.OPENAI_COMPAT_MODEL).toBe("gamma");
+      // 菜单里选回 alpha：地址、密钥和它自己的设置都换回来
+      answers.push(pickLabel("Use alpha"));
+      await configure.model(undefined);
+      expect(process.env.OPENAI_COMPAT_BASE_URL).toBe("http://a/v1");
+      expect(process.env.OPENAI_COMPAT_API_KEY).toBe("ka");
+      expect(process.env.OPENAI_COMPAT_MODEL).toBe("alpha");
+      expect(process.env.JADE_CONTEXT_WINDOW).toBe("1M");
+      // 按名字切换
+      await configure.model("gamma");
+      expect(process.env.OPENAI_COMPAT_API_KEY).toBe("kb");
+      expect(process.env.JADE_MAX_TOKENS).toBe("32K");
+      expect(process.env.JADE_CONTEXT_WINDOW).toBeUndefined();
+      // 写错的 token 数不保存
+      answers.push(pickLabel("Context window"));
+      inputs.push("lots");
+      await configure.model(undefined);
+      expect(process.env.JADE_CONTEXT_WINDOW).toBeUndefined();
+      const file = JSON.parse(await readFile(modelsFile, "utf8")) as { services: { env: Record<string, string>; models: { name: string; settings: Record<string, string> }[] }[] };
+      expect(file.services.map((s) => [s.env.OPENAI_COMPAT_BASE_URL, s.models.map((m) => m.name)])).toEqual([
+        ["http://127.0.0.1:9/v1", ["gamma"]],
+        ["http://a/v1", ["alpha", "beta"]],
+      ]);
+      expect(file.services[0]!.models[0]!.settings).toEqual({ JADE_MAX_TOKENS: "32K" });
+      expect(file.services[1]!.models[0]!.settings).toEqual({ JADE_MAX_TOKENS: "32K", JADE_CONTEXT_WINDOW: "1M" });
+      // 忘掉 beta；服务下还有 alpha，服务保留
+      answers.push(pickLabel("Forget a saved model"), (c: { label: string; value: unknown }[]) => c.find((x) => x.label === "beta")!.value);
+      await configure.model(undefined);
+      const after = JSON.parse(await readFile(modelsFile, "utf8")) as typeof file;
+      expect(after.services.map((s) => s.models.map((m) => m.name))).toEqual([["gamma"], ["alpha"]]);
+    } finally {
+      for (const k of keys) {
+        if (saved[k] === undefined) delete process.env[k];
+        else process.env[k] = saved[k];
+      }
+    }
+  });
+
+  test("token counts accept K and M", () => {
+    expect(parseTokens("X", "32000")).toBe(32_000);
+    expect(parseTokens("X", "512K")).toBe(512_000);
+    expect(parseTokens("X", "1m")).toBe(1_000_000);
+    expect(parseTokens("X", "1.5M")).toBe(1_500_000);
+    expect(parseTokens("X", "128_000")).toBe(128_000);
+    expect(() => parseTokens("X", "lots")).toThrow("X must be");
+    expect(() => parseTokens("X", "0")).toThrow("X must be");
+    expect(() => parseTokens("X", "1.5")).toThrow("X must be");
   });
 
   test("updateEnvFile replaces, appends and removes keys and keeps everything else", async () => {
@@ -413,10 +503,52 @@ describe("terminal UI", () => {
     screen.log("done");
     await sleep(80);
     const out = output();
-    expect(out).toContain("✻ thinking");
-    expect(out).toContain("pondering");
+    expect(out).toContain("✻ pondering ▸");
     expect(out.indexOf("first line")).toBeLessThan(out.indexOf("second"));
     expect(out).toContain("done");
+  });
+
+  test("thinking shows only its latest line until it is expanded", async () => {
+    const { screen, type, output, clear } = setup();
+    screen.stream("thinking", "step one\nstep two\nstep th");
+    await sleep(80);
+    expect(output()).toContain("✻ step th");
+    expect(output()).not.toContain("step one");
+    screen.stream("thinking", "ree\n");
+    screen.endStream();
+    await sleep(80);
+    expect(output()).toContain("✻ step three ▸");
+    expect(output()).not.toContain("step one");
+    // 对话区第 1 行在屏幕第 6 行
+    clear();
+    await type("\x1b[<0;5;6M");
+    expect(output()).toContain("✻ thinking ▾");
+    expect(output()).toContain("step one");
+    expect(output()).toContain("step three");
+  });
+
+  test("a tool call and its result share one row; progress shows only the latest line", async () => {
+    const { screen, type, output, clear } = setup();
+    screen.log("● bash(npm test)", { id: "t1" });
+    screen.progress("t1", "  │ running 1");
+    screen.progress("t1", "  │ running 2");
+    await sleep(80);
+    expect(output()).toContain("running 2");
+    expect(output()).not.toContain("running 1");
+    clear();
+    screen.progress("t1", undefined);
+    screen.amend("t1", "⎿ ok (+2 lines)", { details: "    out-1\n    out-2" });
+    await sleep(80);
+    expect(output()).toContain("● bash(npm test) ⎿ ok (+2 lines) ▸");
+    expect(output()).not.toContain("running 2");
+    expect(output()).not.toContain("out-1");
+    clear();
+    await type("\x1b[<0;5;6M");
+    expect(output()).toContain("out-1");
+    // 找不到那一项时另起一行
+    screen.amend("missing", "⎿ orphan");
+    await sleep(80);
+    expect(output()).toContain("  ⎿ orphan");
   });
 
   test("runs fullscreen with a header showing the version, model and directory", async () => {
@@ -482,6 +614,16 @@ describe("terminal UI", () => {
     clear();
     await type("\x1b[<0;5;6M");
     expect(output()).not.toContain("hidden-1");
+  });
+
+  test("clicks still land on the right line during the full repaint after startup", async () => {
+    const { screen, type, output } = setup();
+    screen.log("head", { details: "    hidden-1" });
+    // 启动后 100ms 起有一帧整帧重画（上下各垫一行），这时候点击换算的行号曾经差一行
+    await sleep(120);
+    await type("\x1b[<0;5;6M");
+    await sleep(100);
+    expect(output()).toContain("hidden-1");
   });
 
   test("clear empties the conversation", async () => {

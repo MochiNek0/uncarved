@@ -36,9 +36,21 @@ export interface Screen {
   readonly interactive: boolean;
   /**
    * 追加已经完成的输出，可以带 ANSI 颜色。
-   * details：折叠起来的完整内容，终端界面里点击 text 展开；纯文本输出不显示
+   * details：折叠起来的完整内容，终端界面里点击 text 展开；纯文本输出不显示。
+   * id：之后用 amend 给这一项补充内容（工具调用的结果）；终端界面里这一项收起时只占一行
    */
-  log(text: string, opts?: { details?: string }): void;
+  log(text: string, opts?: { details?: string; id?: string }): void;
+  /**
+   * 给之前用 id 记下的一项补充内容：终端界面里接在那一项后面合成一项（details 替换原来的），
+   * 纯文本输出另起一行缩进显示。找不到那一项时也是另起一行
+   */
+  amend(id: string, text: string, opts?: { details?: string }): void;
+  /**
+   * 正在运行的工具 id 的一行进度（已经排好版）；undefined 表示工具结束了。
+   * 终端界面只在对话最后显示每个工具最新的一行，结束时去掉；纯文本输出逐行打印。
+   * output 表示是工具自己的输出，纯文本输出里每个工具最多打印 20 行
+   */
+  progress(id: string, line: string | undefined, opts?: { output?: boolean }): void;
   /** 流式输出模型的正文或思考 */
   stream(kind: "text" | "thinking", text: string): void;
   /** 结束当前的流式块 */
@@ -70,10 +82,14 @@ export const bold = paint("1");
 
 // ---------- 纯文本实现 ----------
 
+const MAX_OUTPUT_LINES = 20;
+
 export function plainScreen(opts: { interactive: boolean }): Screen {
   let atLineStart = true;
   let streaming: "text" | "thinking" | undefined;
   let rl: Interface | undefined;
+  /** 每个工具已经打印了多少行输出 */
+  const outputLines = new Map<string, number>();
 
   const write = (s: string) => {
     if (!s) return;
@@ -93,6 +109,21 @@ export function plainScreen(opts: { interactive: boolean }): Screen {
     interactive: opts.interactive,
     log: (text) => {
       streaming = undefined;
+      line(text);
+    },
+    amend: (_id, text) => {
+      streaming = undefined;
+      line(`  ${text}`);
+    },
+    progress: (id, text, o) => {
+      if (text === undefined) return void outputLines.delete(id);
+      streaming = undefined;
+      if (o?.output) {
+        const shown = outputLines.get(id) ?? 0;
+        if (shown > MAX_OUTPUT_LINES) return;
+        outputLines.set(id, shown + 1);
+        if (shown === MAX_OUTPUT_LINES) return line(dim("  │ …"));
+      }
       line(text);
     },
     stream: (kind, text) => {

@@ -38,6 +38,18 @@ export async function loadEnvFile(file: string, env: Record<string, string | und
   return true;
 }
 
+/**
+ * token 数：整数，或者带 K（千）、M（百万）的写法，例如 32000、512K、1M、1.5M，不区分大小写，可以用 _ 分隔数字。
+ * 不是正整数时抛出，错误信息里带变量名 name
+ */
+export function parseTokens(name: string, text: string): number {
+  const m = /^\s*(\d+(?:\.\d+)?)\s*([km])?\s*$/i.exec(text.replaceAll("_", ""));
+  const unit = m?.[2] ? (m[2].toLowerCase() === "k" ? 1_000 : 1_000_000) : 1;
+  const n = m ? (unit === 1 ? Number(m[1]) : Math.round(Number(m[1]) * unit)) : NaN;
+  if (!Number.isInteger(n) || n <= 0) throw new Error(`${name} must be a number of tokens such as 32000, 512K or 1M, got ${JSON.stringify(text)}`);
+  return n;
+}
+
 /** 至少配置了一种模型 */
 export function hasProvider(env: Record<string, string | undefined> = process.env): boolean {
   return Boolean(env.JADE_PROVIDER || env.OPENAI_API_KEY || env.OPENAI_COMPAT_BASE_URL || env.ANTHROPIC_API_KEY);
@@ -81,6 +93,51 @@ export async function updateEnvFile(
     if (value === undefined) delete env[key];
     else env[key] = value;
   }
+}
+
+/**
+ * 保存过的服务和模型：$JADE_HOME/models.json。同一个服务（类型、地址、密钥都相同）只存一份，下面是在它上面用过的模型，
+ * 每个模型带自己的设置（输出上限、思考力度、上下文窗口）。.env 里始终是当前用的那一个；这里记着用过的全部，/model 可以切回去
+ */
+export interface SavedService {
+  /** 服务的变量：JADE_PROVIDER、地址、密钥等 */
+  env: Record<string, string>;
+  /** 最近用过的在前 */
+  models: SavedModel[];
+}
+
+export interface SavedModel {
+  name: string;
+  /** 这个模型自己的设置变量 */
+  settings: Record<string, string>;
+}
+
+const strings = (v: unknown): Record<string, string> =>
+  typeof v === "object" && v !== null ? (Object.fromEntries(Object.entries(v).filter(([, x]) => typeof x === "string")) as Record<string, string>) : {};
+
+/** 读不了或格式不对时返回空数组 */
+export async function readSavedServices(file: string): Promise<SavedService[]> {
+  try {
+    const data = JSON.parse(await readFile(file, "utf8")) as { services?: unknown };
+    if (!Array.isArray(data.services)) return [];
+    return data.services.flatMap((raw: unknown) => {
+      const s = raw as { env?: unknown; models?: unknown } | null;
+      if (!s || !Array.isArray(s.models)) return [];
+      const models = s.models.flatMap((m: unknown) => {
+        const name = (m as { name?: unknown } | null)?.name;
+        return typeof name === "string" && name ? [{ name, settings: strings((m as { settings?: unknown }).settings) }] : [];
+      });
+      return models.length ? [{ env: strings(s.env), models }] : [];
+    });
+  } catch {
+    return [];
+  }
+}
+
+export async function writeSavedServices(file: string, services: SavedService[]): Promise<void> {
+  await mkdir(path.dirname(file), { recursive: true });
+  // 里面有 API 密钥
+  await writeFile(file, JSON.stringify({ services }, null, 2) + "\n", { mode: 0o600 });
 }
 
 /** 含空白、# 或引号的值加双引号，parseEnv 能原样读回 */

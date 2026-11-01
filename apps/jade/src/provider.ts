@@ -1,6 +1,7 @@
 // Provider：按环境变量选择，外面包一层重试（4.7：重试是包装 Provider 的事）。
 
 import { ProviderError, type Provider } from "uncarved";
+import { parseTokens } from "./config.ts";
 
 export interface RetryOptions {
   /** 最多重试几次，默认 4 */
@@ -126,7 +127,7 @@ export function providerInfo(env: Env = process.env): ProviderInfo {
  */
 export async function providerFromEnv(env: Env = process.env): Promise<Provider> {
   const kind = providerKind(env);
-  const maxTokens = env.JADE_MAX_TOKENS ? positiveInt("JADE_MAX_TOKENS", env.JADE_MAX_TOKENS) : undefined;
+  const maxTokens = env.JADE_MAX_TOKENS ? parseTokens("JADE_MAX_TOKENS", env.JADE_MAX_TOKENS) : undefined;
   const effort = effortFromEnv(env);
   if (kind === "openai") {
     if (!env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is required for the openai provider");
@@ -193,12 +194,6 @@ export async function listModels(env: Env = process.env, fetchImpl: typeof fetch
   } catch {
     return [];
   }
-}
-
-function positiveInt(name: string, text: string): number {
-  const n = Number(text);
-  if (!Number.isInteger(n) || n <= 0) throw new Error(`${name} must be a positive integer, got ${JSON.stringify(text)}`);
-  return n;
 }
 
 function jsonObject(name: string, text: string): Record<string, unknown> {

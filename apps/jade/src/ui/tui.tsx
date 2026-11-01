@@ -70,6 +70,8 @@ interface UiState {
   /** 对话区离底部滚上去了多少行；0 表示跟着最新的输出 */
   scroll: number;
   busy?: { label: string; since: number };
+  /** 正在运行的工具最新的一行进度，显示在对话的最后，工具结束时去掉 */
+  progress: { id: string; line: string }[];
   queued: string[];
   dialogs: Dialog[];
   status: StatusInfo;
@@ -82,16 +84,46 @@ const MAX_LINES = 10_000;
 const wrap = (text: string, width: number) =>
   wrapAnsi(text, width, { hard: true, trim: false }).split("\n");
 
-/** 对话里的一项：普通的一行，或者带折叠内容的一段（点击展开、收起） */
+/**
+ * 对话里的一项：普通的一行，或者可以点击展开、收起的一段。
+ * - details：折叠起来的完整内容
+ * - oneRow：收起时只占一行，放不下的部分截掉，展开时完整显示
+ * - title：展开时代替 text 显示的标题（例如思考收起时显示最新的一行，展开时显示"thinking"）
+ */
 interface Line {
   text: string;
-  fold?: { details: string; open: boolean };
+  details?: string;
+  oneRow?: boolean;
+  title?: string;
+  open?: boolean;
+  /** 之后用 amend 补充内容时用的名字 */
+  id?: string;
 }
 
+/** 按宽度截成一行，截掉了内容时以 … 结尾；留出两列给 … 和展开标记 */
+function oneRow(text: string, width: number): { row: string; cut: boolean } {
+  const rows = wrap(text, Math.max(1, width - 3));
+  const cut = rows.length > 1;
+  return { row: cut ? `${rows[0]}${dim("…")}` : rows[0]!, cut };
+}
+
+/** 这一项能不能展开：有折叠的内容，或者收起时被截掉了一部分 */
+function foldable(l: Line, width: number): boolean {
+  return l.details !== undefined || (Boolean(l.oneRow) && oneRow(l.text, width).cut);
+}
+
+/** 思考收起时显示的一行：最新的非空行 */
+const thinkingHead = (text: string) =>
+  dim(`✻ ${text.split("\n").findLast((l) => l.trim())?.trim() ?? "thinking"}`);
+
 function wrapLine(l: Line, width: number): string[] {
-  if (!l.fold) return wrap(l.text, width);
-  const head = wrap(`${l.text}${dim(l.fold.open ? " ▾" : " ▸")}`, width);
-  return l.fold.open ? [...head, ...wrap(l.fold.details, width)] : head;
+  if (!foldable(l, width)) return wrap(l.text, width);
+  if (!l.open) {
+    const head = l.oneRow ? oneRow(l.text, width).row : l.text;
+    return wrap(`${head}${dim(" ▸")}`, width);
+  }
+  const head = wrap(`${l.title ?? l.text}${dim(" ▾")}`, width);
+  return l.details === undefined ? head : [...head, ...wrap(l.details, width)];
 }
 
 /** 状态容器：频繁的流式更新合并到一帧再通知界面 */
@@ -103,12 +135,14 @@ class Store {
   #lines: Line[] = [];
   /** 按 #width 折好的行 */
   #wrapped: string[] = [];
-  /** #wrapped 的每一行属于哪个可折叠项；普通行为 undefined */
-  #owners: (Line | undefined)[] = [];
+  /** #wrapped 的每一行属于哪一项 */
+  #owners: Line[] = [];
+  /** 带名字的项，amend 用 */
+  #named = new Map<string, Line>();
   #width = 0;
 
   constructor(status: StatusInfo) {
-    this.state = { version: 0, scroll: 0, queued: [], dialogs: [], status };
+    this.state = { version: 0, scroll: 0, progress: [], queued: [], dialogs: [], status };
   }
 
   subscribe = (fn: () => void) => {
@@ -129,16 +163,18 @@ class Store {
     for (const fn of this.#listeners) fn();
   }
 
-  /** 追加普通的行；带 details 时追加一个可折叠项，texts 是收起时显示的部分 */
-  append(texts: string[], details?: string) {
+  /** 追加普通的行；带 item 时 texts 合成一项（可折叠、可以之后补充），texts 是收起时显示的部分 */
+  append(texts: string[], item?: Omit<Line, "text">) {
     if (texts.length === 0) return;
     const lines: Line[] =
-      details === undefined
+      item === undefined
         ? texts.flatMap((t) => t.split("\n")).map((text) => ({ text }))
-        : [{ text: texts.join("\n"), fold: { details, open: false } }];
+        : [{ ...item, text: texts.join("\n") }];
     this.#lines.push(...lines);
+    for (const l of lines) if (l.id !== undefined) this.#named.set(l.id, l);
     if (this.#lines.length > MAX_LINES) {
       this.#lines = this.#lines.slice(-MAX_LINES * 0.8);
+      this.#named = new Map(this.#lines.flatMap((l) => (l.id === undefined ? [] : [[l.id, l] as const])));
       this.#width = 0;
     }
     const before = this.#wrapped.length;
@@ -151,10 +187,34 @@ class Store {
     this.update({ version: this.state.version + 1, scroll });
   }
 
+  /** 改写带名字的那一项；找不到时返回 false */
+  amend(id: string, change: (l: Line) => void): boolean {
+    const line = this.#named.get(id);
+    if (!line) return false;
+    change(line);
+    if (!this.#width) {
+      this.update({ version: this.state.version + 1 });
+      return true;
+    }
+    const first = this.#owners.indexOf(line);
+    let count = 0;
+    while (first >= 0 && this.#owners[first + count] === line) count++;
+    const rows = wrapLine(line, this.#width);
+    let scroll = this.state.scroll;
+    if (first >= 0) {
+      this.#wrapped.splice(first, count, ...rows);
+      this.#owners.splice(first, count, ...rows.map(() => line));
+      // 这一项在往上翻看时的可见部分下面，行数变了要跟着调，看的地方才不动
+      if (scroll > 0 && first >= this.#wrapped.length - scroll) scroll += rows.length - count;
+    }
+    this.update({ version: this.state.version + 1, scroll });
+    return true;
+  }
+
   #push(l: Line) {
     const rows = wrapLine(l, this.#width);
     this.#wrapped.push(...rows);
-    for (const _ of rows) this.#owners.push(l.fold ? l : undefined);
+    for (const _ of rows) this.#owners.push(l);
   }
 
   /** 按给定宽度折好的全部输出；宽度变了（终端缩放）才重新折行 */
@@ -175,18 +235,18 @@ class Store {
    */
   toggle(row: number, start: number, view: number) {
     const line = this.#owners[row];
-    if (!line?.fold) return;
+    if (!line || !foldable(line, this.#width)) return;
     let first = row;
     while (first > 0 && this.#owners[first - 1] === line) first--;
     let count = 0;
     while (this.#owners[first + count] === line) count++;
-    line.fold.open = !line.fold.open;
+    line.open = !line.open;
     const rows = wrapLine(line, this.#width);
     this.#wrapped.splice(first, count, ...rows);
     this.#owners.splice(first, count, ...rows.map(() => line));
     const end = Math.max(
       start + view,
-      line.fold.open ? Math.min(first + rows.length, first + view) : 0,
+      line.open ? Math.min(first + rows.length, first + view) : 0,
     );
     this.update(
       {
@@ -201,8 +261,9 @@ class Store {
     this.#lines = [];
     this.#wrapped = [];
     this.#owners = [];
+    this.#named.clear();
     this.update(
-      { version: this.state.version + 1, live: undefined, scroll: 0 },
+      { version: this.state.version + 1, live: undefined, progress: [], scroll: 0 },
       true,
     );
   }
@@ -234,17 +295,32 @@ export function tuiScreen(opts: TuiOptions): Screen {
   const stdout = opts.io?.stdout ?? process.stdout;
   const store = new Store(opts.status);
 
-  const styled = (kind: "text" | "thinking", lines: string[]) =>
-    kind === "thinking" ? lines.map((l) => (l ? dim(l) : l)) : lines;
-
-  /** 把流式块里已经完整的行移进 Static，只把最后不完整的一行留在底部 */
+  /**
+   * 结束或推进流式块。正文：已经完整的行移进对话，只把最后不完整的一行留在底部；
+   * 思考：整块留在底部只显示最新的一行，结束时（all）合成一个可展开的项，收起时也只显示最新的一行
+   */
   const flushLive = (all = false) => {
     const live = store.state.live;
     if (!live) return;
+    if (live.kind === "thinking") {
+      if (!all) return;
+      store.update({ live: undefined });
+      const text = live.text.replace(/\s+$/, "");
+      if (!text) return;
+      store.append([thinkingHead(text)], {
+        oneRow: true,
+        title: dim("✻ thinking"),
+        details: text
+          .split("\n")
+          .map((l) => (l ? dim(`  ${l}`) : l))
+          .join("\n"),
+      });
+      return;
+    }
     const lines = live.text.split("\n");
     const rest = all ? "" : lines.pop()!;
     if (all && lines.at(-1) === "") lines.pop();
-    store.append(styled(live.kind, lines));
+    store.append(lines);
     store.update({
       live: rest || !all ? { kind: live.kind, text: rest } : undefined,
     });
@@ -300,7 +376,31 @@ export function tuiScreen(opts: TuiOptions): Screen {
     log(text, o) {
       flushLive(true);
       store.update({ live: undefined });
-      store.append(text.split("\n"), o?.details);
+      // 带名字的项（工具调用）收起时只占一行，结果用 amend 接在后面
+      store.append(
+        text.split("\n"),
+        o?.details !== undefined || o?.id !== undefined
+          ? { details: o.details, id: o.id, oneRow: o.id !== undefined }
+          : undefined,
+      );
+    },
+    amend(id, text, o) {
+      flushLive(true);
+      const found = store.amend(id, (l) => {
+        l.text = `${l.text} ${text}`;
+        if (o?.details !== undefined) l.details = o.details;
+      });
+      if (!found)
+        store.append(
+          [`  ${text}`],
+          o?.details !== undefined ? { details: o.details } : undefined,
+        );
+    },
+    progress(id, line) {
+      const rest = store.state.progress.filter((p) => p.id !== id);
+      store.update({
+        progress: line === undefined ? rest : [...rest, { id, line }],
+      });
     },
     stream(kind, text) {
       const live = store.state.live;
@@ -309,8 +409,7 @@ export function tuiScreen(opts: TuiOptions): Screen {
         store.update({ live: undefined });
       }
       if (!store.state.live) {
-        if (kind === "thinking") store.append([dim("✻ thinking")]);
-        else text = text.replace(/^\n+/, "");
+        if (kind === "text") text = text.replace(/^\n+/, "");
         if (!text) return;
       }
       store.update({
@@ -354,7 +453,7 @@ export function tuiScreen(opts: TuiOptions): Screen {
     },
     async close() {
       flushLive(true);
-      store.update({ live: undefined, busy: undefined }, true);
+      store.update({ live: undefined, busy: undefined, progress: [] }, true);
       // 等最后一帧画完再卸载；卸载时 Ink 退出备用屏幕
       await new Promise((r) => setTimeout(r, 50));
       stdout.write(MOUSE_OFF);
@@ -396,12 +495,15 @@ function App({
   const { height, top } = useBoxMetrics(ref);
   const width = Math.max(10, columns - 2);
   const done = store.lines(width);
-  const live = state.live?.text
-    ? wrap(
-        state.live.kind === "thinking" ? dim(state.live.text) : state.live.text,
-        width,
-      )
-    : [];
+  // 还没结束的流式块和正在运行的工具的进度：思考只显示最新的一行，进度每个工具一行
+  const live = [
+    ...(state.live?.text
+      ? state.live.kind === "thinking"
+        ? [oneRow(thinkingHead(state.live.text), width).row]
+        : wrap(state.live.text, width)
+      : []),
+    ...state.progress.map((p) => oneRow(p.line, width).row),
+  ];
   const total = done.length + live.length;
   // 往上翻看时最后一行用来提示
   const scrolled = state.scroll > 0 && total > height;
@@ -468,53 +570,56 @@ function App({
       paddingY={repaint ? 1 : 0}
       overflowY="hidden"
     >
-      <Header status={state.status} version={version} />
-      <Box
-        ref={ref}
-        flexDirection="column"
-        flexGrow={1}
-        flexShrink={1}
-        flexBasis={0}
-        overflowY="hidden"
-        paddingX={1}
-      >
-        {shown.map((l, i) => (
-          <Text key={i} wrap="truncate-end">
-            {l || " "}
-          </Text>
-        ))}
-        {scrolled ? (
-          <Text dimColor wrap="truncate-end">
-            {`── ↓ ${scroll} more lines · wheel / PgDn to scroll · ctrl+end to jump to the bottom ──`}
-          </Text>
-        ) : null}
-      </Box>
-      <Box flexDirection="column" flexShrink={0}>
-        {state.busy && !dialog ? (
-          <Spinner label={state.busy.label} since={state.busy.since} />
-        ) : null}
-        {state.queued.map((q, i) => (
-          <Text key={i} dimColor wrap="truncate-end">
-            {"  ↳ queued: "}
-            {q.replace(/\s+/g, " ")}
-          </Text>
-        ))}
-        {dialog ? (
-          dialog.kind === "select" ? (
-            <SelectDialog key={dialogKey(dialog)} dialog={dialog} />
-          ) : (
-            <InputDialog key={dialogKey(dialog)} dialog={dialog} />
-          )
-        ) : null}
-        <Prompt
-          commands={commands}
-          handlers={handlers}
-          history={history}
-          busy={Boolean(state.busy)}
-          active={!dialog}
-          onSubmit={() => store.scrollBy(-max, max)}
-        />
-        <StatusBar status={state.status} />
+      {/* 垫的空白放在外层：里面这层在重画那一帧和平时一样高，对话区的 top（相对父节点）不变，点击换算的行号不会差一行 */}
+      <Box flexDirection="column" flexGrow={1} overflowY="hidden">
+        <Header status={state.status} version={version} />
+        <Box
+          ref={ref}
+          flexDirection="column"
+          flexGrow={1}
+          flexShrink={1}
+          flexBasis={0}
+          overflowY="hidden"
+          paddingX={1}
+        >
+          {shown.map((l, i) => (
+            <Text key={i} wrap="truncate-end">
+              {l || " "}
+            </Text>
+          ))}
+          {scrolled ? (
+            <Text dimColor wrap="truncate-end">
+              {`── ↓ ${scroll} more lines · wheel / PgDn to scroll · ctrl+end to jump to the bottom ──`}
+            </Text>
+          ) : null}
+        </Box>
+        <Box flexDirection="column" flexShrink={0}>
+          {state.busy && !dialog ? (
+            <Spinner label={state.busy.label} since={state.busy.since} />
+          ) : null}
+          {state.queued.map((q, i) => (
+            <Text key={i} dimColor wrap="truncate-end">
+              {"  ↳ queued: "}
+              {q.replace(/\s+/g, " ")}
+            </Text>
+          ))}
+          {dialog ? (
+            dialog.kind === "select" ? (
+              <SelectDialog key={dialogKey(dialog)} dialog={dialog} />
+            ) : (
+              <InputDialog key={dialogKey(dialog)} dialog={dialog} />
+            )
+          ) : null}
+          <Prompt
+            commands={commands}
+            handlers={handlers}
+            history={history}
+            busy={Boolean(state.busy)}
+            active={!dialog}
+            onSubmit={() => store.scrollBy(-max, max)}
+          />
+          <StatusBar status={state.status} />
+        </Box>
       </Box>
     </Box>
   );
