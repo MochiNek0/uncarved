@@ -27,6 +27,12 @@ export interface RetryOptions {
 /** 是不是被限流了（429，或者错误信息里这么说） */
 export const isRateLimit = (err: ProviderError) => err.status === 429 || /\b429\b|rate.?limit|too many requests/i.test(err.message);
 
+/**
+ * 是不是同时进行的请求太多（"concurrency limit"），而不是每分钟的请求太多。
+ * 这种限流也要一起等，但不能拿来推每分钟的上限：等前面的请求结束就好了，推出来的上限只会让之后一直变慢
+ */
+export const isConcurrencyLimit = (err: ProviderError) => /concurren/i.test(err.message);
+
 export function withRetry(inner: Provider, opts: RetryOptions = {}): Provider {
   const delays = opts.delaysMs ?? RETRY_DELAYS_MS;
   const retries = opts.retries ?? delays.length;
@@ -55,7 +61,7 @@ export function withRetry(inner: Provider, opts: RetryOptions = {}): Provider {
           const planned = delays[Math.min(attempt, delays.length) - 1] ?? 1000;
           const delayMs = Math.round(Math.min(err.retryAfterMs ?? planned * (0.8 + 0.2 * random()), max));
           // 限流时所有共用这个 gate 的请求（子 Agent、压缩）一起等，不再各自去撞
-          if (isRateLimit(err)) opts.gate?.limited(delayMs);
+          if (isRateLimit(err)) opts.gate?.limited(delayMs, { learn: !isConcurrencyLimit(err) });
           // 失败的这次已经推送过增量的，先让订阅者作废它们（4.7）
           if (streamed) options.onDelta?.({ kind: "reset" });
           opts.onRetry?.({ attempt, retries, delayMs, error: err });
@@ -124,12 +130,12 @@ export class RateGate {
 
   /**
    * 被限流了：ms 内不再发请求。没设上限时，按最近一分钟发出的请求数推一个上限（比它少一个）；
-   * 一分钟里只发了一两个请求就被限流，多半是服务端繁忙，不是请求太多，不推
+   * 一分钟里只发了一两个请求就被限流，多半是服务端繁忙，不是请求太多，不推；learn 为 false（并发数限流）时也不推
    */
-  limited(ms: number) {
+  limited(ms: number, { learn = true }: { learn?: boolean } = {}) {
     const now = this.#now();
     this.#until = Math.max(this.#until, now + ms);
-    if (this.#explicit) return;
+    if (this.#explicit || !learn) return;
     const recent = this.#recent(now);
     if (recent < 3) return;
     const next = recent - 1;
