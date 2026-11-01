@@ -404,3 +404,115 @@ test("工具调用前只有空白的文本不保留；没有工具调用时照�
   expect((await provider.complete(req, { signal: new AbortController().signal })).content.map((b) => b.kind)).toEqual(["tool_use"]);
   expect((await provider.complete(req, { signal: new AbortController().signal })).content).toMatchObject([{ kind: "text", text: " " }]);
 });
+
+// 先发出 parts（每段之间隔 gapMs），然后既不发数据也不关闭；响应体本身不理会 signal，验证超时不依赖 fetch 关掉响应体
+function stallingFetch(parts: string[], gapMs = 0) {
+  return (async () =>
+    new Response(
+      new ReadableStream<Uint8Array>({
+        async start(ctrl) {
+          for (const p of parts) {
+            if (gapMs) await new Promise((r) => setTimeout(r, gapMs));
+            ctrl.enqueue(new TextEncoder().encode(p));
+          }
+        },
+      }),
+      { headers: { "content-type": "text/event-stream" } },
+    )) as unknown as typeof fetch;
+}
+
+test("空闲超时：流到一半不再发数据时中断，抛出可重试的 ProviderError", async () => {
+  const provider = openaiCompatProvider({
+    baseURL: "https://example.test/v1",
+    model: "m",
+    idleTimeoutMs: 50,
+    fetch: stallingFetch([`data: ${chunk({ content: "half" })}\n\n`]),
+  });
+  const started = Date.now();
+  const err = await provider.complete({ system: [], tools: [], messages: [] }, { signal: new AbortController().signal }).catch((e) => e);
+  expect(err).toBeInstanceOf(ProviderError);
+  expect(err).toMatchObject({ retryable: true, message: expect.stringContaining("no data from the server") });
+  expect(Date.now() - started).toBeLessThan(2000);
+});
+
+test("空闲超时：一直不给响应头时中断请求，抛出可重试的 ProviderError", async () => {
+  // 和真实的 fetch 一样，signal 中断时以它的 reason 失败
+  const fetchFn = ((_url: string, init: RequestInit) =>
+    new Promise((_, reject) => init.signal!.addEventListener("abort", () => reject(init.signal!.reason)))) as unknown as typeof fetch;
+  const provider = openaiCompatProvider({ baseURL: "https://example.test/v1", model: "m", idleTimeoutMs: 50, fetch: fetchFn });
+  const err = await provider.complete({ system: [], tools: [], messages: [] }, { signal: new AbortController().signal }).catch((e) => e);
+  expect(err).toBeInstanceOf(ProviderError);
+  expect(err).toMatchObject({ retryable: true, message: expect.stringContaining("no data from the server") });
+});
+
+test("空闲超时按两段数据之间的间隔算，不按总时长：持续有数据（包括 keep-alive 注释）就不中断", async () => {
+  const parts = [": keep-alive\n\n", `data: ${chunk({ content: "a" })}\n\n`, ": keep-alive\n\n", `data: ${chunk({ content: "b" }, "stop")}\n\n`, "data: [DONE]\n\n"];
+  const fetchFn = (async () =>
+    new Response(
+      new ReadableStream<Uint8Array>({
+        async start(ctrl) {
+          for (const p of parts) {
+            await new Promise((r) => setTimeout(r, 30));
+            ctrl.enqueue(new TextEncoder().encode(p));
+          }
+          ctrl.close();
+        },
+      }),
+    )) as unknown as typeof fetch;
+  // 总时长约 150ms，超过 80ms，但每段之间只有 30ms
+  const provider = openaiCompatProvider({ baseURL: "https://example.test/v1", model: "m", idleTimeoutMs: 80, fetch: fetchFn });
+  const res = await provider.complete({ system: [], tools: [], messages: [] }, { signal: new AbortController().signal });
+  expect(res.content).toMatchObject([{ kind: "text", text: "ab" }]);
+});
+
+test("等待数据时用户取消：照原样抛出取消的原因，不当成超时", async () => {
+  const provider = openaiCompatProvider({ baseURL: "https://example.test/v1", model: "m", idleTimeoutMs: 10_000, fetch: stallingFetch([]) });
+  const ctrl = new AbortController();
+  const reason = new Error("user cancelled");
+  setTimeout(() => ctrl.abort(reason), 20);
+  const err = await provider.complete({ system: [], tools: [], messages: [] }, { signal: ctrl.signal }).catch((e) => e);
+  expect(err).toBe(reason);
+});
+
+test("工具结果里的图片：toolResultImages 时放进紧跟 tool 消息的 user 消息，否则换成占位说明", async () => {
+  const png = { type: "base64", media_type: "image/png", data: "AAAA" };
+  const origin = { by: "tool" as const, name: "screenshot" };
+  const messages = [
+    { role: "user" as const, content: [{ kind: "text" as const, text: "draw", origin: { by: "user" as const }, trust: "trusted" as const }] },
+    { role: "assistant" as const, content: [{ kind: "tool_use" as const, id: "c1", name: "screenshot", input: { path: "a.html" }, origin: { by: "model" as const }, trust: "trusted" as const }] },
+    {
+      role: "user" as const,
+      content: [
+        {
+          kind: "tool_result" as const,
+          toolUseId: "c1",
+          isError: false,
+          content: [
+            { kind: "text" as const, text: "Screenshot of a.html:", origin, trust: "untrusted" as const },
+            { kind: "image" as const, source: png, origin, trust: "untrusted" as const },
+          ],
+          origin,
+          trust: "untrusted" as const,
+        },
+      ],
+    },
+  ] as unknown as import("uncarved").Message[];
+  const bodyWith = async (toolResultImages: boolean) => {
+    const { fetchFn, bodies } = fakeServer([[chunk({ content: "ok" }, "stop")]]);
+    const provider = openaiCompatProvider({ baseURL: "https://example.test/v1", model: "m", fetch: fetchFn, toolResultImages });
+    await provider.complete({ system: [], tools: [], messages }, { signal: new AbortController().signal });
+    return bodies[0]!.messages as Array<{ role: string; content: unknown }>;
+  };
+
+  const on = await bodyWith(true);
+  expect(on.map((m) => m.role)).toEqual(["user", "assistant", "tool", "user"]);
+  expect(on[2]!.content).toBe("Screenshot of a.html:\n[image 1: attached in the next user message]");
+  expect(on[3]!.content).toEqual([
+    { type: "text", text: "[image 1, returned by tool call c1]" },
+    { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } },
+  ]);
+
+  const off = await bodyWith(false);
+  expect(off.map((m) => m.role)).toEqual(["user", "assistant", "tool"]);
+  expect(off[2]!.content).toContain("[image omitted");
+});

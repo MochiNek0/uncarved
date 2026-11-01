@@ -33,6 +33,13 @@ export interface OpenAIResponsesOptions {
   extraBody?: Record<string, unknown>;
   /** 每次请求都合并进请求头，ext 中的 headers 覆盖它 */
   headers?: Record<string, string>;
+  /** 多久没收到任何数据（等响应头、流中两段数据之间）就中断并重试，毫秒；0 表示不限。默认 DEFAULT_IDLE_TIMEOUT_MS */
+  idleTimeoutMs?: number;
+  /**
+   * 把工具结果里的图片（读取的图片文件、截图）发给模型，放在紧跟工具结果的 user 消息里。
+   * 默认 false：不支持图片的模型收到图片会拒绝整个请求，而图片会一直留在历史里，之后每次请求都会失败
+   */
+  toolResultImages?: boolean;
   /** 可替换，便于测试 */
   fetch?: typeof fetch;
 }
@@ -80,94 +87,159 @@ export function openaiResponsesProvider(opts: OpenAIResponsesOptions): Provider 
       if (reserved) throw new Error(`${PROVIDER_ID}: extra body must not set "${reserved}"`);
 
       const instructions = req.system.map((s) => s.text).join("\n\n");
-      const res = await send(doFetch, url, signal, {
-        method: "POST",
-        signal,
-        headers: {
-          "content-type": "application/json",
-          ...(opts.apiKey ? { authorization: `Bearer ${opts.apiKey}` } : {}),
-          ...opts.headers,
-          ...ext.headers,
-        },
-        body: JSON.stringify({
-          model: opts.model,
-          stream: true,
-          store,
-          // 不在服务端保存时，推理内容只能以加密形式带回来再发回去
-          ...(store ? {} : { include: ["reasoning.encrypted_content"] }),
-          ...(instructions ? { instructions } : {}),
-          ...(opts.maxTokens ? { max_output_tokens: opts.maxTokens } : {}),
-          ...(opts.reasoning ? { reasoning: opts.reasoning } : {}),
-          ...extra,
-          input: toInput(req, store),
-          ...(req.tools.length > 0
-            ? {
-                tools: req.tools.map((t) => ({
-                  type: "function",
-                  name: t.name,
-                  description: t.description,
-                  parameters: t.inputSchema,
-                  // Responses API 默认 strict，会拒绝大多数普通的 JSON Schema
-                  strict: false,
-                })),
-              }
-            : {}),
-        }),
-      });
-
-      let model = (extra.model as string | undefined) ?? opts.model;
-      const done: Item[] = [];
-      let final: StreamEvent["response"];
-
+      const idle = idleTimer(signal, opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS);
       try {
-        for await (const ev of readSSE(res.body)) {
-          switch (ev.type) {
-            case "response.created":
-              if (ev.response?.model) model = ev.response.model;
-              break;
-            case "response.output_text.delta":
-              if (ev.delta) onDelta?.({ kind: "text", text: ev.delta });
-              break;
-            case "response.reasoning_summary_text.delta":
-              if (ev.delta) onDelta?.({ kind: "thinking", text: ev.delta });
-              break;
-            case "response.output_item.done":
-              if (ev.item) done[ev.output_index ?? done.length] = ev.item;
-              break;
-            case "response.completed":
-            case "response.incomplete":
-              final = ev.response;
-              break;
-            case "response.failed": {
-              const code = ev.response?.error?.code;
-              throw new ProviderError(`${PROVIDER_ID} response failed: ${ev.response?.error?.message ?? "unknown error"}`, {
-                retryable: code === "server_error" || code === "rate_limit_exceeded",
-              });
+        const res = await send(doFetch, url, signal, {
+          method: "POST",
+          signal: idle.signal,
+          headers: {
+            "content-type": "application/json",
+            ...(opts.apiKey ? { authorization: `Bearer ${opts.apiKey}` } : {}),
+            ...opts.headers,
+            ...ext.headers,
+          },
+          body: JSON.stringify({
+            model: opts.model,
+            stream: true,
+            store,
+            // 不在服务端保存时，推理内容只能以加密形式带回来再发回去
+            ...(store ? {} : { include: ["reasoning.encrypted_content"] }),
+            ...(instructions ? { instructions } : {}),
+            ...(opts.maxTokens ? { max_output_tokens: opts.maxTokens } : {}),
+            ...(opts.reasoning ? { reasoning: opts.reasoning } : {}),
+            ...extra,
+            input: toInput(req, store, opts.toolResultImages ?? false),
+            ...(req.tools.length > 0
+              ? {
+                  tools: req.tools.map((t) => ({
+                    type: "function",
+                    name: t.name,
+                    description: t.description,
+                    parameters: t.inputSchema,
+                    // Responses API 默认 strict，会拒绝大多数普通的 JSON Schema
+                    strict: false,
+                  })),
+                }
+              : {}),
+          }),
+        });
+
+        let model = (extra.model as string | undefined) ?? opts.model;
+        const done: Item[] = [];
+        let final: StreamEvent["response"];
+
+        try {
+          for await (const ev of readSSE(watched(res.body, idle))) {
+            switch (ev.type) {
+              case "response.created":
+                if (ev.response?.model) model = ev.response.model;
+                break;
+              case "response.output_text.delta":
+                if (ev.delta) onDelta?.({ kind: "text", text: ev.delta });
+                break;
+              case "response.reasoning_summary_text.delta":
+                if (ev.delta) onDelta?.({ kind: "thinking", text: ev.delta });
+                break;
+              case "response.output_item.done":
+                if (ev.item) done[ev.output_index ?? done.length] = ev.item;
+                break;
+              case "response.completed":
+              case "response.incomplete":
+                final = ev.response;
+                break;
+              case "response.failed": {
+                const code = ev.response?.error?.code;
+                throw new ProviderError(`${PROVIDER_ID} response failed: ${ev.response?.error?.message ?? "unknown error"}`, {
+                  retryable: code === "server_error" || code === "rate_limit_exceeded",
+                });
+              }
+              case "error":
+                throw new ProviderError(`${PROVIDER_ID} stream error: ${ev.message ?? "unknown error"}`, {
+                  retryable: ev.code === "server_error" || ev.code === "rate_limit_exceeded",
+                });
             }
-            case "error":
-              throw new ProviderError(`${PROVIDER_ID} stream error: ${ev.message ?? "unknown error"}`, {
-                retryable: ev.code === "server_error" || ev.code === "rate_limit_exceeded",
-              });
           }
+        } catch (err) {
+          throw streamError(err, signal);
         }
-      } catch (err) {
-        throw streamError(err, signal);
+        // 没有收到最终响应就断开，多半是连接中断
+        if (!final) throw new ProviderError(`${PROVIDER_ID} stream ended without a final response`, { retryable: true });
+        if (final.model) model = final.model;
+
+        const items = done.filter(Boolean);
+        const origin: Origin = { by: "model", provider: PROVIDER_ID, model };
+        const content = (items.length > 0 ? items : (final.output ?? [])).flatMap((item) => toBlocks(item, origin));
+        const u = final.usage;
+        const usage: Usage | undefined = u
+          ? { inputTokens: u.input_tokens, outputTokens: u.output_tokens, cacheReadTokens: u.input_tokens_details?.cached_tokens }
+          : undefined;
+
+        return { provider: PROVIDER_ID, model, content, stopReason: toStopReason(final, content), usage };
+      } finally {
+        idle.stop();
       }
-      // 没有收到最终响应就断开，多半是连接中断
-      if (!final) throw new ProviderError(`${PROVIDER_ID} stream ended without a final response`, { retryable: true });
-      if (final.model) model = final.model;
-
-      const items = done.filter(Boolean);
-      const origin: Origin = { by: "model", provider: PROVIDER_ID, model };
-      const content = (items.length > 0 ? items : (final.output ?? [])).flatMap((item) => toBlocks(item, origin));
-      const u = final.usage;
-      const usage: Usage | undefined = u
-        ? { inputTokens: u.input_tokens, outputTokens: u.output_tokens, cacheReadTokens: u.input_tokens_details?.cached_tokens }
-        : undefined;
-
-      return { provider: PROVIDER_ID, model, content, stopReason: toStopReason(final, content), usage };
     },
   };
+}
+
+/** 默认多久没收到任何数据就当作连接卡住 */
+export const DEFAULT_IDLE_TIMEOUT_MS = 90_000;
+
+interface Idle {
+  /** 用户取消或超时都会中断它 */
+  signal: AbortSignal;
+  /** 收到数据了，重新计时 */
+  touch(): void;
+  stop(): void;
+}
+
+/**
+ * 空闲计时：服务端有时接受了请求却一直不回（不给响应头，或者流到一半不再发数据），不设时限就会一直等到用户手动取消。
+ * 超时后中断请求，抛出可重试的错误，交给重试重新请求
+ */
+function idleTimer(parent: AbortSignal, ms: number): Idle {
+  const ctrl = new AbortController();
+  const abort = () => ctrl.abort(parent.reason);
+  if (parent.aborted) abort();
+  else parent.addEventListener("abort", abort, { once: true });
+  // 0、负数或超出 setTimeout 范围（会被当成 1ms）时不计时
+  const enabled = ms > 0 && ms <= 2 ** 31 - 1;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const touch = () => {
+    if (!enabled || ctrl.signal.aborted) return;
+    clearTimeout(timer);
+    timer = setTimeout(() => ctrl.abort(new Error(`no data from the server for ${Math.round(ms / 1000)}s`)), ms);
+  };
+  touch();
+  return {
+    signal: ctrl.signal,
+    touch,
+    stop() {
+      clearTimeout(timer);
+      parent.removeEventListener("abort", abort);
+    },
+  };
+}
+
+/** 逐段读取响应体，每收到一段就重新计时。中断时立即结束读取，不依赖 fetch 的实现会不会随 signal 关掉响应体 */
+async function* watched(body: ReadableStream<Uint8Array>, idle: Idle): AsyncGenerator<Uint8Array> {
+  const reader = body.getReader();
+  let onAbort = () => {};
+  const aborted = new Promise<never>((_, reject) => (onAbort = () => reject(idle.signal.reason)));
+  aborted.catch(() => {});
+  if (idle.signal.aborted) onAbort();
+  else idle.signal.addEventListener("abort", onAbort, { once: true });
+  try {
+    for (;;) {
+      const { done, value } = await Promise.race([reader.read(), aborted]);
+      if (done) return;
+      idle.touch();
+      yield value;
+    }
+  } finally {
+    idle.signal.removeEventListener("abort", onAbort);
+    reader.cancel().catch(() => {});
+  }
 }
 
 /** 发送请求；网络错误和 HTTP 错误都转成 ProviderError，取消照原样抛出 */
@@ -266,9 +338,9 @@ function toStopReason(final: NonNullable<StreamEvent["response"]>, content: Bloc
 
 // ---------- 历史 → input ----------
 
-function toInput(req: ModelRequest, store: boolean): Item[] {
+function toInput(req: ModelRequest, store: boolean, toolImages: boolean): Item[] {
   const out: Item[] = [];
-  for (const m of req.messages) out.push(...(m.role === "assistant" ? fromAssistant(m, store) : fromUser(m)));
+  for (const m of req.messages) out.push(...(m.role === "assistant" ? fromAssistant(m, store) : fromUser(m, toolImages)));
   return out;
 }
 
@@ -302,14 +374,26 @@ function fromAssistant(m: Message, store: boolean): Item[] {
   return out;
 }
 
-function fromUser(m: Message): Item[] {
+function fromUser(m: Message, toolImages: boolean): Item[] {
   const out: Item[] = [];
   const parts: Array<Record<string, unknown>> = [];
+  /** 工具结果里的图片，放进紧跟工具结果的 user 消息 */
+  const images: Array<Record<string, unknown>> = [];
+  let n = 0;
   for (const b of m.content) {
     if (b.kind === "tool_result") {
-      // 工具结果按文本发送：图片、文档换成占位说明，让模型知道少了内容
+      // 工具结果按文本发送：图片能转发时在原处留一句说明指向后面的 user 消息；否则图片、文档都换成占位说明，让模型知道少了内容
       const body = b.content
-        .flatMap((c) => (c.kind === "text" ? [c.text] : c.kind === "image" || c.kind === "document" ? [omitted(c.kind)] : []))
+        .flatMap((c) => {
+          if (c.kind === "text") return [c.text];
+          const part = c.kind === "image" && toolImages ? toInputPart("image", c.source) : undefined;
+          if (part) {
+            n++;
+            images.push({ type: "input_text", text: `[image ${n}, returned by tool call ${b.toolUseId}]` }, part);
+            return [`[image ${n}: attached in the next user message]`];
+          }
+          return c.kind === "image" || c.kind === "document" ? [omitted(c.kind)] : [];
+        })
         .join("\n");
       // 这个格式没有 is_error 字段，错误结果加前缀，否则模型会把拒绝理由当成正常输出；空的错误结果给一个最小占位
       out.push({ type: "function_call_output", call_id: b.toolUseId, output: b.isError ? errorText(body) : body });
@@ -319,6 +403,7 @@ function fromUser(m: Message): Item[] {
       parts.push(toInputPart(b.kind, b.source) ?? { type: "input_text", text: omitted(b.kind) });
     }
   }
+  parts.unshift(...images);
   if (parts.length > 0) out.push({ type: "message", role: "user", content: parts });
   return out;
 }
@@ -375,7 +460,7 @@ function parseArgs(s: string): unknown {
   }
 }
 
-async function* readSSE(body: ReadableStream<Uint8Array>): AsyncGenerator<StreamEvent> {
+async function* readSSE(body: AsyncIterable<Uint8Array>): AsyncGenerator<StreamEvent> {
   // event: 行与 data 中的 type 重复，只看 data
   for await (const data of sseData(body)) {
     if (data.trim() === "[DONE]") return;
@@ -387,7 +472,7 @@ async function* readSSE(body: ReadableStream<Uint8Array>): AsyncGenerator<Stream
  * 按 SSE 规范切分事件，返回每个事件的 data：一个事件的多行 data 以换行拼接，空行结束一个事件。
  * 部分服务端事件之间不空行：已攒下的 data 本身是完整的 JSON 时，新的 data 行视为下一个事件
  */
-async function* sseData(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
+async function* sseData(body: AsyncIterable<Uint8Array>): AsyncGenerator<string> {
   let data: string[] = [];
   const complete = (text: string) => {
     if (text.trim() === "[DONE]") return true;
@@ -414,10 +499,10 @@ async function* sseData(body: ReadableStream<Uint8Array>): AsyncGenerator<string
 }
 
 /** 逐行读取（去掉行尾的 \r）。部分服务端最后一个事件后面没有空行：流结束时补一个空行 */
-async function* sseLines(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
+async function* sseLines(body: AsyncIterable<Uint8Array>): AsyncGenerator<string> {
   const decoder = new TextDecoder();
   let buffer = "";
-  for await (const bytes of body as unknown as AsyncIterable<Uint8Array>) {
+  for await (const bytes of body) {
     buffer += decoder.decode(bytes, { stream: true });
     let nl: number;
     while ((nl = buffer.indexOf("\n")) >= 0) {

@@ -433,3 +433,53 @@ test("被截断的工具调用：参数是半截 JSON 时回传能解析的对�
     { ...truncated, arguments: JSON.stringify({ unparsed_arguments: '{"x": "ab' }) },
   ]);
 });
+
+test("空闲超时：流到一半不再发数据时中断，抛出可重试的 ProviderError", async () => {
+  const fetchFn = (async () =>
+    new Response(
+      new ReadableStream<Uint8Array>({
+        start(ctrl) {
+          // 只发一个注释行，然后既不发数据也不关闭；响应体本身不理会 signal
+          ctrl.enqueue(new TextEncoder().encode(": keep-alive\n\n"));
+        },
+      }),
+      { headers: { "content-type": "text/event-stream" } },
+    )) as unknown as typeof fetch;
+  const provider = openaiResponsesProvider({ baseURL: "https://example.test/v1", apiKey: "k", model: "m", idleTimeoutMs: 50, fetch: fetchFn });
+  const err = await provider.complete({ system: [], tools: [], messages: [] }, { signal: new AbortController().signal }).catch((e) => e);
+  expect(err).toBeInstanceOf(ProviderError);
+  expect(err).toMatchObject({ retryable: true, message: expect.stringContaining("no data from the server") });
+});
+
+test("工具结果里的图片：toolResultImages 时放进紧跟 function_call_output 的 user 消息", async () => {
+  const origin = { by: "tool" as const, name: "screenshot" };
+  const messages = [
+    { role: "assistant", content: [{ kind: "tool_use", id: "c1", name: "screenshot", input: {}, origin: { by: "model" }, trust: "trusted" }] },
+    {
+      role: "user",
+      content: [
+        {
+          kind: "tool_result",
+          toolUseId: "c1",
+          isError: false,
+          content: [{ kind: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" }, origin, trust: "untrusted" }],
+          origin,
+          trust: "untrusted",
+        },
+      ],
+    },
+  ] as unknown as import("uncarved").Message[];
+  const { fetchFn, bodies } = fakeServer([[created, itemDone(0, { type: "message", role: "assistant", content: [{ type: "output_text", text: "ok" }] }), completed()]]);
+  const provider = openaiResponsesProvider({ baseURL: "https://example.test/v1", apiKey: "k", model: "m", fetch: fetchFn, toolResultImages: true });
+  await provider.complete({ system: [], tools: [], messages }, { signal: new AbortController().signal });
+  const input = bodies[0]!.input as Array<Record<string, any>>;
+  expect(input.at(-2)).toMatchObject({ type: "function_call_output", call_id: "c1", output: "[image 1: attached in the next user message]" });
+  expect(input.at(-1)).toEqual({
+    type: "message",
+    role: "user",
+    content: [
+      { type: "input_text", text: "[image 1, returned by tool call c1]" },
+      { type: "input_image", image_url: "data:image/png;base64,AAAA" },
+    ],
+  });
+});

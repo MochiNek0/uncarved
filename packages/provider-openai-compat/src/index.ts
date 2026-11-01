@@ -25,6 +25,13 @@ export interface OpenAICompatOptions {
   extraBody?: Record<string, unknown>;
   /** 每次请求都合并进请求头，ext 中的 headers 覆盖它 */
   headers?: Record<string, string>;
+  /** 多久没收到任何数据（等响应头、流中两段数据之间）就中断并重试，毫秒；0 表示不限。默认 DEFAULT_IDLE_TIMEOUT_MS */
+  idleTimeoutMs?: number;
+  /**
+   * 把工具结果里的图片（读取的图片文件、截图）发给模型。tool 消息只能是文本，图片放在紧跟其后的 user 消息里。
+   * 默认 false：不支持图片的模型收到图片会拒绝整个请求，而图片会一直留在历史里，之后每次请求都会失败
+   */
+  toolResultImages?: boolean;
   /** 可替换，便于测试 */
   fetch?: typeof fetch;
 }
@@ -66,122 +73,187 @@ export function openaiCompatProvider(opts: OpenAICompatOptions): Provider {
       const reserved = RESERVED.find((k) => k in extra);
       if (reserved) throw new Error(`${PROVIDER_ID}: extra body must not set "${reserved}"`);
 
-      const res = await send(doFetch, url, signal, {
-        method: "POST",
-        signal,
-        headers: {
-          "content-type": "application/json",
-          ...(opts.apiKey ? { authorization: `Bearer ${opts.apiKey}` } : {}),
-          ...opts.headers,
-          ...ext.headers,
-        },
-        body: JSON.stringify({
-          model: opts.model,
-          stream: true,
-          stream_options: { include_usage: true },
-          ...(opts.maxTokens ? { max_tokens: opts.maxTokens } : {}),
-          ...extra,
-          messages: toMessages(req),
-          ...(req.tools.length > 0
-            ? {
-                tools: req.tools.map((t) => ({
-                  type: "function",
-                  function: { name: t.name, description: t.description, parameters: t.inputSchema },
-                })),
-              }
-            : {}),
-        }),
-      });
-
-      let model = (extra.model as string | undefined) ?? opts.model;
-      let text = "";
-      let reasoning = "";
-      let finish: string | null = null;
-      let usage: StreamChunk["usage"] = null;
-      const calls: Array<{ id: string; name: string; arguments: string }> = [];
-      let done = false;
-
+      const idle = idleTimer(signal, opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS);
       try {
-        for await (const chunk of readSSE(res.body, () => (done = true))) {
-          if (chunk.error) {
-            const code = chunk.error.code;
-            throw new ProviderError(`${PROVIDER_ID} stream error: ${chunk.error.message ?? JSON.stringify(chunk.error)}`, {
-              // 部分服务端把 HTTP 状态码放在 code 里
-              retryable: typeof code === "number" && (code === 408 || code === 429 || code >= 500),
-              status: typeof code === "number" ? code : undefined,
-            });
-          }
-          if (chunk.model) model = chunk.model;
-          if (chunk.usage) usage = chunk.usage;
-          const choice = chunk.choices?.[0];
-          if (!choice) continue;
-          const d = choice.delta ?? {};
-          if (d.content) {
-            text += d.content;
-            onDelta?.({ kind: "text", text: d.content });
-          }
-          if (d.reasoning_content) {
-            reasoning += d.reasoning_content;
-            onDelta?.({ kind: "thinking", text: d.reasoning_content });
-          }
-          for (const tc of d.tool_calls ?? []) {
-            // 没有 index 时：带着新的 id 就是新的调用；也没有 id 时，最后一个调用已经开始接收参数后又来了 name，
-            // 也是新的调用；否则接在最后一个调用后面
-            const last = calls.length - 1;
-            const prev = calls[last];
-            const fresh = !prev || (tc.id ? tc.id !== prev.id : !!tc.function?.name && prev.arguments !== "");
-            const index = tc.index ?? (fresh ? last + 1 : last);
-            const c = (calls[index] ??= { id: "", name: "", arguments: "" });
-            if (tc.id) c.id = tc.id;
-            // 名字一般只在第一块里给出；部分服务端每一块都重复完整的名字，不能再拼上去
-            if (tc.function?.name && tc.function.name !== c.name) c.name += tc.function.name;
-            if (tc.function?.arguments) c.arguments += tc.function.arguments;
-          }
-          if (choice.finish_reason) finish = choice.finish_reason;
-        }
-      } catch (err) {
-        throw streamError(err, signal);
-      }
-      // 既没有 finish_reason 也没有 [DONE]：连接中途断开，内容不完整
-      if (finish === null && !done) {
-        throw new ProviderError(`${PROVIDER_ID} stream ended before the response finished`, { retryable: true });
-      }
-
-      const origin: Origin = { by: "model", provider: PROVIDER_ID, model };
-      const content: Block[] = [];
-      if (reasoning) content.push({ kind: "thinking", text: reasoning, origin, trust: "trusted" });
-      // 有的模型在工具调用前只输出几个换行，这种文本没有内容，存下来只会在之后每次请求里重复发送
-      if (text.trim() || (text && !calls.some(Boolean))) content.push({ kind: "text", text, origin, trust: "trusted" });
-      for (const c of calls.filter(Boolean)) {
-        content.push({
-          kind: "tool_use",
-          // 部分服务端不给 id；同一批里重复的 id 无法对应结果。生成的 id 随响应写入日志，重建时不受影响
-          id: c.id || `call_${crypto.randomUUID()}`,
-          name: c.name,
-          input: parseArgs(c.arguments),
-          origin,
-          trust: "trusted",
-          // 保留原始参数字符串，回传时不重新序列化（I-6）
-          ext: { [PROVIDER_ID]: { arguments: c.arguments } },
+        const res = await send(doFetch, url, signal, {
+          method: "POST",
+          signal: idle.signal,
+          headers: {
+            "content-type": "application/json",
+            ...(opts.apiKey ? { authorization: `Bearer ${opts.apiKey}` } : {}),
+            ...opts.headers,
+            ...ext.headers,
+          },
+          body: JSON.stringify({
+            model: opts.model,
+            stream: true,
+            stream_options: { include_usage: true },
+            ...(opts.maxTokens ? { max_tokens: opts.maxTokens } : {}),
+            ...extra,
+            messages: toMessages(req, opts.toolResultImages ?? false),
+            ...(req.tools.length > 0
+              ? {
+                  tools: req.tools.map((t) => ({
+                    type: "function",
+                    function: { name: t.name, description: t.description, parameters: t.inputSchema },
+                  })),
+                }
+              : {}),
+          }),
         });
-      }
 
-      return {
-        provider: PROVIDER_ID,
-        model,
-        content,
-        stopReason: toStopReason(finish, calls.length > 0),
-        // prompt_tokens 已经包含命中缓存的部分
-        usage: usage
-          ? {
-              inputTokens: usage.prompt_tokens,
-              outputTokens: usage.completion_tokens,
-              cacheReadTokens: usage.prompt_tokens_details?.cached_tokens ?? undefined,
+        let model = (extra.model as string | undefined) ?? opts.model;
+        let text = "";
+        let reasoning = "";
+        let finish: string | null = null;
+        let usage: StreamChunk["usage"] = null;
+        const calls: Array<{ id: string; name: string; arguments: string }> = [];
+        let done = false;
+
+        try {
+          for await (const chunk of readSSE(watched(res.body, idle), () => (done = true))) {
+            if (chunk.error) {
+              const code = chunk.error.code;
+              throw new ProviderError(`${PROVIDER_ID} stream error: ${chunk.error.message ?? JSON.stringify(chunk.error)}`, {
+                // 部分服务端把 HTTP 状态码放在 code 里
+                retryable: typeof code === "number" && (code === 408 || code === 429 || code >= 500),
+                status: typeof code === "number" ? code : undefined,
+              });
             }
-          : undefined,
-      };
+            if (chunk.model) model = chunk.model;
+            if (chunk.usage) usage = chunk.usage;
+            const choice = chunk.choices?.[0];
+            if (!choice) continue;
+            const d = choice.delta ?? {};
+            if (d.content) {
+              text += d.content;
+              onDelta?.({ kind: "text", text: d.content });
+            }
+            if (d.reasoning_content) {
+              reasoning += d.reasoning_content;
+              onDelta?.({ kind: "thinking", text: d.reasoning_content });
+            }
+            for (const tc of d.tool_calls ?? []) {
+              // 没有 index 时：带着新的 id 就是新的调用；也没有 id 时，最后一个调用已经开始接收参数后又来了 name，
+              // 也是新的调用；否则接在最后一个调用后面
+              const last = calls.length - 1;
+              const prev = calls[last];
+              const fresh = !prev || (tc.id ? tc.id !== prev.id : !!tc.function?.name && prev.arguments !== "");
+              const index = tc.index ?? (fresh ? last + 1 : last);
+              const c = (calls[index] ??= { id: "", name: "", arguments: "" });
+              if (tc.id) c.id = tc.id;
+              // 名字一般只在第一块里给出；部分服务端每一块都重复完整的名字，不能再拼上去
+              if (tc.function?.name && tc.function.name !== c.name) c.name += tc.function.name;
+              if (tc.function?.arguments) c.arguments += tc.function.arguments;
+            }
+            if (choice.finish_reason) finish = choice.finish_reason;
+          }
+        } catch (err) {
+          throw streamError(err, signal);
+        }
+        // 既没有 finish_reason 也没有 [DONE]：连接中途断开，内容不完整
+        if (finish === null && !done) {
+          throw new ProviderError(`${PROVIDER_ID} stream ended before the response finished`, { retryable: true });
+        }
+
+        const origin: Origin = { by: "model", provider: PROVIDER_ID, model };
+        const content: Block[] = [];
+        if (reasoning) content.push({ kind: "thinking", text: reasoning, origin, trust: "trusted" });
+        // 有的模型在工具调用前只输出几个换行，这种文本没有内容，存下来只会在之后每次请求里重复发送
+        if (text.trim() || (text && !calls.some(Boolean))) content.push({ kind: "text", text, origin, trust: "trusted" });
+        for (const c of calls.filter(Boolean)) {
+          content.push({
+            kind: "tool_use",
+            // 部分服务端不给 id；同一批里重复的 id 无法对应结果。生成的 id 随响应写入日志，重建时不受影响
+            id: c.id || `call_${crypto.randomUUID()}`,
+            name: c.name,
+            input: parseArgs(c.arguments),
+            origin,
+            trust: "trusted",
+            // 保留原始参数字符串，回传时不重新序列化（I-6）
+            ext: { [PROVIDER_ID]: { arguments: c.arguments } },
+          });
+        }
+
+        return {
+          provider: PROVIDER_ID,
+          model,
+          content,
+          stopReason: toStopReason(finish, calls.length > 0),
+          // prompt_tokens 已经包含命中缓存的部分
+          usage: usage
+            ? {
+                inputTokens: usage.prompt_tokens,
+                outputTokens: usage.completion_tokens,
+                cacheReadTokens: usage.prompt_tokens_details?.cached_tokens ?? undefined,
+              }
+            : undefined,
+        };
+      } finally {
+        idle.stop();
+      }
     },
   };
+}
+
+/** 默认多久没收到任何数据就当作连接卡住 */
+export const DEFAULT_IDLE_TIMEOUT_MS = 90_000;
+
+interface Idle {
+  /** 用户取消或超时都会中断它 */
+  signal: AbortSignal;
+  /** 收到数据了，重新计时 */
+  touch(): void;
+  stop(): void;
+}
+
+/**
+ * 空闲计时：服务端有时接受了请求却一直不回（不给响应头，或者流到一半不再发数据），不设时限就会一直等到用户手动取消。
+ * 超时后中断请求，抛出可重试的错误，交给重试重新请求
+ */
+function idleTimer(parent: AbortSignal, ms: number): Idle {
+  const ctrl = new AbortController();
+  const abort = () => ctrl.abort(parent.reason);
+  if (parent.aborted) abort();
+  else parent.addEventListener("abort", abort, { once: true });
+  // 0、负数或超出 setTimeout 范围（会被当成 1ms）时不计时
+  const enabled = ms > 0 && ms <= 2 ** 31 - 1;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const touch = () => {
+    if (!enabled || ctrl.signal.aborted) return;
+    clearTimeout(timer);
+    timer = setTimeout(() => ctrl.abort(new Error(`no data from the server for ${Math.round(ms / 1000)}s`)), ms);
+  };
+  touch();
+  return {
+    signal: ctrl.signal,
+    touch,
+    stop() {
+      clearTimeout(timer);
+      parent.removeEventListener("abort", abort);
+    },
+  };
+}
+
+/** 逐段读取响应体，每收到一段就重新计时。中断时立即结束读取，不依赖 fetch 的实现会不会随 signal 关掉响应体 */
+async function* watched(body: ReadableStream<Uint8Array>, idle: Idle): AsyncGenerator<Uint8Array> {
+  const reader = body.getReader();
+  let onAbort = () => {};
+  const aborted = new Promise<never>((_, reject) => (onAbort = () => reject(idle.signal.reason)));
+  aborted.catch(() => {});
+  if (idle.signal.aborted) onAbort();
+  else idle.signal.addEventListener("abort", onAbort, { once: true });
+  try {
+    for (;;) {
+      const { done, value } = await Promise.race([reader.read(), aborted]);
+      if (done) return;
+      idle.touch();
+      yield value;
+    }
+  } finally {
+    idle.signal.removeEventListener("abort", onAbort);
+    reader.cancel().catch(() => {});
+  }
 }
 
 /** 发送请求；网络错误和 HTTP 错误都转成 ProviderError，取消照原样抛出 */
@@ -230,10 +302,10 @@ function retryAfter(v: string | null): number | undefined {
   return Number.isNaN(at) ? undefined : Math.max(0, at - Date.now());
 }
 
-function toMessages(req: ModelRequest): ChatMessage[] {
+function toMessages(req: ModelRequest, toolImages: boolean): ChatMessage[] {
   const out: ChatMessage[] = [];
   if (req.system.length > 0) out.push({ role: "system", content: req.system.map((s) => s.text).join("\n\n") });
-  for (const m of req.messages) out.push(...(m.role === "assistant" ? fromAssistant(m) : fromUser(m)));
+  for (const m of req.messages) out.push(...(m.role === "assistant" ? fromAssistant(m) : fromUser(m, toolImages)));
   return out;
 }
 
@@ -255,14 +327,26 @@ function fromAssistant(m: Message): ChatMessage[] {
   return [{ role: "assistant", content: text || null, ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}) }];
 }
 
-function fromUser(m: Message): ChatMessage[] {
+function fromUser(m: Message, toolImages: boolean): ChatMessage[] {
   const out: ChatMessage[] = [];
   const parts: ContentPart[] = [];
+  /** 工具结果里的图片：tool 消息只能是文本，图片放进紧跟其后的 user 消息 */
+  const images: ContentPart[] = [];
+  let n = 0;
   for (const b of m.content) {
     if (b.kind === "tool_result") {
-      // tool 消息只能是文本：图片、文档换成占位说明，让模型知道少了内容
+      // 图片能转发时在原处留一句说明指向后面的 user 消息；否则图片、文档都换成占位说明，让模型知道少了内容
       const body = b.content
-        .flatMap((c) => (c.kind === "text" ? [c.text] : c.kind === "image" || c.kind === "document" ? [omitted(c.kind)] : []))
+        .flatMap((c) => {
+          if (c.kind === "text") return [c.text];
+          const url = c.kind === "image" && toolImages ? sourceURL(c.source) : undefined;
+          if (url) {
+            n++;
+            images.push({ type: "text", text: `[image ${n}, returned by tool call ${b.toolUseId}]` }, { type: "image_url", image_url: { url } });
+            return [`[image ${n}: attached in the next user message]`];
+          }
+          return c.kind === "image" || c.kind === "document" ? [omitted(c.kind)] : [];
+        })
         .join("\n");
       // 这个格式没有 is_error 字段，错误结果加前缀，否则模型会把拒绝理由当成正常输出；
       // 空的结果给一个最小占位，否则部分服务端会拒绝空内容
@@ -277,6 +361,7 @@ function fromUser(m: Message): ChatMessage[] {
       parts.push({ type: "text", text: omitted("document") });
     }
   }
+  parts.unshift(...images);
   if (parts.length > 0) {
     // 只有文本时仍发字符串：不支持多段内容的服务端也能用
     const texts = parts.flatMap((p) => (p.type === "text" ? [p.text] : []));
@@ -345,7 +430,7 @@ function toStopReason(finish: string | null, hasToolCalls: boolean): StopReason 
 }
 
 /** onDone：收到 [DONE] 时调用，用来区分正常结束和连接断开 */
-async function* readSSE(body: ReadableStream<Uint8Array>, onDone: () => void): AsyncGenerator<StreamChunk> {
+async function* readSSE(body: AsyncIterable<Uint8Array>, onDone: () => void): AsyncGenerator<StreamChunk> {
   for await (const data of sseData(body)) {
     if (data.trim() === "[DONE]") {
       onDone();
@@ -359,7 +444,7 @@ async function* readSSE(body: ReadableStream<Uint8Array>, onDone: () => void): A
  * 按 SSE 规范切分事件，返回每个事件的 data：一个事件的多行 data 以换行拼接，空行结束一个事件。
  * 部分服务端事件之间不空行：已攒下的 data 本身是完整的 JSON 时，新的 data 行视为下一个事件
  */
-async function* sseData(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
+async function* sseData(body: AsyncIterable<Uint8Array>): AsyncGenerator<string> {
   let data: string[] = [];
   const complete = (text: string) => {
     if (text.trim() === "[DONE]") return true;
@@ -386,10 +471,10 @@ async function* sseData(body: ReadableStream<Uint8Array>): AsyncGenerator<string
 }
 
 /** 逐行读取（去掉行尾的 \r）。部分服务端最后一个事件后面没有空行：流结束时补一个空行 */
-async function* sseLines(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
+async function* sseLines(body: AsyncIterable<Uint8Array>): AsyncGenerator<string> {
   const decoder = new TextDecoder();
   let buffer = "";
-  for await (const bytes of body as unknown as AsyncIterable<Uint8Array>) {
+  for await (const bytes of body) {
     buffer += decoder.decode(bytes, { stream: true });
     let nl: number;
     while ((nl = buffer.indexOf("\n")) >= 0) {
