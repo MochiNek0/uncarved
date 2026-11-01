@@ -23,6 +23,8 @@ export interface StatusInfo {
   spent?: { input: number; output: number };
   /** 上一次请求的输入中命中缓存的比例（0–1）；服务不报告缓存用量时为 undefined */
   cache?: number;
+  /** 输出速度（token/秒）：live 为 true 时是正在输出的这次回复按字数估的，否则是上一次回复按服务端报的用量算的 */
+  speed?: { tps: number; live?: boolean };
 }
 
 export interface CommandInfo {

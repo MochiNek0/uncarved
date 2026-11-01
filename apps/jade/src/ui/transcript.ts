@@ -79,6 +79,34 @@ export function transcript(opts: TranscriptOptions): Transcript {
     });
   }
 
+  /**
+   * 输出速度：从第一个增量开始计时（不算等待首个 token 的时间），输出中按字数估 token 数，每半秒更新一次状态栏；
+   * 回复结束后用服务端报的输出 token 数算准确值。不支持流式的服务从发出请求开始算
+   */
+  const speed = { requested: 0, first: 0, estimate: 0, shown: 0 };
+  const startSpeed = () => {
+    speed.requested = Date.now();
+    speed.first = 0;
+    speed.estimate = 0;
+  };
+  const trackSpeed = (text: string) => {
+    const now = Date.now();
+    if (!speed.first) speed.first = now;
+    const wide = text.match(/[^\x00-\x7f]/g)?.length ?? 0;
+    speed.estimate += (text.length - wide) / 4 + wide;
+    if (now - speed.shown < 500 || now - speed.first < 1000) return;
+    speed.shown = now;
+    screen.status({ speed: { tps: speed.estimate / ((now - speed.first) / 1000), live: true } });
+  };
+  const finishSpeed = (u: Usage | undefined) => {
+    const from = speed.first || speed.requested;
+    const seconds = (Date.now() - from) / 1000;
+    const tokens = u?.outputTokens ?? Math.round(speed.estimate);
+    if (from && tokens > 0 && seconds >= 0.2) screen.status({ speed: { tps: tokens / seconds } });
+    speed.first = 0;
+    speed.estimate = 0;
+  };
+
   const toolNames = new Map<string, string>();
   /** 正在重新显示恢复的会话里已有的内容：只输出，不显示进行中的状态 */
   let replaying = false;
@@ -130,9 +158,11 @@ export function transcript(opts: TranscriptOptions): Transcript {
             screen.log(yellow("[output above discarded; retrying]"));
           }
           streamed = false;
+          startSpeed();
           return;
         }
         streamed = true;
+        trackSpeed(n.delta.text);
         if (n.delta.kind === "thinking") {
           screen.busy("Thinking");
           screen.stream("thinking", n.delta.text);
@@ -175,11 +205,13 @@ export function transcript(opts: TranscriptOptions): Transcript {
     switch (e.type) {
       case "model.requested":
         activity("Waiting for the model");
+        if (!replaying) startSpeed();
         return;
       case "model.responded": {
         const d = e.data as EventDataMap["model.responded"];
         void countUsage(e);
         showContext(d.usage);
+        if (!replaying) finishSpeed(d.usage);
         for (const b of d.content) if (b.kind === "tool_use") toolNames.set(b.id, b.name);
         // 不支持流式的 provider：直接打印最终文本
         if (!streamed) {

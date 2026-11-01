@@ -22,6 +22,7 @@ import {
   useState,
   useSyncExternalStore,
 } from "react";
+import stringWidth from "string-width";
 import wrapAnsi from "wrap-ansi";
 import { mentionAt, mentionText, rankPaths } from "../mentions.ts";
 import { edit, empty, layout, type EditState } from "./editor.ts";
@@ -66,7 +67,8 @@ type Dialog =
 interface UiState {
   /** 对话内容变化时递增，让界面重画 */
   version: number;
-  live?: { kind: "text" | "thinking"; text: string };
+  /** 还没结束的正文：完整的行已经移进对话，这里只有最后不完整的一行（思考是对话里的一项，见 Thinking） */
+  live?: { text: string };
   /** 对话区离底部滚上去了多少行；0 表示跟着最新的输出 */
   scroll: number;
   busy?: { label: string; since: number };
@@ -88,10 +90,12 @@ const wrap = (text: string, width: number) =>
  * 对话里的一项：普通的一行，或者可以点击展开、收起的一段。
  * - details：折叠起来的完整内容
  * - oneRow：收起时只占一行，放不下的部分截掉，展开时完整显示
- * - title：展开时代替 text 显示的标题（例如思考收起时显示最新的一行，展开时显示"thinking"）
+ * - title：展开时代替 text 显示的标题
+ * - think：思考；收起时按宽度现排一行（思考中显示最新的进展，结束后显示用了多久），展开时显示全文
  */
 interface Line {
   text: string;
+  think?: Thinking;
   details?: string;
   oneRow?: boolean;
   title?: string;
@@ -109,14 +113,65 @@ function oneRow(text: string, width: number): { row: string; cut: boolean } {
 
 /** 这一项能不能展开：有折叠的内容，或者收起时被截掉了一部分 */
 function foldable(l: Line, width: number): boolean {
+  if (l.think) return l.think.text.trim() !== "";
   return l.details !== undefined || (Boolean(l.oneRow) && oneRow(l.text, width).cut);
 }
 
-/** 思考收起时显示的一行：最新的非空行 */
-const thinkingHead = (text: string) =>
-  dim(`✻ ${text.split("\n").findLast((l) => l.trim())?.trim() ?? "thinking"}`);
+/** 一段思考：start、end 是开始和结束的时间（毫秒），没有 end 表示还在思考 */
+interface Thinking {
+  text: string;
+  start: number;
+  end?: number;
+}
+
+const elapsed = (t: Thinking) =>
+  `${Math.max(0, Math.round(((t.end ?? Date.now()) - t.start) / 1000))}s`;
+
+/** 按显示宽度取 text 末尾最多 cols 列；截掉了开头时以 … 开头 */
+export function tail(text: string, cols: number): string {
+  if (stringWidth(text) <= cols) return text;
+  const chars = [...text];
+  let out = "";
+  let w = 1;
+  for (let i = chars.length - 1; i >= 0; i--) {
+    const cw = stringWidth(chars[i]!);
+    if (w + cw > cols) break;
+    out = chars[i] + out;
+    w += cw;
+  }
+  return `…${out}`;
+}
+
+/**
+ * 思考收起时的一行（不含展开标记）：思考中显示"✻ Thinking 12s · "加上最新一行的末尾，跟着模型实时往前走；
+ * 结束后显示"✻ Thought for 12s"
+ */
+function thinkingRow(t: Thinking, width: number): string {
+  if (t.end !== undefined) return dim(`✻ Thought for ${elapsed(t)}`);
+  const label = `✻ Thinking ${elapsed(t)}`;
+  const latest = t.text
+    .split("\n")
+    .findLast((l) => l.trim())
+    ?.trim()
+    .replace(/\s+/g, " ");
+  // 留出 " · "、" ▸" 和一列余量
+  const room = width - stringWidth(label) - 6;
+  return dim(latest && room >= 8 ? `${label} · ${tail(latest, room)}` : `${label}…`);
+}
 
 function wrapLine(l: Line, width: number): string[] {
+  if (l.think) {
+    if (!foldable(l, width)) return [thinkingRow(l.think, width)];
+    if (!l.open) return [`${thinkingRow(l.think, width)}${dim(" ▸")}`];
+    const t = l.think;
+    const title = dim(t.end === undefined ? `✻ Thinking ${elapsed(t)}` : `✻ Thought for ${elapsed(t)}`);
+    const body = t.text
+      .replace(/\s+$/, "")
+      .split("\n")
+      .map((r) => (r ? dim(`  ${r}`) : r))
+      .join("\n");
+    return [...wrap(`${title}${dim(" ▾")}`, width), ...wrap(body, width)];
+  }
   if (!foldable(l, width)) return wrap(l.text, width);
   if (!l.open) {
     const head = l.oneRow ? oneRow(l.text, width).row : l.text;
@@ -296,34 +351,36 @@ export function tuiScreen(opts: TuiOptions): Screen {
   const store = new Store(opts.status);
 
   /**
-   * 结束或推进流式块。正文：已经完整的行移进对话，只把最后不完整的一行留在底部；
-   * 思考：整块留在底部只显示最新的一行，结束时（all）合成一个可展开的项，收起时也只显示最新的一行
+   * 正在进行的思考：一开始就作为一项放进对话（可以点击展开），之后的增量攒起来，每隔一小段时间改写一次那一项。
+   * 收起时只占一行，显示模型最新想到了哪里；结束时换成用了多久
    */
+  let thinking:
+    | { id: string; think: Thinking; timer?: ReturnType<typeof setTimeout> }
+    | undefined;
+  let thinkingCount = 0;
+  const redrawThinking = () => {
+    if (!thinking) return;
+    clearTimeout(thinking.timer);
+    thinking.timer = undefined;
+    store.amend(thinking.id, () => {});
+  };
+  const endThinking = () => {
+    if (!thinking) return;
+    thinking.think.end = Date.now();
+    redrawThinking();
+    thinking = undefined;
+  };
+
+  /** 推进正文：已经完整的行移进对话，只把最后不完整的一行留在底部；all 时全部移进去，连同思考一起结束 */
   const flushLive = (all = false) => {
+    if (all) endThinking();
     const live = store.state.live;
     if (!live) return;
-    if (live.kind === "thinking") {
-      if (!all) return;
-      store.update({ live: undefined });
-      const text = live.text.replace(/\s+$/, "");
-      if (!text) return;
-      store.append([thinkingHead(text)], {
-        oneRow: true,
-        title: dim("✻ thinking"),
-        details: text
-          .split("\n")
-          .map((l) => (l ? dim(`  ${l}`) : l))
-          .join("\n"),
-      });
-      return;
-    }
     const lines = live.text.split("\n");
     const rest = all ? "" : lines.pop()!;
     if (all && lines.at(-1) === "") lines.pop();
     store.append(lines);
-    store.update({
-      live: rest || !all ? { kind: live.kind, text: rest } : undefined,
-    });
+    store.update({ live: rest || !all ? { text: rest } : undefined });
   };
 
   const ask = <T,>(dialog: Dialog) =>
@@ -403,18 +460,27 @@ export function tuiScreen(opts: TuiOptions): Screen {
       });
     },
     stream(kind, text) {
-      const live = store.state.live;
-      if (live && live.kind !== kind) {
-        flushLive(true);
-        store.update({ live: undefined });
+      if (kind === "thinking") {
+        if (store.state.live) {
+          flushLive(true);
+          store.update({ live: undefined });
+        }
+        if (!thinking) {
+          if (!text.trim()) return;
+          const think: Thinking = { text: "", start: Date.now() };
+          thinking = { id: `\0thinking-${thinkingCount++}`, think };
+          store.append([""], { id: thinking.id, think });
+        }
+        thinking.think.text += text;
+        thinking.timer ??= setTimeout(redrawThinking, 50);
+        return;
       }
+      endThinking();
       if (!store.state.live) {
-        if (kind === "text") text = text.replace(/^\n+/, "");
+        text = text.replace(/^\n+/, "");
         if (!text) return;
       }
-      store.update({
-        live: { kind, text: (store.state.live?.text ?? "") + text },
-      });
+      store.update({ live: { text: (store.state.live?.text ?? "") + text } });
       if (text.includes("\n")) flushLive();
     },
     endStream() {
@@ -449,6 +515,8 @@ export function tuiScreen(opts: TuiOptions): Screen {
         resolve: () => {},
       }),
     clear() {
+      clearTimeout(thinking?.timer);
+      thinking = undefined;
       store.clear();
     },
     async close() {
@@ -472,6 +540,15 @@ export function tuiScreen(opts: TuiOptions): Screen {
  */
 const MOUSE = /^\[<(\d+);\d+;(\d+)([Mm])$/;
 const WHEEL_LINES = 3;
+/** 终端矮于这么多行时标题只占一行 */
+const COMPACT_ROWS = 24;
+
+/**
+ * 底部的菜单、选择框、多行输入最多占多少行：终端很矮时整个界面会高过终端，
+ * 超出的部分被裁掉，输入框的边框和状态栏就显示不全了
+ */
+const roomFor = (rows: number, max: number) =>
+  Math.max(3, Math.min(max, Math.floor((rows - 10) / 2)));
 
 function App({
   store,
@@ -497,11 +574,7 @@ function App({
   const done = store.lines(width);
   // 还没结束的流式块和正在运行的工具的进度：思考只显示最新的一行，进度每个工具一行
   const live = [
-    ...(state.live?.text
-      ? state.live.kind === "thinking"
-        ? [oneRow(thinkingHead(state.live.text), width).row]
-        : wrap(state.live.text, width)
-      : []),
+    ...(state.live?.text ? wrap(state.live.text, width) : []),
     ...state.progress.map((p) => oneRow(p.line, width).row),
   ];
   const total = done.length + live.length;
@@ -572,7 +645,11 @@ function App({
     >
       {/* 垫的空白放在外层：里面这层在重画那一帧和平时一样高，对话区的 top（相对父节点）不变，点击换算的行号不会差一行 */}
       <Box flexDirection="column" flexGrow={1} overflowY="hidden">
-        <Header status={state.status} version={version} />
+        <Header
+          status={state.status}
+          version={version}
+          compact={rows < COMPACT_ROWS}
+        />
         <Box
           ref={ref}
           flexDirection="column"
@@ -618,7 +695,7 @@ function App({
             active={!dialog}
             onSubmit={() => store.scrollBy(-max, max)}
           />
-          <StatusBar status={state.status} />
+          <StatusBar status={state.status} width={Math.max(10, columns - 2)} />
         </Box>
       </Box>
     </Box>
@@ -648,10 +725,37 @@ function Bot() {
   );
 }
 
-function Header({ status, version }: { status: StatusInfo; version: string }) {
+function Header({
+  status,
+  version,
+  compact,
+}: {
+  status: StatusInfo;
+  version: string;
+  /** 终端很矮时只占一行，把高度留给对话和输入框 */
+  compact: boolean;
+}) {
+  const { columns } = useWindowSize();
+  if (compact)
+    return (
+      <Box flexShrink={0} paddingX={1}>
+        <Text wrap="truncate-end">
+          <Text color="cyan" bold>
+            jade
+          </Text>
+          <Text dimColor> · </Text>
+          <Text color="cyan">{status.model}</Text>
+          <Text dimColor> · </Text>
+          <Text>{status.cwd}</Text>
+          {status.branch ? (
+            <Text color="magenta"> ({status.branch})</Text>
+          ) : null}
+        </Text>
+      </Box>
+    );
   return (
     <Box flexShrink={0} borderStyle="round" borderColor="cyan" paddingX={1}>
-      <Bot />
+      {columns >= 50 ? <Bot /> : null}
       <Box flexDirection="column" flexGrow={1} flexShrink={1}>
         <Text wrap="truncate-end">
           <Text color="cyan" bold>
@@ -696,14 +800,50 @@ function Spinner({ label, since }: { label: string; since: number }) {
   const seconds = Math.floor((now - since) / 1000);
   return (
     <Box marginTop={1}>
-      <Text color="cyan">{FRAMES[Math.floor(now / 100) % FRAMES.length]} </Text>
-      <Text>{label}… </Text>
-      <Text dimColor>({seconds}s · esc to interrupt)</Text>
+      <Text wrap="truncate-end">
+        <Text color="cyan">{FRAMES[Math.floor(now / 100) % FRAMES.length]} </Text>
+        <Text>{label}… </Text>
+        <Text dimColor>({seconds}s · esc to interrupt)</Text>
+      </Text>
     </Box>
   );
 }
 
-function StatusBar({ status }: { status: StatusInfo }) {
+/**
+ * 状态栏的一段，段之间用 " · " 隔开。放不下时按步骤缩短：shortAt 是换成短写法 short 的那一步，
+ * dropAt 是去掉整段的那一步；数字大的先做，没有 dropAt 的段一直保留
+ */
+interface Segment {
+  text: string;
+  short?: string;
+  shortAt?: number;
+  dropAt?: number;
+  color?: string;
+  dim?: boolean;
+}
+
+/** 在 width 列里放下尽量多的内容（保持原来的顺序） */
+export function fitSegments(segments: Segment[], width: number): Segment[] {
+  const kept = segments.map((s) => ({ ...s }));
+  const total = () =>
+    kept.reduce((n, s, i) => n + stringWidth(s.text) + (i ? 3 : 0), 0);
+  const steps = kept
+    .flatMap((s) => [
+      ...(s.short !== undefined && s.shortAt !== undefined
+        ? [{ s, at: s.shortAt, drop: false }]
+        : []),
+      ...(s.dropAt !== undefined ? [{ s, at: s.dropAt, drop: true }] : []),
+    ])
+    .sort((a, b) => b.at - a.at);
+  for (const { s, drop } of steps) {
+    if (total() <= width) break;
+    if (drop) kept.splice(kept.indexOf(s), 1);
+    else s.text = s.short!;
+  }
+  return kept;
+}
+
+function StatusBar({ status, width }: { status: StatusInfo; width: number }) {
   const ctx = status.context;
   const pct = ctx ? Math.round((ctx.used / ctx.limit) * 100) : 0;
   /** 离自动压缩还有多远：到阈值的 85% 起变黄 */
@@ -718,34 +858,80 @@ function StatusBar({ status }: { status: StatusInfo }) {
           : status.mode === "plan"
             ? "magenta"
             : "green";
+  const speed = status.speed;
+  // 窄的时候依次：提示变短、去掉提示、用量变短、去掉缓存、模式变短、去掉用量、上下文变短、去掉速度
+  const segments: Segment[] = [
+    {
+      text: `${status.mode} (shift+tab)`,
+      short: status.mode,
+      shortAt: 6,
+      color: modeColor,
+    },
+    ctx
+      ? {
+          text: `ctx ${tokens(ctx.used)}/${tokens(ctx.limit)} (${pct}%)${ctx.compactAt ? `, compacts at ${tokens(ctx.compactAt)}` : ""}`,
+          short: `ctx ${pct}%`,
+          shortAt: 4,
+          color: nearCompact ? "yellow" : undefined,
+          dim: !nearCompact,
+        }
+      : { text: "ctx —", dim: true },
+    ...(speed
+      ? [
+          {
+            text: `${speed.live ? "~" : ""}${speed.tps >= 100 ? Math.round(speed.tps) : speed.tps.toFixed(1)} tok/s`,
+            dropAt: 3,
+            dim: true,
+          },
+        ]
+      : []),
+    ...(status.cache !== undefined
+      ? [{ text: `cache ${Math.round(status.cache * 100)}%`, dropAt: 7, dim: true }]
+      : []),
+    ...(status.spent
+      ? [
+          {
+            text: `session ${tokens(status.spent.input)} in / ${tokens(status.spent.output)} out`,
+            short: `${tokens(status.spent.input)} in / ${tokens(status.spent.output)} out`,
+            shortAt: 8,
+            dropAt: 5,
+            dim: true,
+          },
+        ]
+      : []),
+    {
+      text: "PgUp/PgDn scroll · click ▸ to expand · shift+drag to select",
+      short: "click ▸ to expand",
+      shortAt: 10,
+      dropAt: 9,
+      dim: true,
+    },
+  ];
+  const shown = fitSegments(segments, width);
   return (
     <Box paddingX={1}>
       <Text wrap="truncate-end">
-        <Text color={modeColor}>{status.mode}</Text>
-        <Text dimColor> (shift+tab) · </Text>
-        {ctx ? (
-          <Text color={nearCompact ? "yellow" : undefined} dimColor={!nearCompact}>
-            ctx {tokens(ctx.used)}/{tokens(ctx.limit)} ({pct}%)
-            {ctx.compactAt ? `, compacts at ${tokens(ctx.compactAt)}` : ""}
+        {shown.map((s, i) => (
+          <Text key={i}>
+            {i ? <Text dimColor> · </Text> : null}
+            <Text color={s.color} dimColor={s.dim}>
+              {s.text}
+            </Text>
           </Text>
-        ) : (
-          <Text dimColor>ctx —</Text>
-        )}
-        {status.cache !== undefined && (
-          <Text dimColor> · cache {Math.round(status.cache * 100)}%</Text>
-        )}
-        {status.spent && (
-          <Text dimColor>
-            {" "}
-            · session {tokens(status.spent.input)} in / {tokens(status.spent.output)} out
-          </Text>
-        )}
-        <Text dimColor>
-          {" "}
-          · PgUp/PgDn scroll · click ▸ to expand · shift+drag to select
-        </Text>
+        ))}
       </Text>
     </Box>
+  );
+}
+
+/** 一行提示：按宽度选第一个放得下的写法，都放不下时用最后一个并截断 */
+function Hint({ variants, width }: { variants: string[]; width: number }) {
+  const text =
+    variants.find((v) => stringWidth(v) <= width) ?? variants.at(-1)!;
+  return (
+    <Text dimColor wrap="truncate-end">
+      {text}
+    </Text>
   );
 }
 
@@ -813,6 +999,7 @@ function EditableText({
   mask,
   placeholder,
   active,
+  maxRows = Infinity,
 }: {
   state: EditState;
   width: number;
@@ -820,6 +1007,8 @@ function EditableText({
   mask?: boolean;
   placeholder?: string;
   active: boolean;
+  /** 最多显示几行；输入更长时只显示光标附近的几行 */
+  maxRows?: number;
 }) {
   const ref = useRef<DOMElement>(null);
   // 只用来在布局变化后重画一次、重新计算光标位置；它给的是相对父元素的坐标，光标要的是相对整个输出
@@ -829,7 +1018,15 @@ function EditableText({
   const cursor = mask
     ? [...state.value.slice(0, state.cursor)].length
     : state.cursor;
-  const { rows, row, col } = layout(shown, cursor, width - prefix.length);
+  const all = layout(shown, cursor, width - prefix.length);
+  const { col } = all;
+  // 行数超过 maxRows 时滚动，光标所在的行总在可见范围里
+  const first = Math.max(
+    0,
+    Math.min(all.row - maxRows + 1, all.rows.length - maxRows),
+  );
+  const rows = all.rows.slice(first, first + maxRows);
+  const row = all.row - first;
 
   // 光标位置要在渲染时设：useCursor 在这次提交时交给 Ink，跟这一帧一起画出来。
   // 放在 useEffect 里会晚一帧，光标总是停在上一次按键的位置（只移动光标时最明显）。
@@ -845,15 +1042,19 @@ function EditableText({
   return (
     <Box ref={ref} flexDirection="column">
       {state.value === "" && placeholder ? (
-        <Text>
+        <Text wrap="truncate-end">
           <Text color="cyan">{prefix}</Text>
           <Text dimColor>{placeholder}</Text>
         </Text>
       ) : (
         rows.map((r, i) => (
-          <Text key={i} wrap="truncate-end">
+          <Text key={first + i} wrap="truncate-end">
             <Text color="cyan">
-              {i === 0 ? prefix : " ".repeat(prefix.length)}
+              {first + i === 0
+                ? prefix
+                : i === 0
+                  ? "↑".padEnd(prefix.length)
+                  : " ".repeat(prefix.length)}
             </Text>
             {r}
           </Text>
@@ -898,7 +1099,11 @@ function Prompt({
   const browsing = useRef(-1);
   const draft = useRef("");
   const lastCtrlC = useRef(0);
-  const { columns } = useWindowSize();
+  const { columns, rows } = useWindowSize();
+  /** 补全菜单、搜索结果最多显示几项；输入框最多几行 */
+  const menuRows = roomFor(rows, MENTION_ROWS);
+  const inputRows = roomFor(rows, 10);
+  const hintWidth = Math.max(10, columns - 3);
   // @ 引用补全用的路径；排好的结果按（路径表，查询）缓存，按键处理和渲染都要用时不重复排
   const [getPaths, setPaths] = useLive<string[]>([]);
   const ranked = useRef<{ paths: string[]; query: string; result: string[] }>(
@@ -983,10 +1188,9 @@ function Prompt({
     };
   }, [mentioning]);
   // 结果多时只显示选中项附近的几条
-  const first = Math.max(
-    0,
-    Math.min(hit - Math.floor(MENTION_ROWS / 2), results.length - MENTION_ROWS),
-  );
+  const first = around(hit, results.length, menuRows);
+  const firstMatch = around(Math.max(0, matches.indexOf(pick!)), matches.length, menuRows);
+  const firstFound = around(Math.max(0, found.indexOf(file!)), found.length, menuRows);
 
   const set = (s: EditState) => {
     setState(s);
@@ -1163,6 +1367,7 @@ function Prompt({
             prefix="search history› "
             placeholder="type to filter"
             active={active}
+            maxRows={inputRows}
           />
         ) : (
           <EditableText
@@ -1172,16 +1377,19 @@ function Prompt({
             placeholder={
               busy
                 ? "Type to queue a message · esc to interrupt"
-                : "Message jade · / commands · @ files · ↑ or ctrl+r for history"
+                : columns >= 70
+                  ? "Message jade · / commands · @ files · ↑ or ctrl+r for history"
+                  : "Message jade · / commands · @ files"
             }
             active={active}
+            maxRows={inputRows}
           />
         )}
       </Box>
       {search ? (
         <Box flexDirection="column" paddingX={2}>
           {results.length ? (
-            results.slice(first, first + MENTION_ROWS).map((h, i) => {
+            results.slice(first, first + menuRows).map((h, i) => {
               const on = first + i === hit;
               return (
                 <Text
@@ -1198,14 +1406,17 @@ function Prompt({
           ) : (
             <Text dimColor> no match</Text>
           )}
-          <Text dimColor>
-            {" "}
-            ↑↓ or ctrl+r select · enter/tab put in the input · esc cancel
-          </Text>
+          <Hint
+            width={hintWidth}
+            variants={[
+              " ↑↓ or ctrl+r select · enter/tab put in the input · esc cancel",
+              " ↑↓ select · enter use · esc cancel",
+            ]}
+          />
         </Box>
       ) : matches.length ? (
         <Box flexDirection="column" paddingX={2}>
-          {matches.map((c) => {
+          {matches.slice(firstMatch, firstMatch + menuRows).map((c) => {
             const on = c === pick;
             return (
               <Text key={c.name} wrap="truncate-end">
@@ -1217,11 +1428,17 @@ function Prompt({
               </Text>
             );
           })}
-          <Text dimColor> ↑↓ select · enter run · tab complete</Text>
+          <Hint
+            width={hintWidth}
+            variants={[
+              ` ↑↓ select · enter run · tab complete${matches.length > menuRows ? ` · ${matches.length} commands` : ""}`,
+              " ↑↓ · enter run · tab complete",
+            ]}
+          />
         </Box>
       ) : found.length ? (
         <Box flexDirection="column" paddingX={2}>
-          {found.map((p) => {
+          {found.slice(firstFound, firstFound + menuRows).map((p) => {
             const on = p === file;
             return (
               <Text
@@ -1235,11 +1452,14 @@ function Prompt({
               </Text>
             );
           })}
-          <Text dimColor>
-            {" "}
-            ↑↓ select · enter/tab insert the path · the file's content is sent
-            with the message
-          </Text>
+          <Hint
+            width={hintWidth}
+            variants={[
+              " ↑↓ select · enter/tab insert the path · the file's content is sent with the message",
+              " ↑↓ select · enter/tab insert the path",
+              " ↑↓ · enter insert",
+            ]}
+          />
         </Box>
       ) : notice ? (
         <Text color="yellow"> {notice}</Text>
@@ -1251,8 +1471,15 @@ function Prompt({
 /** @ 补全最多显示几项 */
 const MENTION_ROWS = 8;
 
+/** 长列表只显示 size 项时，为了让第 selected 项在中间附近，从第几项开始显示 */
+function around(selected: number, total: number, size: number): number {
+  return Math.max(0, Math.min(selected - Math.floor(size / 2), total - size));
+}
+
 /** 选择框一次最多显示几项 */
 const VISIBLE = 10;
+/** 选项多于这么多时可以打字筛选（这时 j/k 和数字键不再是快捷键） */
+const FILTER_FROM = 10;
 
 function SelectDialog({
   dialog,
@@ -1260,12 +1487,25 @@ function SelectDialog({
   dialog: Extract<Dialog, { kind: "select" }>;
 }) {
   const [getSelected, setSelected] = useLive(0);
-  const selected = getSelected();
-  const n = dialog.choices.length;
-  const { rows } = useWindowSize();
+  const [getQuery, setQuery] = useLive("");
+  const { rows, columns } = useWindowSize();
+  const filtering = dialog.choices.length > FILTER_FROM;
+  const query = getQuery();
+  /** 筛选后的选项和它们原来的序号 */
+  const filtered = () => {
+    const q = getQuery().toLowerCase();
+    return dialog.choices
+      .map((c, i) => ({ c, i }))
+      .filter(({ c }) => !q || `${c.label} ${c.hint ?? ""}`.toLowerCase().includes(q));
+  };
+  const items = filtered();
+  const n = items.length;
+  const selected = Math.min(getSelected(), Math.max(0, n - 1));
+  // 终端矮时少显示几项，加上预览一起不超过终端的高度
+  const visible = roomFor(rows, VISIBLE);
   // 预览（例如要写入的文件）过长时截断：整个界面高过终端时 Ink 会每帧清屏重画
   const lines = dialog.body?.split("\n") ?? [];
-  const room = Math.max(3, rows - Math.min(n, VISIBLE) - 16);
+  const room = Math.max(3, rows - Math.min(n, visible) - 16);
   const body =
     lines.length > room
       ? [
@@ -1274,24 +1514,44 @@ function SelectDialog({
         ].join("\n")
       : dialog.body;
   useInput((input, key) => {
-    const selected = getSelected();
-    if (key.upArrow || input === "k")
-      return setSelected((selected - 1 + n) % n);
-    if (key.downArrow || input === "j") return setSelected((selected + 1) % n);
-    if (key.return) return dialog.resolve(dialog.choices[selected]!.value);
+    const items = filtered();
+    const n = items.length;
+    const selected = Math.min(getSelected(), Math.max(0, n - 1));
+    if (key.upArrow || (!filtering && input === "k"))
+      return n && setSelected((selected - 1 + n) % n);
+    if (key.downArrow || (!filtering && input === "j"))
+      return n && setSelected((selected + 1) % n);
+    if (key.return) {
+      if (n) dialog.resolve(items[selected]!.c.value);
+      return;
+    }
+    if (key.escape && filtering && getQuery()) {
+      setQuery("");
+      return setSelected(0);
+    }
     if (key.escape || (key.ctrl && input === "c"))
       return dialog.resolve(undefined);
-    if (key.pageDown) return setSelected(Math.min(n - 1, selected + VISIBLE));
-    if (key.pageUp) return setSelected(Math.max(0, selected - VISIBLE));
+    if (key.pageDown) return setSelected(Math.min(n - 1, selected + visible));
+    if (key.pageUp) return setSelected(Math.max(0, selected - visible));
+    if (filtering) {
+      if (key.backspace || key.delete) {
+        setQuery([...getQuery()].slice(0, -1).join(""));
+        return setSelected(0);
+      }
+      if (key.ctrl || key.meta || key.tab || MOUSE.test(input)) return;
+      const text = input.replace(/[\x00-\x1f\x7f]/g, "");
+      if (text) {
+        setQuery(getQuery() + text);
+        setSelected(0);
+      }
+      return;
+    }
     const digit = Number(input);
     if (Number.isInteger(digit) && digit >= 1 && digit <= Math.min(n, 9))
-      dialog.resolve(dialog.choices[digit - 1]!.value);
+      dialog.resolve(items[digit - 1]!.c.value);
   });
   // 选项多时只显示选中项附近的一段
-  const start = Math.max(
-    0,
-    Math.min(selected - Math.floor(VISIBLE / 2), n - VISIBLE),
-  );
+  const start = around(selected, n, visible);
   return (
     <Box
       flexDirection="column"
@@ -1300,30 +1560,48 @@ function SelectDialog({
       paddingX={1}
       marginTop={1}
     >
-      <Text bold>{dialog.title}</Text>
+      <Text bold wrap="truncate-end">
+        {dialog.title}
+      </Text>
       {body ? <Text>{body}</Text> : null}
-      <Box flexDirection="column" marginTop={1}>
+      {filtering ? (
+        <Text wrap="truncate-end">
+          <Text color="cyan">filter› </Text>
+          {query ? (
+            <Text>{query}</Text>
+          ) : (
+            <Text dimColor>type to filter {dialog.choices.length} items</Text>
+          )}
+        </Text>
+      ) : null}
+      <Box flexDirection="column" marginTop={filtering ? 0 : 1}>
         {start > 0 ? <Text dimColor> ↑ {start} more</Text> : null}
-        {dialog.choices.slice(start, start + VISIBLE).map((c, j) => {
-          const i = start + j;
+        {n === 0 ? <Text dimColor> no match</Text> : null}
+        {items.slice(start, start + visible).map(({ c, i }, j) => {
+          const on = start + j === selected;
           return (
             <Text key={i} wrap="truncate-end">
-              <Text
-                color={i === selected ? "cyan" : undefined}
-                bold={i === selected}
-              >
-                {i === selected ? "❯ " : "  "}
-                {i + 1}. {c.label}
+              <Text color={on ? "cyan" : undefined} bold={on}>
+                {on ? "❯ " : "  "}
+                {filtering ? "" : `${i + 1}. `}
+                {c.label}
               </Text>
               {c.hint ? <Text dimColor> {c.hint}</Text> : null}
             </Text>
           );
         })}
-        {start + VISIBLE < n ? (
-          <Text dimColor> ↓ {n - start - VISIBLE} more</Text>
+        {start + visible < n ? (
+          <Text dimColor> ↓ {n - start - visible} more</Text>
         ) : null}
       </Box>
-      <Text dimColor>↑↓ select · enter confirm · esc cancel</Text>
+      <Hint
+        width={Math.max(10, columns - 4)}
+        variants={
+          filtering
+            ? ["↑↓ select · type to filter · enter confirm · esc clear/cancel", "↑↓ · enter · esc"]
+            : ["↑↓ select · enter confirm · esc cancel", "↑↓ · enter · esc"]
+        }
+      />
     </Box>
   );
 }

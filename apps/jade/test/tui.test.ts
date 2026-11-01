@@ -15,7 +15,7 @@ import {
 import { configurator } from "../src/ui/configure.ts";
 import { edit, layout } from "../src/ui/editor.ts";
 import type { Screen } from "../src/ui/screen.ts";
-import { tuiScreen, type TuiHandlers } from "../src/ui/tui.tsx";
+import { fitSegments, tail, tuiScreen, type TuiHandlers } from "../src/ui/tui.tsx";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const strip = (s: string) =>
@@ -155,9 +155,16 @@ describe("model configuration", () => {
       await configure.model(undefined);
       expect(process.env.OPENAI_COMPAT_BASE_URL).toBe("http://127.0.0.1:9/v1");
       expect(process.env.OPENAI_COMPAT_MODEL).toBe("gamma");
-      // 菜单里选回 alpha：地址、密钥和它自己的设置都换回来
-      answers.push(pickLabel("Use alpha"));
+      // 菜单里只列当前服务的模型；别的服务的先进子菜单（只有一个服务时直接列模型）。
+      // 选回 alpha：地址、密钥和它自己的设置都换回来
+      let menu: string[] = [];
+      answers.push((c: { label: string; value: unknown }[]) => {
+        menu = c.map((x) => x.label);
+        return pickLabel("Use a model from another service…")(c);
+      }, pickLabel("alpha"));
       await configure.model(undefined);
+      expect(menu).not.toContain("Use alpha");
+      expect(menu).not.toContain("Use beta");
       expect(process.env.OPENAI_COMPAT_BASE_URL).toBe("http://a/v1");
       expect(process.env.OPENAI_COMPAT_API_KEY).toBe("ka");
       expect(process.env.OPENAI_COMPAT_MODEL).toBe("alpha");
@@ -294,6 +301,10 @@ describe("terminal UI", () => {
       output: () => strip(out),
       raw: () => out,
       clear: () => void (out = ""),
+      resize: (columns: number, rows: number) => {
+        Object.assign(stdout, { columns, rows });
+        stdout.emit("resize");
+      },
     };
   }
 
@@ -503,28 +514,63 @@ describe("terminal UI", () => {
     screen.log("done");
     await sleep(80);
     const out = output();
-    expect(out).toContain("✻ pondering ▸");
+    expect(out).toContain("✻ Thought for 0s ▸");
     expect(out.indexOf("first line")).toBeLessThan(out.indexOf("second"));
     expect(out).toContain("done");
   });
 
-  test("thinking shows only its latest line until it is expanded", async () => {
+  test("thinking shows where the model is in one row and can be expanded while it is still thinking", async () => {
     const { screen, type, output, clear } = setup();
     screen.stream("thinking", "step one\nstep two\nstep th");
     await sleep(80);
-    expect(output()).toContain("✻ step th");
+    expect(output()).toContain("✻ Thinking 0s · step th ▸");
     expect(output()).not.toContain("step one");
-    screen.stream("thinking", "ree\n");
-    screen.endStream();
+    // 很长的一行只显示末尾，跟着模型往前走
+    screen.stream("thinking", `ree ${"x".repeat(200)} latest words`);
     await sleep(80);
-    expect(output()).toContain("✻ step three ▸");
-    expect(output()).not.toContain("step one");
-    // 对话区第 1 行在屏幕第 6 行
+    expect(output()).toContain("latest words ▸");
+    // 思考中就能点开：对话区第 1 行在屏幕第 6 行
     clear();
     await type("\x1b[<0;5;6M");
-    expect(output()).toContain("✻ thinking ▾");
+    expect(output()).toContain("✻ Thinking 0s ▾");
     expect(output()).toContain("step one");
-    expect(output()).toContain("step three");
+    // 展开着的时候新内容接着出现
+    clear();
+    screen.stream("thinking", "\nstep four");
+    await sleep(80);
+    expect(output()).toContain("step four");
+    screen.endStream();
+    await sleep(80);
+    expect(output()).toContain("✻ Thought for 0s ▾");
+    clear();
+    await type("\x1b[<0;5;6M");
+    expect(output()).toContain("✻ Thought for 0s ▸");
+    expect(output()).not.toContain("step one");
+  });
+
+  test("the status bar shows the output speed and drops the least useful parts in a narrow window", () => {
+    const all = [
+      { text: "ask (shift+tab)", short: "ask", shortAt: 6 },
+      { text: "ctx 50k/200k (25%)", short: "ctx 25%", shortAt: 4 },
+      { text: "42 tok/s", dropAt: 3 },
+      { text: "PgUp/PgDn scroll", dropAt: 9 },
+    ];
+    expect(fitSegments(all, 200).map((s) => s.text)).toEqual(["ask (shift+tab)", "ctx 50k/200k (25%)", "42 tok/s", "PgUp/PgDn scroll"]);
+    expect(fitSegments(all, 45).map((s) => s.text)).toEqual(["ask", "ctx 50k/200k (25%)", "42 tok/s"]);
+    expect(fitSegments(all, 20).map((s) => s.text)).toEqual(["ask", "ctx 25%"]);
+    expect(tail("abcdefghij", 5)).toBe("…ghij");
+    expect(tail("中文中文", 5)).toBe("…中文");
+  });
+
+  test("a short terminal keeps the input box and status bar on screen while the command menu is open", async () => {
+    const { type, output, resize } = setup();
+    resize(60, 16);
+    await sleep(250);
+    await type("/");
+    const out = output();
+    const lastFrame = out.slice(out.lastIndexOf("jade ·"));
+    expect(lastFrame).toContain("╰");
+    expect(lastFrame).toContain("ask");
   });
 
   test("a tool call and its result share one row; progress shows only the latest line", async () => {
