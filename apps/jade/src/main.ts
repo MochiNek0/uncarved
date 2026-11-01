@@ -13,6 +13,7 @@ import { JsonlLogStore, JsonlTrustStore } from "@uncarved/store-jsonl";
 import {
   readAll,
   Runtime,
+  RuntimeBusy,
   UntrustedPlugin,
   type Block,
   type Plugin,
@@ -33,7 +34,7 @@ import { compactThreshold, contextWindowFromEnv, contextWindowInfo, isContextOve
 import { InputHistory } from "./history.ts";
 import { attachMentions, mentionCandidates } from "./mentions.ts";
 import { repoRoot } from "./plugins/prompts.ts";
-import { providerFromEnv, providerInfo, switchable, withRetry } from "./provider.ts";
+import { isRateLimit, providerFromEnv, providerInfo, RateGate, rpmFromEnv, switchable, withRetry } from "./provider.ts";
 import { SessionIndex } from "./sessions.ts";
 import { lastTurnChanges, UNDO_KEY, type Checkpoint, type UndoState } from "./tools/checkpoint.ts";
 import { display } from "./tools/fs.ts";
@@ -75,12 +76,12 @@ const COMMANDS: CommandInfo[] = [
   { name: "hooks", about: "execution order of every extension point" },
   { name: "exit", about: "quit (the session stays resumable)" },
 ];
-/** 运行中也立即执行的命令（不碰运行时，或者只读） */
-const INSTANT = new Set(["help", "model", "usage", "rules", "hooks", "plugins", "exit", "quit"]);
+/** 运行中也立即执行的命令（不碰运行时，或者只读；/mode 运行中先记在 pendingMode） */
+const INSTANT = new Set(["help", "model", "mode", "usage", "rules", "hooks", "plugins", "exit", "quit"]);
 /** 内置插件提供的命令（/memory 在 jade/memory 里，等等）：名字保留给它们，自定义命令不能占用 */
 const BUILTIN_PLUGIN_COMMANDS = ["memory", "checks", "mcp", "skills", "compact"];
 
-const KEYS = `Keys: enter send · \\ or alt+enter new line · ↑↓ history · @ reference a file · esc interrupt · shift+tab cycle ask/auto-edit/plan · ctrl+c twice to exit
+const KEYS = `Keys: enter send · \\ or alt+enter new line · ↑↓ history · @ reference a file · esc interrupt (twice to also clear queued messages) · shift+tab cycle ask/auto-edit/plan · ctrl+c twice to exit
       mouse wheel or PgUp/PgDn scroll the conversation · ctrl+home/ctrl+end jump to the top/bottom · shift+drag selects text
 While jade is working you can keep typing: messages are queued and sent when the current turn ends.`;
 
@@ -280,11 +281,39 @@ if (!hasProvider()) {
   }
 }
 
+/**
+ * 外面包一层重试和限速。限速对这个服务的所有请求（主 Agent、子 Agent、压缩）共用：
+ * JADE_RPM 设了上限时把请求平均分布在一分钟里；被限流时所有请求一起等，而不是各自去撞
+ */
 function retrying(inner: Provider) {
+  /** 状态行正显示着排队或等待重试：请求发出后换回来 */
+  let waiting = false;
+  const gate = new RateGate({
+    rpm: rpmFromEnv(),
+    onWait: (ms) => {
+      if (ms < 1000) return;
+      waiting = true;
+      screen.busy(`Pacing requests (${gate.rpm ? `${+gate.rpm.toFixed(1)}/min` : "rate limited"}, ${seconds(ms)})`);
+    },
+    onLearn: (rpm) =>
+      screen.log(dim(`[rate limited: spacing requests to ${rpm} per minute from now on; set the exact limit with /model → requests per minute]`)),
+  });
   return withRetry(inner, {
-    onRetry: ({ attempt, delayMs, error }) => screen.log(yellow(`[retry ${attempt} in ${Math.round(delayMs / 1000)}s: ${error.message}]`)),
+    gate,
+    onRequest: () => {
+      if (waiting && running) screen.busy("Waiting for the model");
+      waiting = false;
+    },
+    onRetry: ({ attempt, retries, delayMs, error }) => {
+      const why = isRateLimit(error) ? "rate limited" : clip(error.message.replace(/\s+/g, " "), 160);
+      screen.log(yellow(`[${why} · retry ${attempt}/${retries} in ${seconds(delayMs)}]`));
+      waiting = true;
+      screen.busy(`Waiting to retry (${attempt}/${retries}, ${seconds(delayMs)})`);
+    },
   });
 }
+
+const seconds = (ms: number) => (ms >= 60_000 ? `${Math.floor(ms / 60_000)}m${Math.round((ms % 60_000) / 1000) ? `${Math.round((ms % 60_000) / 1000)}s` : ""}` : `${Math.max(1, Math.round(ms / 1000))}s`);
 
 const store = new JsonlLogStore(path.join(home, "sessions"));
 const trust = new JsonlTrustStore(path.join(home, "trust.jsonl"));
@@ -297,6 +326,11 @@ const skillsLoaded = await loadSkills({ home, root: repo, cwd: realPath(cwd), pl
 for (const w of skillsLoaded.warnings) screen.log(yellow(`[warning] ${w}`));
 const skills = skillsLoaded.skills;
 const mcpClients = await connectMcp();
+/**
+ * 运行中切换的权限模式：这一轮正占着日志，写不进去。关卡先按它判断（下一个工具调用就生效），
+ * 这一轮结束后再记进日志（flushPendingMode）
+ */
+let pendingMode: Mode | undefined;
 /** 每个会话用一套新的插件实例：插件里有按会话记的状态（例如压缩、重复调用的计数） */
 const makeJade = (mode?: Mode) =>
   createJade({
@@ -312,6 +346,7 @@ const makeJade = (mode?: Mode) =>
     compactTokens: compactAt,
     approveSubagent,
     sharedRules: (): AllowRule[] => [...settings().rules, ...pendingRules],
+    pendingMode: () => pendingMode,
     approveCheck: process.env.JADE_CHECKS === "off" ? undefined : approveCheck,
     checkConfirmed: (c) => trust.has(checkHash(c)),
     checksUnavailable: process.env.JADE_CHECKS === "off" ? "Edit-time checks are turned off by JADE_CHECKS=off." : undefined,
@@ -468,8 +503,30 @@ let sessionId = rt.state.sessionId;
 const settings = (): PolicySettings => jade.policy.settings(rt.state.derived);
 const saveSettings = async (next: PolicySettings) => {
   await rt.record(POLICY_KEY, next);
+  pendingMode = undefined;
   screen.status({ mode: next.mode });
 };
+
+/** 换权限模式；运行时正在执行这一轮时先记在 pendingMode，关卡立即按它判断，这一轮结束后再写进日志 */
+async function setMode(mode: Mode) {
+  try {
+    await saveSettings({ ...settings(), mode });
+  } catch (err) {
+    if (!(err instanceof RuntimeBusy)) throw err;
+    pendingMode = mode;
+    screen.status({ mode });
+  }
+}
+
+/** 把运行中切换的模式写进日志 */
+async function flushPendingMode() {
+  if (pendingMode === undefined) return;
+  try {
+    await saveSettings(settings());
+  } catch (err) {
+    if (!(err instanceof RuntimeBusy)) screen.log(red(`[error] ${errorText(err)}`));
+  }
+}
 
 // ---------- 渲染 ----------
 
@@ -697,15 +754,37 @@ async function occupy(fn: () => Promise<void>) {
   } finally {
     running = false;
     work = undefined;
+    interruptPending = false;
     screen.busy(undefined);
+    await flushPendingMode();
   }
 }
 
+/**
+ * 上一次打断的时间；正在收尾的这一轮结束、开始下一条排队的输入之前一直算"刚打断过"（interruptPending）。
+ * 刚打断过时再按一次 esc，连排队的消息一起清掉
+ */
+let interruptedAt = 0;
+let interruptPending = false;
+/** 第二次 esc 算作"再按一次"的时间窗口（从打断的那一轮结束、开始下一条排队的输入算起） */
+const SECOND_ESC_MS = 3000;
+
 function interrupt() {
   if (!running) return;
+  const again = interruptPending || Date.now() - interruptedAt < SECOND_ESC_MS;
+  interruptedAt = Date.now();
+  interruptPending = true;
   commandAbort?.abort(new Error("interrupted by user"));
   rt.abort("interrupted by user");
   screen.busy("Interrupting");
+  if (queue.length === 0) return;
+  if (again) {
+    const n = queue.splice(0).length;
+    screen.queued(queue);
+    screen.log(dim(`[cleared ${n} queued message${n > 1 ? "s" : ""}]`));
+  } else {
+    screen.log(dim(`[${queue.length} queued message${queue.length > 1 ? "s" : ""} will still be sent; press esc again to clear ${queue.length > 1 ? "them" : "it"}]`));
+  }
 }
 
 /** 离开会话但保留它：写入 session.detached，插件的收尾写入完成后再退出（4.2） */
@@ -743,6 +822,7 @@ async function quit(code = 0) {
  * 恢复失败时留在当前会话
  */
 async function switchSession(id?: string) {
+  await flushPendingMode();
   const mode = settings().mode;
   const next = await makeJade(mode);
   let nextRt: Runtime;
@@ -765,7 +845,7 @@ async function switchSession(id?: string) {
   announcedMode = undefined;
   pendingRules.length = 0;
   screen.clear();
-  screen.status({ session: sessionId, mode: settings().mode, context: undefined, cache: undefined, spent: undefined });
+  screen.status({ session: sessionId, mode: settings().mode, context: undefined, cache: undefined, spent: undefined, speed: undefined });
   if (!id) return screen.log(dim(`Started a new session. The previous one can be resumed with /resume or: jade --resume ${old}`));
   if (!(await resumeSession())) {
     screen.log(dim("Starting a new session instead."));
@@ -841,13 +921,11 @@ function announceMode() {
   announcedMode = mode;
 }
 
-/** Shift+Tab：ask → auto-edit → plan → ask；yolo、readonly 也回到 ask。运行中不切换（日志正在写） */
+/** Shift+Tab：ask → auto-edit → plan → ask；yolo、readonly 也回到 ask。运行中也能切换，从下一个工具调用起生效 */
 const CYCLE: Mode[] = ["ask", "auto-edit", "plan"];
 function cycleMode() {
-  if (running) return screen.log(dim("[the mode can be changed when jade is idle, or queue /mode <mode>]"));
   const i = CYCLE.indexOf(settings().mode);
-  const next = CYCLE[(i + 1) % CYCLE.length]!;
-  saveSettings({ ...settings(), mode: next }).catch((err) => screen.log(red(`[error] ${errorText(err)}`)));
+  setMode(CYCLE[(i + 1) % CYCLE.length]!).catch((err) => screen.log(red(`[error] ${errorText(err)}`)));
 }
 
 /**
@@ -855,7 +933,8 @@ function cycleMode() {
  * 用户已经排了别的输入、或者不能交互时不问
  */
 async function offerPlan() {
-  if (settings().mode !== "plan" || view.lastEnd !== "end" || !screen.interactive || queue.length > 0) return;
+  // 这一轮中途才切到计划模式的，模型并不知道要给计划，不问
+  if (settings().mode !== "plan" || announcedMode !== "plan" || view.lastEnd !== "end" || !screen.interactive || queue.length > 0) return;
   const last = rt.state.messages.at(-1);
   if (last?.role !== "assistant" || !last.content.some((b) => b.kind === "text" && b.text.trim())) return;
   const choice = await screen.select("Execute this plan?", [
@@ -1015,8 +1094,8 @@ async function command(input: string): Promise<boolean> {
         if (!m) break;
       }
       if (!(MODES as readonly string[]).includes(m)) screen.log(red(`unknown mode ${m}`));
-      else await saveSettings({ ...settings(), mode: m as Mode });
-      screen.log(`mode: ${settings().mode}`);
+      else await setMode(m as Mode);
+      screen.log(`mode: ${settings().mode}${pendingMode ? dim(" (from the next tool call)") : ""}`);
       break;
     }
     case "undo":
@@ -1127,6 +1206,9 @@ async function pump() {
   let exit = false;
   await occupy(async () => {
     while (queue.length > 0 && !quitting) {
+      // 打断的那一轮已经结束：从现在起再给 SECOND_ESC_MS 的时间按第二次 esc
+      if (interruptPending) interruptedAt = Date.now();
+      interruptPending = false;
       const text = queue.shift()!;
       screen.queued(queue);
       echo(text);

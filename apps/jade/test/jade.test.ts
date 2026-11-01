@@ -392,6 +392,16 @@ describe("policy", () => {
     expect(reason.decision === "deny" && reason.reason).toContain("plan mode");
   });
 
+  test("a mode switched while the turn is running applies before it is written to the log", () => {
+    let pending: "plan" | undefined;
+    const p = policy({ cwd, pendingMode: () => pending });
+    const stored = { [POLICY_KEY]: { mode: "auto-edit", rules: [] } };
+    expect(p.settings(stored).mode).toBe("auto-edit");
+    pending = "plan";
+    expect(p.settings(stored).mode).toBe("plan");
+    expect(p.settings({}).mode).toBe("plan");
+  });
+
   test("safe commands reject shell metacharacters", () => {
     expect(isSafeCommand("ls -la src")).toBe(true);
     expect(isSafeCommand("cat a > b")).toBe(false);
@@ -861,7 +871,7 @@ describe("withRetry", () => {
         return { model: "m", content: [], stopReason: "end" };
       },
     };
-    const res = await withRetry(inner, { baseDelayMs: 1 }).complete(
+    const res = await withRetry(inner, { delaysMs: [1] }).complete(
       { system: [], messages: [], tools: [] },
       { signal: new AbortController().signal },
     );
@@ -880,7 +890,7 @@ describe("withRetry", () => {
       },
     };
     const deltas: Delta[] = [];
-    await withRetry(inner, { baseDelayMs: 1 }).complete(
+    await withRetry(inner, { delaysMs: [1] }).complete(
       { system: [], messages: [], tools: [] },
       { signal: new AbortController().signal, onDelta: (d) => deltas.push(d) },
     );
@@ -895,7 +905,7 @@ describe("withRetry", () => {
       },
     };
     await expect(
-      withRetry(inner, { baseDelayMs: 1 }).complete({ system: [], messages: [], tools: [] }, { signal: new AbortController().signal }),
+      withRetry(inner, { delaysMs: [1] }).complete({ system: [], messages: [], tools: [] }, { signal: new AbortController().signal }),
     ).rejects.toThrow("bad request");
   });
 });

@@ -52,6 +52,11 @@ export interface PolicyOptions {
   rules?: () => AllowRule[];
   /** 工作目录之外也可以直接读取的目录（skill 的目录），只影响只读工具 */
   readRoots?: string[];
+  /**
+   * 还没记进日志的模式：运行中切换模式时日志正被这一轮占着写不进去，宿主先放在这里让关卡立即按它判断，
+   * 这一轮结束后再记进日志。关卡的每个决定都记在 tool.decided 里，所以不影响重建（I-5）
+   */
+  pendingMode?: () => Mode | undefined;
 }
 
 export interface Policy {
@@ -210,7 +215,9 @@ export function policy(opts: PolicyOptions): Policy {
 
   const self: Policy = {
     settings(derived) {
-      return structuredClone((derived[POLICY_KEY] as PolicySettings | undefined) ?? defaults);
+      const stored = structuredClone((derived[POLICY_KEY] as PolicySettings | undefined) ?? defaults);
+      const pending = opts.pendingMode?.();
+      return pending ? { ...stored, mode: pending } : stored;
     },
     ruleFor(call) {
       if (call.name === "bash") return bashRule(String((call.input as { command?: unknown }).command ?? ""));

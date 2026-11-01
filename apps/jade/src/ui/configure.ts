@@ -3,7 +3,7 @@
 // 每个模型带自己的设置。/model 可以直接切回去，换了服务或地址之前的也不会丢。
 
 import { hasProvider, parseTokens, readSavedServices, updateEnvFile, writeSavedServices, type SavedModel, type SavedService } from "../config.ts";
-import { EFFORTS, listModels, providerInfo, providerKind, type ProviderKind } from "../provider.ts";
+import { EFFORTS, listModels, providerInfo, providerKind, rpmFromEnv, type ProviderKind } from "../provider.ts";
 import { shortPath } from "./render.ts";
 import { dim, green, red, type Screen } from "./screen.ts";
 
@@ -38,7 +38,7 @@ const KEY_KEY: Record<ProviderKind, string> = { "openai-compat": "OPENAI_COMPAT_
 const URL_KEY: Record<ProviderKind, string> = { "openai-compat": "OPENAI_COMPAT_BASE_URL", openai: "OPENAI_BASE_URL", anthropic: "ANTHROPIC_BASE_URL" };
 
 /** 每个模型自己的设置：切换模型时一起换掉 */
-const MODEL_SETTINGS = ["JADE_MAX_TOKENS", "JADE_EFFORT", "JADE_CONTEXT_WINDOW"];
+const MODEL_SETTINGS = ["JADE_MAX_TOKENS", "JADE_EFFORT", "JADE_CONTEXT_WINDOW", "JADE_RPM"];
 
 /** 一个服务包含的变量 */
 const serviceKeys = (kind: ProviderKind) => [
@@ -86,6 +86,18 @@ function tokensInput(screen: Screen, name: string, text: string): boolean {
     screen.log(red(errorText(err)));
     return false;
   }
+}
+
+/** 选择列表里一组模型的说明：前几个名字 */
+function modelNames(models: SavedModel[]): string {
+  const names = models.slice(0, 3).map((m) => m.name).join(", ");
+  return models.length > 3 ? `${names} +${models.length - 3}` : names;
+}
+
+/** "2 services · 5 models" */
+function countServices(services: SavedService[]): string {
+  const n = services.reduce((sum, s) => sum + s.models.length, 0);
+  return `${services.length} service${services.length > 1 ? "s" : ""} · ${n} model${n > 1 ? "s" : ""}`;
 }
 
 const errorText = (err: unknown) => (err instanceof Error ? err.message : String(err));
@@ -251,9 +263,15 @@ export function configurator(opts: ConfigureOptions): Configure {
       const saved = others.find((o) => o.model.name === arg);
       return void (await (saved ? useSaved(saved.service, saved.model) : switchModel(arg)));
     }
+    // 菜单里只列当前服务保存过的模型；其他服务的先选服务再选模型，配置的模型多时列表不会很长
+    const here = others.filter((o) => serviceId(o.service.env) === currentId);
+    const elsewhere = services.filter((s) => serviceId(s.env) !== currentId);
     const efforts = EFFORTS[info.kind];
-    const action = await screen.select<string>(`Model: ${info.model} (${info.kind})`, [
-      ...others.map((o, i) => ({ label: `Use ${o.model.name}`, value: `saved:${i}`, hint: describeService(o.service) })),
+    const action = await screen.select<string>(`Model: ${info.model} (${describeService({ env: process.env as Record<string, string>, models: [] })})`, [
+      ...here.map((o) => ({ label: `Use ${o.model.name}`, value: `saved:${others.indexOf(o)}`, hint: "saved" })),
+      ...(elsewhere.length
+        ? [{ label: "Use a model from another service…", value: "service" as const, hint: countServices(elsewhere) }]
+        : []),
       { label: "Add a model from this service", value: "model" as const, hint: `current: ${info.model}` },
       { label: "Add a service, or change the base URL or API key", value: "provider" as const, hint: info.baseURL },
       { label: "Output limit per reply", value: "max" as const, hint: process.env.JADE_MAX_TOKENS ? `${process.env.JADE_MAX_TOKENS} tokens` : "service default" },
@@ -265,16 +283,22 @@ export function configurator(opts: ConfigureOptions): Configure {
         value: "window" as const,
         hint: `${opts.contextWindow()} tokens${process.env.JADE_CONTEXT_WINDOW ? "" : " (default)"}`,
       },
+      {
+        label: "Requests per minute",
+        value: "rpm" as const,
+        hint: process.env.JADE_RPM ? `${process.env.JADE_RPM}/min` : "no limit (slows down after being rate limited)",
+      },
       ...(others.length ? [{ label: "Forget a saved model", value: "forget" as const }] : []),
     ]);
     if (action?.startsWith("saved:")) {
       const o = others[Number(action.slice(6))]!;
       await useSaved(o.service, o.model);
+    } else if (action === "service") {
+      const picked = await pickSaved(elsewhere, "Use a model from which service?");
+      if (picked) await useSaved(picked.service, picked.model);
     } else if (action === "forget") {
-      const gone = await screen.select(
-        "Forget which model?",
-        others.map((o) => ({ label: o.model.name, value: o, hint: describeService(o.service) })),
-      );
+      const owners = services.filter((s) => others.some((o) => o.service === s));
+      const gone = await pickSaved(owners, "Forget a model from which service?", (s, m) => !(serviceId(s.env) === currentId && m.name === info.model));
       if (!gone) return;
       const id = serviceId(gone.service.env);
       // 服务下没有模型了就连服务（和它的密钥）一起删掉
@@ -298,12 +322,46 @@ export function configurator(opts: ConfigureOptions): Configure {
         { label: "Default", value: DEFAULT, hint: info.kind === "anthropic" ? "high" : "service default" },
       ]);
       if (effort !== undefined) await applyConfig({ JADE_EFFORT: effort === DEFAULT ? undefined : effort });
+    } else if (action === "rpm") {
+      const n = await screen.input("Requests per minute, e.g. 20 for most free models (empty for no limit)", { initial: process.env.JADE_RPM ?? "" });
+      if (n === undefined) return;
+      try {
+        rpmFromEnv({ JADE_RPM: n });
+      } catch (err) {
+        return screen.log(red(errorText(err)));
+      }
+      await applyConfig({ JADE_RPM: n.trim() || undefined });
     } else if (action === "window") {
       const n = await screen.input("Context window in tokens, e.g. 128000, 512K, 1M (empty to infer it from the model name, or 128K if unknown)", {
         initial: process.env.JADE_CONTEXT_WINDOW ?? "",
       });
       if (n !== undefined && tokensInput(screen, "Context window", n)) await applyConfig({ JADE_CONTEXT_WINDOW: n || undefined });
     }
+  }
+
+  /**
+   * 从几个服务里选一个保存过的模型：只有一个服务时直接列它的模型，否则先选服务。
+   * keep 过滤可选的模型；取消时返回 undefined
+   */
+  async function pickSaved(
+    from: SavedService[],
+    title: string,
+    keep: (s: SavedService, m: SavedModel) => boolean = () => true,
+  ): Promise<{ service: SavedService; model: SavedModel } | undefined> {
+    const groups = from.map((s) => ({ service: s, models: s.models.filter((m) => keep(s, m)) })).filter((g) => g.models.length > 0);
+    const group =
+      groups.length === 1
+        ? groups[0]
+        : await screen.select(
+            title,
+            groups.map((g) => ({ label: describeService(g.service), value: g, hint: modelNames(g.models) })),
+          );
+    if (!group) return undefined;
+    const model = await screen.select(
+      `Model (${describeService(group.service)})`,
+      group.models.map((m) => ({ label: m.name, value: m })),
+    );
+    return model && { service: group.service, model };
   }
 
   return { provider: configureProvider, model: configureModel };

@@ -54,6 +54,8 @@ export interface JadeOptions {
   approveSubagent?: ApproveSubagent;
   /** 子 Agent 也遵守的"总是允许"规则（主会话的），每次判断时取 */
   sharedRules?: () => AllowRule[];
+  /** 运行中切换、还没记进日志的权限模式（见 PolicyOptions.pendingMode） */
+  pendingMode?: () => Mode | undefined;
   /**
    * 编辑后检查的命令第一次运行前由宿主确认；不给就不做编辑后检查。
    * 检查会执行仓库里的代码，所以不能默认放行
@@ -132,7 +134,7 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
   const built = new Map<string, JadePlugin>();
   const add = (p: JadePlugin) => built.set(p.id, p);
 
-  const pol = policy({ cwd, mode: opts.mode, readRoots: off("jade/skills") ? [] : skills.map((x) => x.dir) });
+  const pol = policy({ cwd, mode: opts.mode, pendingMode: opts.pendingMode, readRoots: off("jade/skills") ? [] : skills.map((x) => x.dir) });
   add(pol.plugin);
   // 占位，组装完成后换成真正的提示词插件
   if (!off("jade/prompts")) add({ id: "jade/prompts", version: "0.3.0", kernel: "^0.1" });
