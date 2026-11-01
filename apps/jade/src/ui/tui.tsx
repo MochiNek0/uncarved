@@ -34,6 +34,16 @@ import {
   type StatusInfo,
 } from "./screen.ts";
 
+/**
+ * 界面可用的尺寸：宽度比终端少一列。
+ * Ink 增量重画时每行写成「内容 + ESC[K」；一行正好占满终端宽度时光标停在最后一列（等待换行），
+ * 紧跟的 ESC[K 会把最后一个字符擦掉，输入框之类的右边框就缺了一块。留出最后一列就不会这样
+ */
+function useScreenSize(): { columns: number; rows: number } {
+  const { columns, rows } = useWindowSize();
+  return { columns: Math.max(1, columns - 1), rows };
+}
+
 export interface TuiHandlers {
   /** 用户在输入框里提交了一行（消息或命令） */
   submit(text: string): void;
@@ -565,7 +575,7 @@ function App({
 }) {
   const state = useSyncExternalStore(store.subscribe, store.get);
   const dialog = state.dialogs[0];
-  const { columns, rows } = useWindowSize();
+  const { columns, rows } = useScreenSize();
 
   // 对话区占掉标题和底部之外的全部高度，只画能看见的那几行
   const ref = useRef<DOMElement>(null);
@@ -735,7 +745,7 @@ function Header({
   /** 终端很矮时只占一行，把高度留给对话和输入框 */
   compact: boolean;
 }) {
-  const { columns } = useWindowSize();
+  const { columns } = useScreenSize();
   if (compact)
     return (
       <Box flexShrink={0} paddingX={1}>
@@ -1099,7 +1109,7 @@ function Prompt({
   const browsing = useRef(-1);
   const draft = useRef("");
   const lastCtrlC = useRef(0);
-  const { columns, rows } = useWindowSize();
+  const { columns, rows } = useScreenSize();
   /** 补全菜单、搜索结果最多显示几项；输入框最多几行 */
   const menuRows = roomFor(rows, MENTION_ROWS);
   const inputRows = roomFor(rows, 10);
@@ -1488,7 +1498,7 @@ function SelectDialog({
 }) {
   const [getSelected, setSelected] = useLive(0);
   const [getQuery, setQuery] = useLive("");
-  const { rows, columns } = useWindowSize();
+  const { rows, columns } = useScreenSize();
   const filtering = dialog.choices.length > FILTER_FROM;
   const query = getQuery();
   /** 筛选后的选项和它们原来的序号 */
@@ -1617,7 +1627,7 @@ function InputDialog({
     cursor: initial.length,
   });
   const state = current();
-  const { columns } = useWindowSize();
+  const { columns } = useScreenSize();
   usePaste((text) =>
     setState(edit.insert(current(), text.replace(/\r?\n/g, ""))),
   );

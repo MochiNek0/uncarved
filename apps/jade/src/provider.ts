@@ -196,6 +196,30 @@ export function rpmFromEnv(env: Env = process.env): number | undefined {
   return n;
 }
 
+/**
+ * JADE_IDLE_TIMEOUT：多少秒没收到模型服务的任何数据（等响应头、流中两段数据之间）就中断并重试；0 表示不限。
+ * 不设时用 provider 的默认值（90 秒）。只对 OpenAI 和 OpenAI 兼容服务生效，Claude 由 SDK 自己处理超时
+ */
+export function idleTimeoutFromEnv(env: Env = process.env): number | undefined {
+  const text = env.JADE_IDLE_TIMEOUT?.trim();
+  if (!text) return undefined;
+  const n = Number(text);
+  if (!Number.isFinite(n) || n < 0) throw new Error(`JADE_IDLE_TIMEOUT must be a number of seconds (0 for no limit), got ${JSON.stringify(text)}`);
+  return Math.round(n * 1000);
+}
+
+/**
+ * JADE_VISION：模型能不能看图片（工具读到的图片、截图）。不设时 Claude 和 OpenAI 算能看；
+ * OpenAI 兼容服务的模型五花八门，算不能看：不支持图片的模型收到图片会拒绝整个请求，而图片会一直留在历史里
+ */
+export function visionFromEnv(env: Env = process.env): boolean {
+  const text = env.JADE_VISION?.trim().toLowerCase();
+  if (!text) return providerKind(env) !== "openai-compat";
+  if (["1", "true", "on", "yes"].includes(text)) return true;
+  if (["0", "false", "off", "no"].includes(text)) return false;
+  throw new Error(`JADE_VISION must be on or off, got ${JSON.stringify(env.JADE_VISION)}`);
+}
+
 /** JADE_EFFORT；不设时 Claude 用 high，OpenAI 用服务端默认值 */
 export function effortFromEnv(env: Env = process.env): string | undefined {
   const effort = env.JADE_EFFORT;
@@ -244,6 +268,8 @@ export function providerInfo(env: Env = process.env): ProviderInfo {
  * JADE_MAX_TOKENS 是每次回复的输出上限。不设时 Claude 用 64000，其他服务用服务端默认值（有的只有 4096，思考很容易用完）
  * JADE_EFFORT 是思考的力度，见 effortFromEnv
  * JADE_RPM 是每分钟最多发几个请求，见 rpmFromEnv（限速在 withRetry 的 gate 里做）
+ * JADE_IDLE_TIMEOUT 是等模型服务回数据的时限，见 idleTimeoutFromEnv
+ * JADE_VISION 是模型能不能看图片，见 visionFromEnv
  * 只导入用到的那个服务的包：Anthropic 的 SDK 加载要一百多毫秒，拖慢启动
  */
 export async function providerFromEnv(env: Env = process.env): Promise<Provider> {
@@ -252,6 +278,8 @@ export async function providerFromEnv(env: Env = process.env): Promise<Provider>
   const effort = effortFromEnv(env);
   // 写错时在这里就报错，不等到第一次请求
   rpmFromEnv(env);
+  const idleTimeoutMs = idleTimeoutFromEnv(env);
+  const toolResultImages = visionFromEnv(env);
   if (kind === "openai") {
     if (!env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is required for the openai provider");
     const { openaiResponsesProvider } = await import("@uncarved/provider-openai-responses");
@@ -261,6 +289,8 @@ export async function providerFromEnv(env: Env = process.env): Promise<Provider>
       model: env.OPENAI_MODEL ?? "gpt-5",
       maxTokens,
       reasoning: effort ? { effort: effort as "minimal" | "low" | "medium" | "high" } : undefined,
+      idleTimeoutMs,
+      toolResultImages,
     });
   }
   if (kind === "openai-compat") {
@@ -273,6 +303,8 @@ export async function providerFromEnv(env: Env = process.env): Promise<Provider>
       model: env.OPENAI_COMPAT_MODEL,
       maxTokens,
       extraBody: env.OPENAI_COMPAT_EXTRA_BODY ? jsonObject("OPENAI_COMPAT_EXTRA_BODY", env.OPENAI_COMPAT_EXTRA_BODY) : undefined,
+      idleTimeoutMs,
+      toolResultImages,
     });
   }
   const { anthropicProvider } = await import("@uncarved/provider-anthropic");

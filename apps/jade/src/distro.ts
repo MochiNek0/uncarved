@@ -4,7 +4,7 @@
 // 用户可以停用内置插件（$JADE_HOME/plugins.json），第三方插件可以用 replaces 代替内置插件；jade/policy 两者都不行。
 
 import path from "node:path";
-import { checkCompat, definePlugin, type LogStore, type Plugin, type Provider, type Tool } from "uncarved";
+import { checkCompat, definePlugin, type LogStore, type ModelRequest, type Plugin, type Provider, type Tool } from "uncarved";
 import { budget } from "./plugins/budget.ts";
 import { BUILTINS, BUILTIN_IDS, REQUIRED_IDS } from "./plugins/builtins.ts";
 import { checks as checksPlugin, type ApproveCheck, type Check, type Checks } from "./plugins/checks.ts";
@@ -23,6 +23,8 @@ import { shellTools } from "./tools/shell.ts";
 import { taskTool, type ApproveSubagent } from "./tools/task.ts";
 import { todoTool } from "./tools/todo.ts";
 import { webTools } from "./tools/web.ts";
+import { screenshotTool } from "./tools/screenshot.ts";
+import { visionFromEnv } from "./provider.ts";
 
 const READ_ONLY = new Set(["read_file", "list_dir", "glob", "grep"]);
 
@@ -50,6 +52,8 @@ export interface JadeOptions {
   fetch?: typeof fetch;
   /** web 工具解析主机名用；测试用 */
   lookup?: (hostname: string) => Promise<string[]>;
+  /** 截图用的浏览器；不给时按 JADE_BROWSER 和常见安装位置找，null 表示不提供截图工具 */
+  browser?: string | null;
   /** 子 Agent 要用户批准的调用（例如 web_fetch）交给宿主；不给就拒绝 */
   approveSubagent?: ApproveSubagent;
   /** 子 Agent 也遵守的"总是允许"规则（主会话的），每次判断时取 */
@@ -144,13 +148,43 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
   if (!off("jade/fs")) add(withCounter({ id: "jade/fs", version: "0.1.0", kernel: "^0.1", tools: fsTools(cwd, { checkpoints, responses }) }, responses));
   if (!off("jade/shell")) add({ id: "jade/shell", version: "0.1.0", kernel: "^0.1", tools: shell.tools });
   let web: Tool[] = [];
+  let hasScreenshot = false;
   if (!off("jade/web")) {
     try {
       web = webTools({ env: opts.env, fetch: opts.fetch, lookup: opts.lookup }).tools;
     } catch (err) {
       warnings.push(`web tools are disabled: ${err instanceof Error ? err.message : String(err)}`);
     }
-    add({ id: "jade/web", version: "0.1.0", kernel: "^0.1", tools: web });
+    // 截图只在模型能看图片时有用，否则截图到了模型那里只剩占位说明。/model 运行中会换模型、改 JADE_VISION，
+    // 所以找到浏览器就注册，每次请求前按当时的设置决定发不发给模型，不用重启
+    const canSee = () => {
+      try {
+        return visionFromEnv(opts.env ?? process.env);
+      } catch {
+        // 写错的 JADE_VISION 在创建 provider 时报错
+        return false;
+      }
+    };
+    const shot = opts.browser !== null ? screenshotTool({ cwd, browser: opts.browser, env: opts.env, available: canSee }) : undefined;
+    hasScreenshot = shot !== undefined;
+    add({
+      id: "jade/web",
+      version: "0.2.0",
+      kernel: "^0.1",
+      tools: shot ? [...web, shot] : web,
+      ...(shot
+        ? {
+            needs: ["transform:context.build"],
+            hooks: [
+              {
+                kind: "transform",
+                point: "context.build",
+                fn: (req: ModelRequest) => (canSee() ? req : { ...req, tools: req.tools.filter((t) => t.name !== shot.name) }),
+              },
+            ],
+          }
+        : {}),
+    });
   }
   if (!off("jade/todo")) add({ id: "jade/todo", version: "0.1.0", kernel: "^0.1", tools: [todoTool()] });
 
@@ -246,6 +280,7 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
       // bash 由别的插件提供时不知道它用什么 shell，不写
       shell: toolNames.has("bash") ? (kept.has("jade/shell") ? (shell.executable ?? null) : undefined) : null,
       web: webNames,
+      screenshot: hasScreenshot,
       checks: kept.has("jade/checks") && Boolean(checks),
       tools: toolNames,
     });

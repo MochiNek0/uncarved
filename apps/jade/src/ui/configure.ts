@@ -3,7 +3,7 @@
 // 每个模型带自己的设置。/model 可以直接切回去，换了服务或地址之前的也不会丢。
 
 import { hasProvider, parseTokens, readSavedServices, updateEnvFile, writeSavedServices, type SavedModel, type SavedService } from "../config.ts";
-import { EFFORTS, listModels, providerInfo, providerKind, rpmFromEnv, type ProviderKind } from "../provider.ts";
+import { EFFORTS, listModels, providerInfo, providerKind, rpmFromEnv, visionFromEnv, type ProviderKind } from "../provider.ts";
 import { shortPath } from "./render.ts";
 import { dim, green, red, type Screen } from "./screen.ts";
 
@@ -38,7 +38,22 @@ const KEY_KEY: Record<ProviderKind, string> = { "openai-compat": "OPENAI_COMPAT_
 const URL_KEY: Record<ProviderKind, string> = { "openai-compat": "OPENAI_COMPAT_BASE_URL", openai: "OPENAI_BASE_URL", anthropic: "ANTHROPIC_BASE_URL" };
 
 /** 每个模型自己的设置：切换模型时一起换掉 */
-const MODEL_SETTINGS = ["JADE_MAX_TOKENS", "JADE_EFFORT", "JADE_CONTEXT_WINDOW", "JADE_RPM"];
+const MODEL_SETTINGS = ["JADE_MAX_TOKENS", "JADE_EFFORT", "JADE_CONTEXT_WINDOW", "JADE_RPM", "JADE_VISION"];
+
+/** JADE_VISION 设成了什么；没设或写错时 undefined */
+function visionSetting(): boolean | undefined {
+  if (!process.env.JADE_VISION?.trim()) return undefined;
+  try {
+    return visionFromEnv({ JADE_VISION: process.env.JADE_VISION });
+  } catch {
+    return undefined;
+  }
+}
+
+function visionHint(kind: ProviderKind): string {
+  const v = visionSetting();
+  return v === undefined ? `${kind === "openai-compat" ? "no" : "yes"} (default)` : v ? "yes" : "no";
+}
 
 /** 一个服务包含的变量 */
 const serviceKeys = (kind: ProviderKind) => [
@@ -288,6 +303,7 @@ export function configurator(opts: ConfigureOptions): Configure {
         value: "rpm" as const,
         hint: process.env.JADE_RPM ? `${process.env.JADE_RPM}/min` : "no limit (slows down after being rate limited)",
       },
+      { label: "Can see images", value: "vision" as const, hint: visionHint(info.kind) },
       ...(others.length ? [{ label: "Forget a saved model", value: "forget" as const }] : []),
     ]);
     if (action?.startsWith("saved:")) {
@@ -331,6 +347,19 @@ export function configurator(opts: ConfigureOptions): Configure {
         return screen.log(red(errorText(err)));
       }
       await applyConfig({ JADE_RPM: n.trim() || undefined });
+    } else if (action === "vision") {
+      const DEFAULT = "\0default";
+      const current = visionSetting();
+      const choice = await screen.select("Can this model see images (screenshots, image files)?", [
+        { label: "Yes", value: "on", hint: current === true ? "current" : "the screenshot tool becomes available" },
+        { label: "No", value: "off", hint: current === false ? "current" : "images are replaced with a note" },
+        { label: "Default", value: DEFAULT, hint: info.kind === "openai-compat" ? "no for compatible services" : "yes" },
+      ]);
+      if (choice === undefined) return;
+      // 换了 provider 立即生效：图片发不发、截图工具给不给模型都在每次请求时按它判断，不用重启
+      if (await applyConfig({ JADE_VISION: choice === DEFAULT ? undefined : choice })) {
+        screen.log(dim(visionFromEnv() ? "Images and screenshots will be sent to the model." : "Images will be replaced with a note; the screenshot tool is hidden."));
+      }
     } else if (action === "window") {
       const n = await screen.input("Context window in tokens, e.g. 128000, 512K, 1M (empty to infer it from the model name, or 128K if unknown)", {
         initial: process.env.JADE_CONTEXT_WINDOW ?? "",

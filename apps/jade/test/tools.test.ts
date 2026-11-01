@@ -2,8 +2,9 @@ import { describe, expect, test } from "bun:test";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { ProviderError, type Block, type Message, type Provider, type Tool, type ToolContext } from "uncarved";
-import { estimateTokens, fsTools, htmlToMarkdown, isConcurrencyLimit, isPrivateHost, isRateLimit, nearMiss, RateGate, RETRY_DELAYS_MS, rpmFromEnv, webTools, withRetry } from "../src/index.ts";
+import { estimateTokens, fsTools, htmlToMarkdown, isConcurrencyLimit, isPrivateHost, isRateLimit, nearMiss, RateGate, RETRY_DELAYS_MS, rpmFromEnv, screenshotTool, visionFromEnv, webTools, withRetry } from "../src/index.ts";
 
 // ---------- 辅助 ----------
 
@@ -357,4 +358,75 @@ test("RateGate spaces requests by the limit and pauses everyone after a 429", as
   await expect(paused).rejects.toThrow("done");
   expect(rpmFromEnv({ JADE_RPM: "20" })).toBe(20);
   expect(() => rpmFromEnv({ JADE_RPM: "fast" })).toThrow("JADE_RPM");
+});
+
+describe("screenshot", () => {
+  // 假的浏览器：记下参数，把一张"图片"写到 --screenshot 指定的位置
+  const fakeBrowser = (write = true) => {
+    const calls: string[][] = [];
+    const spawn = async (cmd: string[]) => {
+      calls.push(cmd);
+      const out = cmd.find((a) => a.startsWith("--screenshot="))!.slice("--screenshot=".length);
+      if (write) await writeFile(out, "PNGDATA");
+      const empty = { async *[Symbol.asyncIterator]() {} };
+      return { pid: 1, stdout: empty, stderr: empty, exited: Promise.resolve(0), kill() {} };
+    };
+    return { calls, spawn };
+  };
+
+  test("renders a local file and returns the image", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "jade-shot-test-"));
+    await writeFile(path.join(dir, "a.html"), "<p>hi</p>");
+    const { calls, spawn } = fakeBrowser();
+    const tool = screenshotTool({ cwd: dir, browser: "chrome", spawn })!;
+    const r = await tool.execute({ path: "a.html", width: 640, height: 480 }, ctx());
+    expect(r.isError).toBeFalsy();
+    const content = r.content as Block[];
+    expect(content[0]).toMatchObject({ kind: "text", text: "Screenshot of a.html at 640x480:" });
+    expect(content[1]).toMatchObject({ kind: "image", source: { type: "base64", media_type: "image/png", data: Buffer.from("PNGDATA").toString("base64") } });
+    const args = calls[0]!;
+    expect(args[0]).toBe("chrome");
+    expect(args).toContain("--headless=new");
+    expect(args).toContain("--window-size=640,480");
+    // 用临时的用户目录，不碰用户自己的浏览器配置
+    expect(args.some((a) => a.startsWith("--user-data-dir="))).toBe(true);
+    expect(args.at(-1)).toBe(pathToFileURL(path.join(dir, "a.html")).href);
+  });
+
+  test("rejects bad input and reports a browser that wrote nothing", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "jade-shot-test-"));
+    const tool = screenshotTool({ cwd: dir, browser: "chrome", spawn: fakeBrowser(false).spawn })!;
+    const err = async (input: unknown) => {
+      const r = await tool.execute(input, ctx());
+      expect(r.isError).toBe(true);
+      return r.content as string;
+    };
+    expect(await err({})).toContain("exactly one of path or url");
+    expect(await err({ path: "a.html", url: "http://localhost:3000" })).toContain("exactly one of path or url");
+    expect(await err({ path: "missing.html" })).toContain("file not found");
+    expect(await err({ url: "file:///etc/passwd" })).toContain("only http and https");
+    expect(await err({ url: "http://localhost:3000", width: 50 })).toContain("between 100 and");
+    expect(await err({ url: "http://localhost:3000" })).toContain("without writing a screenshot");
+  });
+
+  test("refuses when the current model cannot see images", async () => {
+    const { calls, spawn } = fakeBrowser();
+    const tool = screenshotTool({ cwd: ".", browser: "chrome", spawn, available: () => false })!;
+    const r = await tool.execute({ url: "http://localhost:3000" }, ctx());
+    expect(r).toMatchObject({ isError: true, content: expect.stringContaining("cannot see images") });
+    expect(calls).toHaveLength(0);
+  });
+
+  test("is only offered when a browser is found", () => {
+    expect(screenshotTool({ cwd: ".", env: { JADE_BROWSER: path.join(os.tmpdir(), "no-such-browser") } })).toBeUndefined();
+  });
+
+  test("JADE_VISION: on by default for Claude and OpenAI, off for compatible services", () => {
+    expect(visionFromEnv({})).toBe(true);
+    expect(visionFromEnv({ OPENAI_API_KEY: "k" })).toBe(true);
+    expect(visionFromEnv({ OPENAI_COMPAT_BASE_URL: "http://x" })).toBe(false);
+    expect(visionFromEnv({ OPENAI_COMPAT_BASE_URL: "http://x", JADE_VISION: "on" })).toBe(true);
+    expect(visionFromEnv({ JADE_VISION: "0" })).toBe(false);
+    expect(() => visionFromEnv({ JADE_VISION: "maybe" })).toThrow("JADE_VISION");
+  });
 });

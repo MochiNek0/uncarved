@@ -61,6 +61,7 @@ import {
   type JadeOptions,
   type CompactState,
 } from "../src/index.ts";
+import { repeats } from "../src/plugins/repeats.ts";
 
 // ---------- 辅助 ----------
 
@@ -97,7 +98,7 @@ async function setup(script: Step[], extra: Partial<JadeOptions> = {}) {
   const { cwd, home } = await workspace();
   const s = scripted(script);
   const store = extra.store ?? new MemoryLogStore();
-  const jade = await createJade({ cwd, home, store, provider: s.provider, today: "2026-10-30", env: {}, ...extra });
+  const jade = await createJade({ cwd, home, store, provider: s.provider, today: "2026-10-30", env: {}, browser: null, ...extra });
   const rt = await Runtime.create({ store, provider: s.provider, plugins: jade.plugins });
   return { cwd, home, store, jade, rt, ...s };
 }
@@ -404,6 +405,34 @@ describe("policy", () => {
     expect(reason.decision === "deny" && reason.reason).toContain("plan mode");
   });
 
+  test("opening a viewable file in the workspace for the user does not ask; anything else still does", () => {
+    const page = path.join(cwd, "out", "pixel.html");
+    expect(decide("ask", "bash", { command: `start "" "${page}"` })).toBe("allow");
+    expect(decide("ask", "bash", { command: `start "${page}"` })).toBe("allow");
+    expect(decide("ask", "bash", { command: `xdg-open "${path.join(cwd, "shot.PNG")}"` })).toBe("allow");
+    expect(decide("ask", "bash", { command: "start \"\" out/report.pdf" })).toBe("allow");
+    // 只是查看，plan、readonly 下也可以
+    expect(decide("plan", "bash", { command: `start "" "${page}"` })).toBe("allow");
+    // 工作目录之外的文件先问
+    expect(decide("ask", "bash", { command: `start "" "${path.resolve("/elsewhere/a.html")}"` })).toBe("ask");
+    // 打开就会执行或跳转的文件、URL、开关、多个参数、cmd 特殊字符
+    for (const command of [
+      `start "" "${path.join(cwd, "run.bat")}"`,
+      `start "" "${path.join(cwd, "x.js")}"`,
+      `start "" "${path.join(cwd, "a.url")}"`,
+      'start "" https://example.com/a.html',
+      'start "" file://c/a.html',
+      "start /wait a.html",
+      'start "" a.html b.html',
+      'start "" "a&calc.html"',
+      'start "" "%TEMP%.html"',
+      "xdg-open --help.html",
+      "start",
+    ]) {
+      expect(decide("ask", "bash", { command })).toBe("ask");
+    }
+  });
+
   test("a mode switched while the turn is running applies before it is written to the log", () => {
     let pending: "plan" | undefined;
     const p = policy({ cwd, pendingMode: () => pending });
@@ -680,6 +709,76 @@ describe("jade session", () => {
     expect(dup).toContain("identical to an earlier call");
     // 下一次回复里再发同一个调用会执行，第二次失败时提醒模型
     expect(resultText(requests[2]!.messages.at(-1)!.content[0]!)).toContain("This exact call has now failed 2 times");
+  });
+
+  test("repeat notes: a command repeated with nothing else run in between, but not when its output changed", async () => {
+    const responses = { calls: 0 };
+    const hooks = repeats({ responses }).hooks!;
+    const fn = (kind: string) => (hooks.find((h) => h.kind === kind) as unknown as { fn: (x: unknown) => unknown }).fn;
+    const gate = fn("gate");
+    const after = fn("transform") as (o: unknown) => { content: Block[] } | undefined;
+    let n = 0;
+    const run = (command: string, out: string, effect = "external") => {
+      responses.calls++;
+      const call = { toolUseId: `t${++n}`, name: "bash", input: { command } };
+      gate({ ...call, tool: { effect } });
+      const r = after({ call, content: [{ kind: "text", text: out, origin: { by: "tool", name: "bash" }, trust: "untrusted" }], isError: false });
+      return r?.content.at(-1)?.kind === "text" && (r.content.at(-1) as { text: string }).text.includes("already ran earlier");
+    };
+    const open = 'start "" page.html';
+    expect(run(open, "Exit code 0")).toBe(false);
+    expect(run(open, "Exit code 0")).toBe(true);
+    // 中间执行了别的命令
+    expect(run("bun run build", "ok")).toBe(false);
+    expect(run(open, "Exit code 0")).toBe(false);
+    // 在等外面的变化：输出变了就不提醒
+    expect(run("gh run view 1", "in progress")).toBe(false);
+    expect(run("gh run view 1", "completed")).toBe(false);
+  });
+
+  test("the screenshot tool is sent only while the model can see images, following JADE_VISION without a restart", async () => {
+    // /model 改设置时写的是同一个环境（运行时是 process.env）
+    const env: Record<string, string | undefined> = { OPENAI_COMPAT_BASE_URL: "http://x" };
+    const { rt, requests } = await setup([reply("one"), reply("two"), reply("three")], { browser: "chrome", env });
+    const tools = (i: number) => requests[i]!.tools.map((t) => t.name);
+    await rt.send(msg("hi"));
+    // 兼容服务默认不能看图片：注册了，但不发给模型
+    expect(tools(0)).not.toContain("screenshot");
+    expect(requests[0]!.system.map((s) => s.text).join("\n")).toContain("When the screenshot tool is available");
+    env.JADE_VISION = "on";
+    await rt.send(msg("again"));
+    expect(tools(1)).toContain("screenshot");
+    env.JADE_VISION = "off";
+    await rt.send(msg("and again"));
+    expect(tools(2)).not.toContain("screenshot");
+    // 系统提示词没有变，缓存不受影响
+    expect(requests[2]!.system).toEqual(requests[0]!.system);
+  });
+
+  test("a successful call repeated with nothing changed in between gets a note", async () => {
+    const { cwd, rt, requests } = await setup([
+      call(use("u1", "read_file", { path: "a.txt" })),
+      call(use("u2", "read_file", { path: "a.txt" })),
+      call(use("u3", "write_file", { path: "b.txt", content: "b" })),
+      call(use("u4", "read_file", { path: "a.txt" })),
+      reply("done"),
+      call(use("u5", "read_file", { path: "a.txt" })),
+      reply("ok"),
+    ]);
+    await writeFile(path.join(cwd, "a.txt"), "x\n");
+    const resultText = (b: Block) => (b.kind === "tool_result" ? b.content.map((c) => (c.kind === "text" ? c.text : "")).join("\n") : "");
+    const last = (i: number) => resultText(requests[i]!.messages.at(-1)!.content[0]!);
+
+    await rt.send(msg("read it"));
+    await rt.send({ kind: "approval", toolUseId: "u3", approved: true });
+    expect(last(1)).not.toContain("already ran earlier");
+    // 中间什么都没做，结果一样
+    expect(last(2)).toContain("already ran earlier");
+    // 中间写了别的文件，可能有影响，不提醒
+    expect(last(4)).not.toContain("already ran earlier");
+    // 用户发了新消息，不提醒
+    await rt.send(msg("read it again"));
+    expect(last(6)).not.toContain("already ran earlier");
   });
 
   test("the session list keeps the first message as the title and the last use as the time", async () => {

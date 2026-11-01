@@ -96,6 +96,31 @@ const FIND_UNSAFE = /^-(exec|execdir|ok|okdir|delete|fprint|fprint0|fprintf|fls)
 /** sed -n 只打印行号范围的脚本：10p、10,20p、$p */
 const SED_PRINT = /^(\d+|\$)(,(\d+|\$))?p$/;
 
+/**
+ * 用默认程序打开后只是查看的文件：浏览器、图片查看器、PDF 阅读器、文本编辑器。
+ * 不含 .js（Windows 默认用 WSH 执行）、.bat、.lnk、.url 这类打开就会执行或跳转的
+ */
+const VIEWABLE = /\.(html?|svg|png|jpe?g|gif|webp|bmp|ico|pdf|md|txt)$/i;
+
+/**
+ * 打开文件给用户看的命令：start "" <文件>（Windows，Git 自带的 /usr/bin/start）、open <文件>（macOS）、xdg-open <文件>。
+ * 只认一个本地文件、扩展名是 VIEWABLE 的形式；路径在不在工作目录里由调用方另外检查。
+ * URL（会把内容带到网络上）、选项、cmd 会特殊处理的字符都不认
+ */
+function opensForViewing(name: string, args: string[]): boolean {
+  let files: string[];
+  if (name === "start") files = args[0] === "" ? args.slice(1) : args;
+  else if (name === "xdg-open" || (name === "open" && process.platform === "darwin")) files = args;
+  else return false;
+  if (files.length !== 1) return false;
+  const f = files[0]!;
+  // 盘符（D:\、D:/）之外的 xxx: 都当成 URL 或协议
+  const scheme = /^[a-z][a-z0-9+.-]*:/i.test(f) && !/^[a-z]:[\\/]/i.test(f);
+  // cmd 的 start 把 /wait、/b 这样的词当成开关；/d/x.html 这种 Git Bash 路径不算
+  const startSwitch = name === "start" && /^\/[^/]*$/.test(f);
+  return !scheme && !startSwitch && !f.startsWith("-") && !/[%^&|<>"!]/.test(f) && VIEWABLE.test(f);
+}
+
 const positional = (args: string[]) => args.filter((a) => !a.startsWith("-"));
 const onlyFlags = (args: string[], allowed: string[]) => args.every((a) => allowed.includes(a));
 
@@ -131,6 +156,8 @@ export function commandKind(words: string[]): CommandKind | undefined {
   const name = first.replace(/^\/(usr\/)?bin\/(?=[^/]+$)/, "");
   if (UNSAFE_ARGS.some((re) => re.test(` ${args.join(" ")} `))) return undefined;
   if (name === "git") return gitKind(args);
+  // 不改任何文件，按只读算；打开工作目录之外的文件照常先问
+  if (opensForViewing(name, args)) return "read";
   if (VERSIONED.has(name) && args.length === 1 && VERSION_ARGS.has(args[0]!)) return "read";
   if (READ_ANY.has(name)) {
     // file -C 会编译并写出 magic 文件
