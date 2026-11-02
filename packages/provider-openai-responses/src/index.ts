@@ -140,6 +140,9 @@ export function openaiResponsesProvider(opts: OpenAIResponsesOptions): Provider 
               case "response.reasoning_summary_text.delta":
                 if (ev.delta) onDelta?.({ kind: "thinking", text: ev.delta });
                 break;
+              case "response.function_call_arguments.delta":
+                if (ev.delta) onDelta?.({ kind: "tool_input", text: ev.delta });
+                break;
               case "response.output_item.done":
                 if (ev.item) done[ev.output_index ?? done.length] = ev.item;
                 break;

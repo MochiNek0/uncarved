@@ -51,6 +51,8 @@ interface StreamChunk {
     delta?: {
       content?: string | null;
       reasoning_content?: string | null;
+      reasoning?: string | null;
+      reasoning_text?: string | null;
       /** 部分服务端不给 index */
       tool_calls?: Array<{ index?: number; id?: string; function?: { name?: string; arguments?: string } }>;
     };
@@ -129,9 +131,12 @@ export function openaiCompatProvider(opts: OpenAICompatOptions): Provider {
               text += d.content;
               onDelta?.({ kind: "text", text: d.content });
             }
-            if (d.reasoning_content) {
-              reasoning += d.reasoning_content;
-              onDelta?.({ kind: "thinking", text: d.reasoning_content });
+            // 思考放在哪个字段各家不一样：DeepSeek、Qwen、llama.cpp 用 reasoning_content，OpenRouter、Ollama、
+            // 新版 vLLM 用 reasoning，也有用 reasoning_text 的。有的服务把同一段同时放进两个字段，只取第一个非空的
+            const thought = d.reasoning_content || d.reasoning || d.reasoning_text;
+            if (thought) {
+              reasoning += thought;
+              onDelta?.({ kind: "thinking", text: thought });
             }
             for (const tc of d.tool_calls ?? []) {
               // 没有 index 时：带着新的 id 就是新的调用；也没有 id 时，最后一个调用已经开始接收参数后又来了 name，
@@ -145,6 +150,7 @@ export function openaiCompatProvider(opts: OpenAICompatOptions): Provider {
               // 名字一般只在第一块里给出；部分服务端每一块都重复完整的名字，不能再拼上去
               if (tc.function?.name && tc.function.name !== c.name) c.name += tc.function.name;
               if (tc.function?.arguments) c.arguments += tc.function.arguments;
+              if (tc.function?.name || tc.function?.arguments) onDelta?.({ kind: "tool_input", text: tc.function?.arguments ?? "" });
             }
             if (choice.finish_reason) finish = choice.finish_reason;
           }

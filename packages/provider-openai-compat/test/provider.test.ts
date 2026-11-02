@@ -57,11 +57,11 @@ test("在完整的内核循环里跑通：流式文本、分段的工具参数�
     plugins: [{ id: "p", version: "1", kernel: "^0.1", tools: [echo] }],
   });
   const deltas: string[] = [];
-  rt.subscribe((n) => n.type === "delta" && n.delta.kind !== "reset" && deltas.push(n.delta.text));
+  rt.subscribe((n) => n.type === "delta" && n.delta.kind !== "reset" && deltas.push(`${n.delta.kind}:${n.delta.text}`));
 
   await rt.send({ kind: "message", content: [{ kind: "text", text: "hi", origin: { by: "user" }, trust: "trusted" }] });
 
-  expect(deltas.join("")).toBe("let me checkdone");
+  expect(deltas).toEqual(["text:let me ", "text:check", 'tool_input:{"x"', "tool_input:: 1}", "text:done"]);
   expect(seen).toEqual([{ x: 1 }]);
   expect(rt.state.messages.at(-1)!.content[0]).toMatchObject({ kind: "text", text: "done" });
 
@@ -515,4 +515,24 @@ test("工具结果里的图片：toolResultImages 时放进紧跟 tool 消息的
   const off = await bodyWith(false);
   expect(off.map((m) => m.role)).toEqual(["user", "assistant", "tool"]);
   expect(off[2]!.content).toContain("[image omitted");
+});
+
+test("思考可以在 reasoning_content、reasoning 或 reasoning_text 里；同一块里有好几个字段时只取第一个非空的，不重复", async () => {
+  const { fetchFn } = fakeServer([
+    [
+      chunk({ reasoning: "a" }),
+      chunk({ reasoning_text: "b" }),
+      chunk({ reasoning_content: "c", reasoning: "c" }),
+      chunk({ reasoning_content: "", reasoning: "d" }),
+      chunk({ content: "ok" }, "stop"),
+    ],
+  ]);
+  const provider = openaiCompatProvider({ baseURL: "https://example.test/v1", model: "m", fetch: fetchFn });
+  const deltas: string[] = [];
+  const res = await provider.complete(
+    { system: [], tools: [], messages: [] },
+    { signal: new AbortController().signal, onDelta: (d) => d.kind !== "reset" && deltas.push(`${d.kind}:${d.text}`) },
+  );
+  expect(deltas).toEqual(["thinking:a", "thinking:b", "thinking:c", "thinking:d", "text:ok"]);
+  expect(res.content[0]).toMatchObject({ kind: "thinking", text: "abcd" });
 });

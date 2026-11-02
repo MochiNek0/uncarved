@@ -101,7 +101,7 @@ test("在完整的内核循环里跑通：流式文本、推理、工具调用�
   rt.subscribe((n) => n.type === "delta" && n.delta.kind !== "reset" && deltas.push(`${n.delta.kind}:${n.delta.text}`));
   await rt.send(userSays("hi"));
 
-  expect(deltas).toEqual(["thinking:think", "text:let me ", "text:check", "text:done"]);
+  expect(deltas).toEqual(["thinking:think", "text:let me ", "text:check", 'tool_input:{"x"', "text:done"]);
   expect(seen).toEqual([{ x: 1 }]);
   const first = rt.state.messages[1]!.content;
   expect(first.map((b) => b.kind)).toEqual(["thinking", "text", "tool_use"]);

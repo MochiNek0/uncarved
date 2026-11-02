@@ -237,9 +237,11 @@ export interface ModelResponse {
 
 /**
  * 流式增量，只推送给订阅者，不记入日志（3.2）。
+ * tool_input：工具调用参数的片段（JSON 文本，可能为空串，例如只带着工具名的第一块）。一般不显示，
+ * 用来知道模型正在输出、计算输出速度；完整的参数以最终回复里的 tool_use 为准。
  * reset：此前推送的本次模型调用的增量全部作废，例如包装 Provider 重试或切换之前（4.7）
  */
-export type Delta = { kind: "text" | "thinking"; text: string } | { kind: "reset" };
+export type Delta = { kind: "text" | "thinking" | "tool_input"; text: string } | { kind: "reset" };
 
 /**
  * 把模型请求翻译成某个模型接口的调用，实现不属于内核（4.7）。

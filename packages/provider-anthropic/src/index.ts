@@ -85,6 +85,7 @@ export function anthropicProvider(opts: AnthropicProviderOptions = {}): Provider
           if (ev.type !== "content_block_delta") continue;
           if (ev.delta.type === "text_delta") onDelta?.({ kind: "text", text: ev.delta.text });
           else if (ev.delta.type === "thinking_delta") onDelta?.({ kind: "thinking", text: ev.delta.thinking });
+          else if (ev.delta.type === "input_json_delta") onDelta?.({ kind: "tool_input", text: ev.delta.partial_json });
         }
         msg = await stream.finalMessage();
       } catch (err) {

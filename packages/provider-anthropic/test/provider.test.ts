@@ -77,17 +77,20 @@ test("模型输出的块原样回传，包括思考块的签名（I-6）", async
       stop_reason: "tool_use",
       usage: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 3 },
     },
-    [{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "he" } }],
+    [
+      { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "he" } },
+      { type: "content_block_delta", index: 2, delta: { type: "input_json_delta", partial_json: '{"x":' } },
+    ],
   );
   const provider = anthropicProvider({ client });
   const deltas: string[] = [];
 
   const res = await provider.complete(
     { system: [], tools: [], messages: [{ role: "user", content: [{ kind: "text", text: "hi", origin: user, trust: "trusted" }] }] },
-    { signal: new AbortController().signal, onDelta: (d) => d.kind !== "reset" && deltas.push(d.text) },
+    { signal: new AbortController().signal, onDelta: (d) => d.kind !== "reset" && deltas.push(`${d.kind}:${d.text}`) },
   );
 
-  expect(deltas).toEqual(["he"]);
+  expect(deltas).toEqual(["text:he", 'tool_input:{"x":']);
   expect(res.stopReason).toBe("tool_use");
   // inputTokens 是输入总量：API 的 input_tokens 加上缓存部分
   expect(res.usage).toMatchObject({ inputTokens: 13, outputTokens: 5, cacheReadTokens: 3 });
