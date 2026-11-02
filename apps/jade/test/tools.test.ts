@@ -259,7 +259,7 @@ test("estimateTokens counts CJK characters as about one token each", () => {
   expect(estimateTokens(msg("中".repeat(400))) - base).toBe(400);
 });
 
-test("withRetry adds jitter to the backoff unless the server says when to retry", async () => {
+test("withRetry adds jitter to the backoff and treats the server's Retry-After as a lower bound", async () => {
   const delays: number[] = [];
   let calls = 0;
   const inner: Provider = {
@@ -267,15 +267,17 @@ test("withRetry adds jitter to the backoff unless the server says when to retry"
     async complete() {
       calls++;
       if (calls === 1) throw new ProviderError("overloaded", { retryable: true });
+      // 比计划短的 Retry-After（例如并发限流每次都回 1 秒）不缩短退避；比计划长的照它等
       if (calls === 2) throw new ProviderError("rate limited", { retryable: true, retryAfterMs: 7 });
+      if (calls === 3) throw new ProviderError("rate limited", { retryable: true, retryAfterMs: 50 });
       return { model: "m", content: [], stopReason: "end" };
     },
   };
-  await withRetry(inner, { delaysMs: [10, 20], random: () => 0, onRetry: (i) => delays.push(i.delayMs) }).complete(
+  await withRetry(inner, { delaysMs: [10, 20, 30], random: () => 0, onRetry: (i) => delays.push(i.delayMs) }).complete(
     { system: [], messages: [], tools: [] },
     { signal: new AbortController().signal },
   );
-  expect(delays).toEqual([8, 7]);
+  expect(delays).toEqual([8, 16, 50]);
 });
 
 test("withRetry waits longer each time, up to 9 retries and at most 3 minutes", async () => {

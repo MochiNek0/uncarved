@@ -10,7 +10,7 @@ const MAX_RETRY_DELAY_MS = 180_000;
 export interface RetryOptions {
   /** 最多重试几次，默认 RETRY_DELAYS_MS 的长度（9 次） */
   retries?: number;
-  /** 第 n 次重试前等多久；次数超过数组长度时用最后一项。上游给了 retryAfterMs 时以它为准 */
+  /** 第 n 次重试前等多久；次数超过数组长度时用最后一项。上游给的 retryAfterMs 更长时以它为准 */
   delaysMs?: number[];
   /** 任何一次等待的上限，默认 3 分钟 */
   maxDelayMs?: number;
@@ -57,9 +57,11 @@ export function withRetry(inner: Provider, opts: RetryOptions = {}): Provider {
           return { ...res, provider: res.provider ?? inner.id };
         } catch (err) {
           if (!(err instanceof ProviderError) || !err.retryable || attempt > retries || options.signal.aborted) throw err;
-          // 没有 retryAfterMs 时在计划的时间上随机缩短最多 20%，并行的子 Agent 同时遇到 429 时不会同时重试
+          // 在计划的时间上随机缩短最多 20%，并行的子 Agent 同时遇到 429 时不会同时重试。
+          // 上游给的 retryAfterMs 只当下限：有的服务（尤其是并发数限流）每次都回 Retry-After: 1，
+          // 拿它代替退避计划会每秒撞一次，十几秒就把重试次数用完
           const planned = delays[Math.min(attempt, delays.length) - 1] ?? 1000;
-          const delayMs = Math.round(Math.min(err.retryAfterMs ?? planned * (0.8 + 0.2 * random()), max));
+          const delayMs = Math.round(Math.min(Math.max(err.retryAfterMs ?? 0, planned * (0.8 + 0.2 * random())), max));
           // 限流时所有共用这个 gate 的请求（子 Agent、压缩）一起等，不再各自去撞
           if (isRateLimit(err)) opts.gate?.limited(delayMs, { learn: !isConcurrencyLimit(err) });
           // 失败的这次已经推送过增量的，先让订阅者作废它们（4.7）
@@ -288,7 +290,9 @@ export async function providerFromEnv(env: Env = process.env): Promise<Provider>
       apiKey: env.OPENAI_API_KEY,
       model: env.OPENAI_MODEL ?? "gpt-5",
       maxTokens,
-      reasoning: effort ? { effort: effort as "minimal" | "low" | "medium" | "high" } : undefined,
+      // 设了思考力度说明是会思考的模型，顺带要思考摘要，否则服务端只思考不返回内容。
+      // 没设时不发 reasoning：不知道模型会不会思考，发给不支持的模型会被拒绝
+      reasoning: effort ? { effort: effort as "minimal" | "low" | "medium" | "high", summary: "auto" } : undefined,
       idleTimeoutMs,
       toolResultImages,
     });
