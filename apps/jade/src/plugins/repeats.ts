@@ -5,15 +5,39 @@
 // 同一个调用已经成功执行过，之后什么都没变（没有执行过只读之外的调用，用户也没有发新消息），
 // 再执行一遍结果也完全一样时，在结果后面提醒模型这是重复的（反复读同一个文件、反复打开同一个网页）。
 // 不拒绝：结果可能已经被压缩掉了，也可能是在等外面的东西变化，只提醒。
+// 打开文件给用户看（start、xdg-open……）会弹出新窗口：这一轮里打开过、之后什么都没改，再打开就直接拒绝。
+// write_file 之后什么都没改又读回同一个文件，提醒模型内容就是它写的那些。
 // 这些记录只在本进程内：恢复会话后从零开始，最多多重试一轮。
 
 import { createHash } from "node:crypto";
+import path from "node:path";
 import type { Block, LogEvent, Plugin } from "uncarved";
 
 export interface RepeatsOptions {
   /** 模型调用的次数，每次调用模型前加一（见 distro） */
   responses: { readonly calls: number };
+  /** 解析相对路径用；默认 process.cwd() */
+  cwd?: string;
   id?: string;
+}
+
+/** 只打开一个文件或网址的命令：start "" x、start x、xdg-open x、open x、explorer x */
+const OPEN = /^\s*(?:start\s+""|start|xdg-open|open|explorer(?:\.exe)?)\s+(?:"([^"]+)"|'([^']+)'|([^\s"'&|;<>]+))\s*$/i;
+
+/** bash 调用打开的目标（规范化后），不是打开命令时是 undefined */
+export function openTarget(call: { name: string; input: unknown }, cwd: string): string | undefined {
+  if (call.name !== "bash") return undefined;
+  const command = (call.input as { command?: unknown } | null)?.command;
+  if (typeof command !== "string") return undefined;
+  const m = OPEN.exec(command);
+  const target = m && (m[1] ?? m[2] ?? m[3]);
+  if (!target) return undefined;
+  return /^[a-z][a-z0-9+.-]*:\/\//i.test(target) ? target : normalize(cwd, target);
+}
+
+function normalize(cwd: string, p: string): string {
+  const full = path.resolve(cwd, p);
+  return process.platform === "win32" ? full.toLowerCase() : full;
 }
 
 /** 提醒模型的失败次数 */
@@ -23,8 +47,9 @@ const hash = (content: Block[]) => createHash("sha1").update(JSON.stringify(cont
 
 export function repeats(opts: RepeatsOptions): Plugin {
   const id = opts.id ?? "jade/repeats";
-  /** 本次回复里已经出现的调用 */
-  let current = { calls: -1, keys: new Set<string>() };
+  const cwd = opts.cwd ?? process.cwd();
+  /** 本次回复里已经出现的调用；mutates：其中有只读之外、也不是打开文件的调用 */
+  let current = { calls: -1, keys: new Set<string>(), mutates: false };
   /** 调用 → 连续失败的次数；成功一次就清掉 */
   const failures = new Map<string, number>();
   /** 每执行成功一个只读之外的调用、用户每发一条消息就加一 */
@@ -33,11 +58,17 @@ export function repeats(opts: RepeatsOptions): Plugin {
   const succeeded = new Map<string, { version: number; result: string }>();
   /** 已放行、还没执行完的调用是不是只读的（tool.after 里拿不到工具的声明） */
   const readOnly = new Map<string, boolean>();
+  /** 每执行成功一个只读之外、也不是打开文件的调用就加一（可能改了文件） */
+  let changes = 0;
+  /** 本轮打开过的目标 → 打开时的 changes；用户发消息时清空 */
+  const opened = new Map<string, number>();
+  /** 本轮用 write_file 写过的文件 → 写完时的 changes；用户发消息时清空 */
+  const written = new Map<string, number>();
   const key = (call: { name: string; input: unknown }) => `${call.name}\0${JSON.stringify(call.input)}`;
   const note = (text: string): Block => ({ kind: "text", text: `[Note from jade] ${text}`, origin: { by: "plugin", id }, trust: "trusted" });
   return {
     id,
-    version: "0.2.0",
+    version: "0.3.0",
     kernel: "^0.1",
     needs: ["gate:tool.gate", "transform:tool.after", "observe:event"],
     hooks: [
@@ -45,12 +76,23 @@ export function repeats(opts: RepeatsOptions): Plugin {
         kind: "gate",
         point: "tool.gate",
         fn: (call) => {
-          if (current.calls !== opts.responses.calls) current = { calls: opts.responses.calls, keys: new Set() };
+          if (current.calls !== opts.responses.calls) current = { calls: opts.responses.calls, keys: new Set(), mutates: false };
           const k = key(call);
           if (current.keys.has(k)) {
             return { decision: "deny", reason: "This call is identical to an earlier call in the same response and was not run; use that call's result." };
           }
           current.keys.add(k);
+          const target = openTarget(call, cwd);
+          // 同一次回复里排在前面的调用可能改了它，还没执行，不拒绝
+          if (target !== undefined && opened.get(target) === changes && !current.mutates) {
+            return {
+              decision: "deny",
+              reason:
+                "This was already opened for the user earlier in this turn and nothing has changed since, so it was not opened again (it is still open). " +
+                "End your turn and tell the user what you changed.",
+            };
+          }
+          if (target === undefined && call.tool.effect !== "read") current.mutates = true;
           readOnly.set(call.toolUseId, call.tool.effect === "read");
           return { decision: "abstain" };
         },
@@ -64,13 +106,22 @@ export function repeats(opts: RepeatsOptions): Plugin {
           readOnly.delete(outcome.call.toolUseId);
           if (!outcome.isError) {
             failures.delete(k);
+            const target = openTarget(outcome.call, cwd);
+            if (target !== undefined) opened.set(target, changes);
+            else if (!read) changes++;
+            const file = (outcome.call.input as { path?: unknown } | null)?.path;
+            if (outcome.call.name === "write_file" && typeof file === "string") written.set(normalize(cwd, file), changes);
+            const readBack =
+              outcome.call.name === "read_file" && typeof file === "string" && written.get(normalize(cwd, file)) === changes
+                ? note("You wrote this file with write_file earlier and nothing has changed since: its content is exactly what you gave. Do not read files back to check them.")
+                : undefined;
             const before = succeeded.get(k);
             // 只读之外的调用（包括这一个）可能改了东西，之后的调用都不算"什么都没变"
             if (!read) version++;
             const result = hash(outcome.content);
             const repeated = before !== undefined && before.version === (read ? version : version - 1) && before.result === result;
             succeeded.set(k, { version, result });
-            if (!repeated) return;
+            if (!repeated) return readBack ? { ...outcome, content: [...outcome.content, readBack] } : undefined;
             const text =
               "This exact call already ran earlier with the same result, and nothing has changed since (no edits, no other commands, no new message from the user). " +
               "Do not repeat it: use what you already have, or end your turn and tell the user where things stand.";
@@ -88,7 +139,11 @@ export function repeats(opts: RepeatsOptions): Plugin {
         point: "event",
         // 用户发了新消息，可能就是要再来一遍（"再打开看看"），之前的记录都不算了
         fn: (e: LogEvent) => {
-          if (e.type === "input.received" && (e as LogEvent<"input.received">).data.kind === "message") version++;
+          if (e.type === "input.received" && (e as LogEvent<"input.received">).data.kind === "message") {
+            version++;
+            opened.clear();
+            written.clear();
+          }
         },
       },
     ],

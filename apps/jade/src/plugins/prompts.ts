@@ -8,7 +8,7 @@
 
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { ContentSource, Layer, Plugin, SystemSegment, Trust } from "uncarved";
@@ -129,7 +129,8 @@ export async function prompts(opts: PromptsOptions): Promise<Plugin> {
     id,
     // 0.3.0：记忆、skill 列表、MCP 说明移到各自的插件（jade/memory、jade/skills、jade/mcp）
     // 0.3.1：写上当前配置的模型（model 选项）
-    version: "0.3.1",
+    // 0.3.2：环境信息里加上工作目录第一层的文件和目录
+    version: "0.3.2",
     kernel: "^0.1",
     needs: ["transform:context.build"],
     hooks: [
@@ -206,7 +207,7 @@ async function environment(opts: PromptsOptions): Promise<string> {
         ]
       : []),
     ...(opts.role !== "subagent" ? [`- Web tools: ${opts.web?.length ? opts.web.join(", ") : "none (web_search needs TAVILY_API_KEY)"}`] : []),
-    `- Today: ${opts.today ?? new Date().toISOString().slice(0, 10)}`,
+    `- Today: ${opts.today ?? localDate()}`,
   ];
   const branch = await git(opts.cwd, ["rev-parse", "--abbrev-ref", "HEAD"]);
   if (branch) {
@@ -216,7 +217,46 @@ async function environment(opts: PromptsOptions): Promise<string> {
   } else {
     lines.push("- Not a git repository");
   }
+  // 让模型一开始就知道仓库的大致样子，不用先盲猜语言、到处 ls
+  const entries = await topLevel(opts.cwd);
+  if (entries.length > 0) {
+    const shown = entries.slice(0, MAX_ENTRIES).join(" ");
+    const more = entries.length > MAX_ENTRIES ? ` … (${entries.length - MAX_ENTRIES} more)` : "";
+    lines.push(`- Top-level entries of the working directory at session start: ${shown}${more}`);
+  }
   return lines.join("\n");
+}
+
+const MAX_ENTRIES = 40;
+
+/**
+ * 工作目录第一层的文件和目录（目录带 /）。git 仓库里取 HEAD 的（跳过忽略的文件，也不用遍历磁盘），
+ * 没有提交时退回读目录，跳过 .git 和 node_modules
+ */
+async function topLevel(cwd: string): Promise<string[]> {
+  try {
+    const { code, stdout } = await run(["git", "ls-tree", "-z", "HEAD"], { cwd });
+    if (code === 0 && stdout) {
+      return stdout
+        .split("\0")
+        .filter(Boolean)
+        .map((l) => {
+          const [meta, name] = l.split("\t") as [string, string];
+          return meta.split(" ")[1] === "tree" ? `${name}/` : name;
+        });
+    }
+  } catch {
+    // 没有 git：读目录
+  }
+  try {
+    const dirents = await readdir(cwd, { withFileTypes: true });
+    return dirents
+      .filter((d) => d.name !== ".git" && d.name !== "node_modules")
+      .map((d) => (d.isDirectory() ? `${d.name}/` : d.name))
+      .sort();
+  } catch {
+    return [];
+  }
 }
 
 /** git 仓库的根目录；不在仓库里时是 cwd 本身 */
@@ -231,4 +271,9 @@ async function git(cwd: string, args: string[]): Promise<string | undefined> {
   } catch {
     return undefined;
   }
+}
+
+/** 本地日期 YYYY-MM-DD；toISOString 是 UTC 的，东八区凌晨会差一天 */
+function localDate(d = new Date()): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }

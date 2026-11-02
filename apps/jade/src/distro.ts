@@ -247,7 +247,7 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
   if (!off("jade/repeats")) {
     // 自己数回复次数：不依赖 jade/fs 是否加载
     const own = { calls: 0 };
-    add(withCounter(repeats({ responses: own }), own));
+    add(withCounter(repeats({ responses: own, cwd }), own));
   }
 
   // ---------- 代替关系：被代替的内置插件让位，代替者的工具名可以和它重复 ----------

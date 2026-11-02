@@ -88,7 +88,11 @@ export function transcript(opts: TranscriptOptions): Transcript {
   const startSpeed = () => {
     speed.first = 0;
     speed.estimate = 0;
+    toolChars = 0;
   };
+  /** 这次回复里工具参数已经生成的字数：写大文件时一写几分钟，显示出来才看得出不是卡住了 */
+  let toolChars = 0;
+  const toolLabel = () => (toolChars < 1000 ? "Writing" : `Writing (${Math.floor(toolChars / 1000)}k chars)`);
   const trackSpeed = (text: string) => {
     const now = Date.now();
     if (!speed.first) speed.first = now;
@@ -169,7 +173,11 @@ export function transcript(opts: TranscriptOptions): Transcript {
         trackSpeed(n.delta.text);
         // 工具参数只用来计时，不显示；也不算已经输出了内容（重试时不用标记作废，回复结束时照常打印没流式输出的正文）
         if (n.delta.kind === "tool_input") {
-          screen.busy("Writing");
+          // 只在千位变了时更新，不让每个增量都重画
+          const before = toolLabel();
+          toolChars += n.delta.text.length;
+          const label = toolLabel();
+          if (label !== before || toolChars === n.delta.text.length) screen.busy(label);
           return;
         }
         streamed = true;

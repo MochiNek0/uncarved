@@ -814,6 +814,52 @@ describe("jade session", () => {
     expect(run("gh run view 1", "completed")).toBe(false);
   });
 
+  test("re-opening an unchanged file in the same turn is denied; reading back a file just written gets a note", async () => {
+    const responses = { calls: 0 };
+    const cwd = path.resolve("/work");
+    const hooks = repeats({ responses, cwd }).hooks!;
+    const fn = (kind: string) => (hooks.find((h) => h.kind === kind) as unknown as { fn: (x: unknown) => unknown }).fn;
+    const gate = fn("gate") as (c: unknown) => { decision: string };
+    const after = fn("transform") as (o: unknown) => { content: Block[] } | undefined;
+    const observe = fn("observe");
+    let n = 0;
+    /** 一次回复里的调用：先全部过关卡，再依次执行；返回每个调用的决定和结果末尾的提醒 */
+    const respond = (...calls: [name: string, input: object, effect: string][]) => {
+      responses.calls++;
+      const made = calls.map(([name, input, effect]) => ({ toolUseId: `t${++n}`, name, input, tool: { effect } }));
+      const decisions = made.map((c) => gate(c).decision);
+      return made.map((c, i) => {
+        if (decisions[i] === "deny") return "deny";
+        const r = after({ call: c, content: [{ kind: "text", text: "ok", origin: { by: "tool", name: c.name }, trust: "untrusted" }], isError: false });
+        const last = r?.content.at(-1);
+        return last?.kind === "text" && last.text.startsWith("[Note from jade]") ? last.text : "allow";
+      });
+    };
+    const open = (p: string): [string, object, string] => ["bash", { command: `start "" ${p}` }, "external"];
+    const write = (p: string): [string, object, string] => ["write_file", { path: p, content: "x" }, "write"];
+    const read = (p: string): [string, object, string] => ["read_file", { path: p }, "read"];
+
+    expect(respond(write("page.html"), open("page.html"))).toEqual(["allow", "allow"]);
+    // 截图之类的只读调用不算改动；路径写法不同也认得出（绝对路径、引号）
+    expect(respond(["screenshot", { path: "page.html" }, "read"], open(`"${path.join(cwd, "page.html")}"`))).toEqual(["allow", "deny"]);
+    // 改了之后再打开可以；同一次回复里先改后开也可以
+    expect(respond(write("page.html"), open("page.html"))).toEqual(["allow", "allow"]);
+    expect(respond(open("page.html"))).toEqual(["deny"]);
+    // 别的文件、网址不受影响；网址也只开一次
+    expect(respond(open("other.html"), open("https://example.com"))).toEqual(["allow", "allow"]);
+    expect(respond(open("https://example.com"))).toEqual(["deny"]);
+    // 不是单纯的打开命令不管
+    expect(respond(["bash", { command: 'start "" page.html && echo hi' }, "external"])).toEqual(["allow"]);
+
+    // 刚写完就读回来：提醒；中间有别的改动：不提醒
+    const [, back] = respond(write("a.txt"), read("a.txt"));
+    expect(back).toContain("You wrote this file with write_file");
+    expect(respond(write("b.txt"), ["bash", { command: "bun run build" }, "external"], read("b.txt"))[2]).toBe("allow");
+    // 用户发了新消息：都重新算
+    observe({ type: "input.received", data: { kind: "message", content: [] } });
+    expect(respond(open("page.html"), read("a.txt"))).toEqual(["allow", "allow"]);
+  });
+
   test("the screenshot tool is sent only while the model can see images, following JADE_VISION without a restart", async () => {
     // /model 改设置时写的是同一个环境（运行时是 process.env）
     const env: Record<string, string | undefined> = { OPENAI_COMPAT_BASE_URL: "http://x" };
@@ -912,6 +958,34 @@ describe("jade session", () => {
     const without = await system(null);
     expect(without).toContain("There is no shell in this session");
     expect(without).not.toContain("with bash");
+  });
+
+  test("the system prompt lists the working directory's top-level entries: committed ones in a repository", async () => {
+    const { cwd, home } = await workspace();
+    const system = async () => {
+      const hook = (await prompts({ cwd, home })).hooks![0]!;
+      if (hook.kind !== "transform" || !("fn" in hook)) throw new Error("expected a local transform");
+      const req = (await hook.fn({ system: [], messages: [], tools: [] } as never, {} as never)) as ModelRequest;
+      return req.system.map((s) => s.text).join("\n");
+    };
+    const line = (text: string) => text.split("\n").find((l) => l.startsWith("- Top-level entries"));
+    await mkdir(path.join(cwd, "src"));
+    await mkdir(path.join(cwd, "node_modules"));
+    await writeFile(path.join(cwd, "src", "a.ts"), "");
+    await writeFile(path.join(cwd, "package.json"), "{}");
+    // 不是仓库：读目录，跳过 node_modules
+    expect(line(await system())).toBe("- Top-level entries of the working directory at session start: package.json src/");
+    // 仓库：只列提交过的
+    const git = (...args: string[]) => Bun.spawnSync(["git", "-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd });
+    git("init", "-q");
+    git("add", "src");
+    git("commit", "-q", "-m", "one");
+    expect(line(await system())).toBe("- Top-level entries of the working directory at session start: src/");
+    // 很多时截断
+    for (let i = 0; i < 45; i++) await writeFile(path.join(cwd, `f${String(i).padStart(2, "0")}.txt`), "");
+    git("add", ".");
+    git("commit", "-q", "-m", "two");
+    expect(line(await system())).toEndWith("… (7 more)");
   });
 
   test("the system prompt names the configured model, read on every request", async () => {

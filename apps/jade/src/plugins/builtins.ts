@@ -24,7 +24,7 @@ export const BUILTINS: readonly BuiltinInfo[] = [
   { id: "jade/checks", about: "project checks after edits, /checks" },
   { id: "jade/compact", about: "compacts the history near the context limit, /compact" },
   { id: "jade/budget", about: "limits the steps of a turn" },
-  { id: "jade/repeats", about: "rejects calls repeated in one response, warns about repeated failures" },
+  { id: "jade/repeats", about: "rejects calls repeated in one response and re-opening an unchanged file, warns about repeated failures and read-backs" },
 ];
 
 export const BUILTIN_IDS: ReadonlySet<string> = new Set(BUILTINS.map((b) => b.id));
