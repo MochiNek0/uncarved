@@ -7,11 +7,14 @@
 
 import { realpathSync, statSync } from "node:fs";
 import path from "node:path";
-import type { GatedToolCall, GateResult, Plugin } from "uncarved";
+import type { GatedToolCall, GateResult, Plugin, Usage } from "uncarved";
 import { validate } from "./schema.ts";
 
-export const MODES = ["ask", "auto-edit", "plan", "yolo", "readonly"] as const;
+/** 用户可以选的权限模式 */
+export const MODES = ["ask", "auto", "plan", "yolo"] as const;
 export type Mode = (typeof MODES)[number];
+/** 关卡认识的模式：再加上只给子 Agent 用的 readonly */
+export type PolicyMode = Mode | "readonly";
 
 /** derived 中保存设置的键 */
 export const POLICY_KEY = "jade/policy";
@@ -39,14 +42,14 @@ export function describeRule(r: AllowRule): string {
 }
 
 export interface PolicySettings {
-  mode: Mode;
+  mode: PolicyMode;
   rules: AllowRule[];
 }
 
 export interface PolicyOptions {
   cwd: string;
   /** 日志里还没有设置时使用 */
-  mode?: Mode;
+  mode?: PolicyMode;
   id?: string;
   /** 日志之外也要遵守的规则，每次判断时取（子 Agent 用主会话的规则） */
   rules?: () => AllowRule[];
@@ -57,7 +60,15 @@ export interface PolicyOptions {
    * 这一轮结束后再记进日志。关卡的每个决定都记在 tool.decided 里，所以不影响重建（I-5）
    */
   pendingMode?: () => Mode | undefined;
+  /**
+   * auto 模式下，规则判断不了、本来要问用户的调用交给它审：返回 allow 就不问，ask 照常问用户。
+   * 不给时 auto 模式只比 ask 多了"工作目录里的改动不问"
+   */
+  review?: (call: GatedToolCall, signal: AbortSignal) => Promise<GateResult & { usage?: Usage }>;
 }
+
+/** 审查要调用模型，内核默认 30 秒的 hook 时限不够（超时按拒绝处理）；审查自己会更早放弃并改为问用户 */
+const REVIEW_HOOK_TIMEOUT_MS = 120_000;
 
 export interface Policy {
   plugin: Plugin;
@@ -146,7 +157,7 @@ function gitKind(args: string[]): CommandKind | undefined {
 type CommandKind = "read" | "edit";
 
 /**
- * 一条简单命令（已分好词）的性质：read 只读；edit 只在工作目录里建目录、碰文件，auto-edit 模式下和改文件一样不问；
+ * 一条简单命令（已分好词）的性质：read 只读；edit 只在工作目录里建目录、碰文件，auto 模式下和改文件一样不问；
  * undefined 表示不认识或可能有副作用
  */
 export function commandKind(words: string[]): CommandKind | undefined {
@@ -396,6 +407,17 @@ const hostOf = (url: string) => {
   }
 };
 
+/**
+ * Windows 上 bash 工具跑的是 Git Bash，模型常把路径写成 /c/Users/...（MSYS 的写法）。
+ * path.resolve 会把它当成当前盘符下的 \c\Users\...，判断成工作目录之外，只读命令也要确认。
+ * 换算成 C:/Users/... 再判断；/tmp、/usr 这类 MSYS 自己的目录不换算，仍然算在外面
+ */
+export function nativePath(p: string, platform: string = process.platform): string {
+  if (platform !== "win32") return p;
+  const m = /^\/([a-zA-Z])(\/.*)?$/.exec(p);
+  return m ? `${m[1]!.toUpperCase()}:${m[2] ?? "/"}` : p;
+}
+
 /** 真实路径：解析符号链接；路径还不存在时解析最近的已存在的上级目录 */
 function real(p: string): string {
   try {
@@ -423,7 +445,7 @@ export function policy(opts: PolicyOptions): Policy {
   const mayMatchParent = (value: string) => value.split(/[\\/]/).some((seg) => /^[.[]/.test(seg) && /[*?[]/.test(seg));
   /** 相对 base 目录的路径 p 指向工作目录之外 */
   const pathOutside = (base: string, p: string, glob: boolean) =>
-    p.startsWith("~") || !inside(path.resolve(base, p)) || (glob && mayMatchParent(p));
+    p.startsWith("~") || !inside(path.resolve(base, nativePath(p))) || (glob && mayMatchParent(p));
   /**
    * 命令参数里有指向工作目录之外的路径。选项也要看：--opt=path 的值，以及粘在短选项后面的值（-f/etc/x）
    */
@@ -456,7 +478,7 @@ export function policy(opts: PolicyOptions): Policy {
         const target = c.words[1];
         // 不带参数的 cd 回到 home；cd 到外面以后，后面的相对路径都说不清了
         if (!target || c.words.length > 2 || target.glob || target.value.startsWith("-") || pathOutside(base, target.value, false)) return undefined;
-        base = path.resolve(base, target.value);
+        base = path.resolve(base, nativePath(target.value));
         continue;
       }
       // 规则覆盖的命令和原来的前缀规则一样不看路径
@@ -474,6 +496,10 @@ export function policy(opts: PolicyOptions): Policy {
   const self: Policy = {
     settings(derived) {
       const stored = structuredClone((derived[POLICY_KEY] as PolicySettings | undefined) ?? defaults);
+      // 旧版本记下的模式：auto-edit 并进了 auto；readonly 不再给用户选，换成同样不改东西的 plan
+      const legacy = stored.mode as string;
+      if (legacy === "auto-edit") stored.mode = "auto";
+      else if (legacy === "readonly" && derived[POLICY_KEY] !== undefined) stored.mode = "plan";
       const pending = opts.pendingMode?.();
       return pending ? { ...stored, mode: pending } : stored;
     },
@@ -549,16 +575,17 @@ export function policy(opts: PolicyOptions): Policy {
         };
       }
       if (mode === "yolo" || ruled) return { decision: "allow" };
-      if (tool.effect === "write") return { decision: mode === "auto-edit" && !outside ? "allow" : "ask" };
+      if (tool.effect === "write") return { decision: mode === "auto" && !outside ? "allow" : "ask" };
       // external
-      const gate = isBash ? bashGate(classifyBash(command, { edits: mode === "auto-edit", ruled: ruledWords })) : undefined;
+      const gate = isBash ? bashGate(classifyBash(command, { edits: mode === "auto", ruled: ruledWords })) : undefined;
       return gate ?? { decision: "ask" };
     },
     plugin: {
       id,
-      version: "0.2.0",
+      version: "0.3.0",
       kernel: "^0.1",
-      needs: ["transform:tool.before", "gate:tool.gate"],
+      // log:emit：auto 模式的审查把用掉的 token 记进日志
+      needs: ["transform:tool.before", "gate:tool.gate", "log:emit"],
       hooks: [
         {
           kind: "transform",
@@ -570,7 +597,21 @@ export function policy(opts: PolicyOptions): Policy {
             return { ...call, input: { ...input, path: path.resolve(opts.cwd, input.path) } };
           },
         },
-        { kind: "gate", point: "tool.gate", fn: (call, ctx) => self.decide(call, self.settings(ctx.derived)) },
+        {
+          kind: "gate",
+          point: "tool.gate",
+          timeoutMs: REVIEW_HOOK_TIMEOUT_MS,
+          fn: async (call, ctx) => {
+            const settings = self.settings(ctx.derived);
+            const result = self.decide(call, settings);
+            // 决定记在 tool.decided 里（I-5），重建时不会再审一遍
+            if (settings.mode !== "auto" || result.decision !== "ask" || !opts.review) return result;
+            const { usage, ...verdict } = await opts.review(call, ctx.signal);
+            // 审查调用不经过 model.responded，用量只能记在这里（和压缩一样），界面据此计入会话用量
+            if (usage) await ctx.emit("reviewed", { toolUseId: call.toolUseId, usage });
+            return verdict;
+          },
+        },
       ],
     },
   };

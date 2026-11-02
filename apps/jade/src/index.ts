@@ -7,6 +7,7 @@ export * from "./plugins/budget.ts";
 export * from "./plugins/compact.ts";
 export * from "./plugins/checks.ts";
 export * from "./plugins/policy.ts";
+export * from "./plugins/review.ts";
 export * from "./plugins/prompts.ts";
 export * from "./plugins/schema.ts";
 export * from "./tools/fs.ts";

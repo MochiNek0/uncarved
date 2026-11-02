@@ -27,7 +27,7 @@ import {
   contextWindowInfo,
   createJade,
   isContextOverflow,
-  type Mode,
+  type PolicyMode,
   DERIVED_KEY,
   effortFromEnv,
   estimateTokens,
@@ -51,6 +51,9 @@ import {
   parseMentions,
   rankPaths,
   policy,
+  nativePath,
+  parseVerdict,
+  reviewer,
   prompts,
   shellTool,
   shellTools,
@@ -381,7 +384,7 @@ describe("policy", () => {
   const cwd = path.resolve("/work");
   const tools = [...fsTools(cwd), shellTool({ cwd })];
   const gated = (name: string, input: unknown) => ({ toolUseId: "t", name, input, tool: tools.find((t) => t.name === name)! });
-  const decide = (mode: Mode, name: string, input: unknown) =>
+  const decide = (mode: PolicyMode, name: string, input: unknown) =>
     policy({ cwd }).decide(gated(name, input), { mode, rules: [] }).decision;
   const inside = path.join(cwd, "a.ts");
   const outside = path.resolve("/etc/passwd");
@@ -390,8 +393,8 @@ describe("policy", () => {
     expect(decide("ask", "read_file", { path: inside })).toBe("allow");
     expect(decide("ask", "read_file", { path: outside })).toBe("ask");
     expect(decide("ask", "write_file", { path: inside, content: "" })).toBe("ask");
-    expect(decide("auto-edit", "write_file", { path: inside, content: "" })).toBe("allow");
-    expect(decide("auto-edit", "write_file", { path: outside, content: "" })).toBe("ask");
+    expect(decide("auto", "write_file", { path: inside, content: "" })).toBe("allow");
+    expect(decide("auto", "write_file", { path: outside, content: "" })).toBe("ask");
     expect(decide("readonly", "write_file", { path: inside, content: "" })).toBe("deny");
     expect(decide("yolo", "bash", { command: "rm -rf build" })).toBe("allow");
     expect(decide("ask", "bash", { command: "git status" })).toBe("allow");
@@ -436,8 +439,9 @@ describe("policy", () => {
   test("a mode switched while the turn is running applies before it is written to the log", () => {
     let pending: "plan" | undefined;
     const p = policy({ cwd, pendingMode: () => pending });
-    const stored = { [POLICY_KEY]: { mode: "auto-edit", rules: [] } };
-    expect(p.settings(stored).mode).toBe("auto-edit");
+    // 旧版本记下的 auto-edit 按 auto 处理
+    const stored = { [POLICY_KEY]: { mode: "auto-edit" as never, rules: [] } };
+    expect(p.settings(stored).mode).toBe("auto");
     pending = "plan";
     expect(p.settings(stored).mode).toBe("plan");
     expect(p.settings({}).mode).toBe("plan");
@@ -585,11 +589,85 @@ describe("policy", () => {
     expect(decide("readonly", "bash", { command: "ls > out" })).toBe("deny");
   });
 
-  test("auto-edit creates directories and touches files inside the working directory without asking", () => {
-    expect(decide("auto-edit", "bash", { command: "mkdir -p src/new && touch src/new/a.ts" })).toBe("allow");
-    expect(decide("auto-edit", "bash", { command: "mkdir /tmp/x" })).toBe("ask");
+  test("auto mode creates directories and touches files inside the working directory without asking", () => {
+    expect(decide("auto", "bash", { command: "mkdir -p src/new && touch src/new/a.ts" })).toBe("allow");
+    expect(decide("auto", "bash", { command: "mkdir /tmp/x" })).toBe("ask");
     expect(decide("ask", "bash", { command: "mkdir -p src/new" })).toBe("ask");
     expect(decide("plan", "bash", { command: "mkdir -p src/new" })).toBe("deny");
+  });
+
+  test("Git Bash paths like /c/Users are read as Windows drive paths", () => {
+    expect(nativePath("/c/Users/me/proj", "win32")).toBe("C:/Users/me/proj");
+    expect(nativePath("/d", "win32")).toBe("D:/");
+    // MSYS 自己的目录、POSIX 上的路径不换算
+    expect(nativePath("/tmp/x", "win32")).toBe("/tmp/x");
+    expect(nativePath("/c/Users", "linux")).toBe("/c/Users");
+    if (process.platform !== "win32") return;
+    const msys = `/${cwd[0]!.toLowerCase()}${cwd.slice(2).replaceAll("\\", "/")}`;
+    expect(decide("ask", "bash", { command: `cd ${msys} && sed -n 1,20p a.ts` })).toBe("allow");
+    expect(decide("ask", "bash", { command: `ls ${msys}/src` })).toBe("allow");
+    // 换算后仍在工作目录之外的照常问
+    expect(decide("ask", "bash", { command: "cat /c/Windows/win.ini" })).toBe("ask");
+  });
+
+  test("auto mode sends only the calls the rules would ask about to the reviewer", async () => {
+    const reviewed: string[] = [];
+    const p = policy({
+      cwd,
+      review: async (call) => {
+        reviewed.push(String((call.input as { command?: string }).command));
+        return { decision: "allow", reason: "part of the task" };
+      },
+    });
+    const gate = p.plugin.hooks!.find((h) => "kind" in h && h.kind === "gate")!;
+    const run = (mode: PolicyMode, name: string, input: unknown) =>
+      (gate as { fn: (c: unknown, ctx: unknown) => Promise<{ decision: string; reason?: string }> }).fn(gated(name, input), {
+        derived: { [POLICY_KEY]: { mode, rules: [] } },
+        signal: new AbortController().signal,
+      });
+    expect(await run("auto", "bash", { command: "bun test" })).toEqual({ decision: "allow", reason: "part of the task" });
+    // 规则已经能决定的不审：只读命令、工作目录里的改动、无效参数
+    expect((await run("auto", "bash", { command: "git status" })).decision).toBe("allow");
+    expect((await run("auto", "write_file", { path: inside, content: "" })).decision).toBe("allow");
+    expect((await run("auto", "bash", { nope: 1 })).decision).toBe("deny");
+    // 其他模式不审
+    expect((await run("ask", "bash", { command: "node build.js" })).decision).toBe("ask");
+    expect((await run("plan", "bash", { command: "node build.js" })).decision).toBe("deny");
+    expect(reviewed).toEqual(["bun test"]);
+  });
+
+  test("the reviewer sees the user's request and falls back to asking when it cannot decide", async () => {
+    const userMsg = (text: string): Message => ({ role: "user", content: [{ kind: "text", text, origin: { by: "user" }, trust: "trusted" }] });
+    const messages: Message[] = [userMsg("run the tests and fix what fails")];
+    let seen = "";
+    let answer: () => string = () => '{"decision": "allow", "reason": "running the tests the user asked for"}';
+    const provider: Provider = {
+      id: "reviewer",
+      async complete(req) {
+        seen = req.messages.map((m) => m.content.map((b) => (b.kind === "text" ? b.text : "")).join("")).join("");
+        return { model: "m", content: [{ kind: "text", text: answer(), origin: { by: "model", provider: "reviewer", model: "m" }, trust: "trusted" }], stopReason: "end" };
+      },
+    };
+    const review = reviewer({ provider, cwd, messages: () => messages });
+    const signal = new AbortController().signal;
+    const call = gated("bash", { command: "bun test" });
+    expect(await review(call, signal)).toEqual({ decision: "allow", reason: "running the tests the user asked for" });
+    expect(seen).toContain("run the tests and fix what fails");
+    expect(seen).toContain("bun test");
+    // 回答里夹着别的文字也能认出来；不认识的决定、看不懂的回答、出错都转给用户，不会替用户拒绝
+    answer = () => 'Sure.\n```json\n{"decision":"ask","reason":"pushes to the remote"}\n```';
+    expect(await review(call, signal)).toEqual({ decision: "ask", reason: "pushes to the remote" });
+    answer = () => '{"decision": "deny"}';
+    expect((await review(call, signal)).decision).toBe("ask");
+    answer = () => "looks fine to me";
+    expect((await review(call, signal)).decision).toBe("ask");
+    answer = () => {
+      throw new ProviderError("HTTP 500", { retryable: false });
+    };
+    const failed = await review(call, signal);
+    expect(failed.decision).toBe("ask");
+    expect(failed.reason).toContain("HTTP 500");
+    expect(parseVerdict('{"decision":"allow"}')).toEqual({ decision: "allow", reason: undefined });
   });
 
   test("always-allow rules cover their command inside a compound command", () => {
@@ -836,6 +914,20 @@ describe("jade session", () => {
     expect(without).not.toContain("with bash");
   });
 
+  test("the system prompt names the configured model, read on every request", async () => {
+    const { cwd, home } = await workspace();
+    let model: { name: string; via: string } | undefined = { name: "m-1", via: "an OpenAI-compatible API at example.test" };
+    const hook = (await prompts({ cwd, home, model: () => model })).hooks![0]!;
+    if (hook.kind !== "transform" || !("fn" in hook)) throw new Error("expected a local transform");
+    const system = async () =>
+      ((await hook.fn({ system: [], messages: [], tools: [] } as never, {} as never)) as ModelRequest).system.map((s) => s.text).join("\n");
+    expect(await system()).toContain('configured to use the model "m-1" via an OpenAI-compatible API at example.test');
+    model = { name: "m-2", via: "the Anthropic API" };
+    expect(await system()).toContain('the model "m-2" via the Anthropic API');
+    model = undefined;
+    expect(await system()).not.toContain("configured to use the model");
+  });
+
   test("project instructions are untrusted and carry their source", async () => {
     const { cwd, home } = await workspace();
     await writeFile(path.join(cwd, "AGENTS.md"), "Use tabs.");
@@ -891,6 +983,25 @@ describe("jade session", () => {
     expect(() => effortFromEnv({ ANTHROPIC_API_KEY: "k", JADE_EFFORT: "minimal" })).toThrow("JADE_EFFORT must be one of");
     expect(() => effortFromEnv({ OPENAI_COMPAT_BASE_URL: "http://x", JADE_EFFORT: "high" })).toThrow("not supported");
     await expect(providerFromEnv({ OPENAI_API_KEY: "k", JADE_EFFORT: "turbo" })).rejects.toThrow("JADE_EFFORT");
+  });
+
+  test("OpenAI asks for a reasoning summary only when JADE_EFFORT is set", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const real = globalThis.fetch;
+    globalThis.fetch = (async (_url: string, init: RequestInit) => {
+      bodies.push(JSON.parse(init.body as string));
+      return new Response("bad request", { status: 400 });
+    }) as unknown as typeof fetch;
+    try {
+      for (const env of [{ OPENAI_API_KEY: "k", JADE_EFFORT: "low" }, { OPENAI_API_KEY: "k" }]) {
+        const provider = await providerFromEnv(env);
+        await provider.complete({ system: [], tools: [], messages: [] }, { signal: new AbortController().signal }).catch(() => {});
+      }
+    } finally {
+      globalThis.fetch = real;
+    }
+    expect(bodies[0]!.reasoning).toEqual({ effort: "low", summary: "auto" });
+    expect(bodies[1]).not.toHaveProperty("reasoning");
   });
 
   test("images and PDFs are estimated by kind, not by the size of their base64 data", () => {
@@ -1026,10 +1137,25 @@ describe("jade session", () => {
     expect(JSON.stringify(nobody.requests[2]!.messages)).toContain("Nobody can approve");
   });
 
+  test("auto mode records the reviewer's decision and its token usage in the log", async () => {
+    const usage = { inputTokens: 900, outputTokens: 20 };
+    const { rt, store, script } = await setup([], {
+      mode: "auto",
+      review: async () => ({ decision: "allow", reason: "the user asked for this", usage }),
+    });
+    script.push(call(use("u1", "bash", { command: "echo hi > /dev/null && node -e 1" })), reply("done"));
+    await rt.send(msg("run it"));
+    const [decided] = await events(store, rt.state.sessionId, "tool.decided");
+    expect(decided!.data).toMatchObject({ decision: "allow", reason: "the user asked for this", decidedBy: "jade/policy" });
+    const [reviewed] = await events(store, rt.state.sessionId, "jade/policy/reviewed");
+    expect(reviewed!.data).toEqual({ toolUseId: "u1", usage });
+    expect(reviewed!.seq).toBeLessThan(decided!.seq);
+  });
+
   test("permission settings live in the log and survive resume", async () => {
     const store = new MemoryLogStore();
     const { rt, cwd, home, provider, script } = await setup([], { store });
-    await rt.record(POLICY_KEY, { mode: "readonly", rules: [] });
+    await rt.record(POLICY_KEY, { mode: "plan", rules: [] });
     await rt.detach();
 
     const again = await createJade({ cwd, home, store, provider, today: "2026-10-30" });
@@ -1039,7 +1165,7 @@ describe("jade session", () => {
 
     const [decided] = await events(store, rt.state.sessionId, "tool.decided");
     expect(decided!.data).toMatchObject({ decision: "deny", decidedBy: "jade/policy" });
-    expect(again.policy.settings(resumed.state.derived).mode).toBe("readonly");
+    expect(again.policy.settings(resumed.state.derived).mode).toBe("plan");
     const types = (await readAll(store, rt.state.sessionId)).map((e) => e.type);
     expect(types.slice(0, 3)).toEqual(["session.started", "derived.recorded", "session.detached"]);
   });

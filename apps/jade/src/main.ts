@@ -27,7 +27,7 @@ import { readPluginSettings } from "./plugins/install.ts";
 import { PLUGIN_HELP, pluginCli, UsageError } from "./plugin-cli.ts";
 import { describeServer, loadMcpConfig, McpClient, mcpTrustHash } from "./mcp.ts";
 import { loadSkills } from "./skills.ts";
-import { hasProvider, loadEnvFile, parseTokens } from "./config.ts";
+import { hasProvider, loadEnvFile, parseTokens, updateEnvFile } from "./config.ts";
 import { createJade, type Jade } from "./distro.ts";
 import { describeRule, MODES, POLICY_KEY, type AllowRule, type Mode, type PolicySettings } from "./plugins/policy.ts";
 import { compactThreshold, contextWindowFromEnv, contextWindowInfo, isContextOverflow } from "./context.ts";
@@ -42,6 +42,7 @@ import type { ApproveSubagent, SubagentApproval } from "./tools/task.ts";
 import type { Check } from "./plugins/checks.ts";
 import { bold, dim, green, plainScreen, red, yellow, type CommandInfo, type Screen } from "./ui/screen.ts";
 import { configurator } from "./ui/configure.ts";
+import { reviewer } from "./plugins/review.ts";
 import { clip, preview, shortPath, summarize } from "./ui/render.ts";
 import { transcript } from "./ui/transcript.ts";
 import { run, VERSION } from "./sys.ts";
@@ -52,7 +53,7 @@ const HELP = `Usage: jade [options] [prompt]
   -p, --print <prompt>   run one prompt and exit
   -c, --continue         continue the most recent session in this directory
   -r, --resume [id]      resume a session by id, or pick one from a list
-  -m, --mode <mode>      permission mode: ${MODES.join(" | ")} (default ask)
+  -m, --mode <mode>      permission mode for this run: ${MODES.join(" | ")} (default: the last mode you switched to, or ask)
       --cwd <dir>        working directory (default: current directory)
   -v, --version
   -h, --help
@@ -81,7 +82,7 @@ const INSTANT = new Set(["help", "model", "mode", "usage", "rules", "hooks", "pl
 /** 内置插件提供的命令（/memory 在 jade/memory 里，等等）：名字保留给它们，自定义命令不能占用 */
 const BUILTIN_PLUGIN_COMMANDS = ["memory", "checks", "mcp", "skills", "compact"];
 
-const KEYS = `Keys: enter send · \\ or alt+enter new line · ↑↓ history · @ reference a file · esc interrupt (twice to also clear queued messages) · shift+tab cycle ask/auto-edit/plan · ctrl+c twice to exit
+const KEYS = `Keys: enter send · \\ or alt+enter new line · ↑↓ history · @ reference a file · esc interrupt (twice to also clear queued messages) · shift+tab cycle ask/auto/plan · ctrl+c twice to exit
       mouse wheel or PgUp/PgDn scroll the conversation · ctrl+home/ctrl+end jump to the top/bottom · shift+drag selects text
 While jade is working you can keep typing: messages are queued and sent when the current turn ends.`;
 
@@ -164,6 +165,11 @@ if (!(await stat(cwd).catch(() => undefined))?.isDirectory()) fail(`${cwd} is no
 const home = process.env.JADE_HOME ?? path.join(os.homedir(), ".jade");
 const envFile = path.join(home, ".env");
 await loadEnvFile(envFile);
+
+/** 新会话的权限模式：-m 只管这一次；没给时用上次在会话里切换到的模式（JADE_MODE，见 rememberMode），都没有时是 ask */
+const savedMode = process.env.JADE_MODE?.trim();
+const badSavedMode = savedMode && !(MODES as readonly string[]).includes(savedMode) ? savedMode : undefined;
+if (savedMode && !badSavedMode) opts.mode ??= savedMode as Mode;
 
 const tui = Boolean(process.stdin.isTTY && process.stdout.isTTY) && opts.print === undefined;
 if (!hasProvider() && !tui) {
@@ -331,6 +337,17 @@ const mcpClients = await connectMcp();
  * 这一轮结束后再记进日志（flushPendingMode）
  */
 let pendingMode: Mode | undefined;
+/** 当前配置的模型和服务，写进系统提示词，用户问起时模型照这个回答；/model 改了配置后下一次请求就是新的 */
+function currentModel(): { name: string; via: string } | undefined {
+  if (!hasProvider()) return undefined;
+  const info = providerInfo();
+  let host: string | undefined;
+  try {
+    host = info.baseURL ? new URL(info.baseURL).host : undefined;
+  } catch {}
+  const api = { anthropic: "the Anthropic API", openai: "the OpenAI Responses API", "openai-compat": "an OpenAI-compatible API" }[info.kind];
+  return { name: info.model, via: host ? `${api} at ${host}` : api };
+}
 /** 每个会话用一套新的插件实例：插件里有按会话记的状态（例如压缩、重复调用的计数） */
 const makeJade = (mode?: Mode) =>
   createJade({
@@ -339,6 +356,7 @@ const makeJade = (mode?: Mode) =>
     store,
     provider,
     mode,
+    model: currentModel,
     extensions: pluginSources,
     disabled: disabledPlugins,
     mcp: mcpClients,
@@ -347,6 +365,8 @@ const makeJade = (mode?: Mode) =>
     approveSubagent,
     sharedRules: (): AllowRule[] => [...settings().rules, ...pendingRules],
     pendingMode: () => pendingMode,
+    // auto 模式的审查用当前的模型；rt 换会话时跟着换，所以每次取
+    review: reviewer({ provider, cwd, messages: () => rt.state.messages }),
     approveCheck: process.env.JADE_CHECKS === "off" ? undefined : approveCheck,
     checkConfirmed: (c) => trust.has(checkHash(c)),
     checksUnavailable: process.env.JADE_CHECKS === "off" ? "Edit-time checks are turned off by JADE_CHECKS=off." : undefined,
@@ -354,6 +374,7 @@ const makeJade = (mode?: Mode) =>
 
 let jade: Jade = await makeJade(opts.mode);
 for (const w of jade.warnings) screen.log(yellow(`[warning] ${w}`));
+if (badSavedMode) screen.log(yellow(`[warning] JADE_MODE=${badSavedMode} is not a mode (${MODES.join(", ")}); starting in ${opts.mode ?? "ask"}`));
 for (const c of shadowed) screen.log(yellow(`[warning] custom command ${display(cwd, c.file)} is ignored: /${c.name} is a built-in command`));
 // 插件的命令加进菜单（名字在各个会话的实例之间不变）。内置命令和 .jade/commands 里的同名命令优先
 // skill 也可以当命令用：/<skill 名> [要做的事]。内置命令和自定义命令优先
@@ -500,15 +521,28 @@ let rt = resumeId
 let sessionId = rt.state.sessionId;
 
 // 权限设置记在日志里（derived），关卡从那里读，恢复会话后仍然有效
-const settings = (): PolicySettings => jade.policy.settings(rt.state.derived);
+// 主会话不会是 readonly（只给子 Agent 用；旧会话里记的 readonly 由关卡换成 plan）
+const settings = () => jade.policy.settings(rt.state.derived) as PolicySettings & { mode: Mode };
 const saveSettings = async (next: PolicySettings) => {
   await rt.record(POLICY_KEY, next);
   pendingMode = undefined;
   screen.status({ mode: next.mode });
 };
 
+/**
+ * 用户切换的模式记进 $JADE_HOME/.env 的 JADE_MODE，之后新开的会话默认用它（恢复的会话仍用它自己记下的模式）。
+ * yolo 不记：免得以后一打开就什么都不问；要默认 yolo 可以手动写 JADE_MODE=yolo 或用 -m yolo
+ */
+async function rememberMode(mode: Mode) {
+  if (mode === "yolo" || process.env.JADE_MODE === mode) return;
+  await updateEnvFile(envFile, { JADE_MODE: mode }).catch((err) =>
+    screen.log(yellow(`[warning] could not remember the mode in ${envFile}: ${errorText(err)}`)),
+  );
+}
+
 /** 换权限模式；运行时正在执行这一轮时先记在 pendingMode，关卡立即按它判断，这一轮结束后再写进日志 */
 async function setMode(mode: Mode) {
+  await rememberMode(mode);
   try {
     await saveSettings({ ...settings(), mode });
   } catch (err) {
@@ -537,7 +571,7 @@ const percent = (part: number, whole: number) => (whole > 0 ? `${Math.round((par
 
 // ---------- 审批 ----------
 
-type Call = { toolUseId: string; name: string; input: unknown };
+type Call = { toolUseId: string; name: string; input: unknown; reason?: string };
 
 /** 问用户是否允许一个调用；选了"总是允许"时交给 remember 记下规则 */
 async function ask(c: Call, who: string, remember: (rule: AllowRule) => Promise<void> | void): Promise<SubagentApproval> {
@@ -555,7 +589,8 @@ async function ask(c: Call, who: string, remember: (rule: AllowRule) => Promise<
       { label: `Yes, and always allow ${always} in this session`, value: "always" as const },
       { label: "No, and tell jade what to do instead", value: "no" as const },
     ],
-    { body: await preview(c, cwd) },
+    // 关卡给了理由的（例如 auto 模式下审查转给用户的），说明为什么要问
+    { body: (c.reason ? `${yellow(c.reason)}\n\n` : "") + (await preview(c, cwd)) },
   );
   if (answer === "always") await remember(rule);
   const approved = answer === "yes" || answer === "always";
@@ -926,10 +961,10 @@ function announceMode() {
   announcedMode = mode;
 }
 
-/** Shift+Tab：ask → auto-edit → plan → ask；yolo、readonly 也回到 ask。运行中也能切换，从下一个工具调用起生效 */
-const CYCLE: Mode[] = ["ask", "auto-edit", "plan"];
+/** Shift+Tab：ask → auto → plan → ask；yolo 也回到 ask。运行中也能切换，从下一个工具调用起生效 */
+const CYCLE: Mode[] = ["ask", "auto", "plan"];
 function cycleMode() {
-  const i = CYCLE.indexOf(settings().mode);
+  const i = CYCLE.indexOf(settings().mode as Mode);
   setMode(CYCLE[(i + 1) % CYCLE.length]!).catch((err) => screen.log(red(`[error] ${errorText(err)}`)));
 }
 
@@ -943,11 +978,12 @@ async function offerPlan() {
   const last = rt.state.messages.at(-1);
   if (last?.role !== "assistant" || !last.content.some((b) => b.kind === "text" && b.text.trim())) return;
   const choice = await screen.select("Execute this plan?", [
-    { label: "Yes, and auto-accept edits", value: "auto-edit" as const, hint: "mode auto-edit" },
+    { label: "Yes, in auto mode", value: "auto" as const, hint: "edits and safe commands run without asking" },
     { label: "Yes, and ask before each edit", value: "ask" as const, hint: "mode ask" },
     { label: "No, keep planning", value: "plan" as const, hint: "type what to change" },
   ]);
   if (!choice || choice === "plan") return;
+  await rememberMode(choice);
   await saveSettings({ ...settings(), mode: choice });
   screen.log(dim(`mode: ${choice}`));
   await say("The plan is approved. Implement it now.");
@@ -1171,10 +1207,9 @@ async function command(input: string): Promise<boolean> {
 
 const MODE_HINTS: Record<string, string> = {
   ask: "ask before edits and commands",
-  "auto-edit": "edit files (and mkdir/touch) without asking; ask before other commands",
-  yolo: "never ask",
-  readonly: "read only, no edits or commands",
+  auto: "edits in this directory run without asking; other commands are reviewed by the model, risky ones still ask",
   plan: "research read-only and propose a plan; edits start after you approve it",
+  yolo: "never ask",
 };
 
 // ---------- 输入 ----------

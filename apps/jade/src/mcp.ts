@@ -627,7 +627,7 @@ export function mcpTools(clients: McpClient[], opts: { readOnly?: boolean } = {}
         name,
         description: `${(info.description ?? info.title ?? info.annotations?.title ?? info.name).trim()}\n\n(Tool "${info.name}" from the MCP server "${client.name}".)`,
         inputSchema: { type: "object", ...schema },
-        // 服务没有声明只读的，都按有外部副作用处理：ask 和 auto-edit 模式下先问
+        // 服务没有声明只读的，都按有外部副作用处理：ask 模式下先问，auto 模式下先交给审查
         effect: readOnly ? "read" : "external",
         concurrency: readOnly ? "safe" : "exclusive",
         idempotent: readOnly || info.annotations?.idempotentHint === true,

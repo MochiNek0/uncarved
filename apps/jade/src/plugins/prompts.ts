@@ -32,6 +32,11 @@ export interface PromptsOptions {
   checks?: boolean;
   /** 本会话实际有的工具；给了时，提示词里不提没有的工具（task、todo_write） */
   tools?: ReadonlySet<string>;
+  /**
+   * 当前配置的模型，用户问"你是什么模型"时模型照这个回答，不凭训练数据猜。
+   * 每次请求时取：/model 换了模型后下一次请求就是新的；换模型本来就用不上原来的提示缓存，这一段跟着变不多花什么
+   */
+  model?: () => { name: string; via: string } | undefined;
 }
 
 /** 同一目录里按顺序找，用第一个存在的 */
@@ -123,10 +128,24 @@ export async function prompts(opts: PromptsOptions): Promise<Plugin> {
   return {
     id,
     // 0.3.0：记忆、skill 列表、MCP 说明移到各自的插件（jade/memory、jade/skills、jade/mcp）
-    version: "0.3.0",
+    // 0.3.1：写上当前配置的模型（model 选项）
+    version: "0.3.1",
     kernel: "^0.1",
     needs: ["transform:context.build"],
-    hooks: [{ kind: "transform", point: "context.build", fn: (req) => ({ ...req, system: [...system, ...req.system] }) }],
+    hooks: [
+      {
+        kind: "transform",
+        point: "context.build",
+        fn: (req) => {
+          const model = opts.model?.();
+          // 说成"配置的模型"：服务商的别名、路由（例如 OpenRouter 的 auto）背后实际回复的可能是别的模型
+          const line = model?.name
+            ? [segment(`Jade is configured to use the model "${model.name}" via ${model.via}. If the user asks which model you are, answer with this rather than guessing from your training.`, "trusted")]
+            : [];
+          return { ...req, system: [...system, ...line, ...req.system] };
+        },
+      },
+    ],
   };
 }
 

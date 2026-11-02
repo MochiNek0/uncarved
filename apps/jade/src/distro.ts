@@ -14,7 +14,7 @@ import { mcpTools, type McpClient } from "./mcp.ts";
 import { skillTool, skillsPrompt, type Skill } from "./skills.ts";
 import { compactor, type Compactor } from "./plugins/compact.ts";
 import { COMMAND_NAME, JADE_VERSION, type HostContext, type JadePlugin, type LoadedPlugin, type PluginCommand } from "./plugins/loader.ts";
-import { policy, type AllowRule, type Mode, type Policy } from "./plugins/policy.ts";
+import { policy, type AllowRule, type Mode, type Policy, type PolicyOptions } from "./plugins/policy.ts";
 import { prompts, realPath, repoRoot } from "./plugins/prompts.ts";
 import { repeats } from "./plugins/repeats.ts";
 import { fsTools } from "./tools/fs.ts";
@@ -44,6 +44,8 @@ export interface JadeOptions {
   /** 压缩阈值；传函数时每次投影前取值 */
   compactTokens?: number | (() => number);
   maxSteps?: number;
+  /** 当前配置的模型，写进主 Agent 的系统提示词（见 prompts 的 model）；每次请求时取 */
+  model?: () => { name: string; via: string } | undefined;
   /** 测试用 */
   today?: string;
   /** 读取搜索服务配置用，默认 process.env；测试用 */
@@ -60,6 +62,8 @@ export interface JadeOptions {
   sharedRules?: () => AllowRule[];
   /** 运行中切换、还没记进日志的权限模式（见 PolicyOptions.pendingMode） */
   pendingMode?: () => Mode | undefined;
+  /** auto 模式下审查规则判断不了的调用（见 PolicyOptions.review）；不给时 auto 模式不审查 */
+  review?: PolicyOptions["review"];
   /**
    * 编辑后检查的命令第一次运行前由宿主确认；不给就不做编辑后检查。
    * 检查会执行仓库里的代码，所以不能默认放行
@@ -138,7 +142,7 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
   const built = new Map<string, JadePlugin>();
   const add = (p: JadePlugin) => built.set(p.id, p);
 
-  const pol = policy({ cwd, mode: opts.mode, pendingMode: opts.pendingMode, readRoots: off("jade/skills") ? [] : skills.map((x) => x.dir) });
+  const pol = policy({ cwd, mode: opts.mode, pendingMode: opts.pendingMode, review: opts.review, readRoots: off("jade/skills") ? [] : skills.map((x) => x.dir) });
   add(pol.plugin);
   // 占位，组装完成后换成真正的提示词插件
   if (!off("jade/prompts")) add({ id: "jade/prompts", version: "0.3.0", kernel: "^0.1" });
@@ -283,6 +287,7 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
       screenshot: hasScreenshot,
       checks: kept.has("jade/checks") && Boolean(checks),
       tools: toolNames,
+      model: opts.model,
     });
   }
   if (kept.has("jade/task")) subSystem.plugin = await prompts({ cwd, home: opts.home, role: "subagent", today: opts.today, web: webNames });
