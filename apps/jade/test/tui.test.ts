@@ -18,6 +18,11 @@ import type { Screen } from "../src/ui/screen.ts";
 import { fitSegments, tail, tuiScreen, type TuiHandlers } from "../src/ui/tui.tsx";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+/** 等到输出里出现 text，最多 ms 毫秒：界面按定时器刷新，机器忙时固定等一小段时间不一定够 */
+async function until(output: () => string, text: string, ms = 2000) {
+  for (const end = Date.now() + ms; !output().includes(text) && Date.now() < end; ) await sleep(10);
+  expect(output()).toContain(text);
+}
 const strip = (s: string) =>
   s.replace(/\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[78]/g, "");
 
@@ -151,20 +156,19 @@ describe("model configuration", () => {
       // 另一个服务：选服务、地址、密钥（服务列不出模型，手动输入名字）；已经设了输出上限，沿用
       answers.push("openai-compat");
       inputs.push("http://127.0.0.1:9/v1", "kb", "gamma");
-      answers.unshift(pickLabel("Add a service, or change the base URL or API key"));
+      answers.unshift(pickLabel("Add a model…"), pickLabel("Another service…"));
       await configure.model(undefined);
       expect(process.env.OPENAI_COMPAT_BASE_URL).toBe("http://127.0.0.1:9/v1");
       expect(process.env.OPENAI_COMPAT_MODEL).toBe("gamma");
-      // 菜单里只列当前服务的模型；别的服务的先进子菜单（只有一个服务时直接列模型）。
+      // 主菜单直接列出所有服务保存过的模型（当前的在最前），设置收在子菜单里。
       // 选回 alpha：地址、密钥和它自己的设置都换回来
       let menu: string[] = [];
       answers.push((c: { label: string; value: unknown }[]) => {
         menu = c.map((x) => x.label);
-        return pickLabel("Use a model from another service…")(c);
-      }, pickLabel("alpha"));
+        return pickLabel("alpha")(c);
+      });
       await configure.model(undefined);
-      expect(menu).not.toContain("Use alpha");
-      expect(menu).not.toContain("Use beta");
+      expect(menu).toEqual(["gamma", "beta", "alpha", "Add a model…", "Settings for gamma…", "Remove a saved model…"]);
       expect(process.env.OPENAI_COMPAT_BASE_URL).toBe("http://a/v1");
       expect(process.env.OPENAI_COMPAT_API_KEY).toBe("ka");
       expect(process.env.OPENAI_COMPAT_MODEL).toBe("alpha");
@@ -175,7 +179,7 @@ describe("model configuration", () => {
       expect(process.env.JADE_MAX_TOKENS).toBe("32K");
       expect(process.env.JADE_CONTEXT_WINDOW).toBeUndefined();
       // 写错的 token 数不保存
-      answers.push(pickLabel("Context window"));
+      answers.push(pickLabel("Settings for gamma…"), pickLabel("Context window"));
       inputs.push("lots");
       await configure.model(undefined);
       expect(process.env.JADE_CONTEXT_WINDOW).toBeUndefined();
@@ -187,7 +191,7 @@ describe("model configuration", () => {
       expect(file.services[0]!.models[0]!.settings).toEqual({ JADE_MAX_TOKENS: "32K" });
       expect(file.services[1]!.models[0]!.settings).toEqual({ JADE_MAX_TOKENS: "32K", JADE_CONTEXT_WINDOW: "1M" });
       // 忘掉 beta；服务下还有 alpha，服务保留
-      answers.push(pickLabel("Forget a saved model"), (c: { label: string; value: unknown }[]) => c.find((x) => x.label === "beta")!.value);
+      answers.push(pickLabel("Remove a saved model…"),(c: { label: string; value: unknown }[]) => c.find((x) => x.label === "beta")!.value);
       await configure.model(undefined);
       const after = JSON.parse(await readFile(modelsFile, "utf8")) as typeof file;
       expect(after.services.map((s) => s.models.map((m) => m.name))).toEqual([["gamma"], ["alpha"]]);
@@ -522,29 +526,25 @@ describe("terminal UI", () => {
   test("thinking shows where the model is in one row and can be expanded while it is still thinking", async () => {
     const { screen, type, output, clear } = setup();
     screen.stream("thinking", "step one\nstep two\nstep th");
-    await sleep(80);
-    expect(output()).toContain("✻ Thinking 0s · step th ▸");
+    await until(output, "✻ Thinking 0s · step th ▸");
     expect(output()).not.toContain("step one");
     // 很长的一行只显示末尾，跟着模型往前走
     screen.stream("thinking", `ree ${"x".repeat(200)} latest words`);
-    await sleep(80);
-    expect(output()).toContain("latest words ▸");
+    await until(output, "latest words ▸");
     // 思考中就能点开：对话区第 1 行在屏幕第 6 行
     clear();
     await type("\x1b[<0;5;6M");
-    expect(output()).toContain("✻ Thinking 0s ▾");
+    await until(output, "✻ Thinking 0s ▾");
     expect(output()).toContain("step one");
     // 展开着的时候新内容接着出现
     clear();
     screen.stream("thinking", "\nstep four");
-    await sleep(80);
-    expect(output()).toContain("step four");
+    await until(output, "step four");
     screen.endStream();
-    await sleep(80);
-    expect(output()).toContain("✻ Thought for 0s ▾");
+    await until(output, "✻ Thought for 0s ▾");
     clear();
     await type("\x1b[<0;5;6M");
-    expect(output()).toContain("✻ Thought for 0s ▸");
+    await until(output, "✻ Thought for 0s ▸");
     expect(output()).not.toContain("step one");
   });
 

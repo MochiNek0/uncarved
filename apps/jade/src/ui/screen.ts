@@ -81,6 +81,9 @@ export const green = paint("32");
 export const yellow = paint("33");
 export const cyan = paint("36");
 export const bold = paint("1");
+export const italic = paint("3");
+export const underline = paint("4");
+export const strike = paint("9");
 
 // ---------- 纯文本实现 ----------
 

@@ -26,6 +26,7 @@ import stringWidth from "string-width";
 import wrapAnsi from "wrap-ansi";
 import { mentionAt, mentionText, rankPaths } from "../mentions.ts";
 import { edit, empty, layout, type EditState } from "./editor.ts";
+import { markdownStream, type MdLine } from "./markdown.ts";
 import {
   dim,
   type Choice,
@@ -78,7 +79,7 @@ interface UiState {
   /** 对话内容变化时递增，让界面重画 */
   version: number;
   /** 还没结束的正文：完整的行已经移进对话，这里只有最后不完整的一行（思考是对话里的一项，见 Thinking） */
-  live?: { text: string };
+  live?: { text: string; /** Markdown 里攒着的部分（还没结束的表格），显示在 text 前面 */ pending?: MdLine[] };
   /** 对话区离底部滚上去了多少行；0 表示跟着最新的输出 */
   scroll: number;
   busy?: { label: string; since: number };
@@ -112,7 +113,13 @@ interface Line {
   open?: boolean;
   /** 之后用 amend 补充内容时用的名字 */
   id?: string;
+  /** 按宽度现排的内容（Markdown 表格、分隔线），代替 text */
+  render?(width: number): string[];
 }
+
+/** Markdown 排好的一行折成屏幕上的行 */
+const mdRows = (l: MdLine, width: number) =>
+  typeof l === "string" ? wrap(l, width) : l.render(width);
 
 /** 按宽度截成一行，截掉了内容时以 … 结尾；留出两列给 … 和展开标记 */
 function oneRow(text: string, width: number): { row: string; cut: boolean } {
@@ -170,6 +177,7 @@ function thinkingRow(t: Thinking, width: number): string {
 }
 
 function wrapLine(l: Line, width: number): string[] {
+  if (l.render) return l.render(width);
   if (l.think) {
     if (!foldable(l, width)) return [thinkingRow(l.think, width)];
     if (!l.open) return [`${thinkingRow(l.think, width)}${dim(" ▸")}`];
@@ -355,6 +363,12 @@ export interface TuiOptions {
 /** 开关鼠标事件上报（SGR 格式），用来接收滚轮和点击；开着时终端里选中文字要按住 Shift */
 const MOUSE_ON = "\x1b[?1000h\x1b[?1006h";
 const MOUSE_OFF = "\x1b[?1006l\x1b[?1000l";
+/**
+ * 光标样式：闪烁的竖线（DECSCUSR 5，再加上 ATT610 的"开始闪烁"给只认它的终端），一眼能看出输入框有焦点；
+ * 退出时还原成终端自己的默认样式。光标什么时候显示仍由 Ink 管（只有输入框或输入对话框有焦点时才显示）
+ */
+const CURSOR_BLINK = "\x1b[5 q\x1b[?12h";
+const CURSOR_RESET = "\x1b[0 q";
 
 export function tuiScreen(opts: TuiOptions): Screen {
   const stdout = opts.io?.stdout ?? process.stdout;
@@ -381,7 +395,16 @@ export function tuiScreen(opts: TuiOptions): Screen {
     thinking = undefined;
   };
 
-  /** 推进正文：已经完整的行移进对话，只把最后不完整的一行留在底部；all 时全部移进去，连同思考一起结束 */
+  /** 正文按 Markdown 排版；一段正文结束时换一个新的，清掉代码块、表格的状态 */
+  let md = markdownStream();
+  const appendMd = (lines: MdLine[]) => {
+    for (const l of lines) {
+      if (typeof l === "string") store.append([l]);
+      else store.append([""], { render: l.render });
+    }
+  };
+
+  /** 推进正文：已经完整的行排版后移进对话，只把最后不完整的一行留在底部；all 时全部移进去，连同思考一起结束 */
   const flushLive = (all = false) => {
     if (all) endThinking();
     const live = store.state.live;
@@ -389,8 +412,12 @@ export function tuiScreen(opts: TuiOptions): Screen {
     const lines = live.text.split("\n");
     const rest = all ? "" : lines.pop()!;
     if (all && lines.at(-1) === "") lines.pop();
-    store.append(lines);
-    store.update({ live: rest || !all ? { text: rest } : undefined });
+    appendMd(lines.flatMap((l) => md.push(l)));
+    if (all) {
+      appendMd(md.flush());
+      md = markdownStream();
+    }
+    store.update({ live: rest || !all ? { text: rest, pending: md.pending() } : undefined });
   };
 
   const ask = <T,>(dialog: Dialog) =>
@@ -429,11 +456,11 @@ export function tuiScreen(opts: TuiOptions): Screen {
         : {}),
     },
   );
-  stdout.write(MOUSE_ON);
+  stdout.write(MOUSE_ON + CURSOR_BLINK);
   // 没走 close 就退出（process.exit）时也要把终端还原，否则会留在备用屏幕、鼠标上报也开着
   const restore = () => {
     try {
-      writeSync(1, `${MOUSE_OFF}\x1b[?1049l\x1b[?25h`);
+      writeSync(1, `${MOUSE_OFF}${CURSOR_RESET}\x1b[?1049l\x1b[?25h`);
     } catch {}
   };
   if (!opts.io) process.on("exit", restore);
@@ -527,6 +554,7 @@ export function tuiScreen(opts: TuiOptions): Screen {
     clear() {
       clearTimeout(thinking?.timer);
       thinking = undefined;
+      md = markdownStream();
       store.clear();
     },
     async close() {
@@ -534,7 +562,7 @@ export function tuiScreen(opts: TuiOptions): Screen {
       store.update({ live: undefined, busy: undefined, progress: [] }, true);
       // 等最后一帧画完再卸载；卸载时 Ink 退出备用屏幕
       await new Promise((r) => setTimeout(r, 50));
-      stdout.write(MOUSE_OFF);
+      stdout.write(MOUSE_OFF + CURSOR_RESET);
       instance.unmount();
       await instance.waitUntilExit();
       process.off("exit", restore);
@@ -575,6 +603,15 @@ function App({
 }) {
   const state = useSyncExternalStore(store.subscribe, store.get);
   const dialog = state.dialogs[0];
+  // 运行中每 100ms 整体重画一次，推动转圈动画。不能让 Spinner 自己重画：
+  // Ink 只在输入框也跟着提交的那一帧保留光标，否则把光标藏起来，运行中光标就不见了
+  const [, tick] = useReducer((n: number) => n + 1, 0);
+  const busy = state.busy !== undefined;
+  useEffect(() => {
+    if (!busy) return;
+    const t = setInterval(tick, 100);
+    return () => clearInterval(t);
+  }, [busy]);
   const { columns, rows } = useScreenSize();
 
   // 对话区占掉标题和底部之外的全部高度，只画能看见的那几行
@@ -584,6 +621,7 @@ function App({
   const done = store.lines(width);
   // 还没结束的流式块和正在运行的工具的进度：思考只显示最新的一行，进度每个工具一行
   const live = [
+    ...(state.live?.pending ?? []).flatMap((l) => mdRows(l, width)),
     ...(state.live?.text ? wrap(state.live.text, width) : []),
     ...state.progress.map((p) => oneRow(p.line, width).row),
   ];
@@ -801,12 +839,9 @@ function dialogKey(d: Dialog): number {
 
 const FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/** 转圈动画由 App 每 100ms 整体重画一次推动（见 App 里的 tick），这里只按当前时间画 */
 function Spinner({ label, since }: { label: string; since: number }) {
-  const [now, setNow] = useState(Date.now());
-  useEffect(() => {
-    const t = setInterval(() => setNow(Date.now()), 100);
-    return () => clearInterval(t);
-  }, []);
+  const now = Date.now();
   const seconds = Math.floor((now - since) / 1000);
   return (
     <Box marginTop={1}>
@@ -861,13 +896,11 @@ function StatusBar({ status, width }: { status: StatusInfo; width: number }) {
   const modeColor =
     status.mode === "yolo"
       ? "red"
-      : status.mode === "auto-edit"
+      : status.mode === "auto"
         ? "yellow"
-        : status.mode === "readonly"
-          ? "blue"
-          : status.mode === "plan"
-            ? "magenta"
-            : "green";
+        : status.mode === "plan"
+          ? "magenta"
+          : "green";
   const speed = status.speed;
   // 窄的时候依次：提示变短、去掉提示、用量变短、去掉缓存、模式变短、去掉用量、上下文变短、去掉速度
   const segments: Segment[] = [
@@ -1040,7 +1073,10 @@ function EditableText({
 
   // 光标位置要在渲染时设：useCursor 在这次提交时交给 Ink，跟这一帧一起画出来。
   // 放在 useEffect 里会晚一帧，光标总是停在上一次按键的位置（只移动光标时最明显）。
-  // 这里用的是上一次的布局；输入框挪了位置时 useBoxMetrics 会再触发一次渲染来纠正
+  // 这里用的是上一次的布局，提交后要核对一遍：
+  // - 输入框相对父元素挪了位置时 useBoxMetrics 会再触发一次渲染
+  // - 只有祖先挪了位置时（窗口尺寸变化后整帧重画那一帧上下各垫一行，下一帧再去掉）它看不出来，
+  //   光标会停在比输入行低一行的地方，要自己比一下整体位置
   const at =
     active && metrics.hasMeasured && ref.current
       ? origin(ref.current)
@@ -1048,6 +1084,12 @@ function EditableText({
   setCursorPosition(
     at && { x: at.x + prefix.length + col, y: at.y + row },
   );
+  const [, recheck] = useReducer((n: number) => n + 1, 0);
+  useEffect(() => {
+    if (!at || !ref.current) return;
+    const now = origin(ref.current);
+    if (now.x !== at.x || now.y !== at.y) recheck();
+  });
 
   return (
     <Box ref={ref} flexDirection="column">

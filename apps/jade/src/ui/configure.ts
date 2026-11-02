@@ -109,10 +109,19 @@ function modelNames(models: SavedModel[]): string {
   return models.length > 3 ? `${names} +${models.length - 3}` : names;
 }
 
-/** "2 services · 5 models" */
-function countServices(services: SavedService[]): string {
-  const n = services.reduce((sum, s) => sum + s.models.length, 0);
-  return `${services.length} service${services.length > 1 ? "s" : ""} · ${n} model${n > 1 ? "s" : ""}`;
+/** 主菜单里设置那一项的简要说明，例如 "64K out · 1M ctx · images" */
+function settingsSummary(kind: ProviderKind, contextWindow: number): string {
+  const env = process.env;
+  const images = visionSetting() ?? kind !== "openai-compat";
+  return [
+    env.JADE_MAX_TOKENS && `${env.JADE_MAX_TOKENS} out`,
+    env.JADE_EFFORT && `${env.JADE_EFFORT} effort`,
+    `${env.JADE_CONTEXT_WINDOW ?? contextWindow} ctx`,
+    env.JADE_RPM && `${env.JADE_RPM}/min`,
+    images ? "images" : "no images",
+  ]
+    .filter(Boolean)
+    .join(" · ");
 }
 
 const errorText = (err: unknown) => (err instanceof Error ? err.message : String(err));
@@ -278,43 +287,34 @@ export function configurator(opts: ConfigureOptions): Configure {
       const saved = others.find((o) => o.model.name === arg);
       return void (await (saved ? useSaved(saved.service, saved.model) : switchModel(arg)));
     }
-    // 菜单里只列当前服务保存过的模型；其他服务的先选服务再选模型，配置的模型多时列表不会很长
-    const here = others.filter((o) => serviceId(o.service.env) === currentId);
-    const elsewhere = services.filter((s) => serviceId(s.env) !== currentId);
-    const efforts = EFFORTS[info.kind];
-    const action = await screen.select<string>(`Model: ${info.model} (${describeService({ env: process.env as Record<string, string>, models: [] })})`, [
-      ...here.map((o) => ({ label: `Use ${o.model.name}`, value: `saved:${others.indexOf(o)}`, hint: "saved" })),
-      ...(elsewhere.length
-        ? [{ label: "Use a model from another service…", value: "service" as const, hint: countServices(elsewhere) }]
-        : []),
-      { label: "Add a model from this service", value: "model" as const, hint: `current: ${info.model}` },
-      { label: "Add a service, or change the base URL or API key", value: "provider" as const, hint: info.baseURL },
-      { label: "Output limit per reply", value: "max" as const, hint: process.env.JADE_MAX_TOKENS ? `${process.env.JADE_MAX_TOKENS} tokens` : "service default" },
-      ...(efforts
-        ? [{ label: "Reasoning effort", value: "effort" as const, hint: process.env.JADE_EFFORT ?? (info.kind === "anthropic" ? "high (default)" : "service default") }]
-        : []),
-      {
-        label: "Context window",
-        value: "window" as const,
-        hint: `${opts.contextWindow()} tokens${process.env.JADE_CONTEXT_WINDOW ? "" : " (default)"}`,
-      },
-      {
-        label: "Requests per minute",
-        value: "rpm" as const,
-        hint: process.env.JADE_RPM ? `${process.env.JADE_RPM}/min` : "no limit (slows down after being rate limited)",
-      },
-      { label: "Can see images", value: "vision" as const, hint: visionHint(info.kind) },
-      ...(others.length ? [{ label: "Forget a saved model", value: "forget" as const }] : []),
+    // 主菜单只管切换：保存过的模型全部直接列出（当前的在最前，然后是同一服务的），选中就换；
+    // 添加模型、当前模型的设置、删除各占一项，细节进子菜单再看。模型多于 10 个时可以打字筛选
+    const here = describeService({ env: process.env as Record<string, string>, models: [] });
+    const multi = services.length > 1;
+    const action = await screen.select<string>("Switch model", [
+      { label: info.model, value: "current", hint: multi ? `current · ${here}` : "current" },
+      ...others.map((o, i) => ({ label: o.model.name, value: `saved:${i}`, hint: multi ? describeService(o.service) : undefined })),
+      { label: "Add a model…", value: "add", hint: "from this service or another one" },
+      { label: `Settings for ${info.model}…`, value: "settings", hint: settingsSummary(info.kind, opts.contextWindow()) },
+      ...(others.length ? [{ label: "Remove a saved model…", value: "forget" }] : []),
     ]);
     if (action?.startsWith("saved:")) {
       const o = others[Number(action.slice(6))]!;
       await useSaved(o.service, o.model);
-    } else if (action === "service") {
-      const picked = await pickSaved(elsewhere, "Use a model from which service?");
-      if (picked) await useSaved(picked.service, picked.model);
-    } else if (action === "forget") {
+    } else if (action === "add") {
+      const where = await screen.select<string>("Add a model from", [
+        { label: "This service", value: "model", hint: here },
+        { label: "Another service…", value: "provider", hint: "or change this one's base URL / API key" },
+      ]);
+      if (where === "model") {
+        const saved = services.find((s) => serviceId(s.env) === currentId)?.models.map((m) => m.name);
+        const model = await chooseModel(process.env, info.model, saved);
+        if (model && model !== info.model) await switchModel(model);
+      } else if (where === "provider") await configureProvider();
+    } else if (action === "settings") await configureSettings();
+    else if (action === "forget") {
       const owners = services.filter((s) => others.some((o) => o.service === s));
-      const gone = await pickSaved(owners, "Forget a model from which service?", (s, m) => !(serviceId(s.env) === currentId && m.name === info.model));
+      const gone = await pickSaved(owners, "Remove a model from which service?", (s, m) => !(serviceId(s.env) === currentId && m.name === info.model));
       if (!gone) return;
       const id = serviceId(gone.service.env);
       // 服务下没有模型了就连服务（和它的密钥）一起删掉
@@ -322,13 +322,24 @@ export function configurator(opts: ConfigureOptions): Configure {
         .map((s) => (serviceId(s.env) === id ? { ...s, models: s.models.filter((m) => m.name !== gone.model.name) } : s))
         .filter((s) => s.models.length > 0);
       await writeSavedServices(modelsFile, rest);
-      screen.log(dim(`Forgot ${gone.model.name} (${describeService(gone.service)}).`));
-    } else if (action === "model") {
-      const saved = services.find((s) => serviceId(s.env) === currentId)?.models.map((m) => m.name);
-      const model = await chooseModel(process.env, info.model, saved);
-      if (model && model !== info.model) await switchModel(model);
-    } else if (action === "provider") await configureProvider();
-    else if (action === "max") {
+      screen.log(dim(`Removed ${gone.model.name} (${describeService(gone.service)}).`));
+    }
+  }
+
+  /** 当前模型自己的设置（切换模型时跟着换）：输出上限、思考力度、上下文窗口、限速、能不能看图 */
+  async function configureSettings() {
+    const info = providerInfo();
+    const efforts = EFFORTS[info.kind];
+    const action = await screen.select<string>(`Settings for ${info.model}`, [
+      { label: "Output limit per reply", value: "max", hint: process.env.JADE_MAX_TOKENS ? `${process.env.JADE_MAX_TOKENS} tokens` : "service default" },
+      ...(efforts
+        ? [{ label: "Reasoning effort", value: "effort", hint: process.env.JADE_EFFORT ?? (info.kind === "anthropic" ? "high (default)" : "service default") }]
+        : []),
+      { label: "Context window", value: "window", hint: `${opts.contextWindow()} tokens${process.env.JADE_CONTEXT_WINDOW ? "" : " (default)"}` },
+      { label: "Requests per minute", value: "rpm", hint: process.env.JADE_RPM ? `${process.env.JADE_RPM}/min` : "no limit (slows down after being rate limited)" },
+      { label: "Can see images", value: "vision", hint: visionHint(info.kind) },
+    ]);
+    if (action === "max") {
       const max = await screen.input("Output limit per reply in tokens, e.g. 32000, 64K (empty for the service default)", { initial: process.env.JADE_MAX_TOKENS ?? "32K" });
       if (max !== undefined && tokensInput(screen, "Output limit", max)) await applyConfig({ JADE_MAX_TOKENS: max || undefined });
     } else if (action === "effort" && efforts) {

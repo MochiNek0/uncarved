@@ -57,10 +57,10 @@ export function transcript(opts: TranscriptOptions): Transcript {
     for (const k of Object.keys(usage) as (keyof Usage)[]) usage[k] += u?.[k] ?? 0;
     if (u) screen.status({ spent: { input: usage.inputTokens, output: usage.outputTokens } });
   };
-  /** 一个事件带来的用量：模型回复、压缩时的总结调用；子 Agent 的用量在它自己的日志里 */
+  /** 一个事件带来的用量：模型回复、压缩时的总结调用、auto 模式的审查；子 Agent 的用量在它自己的日志里 */
   async function countUsage(e: LogEvent) {
     if (e.type === "model.responded") addUsage((e as LogEvent<"model.responded">).data.usage);
-    else if (e.type === "jade/compact/compacted") addUsage((e.data as { usage?: Usage }).usage);
+    else if (e.type === "jade/compact/compacted" || e.type === "jade/policy/reviewed") addUsage((e.data as { usage?: Usage }).usage);
     else if (e.type === "tool.completed") {
       const child = (e as LogEvent<"tool.completed">).data.child;
       if (child) for (const c of await readAll(store, child.sessionId)) await countUsage(c);
@@ -81,11 +81,11 @@ export function transcript(opts: TranscriptOptions): Transcript {
 
   /**
    * 输出速度：从第一个增量开始计时（不算等待首个 token 的时间），输出中按字数估 token 数，每半秒更新一次状态栏；
-   * 回复结束后用服务端报的输出 token 数算准确值。不支持流式的服务从发出请求开始算
+   * 回复结束后用服务端报的输出 token 数算准确值。工具参数的增量也算输出，只调用工具的回复同样从第一个增量开始计时。
+   * 一个增量都没收到的回复（不支持流式的服务）不更新速度：从发出请求开始算会把等待首个 token 的时间也算进去，数字偏低
    */
-  const speed = { requested: 0, first: 0, estimate: 0, shown: 0 };
+  const speed = { first: 0, estimate: 0, shown: 0 };
   const startSpeed = () => {
-    speed.requested = Date.now();
     speed.first = 0;
     speed.estimate = 0;
   };
@@ -99,10 +99,9 @@ export function transcript(opts: TranscriptOptions): Transcript {
     screen.status({ speed: { tps: speed.estimate / ((now - speed.first) / 1000), live: true } });
   };
   const finishSpeed = (u: Usage | undefined) => {
-    const from = speed.first || speed.requested;
-    const seconds = (Date.now() - from) / 1000;
+    const seconds = (Date.now() - speed.first) / 1000;
     const tokens = u?.outputTokens ?? Math.round(speed.estimate);
-    if (from && tokens > 0 && seconds >= 0.2) screen.status({ speed: { tps: tokens / seconds } });
+    if (speed.first && tokens > 0 && seconds >= 0.2) screen.status({ speed: { tps: tokens / seconds } });
     speed.first = 0;
     speed.estimate = 0;
   };
@@ -161,8 +160,13 @@ export function transcript(opts: TranscriptOptions): Transcript {
           startSpeed();
           return;
         }
-        streamed = true;
         trackSpeed(n.delta.text);
+        // 工具参数只用来计时，不显示；也不算已经输出了内容（重试时不用标记作废，回复结束时照常打印没流式输出的正文）
+        if (n.delta.kind === "tool_input") {
+          screen.busy("Writing");
+          return;
+        }
+        streamed = true;
         if (n.delta.kind === "thinking") {
           screen.busy("Thinking");
           screen.stream("thinking", n.delta.text);
@@ -213,10 +217,10 @@ export function transcript(opts: TranscriptOptions): Transcript {
         showContext(d.usage);
         if (!replaying) finishSpeed(d.usage);
         for (const b of d.content) if (b.kind === "tool_use") toolNames.set(b.id, b.name);
-        // 不支持流式的 provider：直接打印最终文本
+        // 不支持流式的 provider、重新显示历史：一次送出最终文本，和流式输出一样排版
         if (!streamed) {
           const text = textOf(d.content).trim();
-          if (text) screen.log(text);
+          if (text) screen.stream("text", text);
         }
         streamed = false;
         screen.endStream();
@@ -237,7 +241,8 @@ export function transcript(opts: TranscriptOptions): Transcript {
             screen.log(renderTodos((d.input as { todos?: Todo[] }).todos ?? []).replace(/^/gm, "  "));
           } else if (d.decidedBy !== "user" || replaying) {
             // 用户批准的调用在审批时已经显示过；重新显示历史时没有审批这一步
-            screen.log(cyan("● ") + head, { id: d.toolUseId });
+            // auto 模式下审查放行的带着理由
+            screen.log(cyan("● ") + head + (d.reason ? dim(` — ${clip(d.reason, 160)}`) : ""), { id: d.toolUseId });
           }
         }
         return;
@@ -311,6 +316,10 @@ export function transcript(opts: TranscriptOptions): Transcript {
         }
         return;
       }
+      case "jade/policy/reviewed":
+        // 审查的结果显示在工具调用那一行，这里只计用量
+        void countUsage(e);
+        return;
       case "jade/compact/trimmed": {
         const d = e.data as { saved: number };
         screen.log(dim(`[cleared old tool output, ~${d.saved} tokens]`));
