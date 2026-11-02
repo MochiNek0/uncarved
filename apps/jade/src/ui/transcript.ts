@@ -7,7 +7,7 @@ import { readAll, type Block, type EventDataMap, type LogEvent, type LogStore, t
 import type { ShellProgress } from "../tools/shell.ts";
 import type { TaskProgress } from "../tools/task.ts";
 import { renderTodos, type Todo } from "../tools/todo.ts";
-import { clip, detailsOf, summarize } from "./render.ts";
+import { callDetails, clip, detailsOf, summarize } from "./render.ts";
 import { bold, cyan, dim, green, red, yellow, type Screen } from "./screen.ts";
 
 export type Notice = Parameters<Parameters<Runtime["subscribe"]>[0]>[0];
@@ -119,6 +119,10 @@ export function transcript(opts: TranscriptOptions): Transcript {
   const running = new Set<string>();
   /** 子 Agent 调用过的工具，结束时放进 task 结果的折叠内容里 */
   const steps = new Map<string, string[]>();
+  /** 正在运行的子 Agent 的标签，显示在它的进度行开头 */
+  const tasks = new Map<string, string>();
+  /** 调用行省略了的参数（例如很长的命令），结果出来后放在折叠内容的最前面 */
+  const calls = new Map<string, string>();
   const progress = (id: string, line: string, o?: { output?: boolean }) => {
     running.add(id);
     screen.progress(id, line, o);
@@ -143,6 +147,8 @@ export function transcript(opts: TranscriptOptions): Transcript {
       for (const id of running) screen.progress(id, undefined);
       running.clear();
       steps.clear();
+      tasks.clear();
+      calls.clear();
       self.lastEnd = undefined;
     },
   };
@@ -192,13 +198,22 @@ export function transcript(opts: TranscriptOptions): Transcript {
 
   function renderProgress(toolUseId: string, p: ShellProgress | TaskProgress) {
     if (typeof p !== "object" || p === null) return;
-    if (p.kind === "task-start") return progress(toolUseId, dim(`  ↳ sub-agent: ${p.description}`));
+    // 每个子 Agent 只有一行进度：标签、调用过几个工具、正在做什么。并行的几个靠标签分清
+    const taskLine = (what: string) => {
+      const n = steps.get(toolUseId)?.length ?? 0;
+      progress(toolUseId, dim(`  ↳ ${tasks.get(toolUseId) ?? "sub-agent"}${n ? ` (${n} tool call${n > 1 ? "s" : ""})` : ""} · ${what}`));
+    };
+    if (p.kind === "task-start") {
+      tasks.set(toolUseId, p.description);
+      return taskLine("starting");
+    }
+    if (p.kind === "task-model") return taskLine("thinking");
     if (p.kind === "task-tool") {
       // 要用户批准的调用在审批时显示
       if (p.decision === "ask") return;
       const step = `${p.decision === "deny" ? "✗" : "·"} ${p.name}(${summarize(cwd, p.name, p.input)})`;
       steps.set(toolUseId, [...(steps.get(toolUseId) ?? []), step]);
-      return progress(toolUseId, dim(`    ${step}`));
+      return taskLine(step);
     }
     // 第三方工具的进度格式 jade 不认识，不显示
     if (typeof (p as { text?: unknown }).text !== "string") return;
@@ -229,9 +244,11 @@ export function transcript(opts: TranscriptOptions): Transcript {
       case "tool.decided": {
         const d = e.data as EventDataMap["tool.decided"];
         const name = toolNames.get(d.toolUseId) ?? "?";
+        const full = callDetails(name, d.input);
+        if (full) calls.set(d.toolUseId, full);
         if (d.decision === "ask") return;
         const head = `${bold(name)}(${summarize(cwd, name, d.input)})`;
-        if (d.decision === "deny") screen.log(red(`✗ ${head}`) + dim(d.reason ? ` — ${clip(d.reason, 200)}` : ""), { id: d.toolUseId });
+        if (d.decision === "deny") screen.log(red(`✗ ${head}`) + dim(d.reason ? ` — ${clip(d.reason, 200)}` : ""), { id: d.toolUseId, details: full });
         else {
           activity(`Running ${name}`);
           if (name === "todo_write") {
@@ -242,7 +259,7 @@ export function transcript(opts: TranscriptOptions): Transcript {
           } else if (d.decidedBy !== "user" || replaying) {
             // 用户批准的调用在审批时已经显示过；重新显示历史时没有审批这一步
             // auto 模式下审查放行的带着理由
-            screen.log(cyan("● ") + head + (d.reason ? dim(` — ${clip(d.reason, 160)}`) : ""), { id: d.toolUseId });
+            screen.log(cyan("● ") + head + (d.reason ? dim(` — ${clip(d.reason, 160)}`) : ""), { id: d.toolUseId, details: full });
           }
         }
         return;
@@ -254,6 +271,9 @@ export function transcript(opts: TranscriptOptions): Transcript {
         doneProgress(d.toolUseId);
         const sub = steps.get(d.toolUseId) ?? [];
         steps.delete(d.toolUseId);
+        tasks.delete(d.toolUseId);
+        const call = calls.get(d.toolUseId);
+        calls.delete(d.toolUseId);
         if (quiet.delete(d.toolUseId) && !d.isError) return;
         const text = textOf(d.content).trim();
         const lines = text.split("\n");
@@ -261,12 +281,14 @@ export function transcript(opts: TranscriptOptions): Transcript {
         const shown = d.isError ? 4 : 1;
         const width = d.isError ? 200 : 160;
         const hidden = sub.length > 0 || lines.length > shown || lines.some((l) => l.length > width);
-        const details = hidden
-          ? [
-              ...(sub.length ? [dim(`    sub-agent ran ${sub.length} tool call${sub.length > 1 ? "s" : ""}:`), ...sub.map((l) => dim(`      ${l}`))] : []),
-              detailsOf(lines, d.isError ? red : (s) => s, MAX_DETAIL_LINES),
-            ].join("\n")
-          : undefined;
+        const details =
+          hidden || call
+            ? [
+                ...(call ? [call] : []),
+                ...(sub.length ? [dim(`    sub-agent ran ${sub.length} tool call${sub.length > 1 ? "s" : ""}:`), ...sub.map((l) => dim(`      ${l}`))] : []),
+                ...(hidden ? [detailsOf(lines, d.isError ? red : (s) => s, MAX_DETAIL_LINES)] : []),
+              ].join("\n")
+            : undefined;
         if (d.isError) screen.amend(d.toolUseId, red(`⎿ ${lines.slice(0, shown).map((l) => clip(l, width)).join("\n    ")}`), { details });
         else screen.amend(d.toolUseId, dim(`⎿ ${clip(lines[0] ?? "", width)}${lines.length > 1 ? ` (+${lines.length - 1} lines)` : ""}`), { details });
         return;
@@ -274,6 +296,8 @@ export function transcript(opts: TranscriptOptions): Transcript {
       case "tool.interrupted": {
         const d = e.data as EventDataMap["tool.interrupted"];
         doneProgress(d.toolUseId);
+        tasks.delete(d.toolUseId);
+        calls.delete(d.toolUseId);
         screen.amend(d.toolUseId, yellow("⎿ interrupted before finishing; not retried"));
         return;
       }
@@ -364,7 +388,10 @@ export function transcript(opts: TranscriptOptions): Transcript {
         if (d.kind === "approval") {
           const name = toolNames.get(d.toolUseId) ?? "?";
           const head = `${bold(name)}(${summarize(cwd, name, asked.get(d.toolUseId))})`;
-          screen.log(d.approved ? green(`✓ ${head}`) : red(`✗ ${head}`) + dim(d.reason ? ` — ${clip(d.reason, 200)}` : ""), { id: d.toolUseId });
+          screen.log(d.approved ? green(`✓ ${head}`) : red(`✗ ${head}`) + dim(d.reason ? ` — ${clip(d.reason, 200)}` : ""), {
+            id: d.toolUseId,
+            details: callDetails(name, asked.get(d.toolUseId)),
+          });
           continue;
         }
         if (d.kind === "retry") {

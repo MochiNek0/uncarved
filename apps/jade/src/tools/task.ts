@@ -6,6 +6,8 @@ import { Runtime, type EventDataMap, type LogStore, type Plugin, type Provider, 
 /** ctx.progress 推送的内容 */
 export type TaskProgress =
   | { kind: "task-start"; sessionId: string; description: string }
+  /** 子 Agent 在等模型回复 */
+  | { kind: "task-model" }
   | { kind: "task-tool"; name: string; input: unknown; decision: string };
 
 /** 子 Agent 的调用要用户批准时，宿主给出的回答 */
@@ -62,7 +64,9 @@ export function taskTool(opts: TaskOptions): Tool {
       const names = new Map<string, string>();
       child.subscribe((n) => {
         if (n.type !== "event") return;
-        if (n.event.type === "model.responded") {
+        if (n.event.type === "model.requested") {
+          progress({ kind: "task-model" });
+        } else if (n.event.type === "model.responded") {
           for (const b of (n.event.data as EventDataMap["model.responded"]).content) if (b.kind === "tool_use") names.set(b.id, b.name);
         } else if (n.event.type === "tool.decided") {
           const d = n.event.data as EventDataMap["tool.decided"];

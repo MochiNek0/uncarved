@@ -43,7 +43,7 @@ import type { Check } from "./plugins/checks.ts";
 import { bold, dim, green, plainScreen, red, yellow, type CommandInfo, type Screen } from "./ui/screen.ts";
 import { configurator } from "./ui/configure.ts";
 import { reviewer } from "./plugins/review.ts";
-import { clip, preview, shortPath, summarize } from "./ui/render.ts";
+import { callDetails, clip, preview, shortPath, summarize } from "./ui/render.ts";
 import { transcript } from "./ui/transcript.ts";
 import { run, VERSION } from "./sys.ts";
 
@@ -598,7 +598,10 @@ async function ask(c: Call, who: string, remember: (rule: AllowRule) => Promise<
     ? undefined
     : (answer === "no" ? await screen.input("What should jade do instead? (optional)") : undefined) || "The user rejected this action.";
   // 主 Agent 的调用的结果之后接在这一行后面
-  screen.log(approved ? green(`✓ ${who}${head}`) : red(`✗ ${who}${head}`) + dim(reason ? ` — ${clip(reason, 200)}` : ""), { id: c.toolUseId });
+  screen.log(approved ? green(`✓ ${who}${head}`) : red(`✗ ${who}${head}`) + dim(reason ? ` — ${clip(reason, 200)}` : ""), {
+    id: c.toolUseId,
+    details: callDetails(c.name, c.input),
+  });
   return { approved, reason };
 }
 

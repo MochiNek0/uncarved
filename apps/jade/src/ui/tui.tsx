@@ -1056,7 +1056,6 @@ function EditableText({
   const ref = useRef<DOMElement>(null);
   // 只用来在布局变化后重画一次、重新计算光标位置；它给的是相对父元素的坐标，光标要的是相对整个输出
   const metrics = useBoxMetrics(ref);
-  const { setCursorPosition } = useCursor();
   const shown = mask ? "•".repeat([...state.value].length) : state.value;
   const cursor = mask
     ? [...state.value.slice(0, state.cursor)].length
@@ -1081,9 +1080,7 @@ function EditableText({
     active && metrics.hasMeasured && ref.current
       ? origin(ref.current)
       : undefined;
-  setCursorPosition(
-    at && { x: at.x + prefix.length + col, y: at.y + row },
-  );
+  const position = at && { x: at.x + prefix.length + col, y: at.y + row };
   const [, recheck] = useReducer((n: number) => n + 1, 0);
   useEffect(() => {
     if (!at || !ref.current) return;
@@ -1093,6 +1090,7 @@ function EditableText({
 
   return (
     <Box ref={ref} flexDirection="column">
+      {active ? <CursorAt position={position} /> : null}
       {state.value === "" && placeholder ? (
         <Text wrap="truncate-end">
           <Text color="cyan">{prefix}</Text>
@@ -1114,6 +1112,16 @@ function EditableText({
       )}
     </Box>
   );
+}
+
+/**
+ * 终端光标只有一个，每个 useCursor 每次提交都会设一遍。没有焦点的输入框（弹出输入框时下面的主输入框）
+ * 不能用它，否则它设的"不显示"会盖掉有焦点的那个，所以只在有焦点时挂上
+ */
+function CursorAt({ position }: { position: { x: number; y: number } | undefined }) {
+  const { setCursorPosition } = useCursor();
+  setCursorPosition(position);
+  return null;
 }
 
 /** 元素相对整个动态输出（Static 之外的部分）左上角的位置 */

@@ -171,3 +171,46 @@ test("the terminal cursor stays visible while the spinner ticks", async () => {
     await screen.close();
   }
 });
+
+// 弹出输入框时下面的主输入框还在，也用着 useCursor；它没有焦点，每次提交都会把光标位置设成"不显示"，盖掉输入框设的位置
+test("the terminal cursor sits in an input dialog while it is open", async () => {
+  const vt = new Vt(100, 40);
+  const stdin = Object.assign(new PassThrough(), { isTTY: true, setRawMode: () => {}, ref: () => {}, unref: () => {} });
+  const stdout = Object.assign(
+    new Writable({
+      write(chunk, _e, done) {
+        vt.write(chunk.toString());
+        done();
+      },
+    }),
+    { isTTY: true, columns: 100, rows: 40 },
+  );
+  const screen = tuiScreen({
+    status: { cwd: "~/p", model: "m", mode: "ask", session: "s" },
+    version: "1",
+    commands: [],
+    handlers: { submit() {}, interrupt() {}, exit() {} },
+    io: { stdin: stdin as unknown as NodeJS.ReadStream, stdout: stdout as unknown as NodeJS.WriteStream },
+  });
+  try {
+    await sleep(200);
+    const answer = screen.input("Model name", { initial: "abc" });
+    await sleep(400);
+    const line = vt.lines.findIndex((l) => l.includes("› abc"));
+    expect(line).toBeGreaterThan(-1);
+    expect({ cursor: vt.row, col: vt.col, shown: vt.visible }).toEqual({ cursor: line, col: vt.lines[line]!.indexOf("› abc") + 5, shown: true });
+    // 打字之后（只有输入框重画）光标也跟着走
+    stdin.write("d");
+    await sleep(200);
+    expect({ cursor: vt.row, col: vt.col, shown: vt.visible }).toEqual({ cursor: line, col: vt.lines[line]!.indexOf("› abcd") + 6, shown: true });
+    stdin.write("\r");
+    expect(await answer).toBe("abcd");
+    // 关掉之后回到主输入框
+    stdin.write("hi");
+    await sleep(300);
+    const input = vt.lines.findIndex((l) => l.includes("› hi"));
+    expect({ cursor: vt.row, col: vt.col, shown: vt.visible }).toEqual({ cursor: input, col: vt.lines[input]!.indexOf("› hi") + 4, shown: true });
+  } finally {
+    await screen.close();
+  }
+});

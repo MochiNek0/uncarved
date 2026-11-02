@@ -33,6 +33,15 @@ export function summarize(cwd: string, name: string, input: unknown): string {
   return where || clip(JSON.stringify(input), 120);
 }
 
+/** summarize 省略了内容时（目前只有多行或很长的 bash 命令），调用行展开后先显示完整的参数 */
+export function callDetails(name: string, input: unknown): string | undefined {
+  if (name !== "bash") return undefined;
+  const command = String(((input ?? {}) as Record<string, unknown>).command ?? "");
+  const lines = command.split("\n");
+  if (lines.length === 1 && lines[0]!.length <= 120) return undefined;
+  return detailsOf(lines.map((l, i) => `${i === 0 ? "$" : " "} ${l}`), dim, 200);
+}
+
 /**
  * 审批时显示的内容：修改显示成带行号和上下文的 diff（读出文件、按工具的规则算出修改后的内容），
  * 命令显示命令本身。文件读不了、替换不成立时退回到只显示参数里的新旧文本

@@ -1182,7 +1182,9 @@ describe("jade session", () => {
     await rt.send(msg("go"));
     expect(progress).toEqual([
       { kind: "task-start", sessionId: expect.any(String), description: "look" },
+      { kind: "task-model" },
       { kind: "task-tool", name: "list_dir", input: { path: expect.any(String) }, decision: "allow" },
+      { kind: "task-model" },
     ]);
   });
 
