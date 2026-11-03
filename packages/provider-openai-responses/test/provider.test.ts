@@ -483,3 +483,20 @@ test("工具结果里的图片：toolResultImages 时放进紧跟 function_call_
     ],
   });
 });
+
+test("api.openai.com 上每个 provider 实例用固定的 prompt_cache_key；其他地址不发，除非指定", async () => {
+  const messages = [{ role: "user", content: userSays("hi").content }] as unknown as import("uncarved").Message[];
+  const run = async (baseURL: string, promptCacheKey?: string | null) => {
+    const reply = (id: string) => [created, itemDone(0, message(id, "a")), completed()];
+    const { fetchFn, bodies } = fakeServer([reply("m1"), reply("m2")]);
+    const p = openaiResponsesProvider({ baseURL, model: "m", fetch: fetchFn, promptCacheKey });
+    for (let i = 0; i < 2; i++) await p.complete({ system: [], tools: [], messages }, { signal: new AbortController().signal });
+    return bodies.map((b) => b.prompt_cache_key);
+  };
+  const [a, b] = await run("https://api.openai.com/v1");
+  expect(typeof a).toBe("string");
+  expect(b).toBe(a);
+  expect(await run("https://proxy.example.com/v1")).toEqual([undefined, undefined]);
+  expect(await run("https://proxy.example.com/v1", "k")).toEqual(["k", "k"]);
+  expect(await run("https://api.openai.com/v1", null)).toEqual([undefined, undefined]);
+});

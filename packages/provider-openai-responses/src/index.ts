@@ -40,6 +40,12 @@ export interface OpenAIResponsesOptions {
    * 默认 false：不支持图片的模型收到图片会拒绝整个请求，而图片会一直留在历史里，之后每次请求都会失败
    */
   toolResultImages?: boolean;
+  /**
+   * 请求带上的 prompt_cache_key：同一个 key 的请求优先路由到同一台缓存了前缀的机器，提高缓存命中率。
+   * 不给时，baseURL 是 api.openai.com 的每个 provider 实例用一个随机 key；其他地址（代理、兼容服务）不发，
+   * 它们不一定认这个参数。传 null 表示不发
+   */
+  promptCacheKey?: string | null;
   /** 可替换，便于测试 */
   fetch?: typeof fetch;
 }
@@ -77,6 +83,7 @@ export function openaiResponsesProvider(opts: OpenAIResponsesOptions): Provider 
   const doFetch = opts.fetch ?? fetch;
   const url = `${opts.baseURL.replace(/\/$/, "")}/responses`;
   const store = opts.store ?? false;
+  const cacheKey = opts.promptCacheKey === undefined ? (isOpenAI(opts.baseURL) ? crypto.randomUUID() : undefined) : (opts.promptCacheKey ?? undefined);
 
   return {
     id: PROVIDER_ID,
@@ -107,6 +114,7 @@ export function openaiResponsesProvider(opts: OpenAIResponsesOptions): Provider 
             ...(instructions ? { instructions } : {}),
             ...(opts.maxTokens ? { max_output_tokens: opts.maxTokens } : {}),
             ...(opts.reasoning ? { reasoning: opts.reasoning } : {}),
+            ...(cacheKey ? { prompt_cache_key: cacheKey } : {}),
             ...extra,
             input: toInput(req, store, opts.toolResultImages ?? false),
             ...(req.tools.length > 0
@@ -450,6 +458,14 @@ function validArguments(raw: string): string {
     return raw;
   } catch {
     return JSON.stringify({ unparsed_arguments: raw });
+  }
+}
+
+function isOpenAI(baseURL: string): boolean {
+  try {
+    return new URL(baseURL).hostname === "api.openai.com";
+  } catch {
+    return false;
   }
 }
 

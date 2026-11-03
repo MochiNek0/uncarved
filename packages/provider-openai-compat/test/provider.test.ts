@@ -166,6 +166,15 @@ test("工具参数优先按原始字符串回传；不是合法 JSON 的（截�
   expect(res.usage).toEqual({ inputTokens: 12, outputTokens: 3, cacheReadTokens: 8 });
 });
 
+test("缓存命中数放在 usage 顶层 cached_tokens 的服务（Kimi 旧格式）也能读到", async () => {
+  const { fetchFn } = fakeServer([
+    [chunk({ content: "ok" }, "stop"), JSON.stringify({ choices: [], usage: { prompt_tokens: 12, completion_tokens: 3, cached_tokens: 5 } })],
+  ]);
+  const provider = openaiCompatProvider({ baseURL: "https://example.test/v1", model: "m", fetch: fetchFn });
+  const res = await provider.complete({ system: [], tools: [], messages: [] }, { signal: new AbortController().signal });
+  expect(res.usage).toEqual({ inputTokens: 12, outputTokens: 3, cacheReadTokens: 5 });
+});
+
 test("错误的工具结果加上 [error] 前缀，这个格式没有 is_error 字段；空的结果给占位", async () => {
   const { fetchFn, bodies } = fakeServer([[chunk({ content: "ok" }, "stop")]]);
   const provider = openaiCompatProvider({ baseURL: "https://example.test/v1", model: "m", fetch: fetchFn });
@@ -535,4 +544,19 @@ test("思考可以在 reasoning_content、reasoning 或 reasoning_text 里；同
   );
   expect(deltas).toEqual(["thinking:a", "thinking:b", "thinking:c", "thinking:d", "text:ok"]);
   expect(res.content[0]).toMatchObject({ kind: "thinking", text: "abcd" });
+});
+
+test("api.openai.com 上每个 provider 实例用固定的 prompt_cache_key；其他地址不发，除非指定", async () => {
+  const run = async (baseURL: string, promptCacheKey?: string | null) => {
+    const { fetchFn, bodies } = fakeServer([[chunk({ content: "a" }, "stop")], [chunk({ content: "b" }, "stop")]]);
+    const p = openaiCompatProvider({ baseURL, model: "m", fetch: fetchFn, promptCacheKey });
+    for (let i = 0; i < 2; i++) await p.complete({ system: [], tools: [], messages: [] }, { signal: new AbortController().signal });
+    return bodies.map((b) => b.prompt_cache_key);
+  };
+  const [a, b] = await run("https://api.openai.com/v1");
+  expect(typeof a).toBe("string");
+  expect(b).toBe(a);
+  expect(await run("https://proxy.example.com/v1")).toEqual([undefined, undefined]);
+  expect(await run("https://proxy.example.com/v1", "k")).toEqual(["k", "k"]);
+  expect(await run("https://api.openai.com/v1", null)).toEqual([undefined, undefined]);
 });

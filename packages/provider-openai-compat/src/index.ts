@@ -32,6 +32,12 @@ export interface OpenAICompatOptions {
    * 默认 false：不支持图片的模型收到图片会拒绝整个请求，而图片会一直留在历史里，之后每次请求都会失败
    */
   toolResultImages?: boolean;
+  /**
+   * 请求带上的 prompt_cache_key：同一个 key 的请求优先路由到同一台缓存了前缀的机器，提高缓存命中率。
+   * 不给时，baseURL 是 api.openai.com 的每个 provider 实例用一个随机 key；其他地址（代理、兼容服务）不发，
+   * 它们不一定认这个参数。传 null 表示不发
+   */
+  promptCacheKey?: string | null;
   /** 可替换，便于测试 */
   fetch?: typeof fetch;
 }
@@ -58,7 +64,13 @@ interface StreamChunk {
     };
     finish_reason?: string | null;
   }>;
-  usage?: { prompt_tokens?: number; completion_tokens?: number; prompt_tokens_details?: { cached_tokens?: number } | null } | null;
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    prompt_tokens_details?: { cached_tokens?: number } | null;
+    /** Kimi 的旧字段，和 prompt_tokens_details.cached_tokens 一样 */
+    cached_tokens?: number;
+  } | null;
   /** 部分服务端在流中途出错时发送的块 */
   error?: { message?: string; code?: number | string };
 }
@@ -66,6 +78,7 @@ interface StreamChunk {
 export function openaiCompatProvider(opts: OpenAICompatOptions): Provider {
   const doFetch = opts.fetch ?? fetch;
   const url = `${opts.baseURL.replace(/\/$/, "")}/chat/completions`;
+  const cacheKey = opts.promptCacheKey === undefined ? (isOpenAI(opts.baseURL) ? crypto.randomUUID() : undefined) : (opts.promptCacheKey ?? undefined);
 
   return {
     id: PROVIDER_ID,
@@ -91,6 +104,7 @@ export function openaiCompatProvider(opts: OpenAICompatOptions): Provider {
             stream: true,
             stream_options: { include_usage: true },
             ...(opts.maxTokens ? { max_tokens: opts.maxTokens } : {}),
+            ...(cacheKey ? { prompt_cache_key: cacheKey } : {}),
             ...extra,
             messages: toMessages(req, opts.toolResultImages ?? false),
             ...(req.tools.length > 0
@@ -191,7 +205,7 @@ export function openaiCompatProvider(opts: OpenAICompatOptions): Provider {
             ? {
                 inputTokens: usage.prompt_tokens,
                 outputTokens: usage.completion_tokens,
-                cacheReadTokens: usage.prompt_tokens_details?.cached_tokens ?? undefined,
+                cacheReadTokens: usage.prompt_tokens_details?.cached_tokens ?? usage.cached_tokens ?? undefined,
               }
             : undefined,
         };
@@ -407,6 +421,14 @@ function argumentsOf(b: Extract<Block, { kind: "tool_use" }>): string {
     return raw;
   } catch {
     return JSON.stringify({ unparsed_arguments: raw });
+  }
+}
+
+function isOpenAI(baseURL: string): boolean {
+  try {
+    return new URL(baseURL).hostname === "api.openai.com";
+  } catch {
+    return false;
   }
 }
 
