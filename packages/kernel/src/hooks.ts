@@ -166,13 +166,13 @@ export class HookBus {
     /** 对每个 hook 的输出做检查，抛错视同该 hook 出错 */
     check?: (value: TransformPayloads[P]) => void,
   ): Promise<TransformPayloads[P]> {
-    // 每个 hook 拿到一份拷贝：出错被跳过的 hook 原地改过的值不会留下来。
-    // hook 的输出也立即拷贝：超时后仍在运行、或留着引用的 hook 改不到之后的值，
-    // 输出无法拷贝时算作这个 hook 出错
+    // hook 的输出立即拷贝：超时后仍在运行、或留着引用的 hook 改不到之后的值，输出无法拷贝时算作这个 hook 出错。
+    // 所以 value 始终是私有的。optional 的 hook 再拿一份拷贝：它出错被跳过时，原地改过的值不会留下来；
+    // 其他 hook 出错时整个流水线失败，value 不再使用，直接交给它，省一次拷贝（历史很长时每次拷贝要几毫秒）
     for (const h of this.ordered(point)) {
       if (h.spec.kind !== "transform") continue;
       try {
-        const input = structuredClone(value);
+        const input = h.spec.optional ? structuredClone(value) : value;
         const out = await invoke(h.spec.fn as AnyFn, input, ctx(h.plugin), h.spec.timeoutMs);
         const next = structuredClone(out === undefined ? input : (out as TransformPayloads[P]));
         check?.(next);

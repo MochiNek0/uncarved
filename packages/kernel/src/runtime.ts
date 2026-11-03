@@ -209,6 +209,16 @@ export class Runtime {
     return structuredClone(this.#state);
   }
 
+  /** 当前阶段；不像 state 那样拷贝整段历史 */
+  get phase(): State["phase"] {
+    return this.#state.phase;
+  }
+
+  /** 一项派生数据的拷贝；不像 state 那样拷贝整段历史 */
+  derived(key: string): unknown {
+    return structuredClone(this.#state.derived[key]);
+  }
+
   /** 某个扩展点上 hook 的实际执行顺序（5.3） */
   hookOrder(point: string): string[] {
     return this.#hooks.ordered(point).map((h) => h.plugin);
@@ -412,8 +422,9 @@ export class Runtime {
             continue;
           }
           if (m.role !== "assistant") throw new ModelOutputModified();
-          const at = logged.indexOf(canonical(b), next);
-          if (at < 0) throw new ModelOutputModified();
+          let at = next;
+          while (at < logged.length && !sameJson(logged[at], b)) at++;
+          if (at >= logged.length) throw new ModelOutputModified();
           next = at + 1;
         }
       }
@@ -675,11 +686,34 @@ async function resolves(store: LogStore, sessionId: string, match: (e: LogEvent)
   return false;
 }
 
-/** 消息中所有模型来源的块，按出现顺序，规范化的 JSON 表示（键排序，忽略键的顺序） */
-function modelBlocks(messages: Message[]): string[] {
-  const out: string[] = [];
-  for (const m of messages) for (const b of m.content) if (b.origin.by === "model") out.push(canonical(b));
+/** 消息中所有模型来源的块，按出现顺序 */
+function modelBlocks(messages: Message[]): Block[] {
+  const out: Block[] = [];
+  for (const m of messages) for (const b of m.content) if (b.origin.by === "model") out.push(b);
   return out;
+}
+
+/**
+ * 两个值的规范化 JSON 表示（canonical）是否相同：忽略键的顺序和值为 undefined 的键。
+ * 直接比较，不拼字符串：每个 hook 的输出都要对整段历史检查一遍，不一样的块通常在第一个字段就分出来
+ */
+function sameJson(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (!sameJson(a[i], b[i])) return false;
+    return true;
+  }
+  if (a && b && typeof a === "object" && typeof b === "object") {
+    const x = a as Record<string, unknown>;
+    const y = b as Record<string, unknown>;
+    const kx = Object.keys(x).filter((k) => x[k] !== undefined);
+    const ky = Object.keys(y).filter((k) => y[k] !== undefined);
+    if (kx.length !== ky.length) return false;
+    for (const k of kx) if (!Object.hasOwn(y, k) || !sameJson(x[k], y[k])) return false;
+    return true;
+  }
+  return canonical(a) === canonical(b);
 }
 
 function canonical(v: unknown): string {
