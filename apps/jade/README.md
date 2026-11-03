@@ -22,6 +22,8 @@ Windows 上 `bash` 工具需要 [Git for Windows](https://git-scm.com/download/w
 
 可选：装了 [ripgrep](https://github.com/BurntSushi/ripgrep)（`rg`）时搜索更快，没有时自动改用内置搜索。
 
+**升级**：终端界面启动后每天最多查一次 npm，有新版本时按安装方式（npm、Bun、pnpm 或 Yarn 的全局安装）在后台升级，下次启动生效；输出记在 `$JADE_HOME/update.log`。升级失败时（比如全局目录需要管理员权限）提示一行，这个版本一天内不再自动试。`JADE_AUTO_UPDATE=off` 时只提示不升级，`JADE_UPDATE_CHECK=off` 时连检查都不做。手动升级用 `jade update`，`jade update --check` 只查看有没有新版本。从仓库运行或用 `npm link` 链接的 jade 不检查也不升级。
+
 > npm 上另有一个同名的旧模板引擎 `jade`（Pug 的前身），它也提供 `jade` 命令。两个都全局安装时会冲突。
 
 ## 配置模型

@@ -50,9 +50,11 @@ import { reviewer } from "./plugins/review.ts";
 import { callDetails, clip, preview, shortPath, summarize } from "./ui/render.ts";
 import { transcript } from "./ui/transcript.ts";
 import { run, VERSION } from "./sys.ts";
+import { autoUpdate, autoUpdateEnabled, detectInstall, newerVersion, updateCli } from "./update.ts";
 
 const HELP = `Usage: jade [options] [prompt]
        jade plugin <list|add|update|remove|enable|disable>   (jade plugin --help)
+       jade update [--check]   upgrade jade to the latest version on npm
 
   -p, --print <prompt>   run one prompt and exit
   -c, --continue         continue the most recent session in this directory
@@ -111,6 +113,7 @@ if (argv[0] === "plugin" || argv[0] === "plugins") {
     process.exit(err instanceof UsageError ? 2 : 1);
   }
 }
+if (argv[0] === "update") process.exit(await updateCli(argv.slice(1)));
 const opts: { print?: string; cont?: boolean; resume?: string; mode?: Mode; cwd?: string; prompt: string[] } = { prompt: [] };
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i]!;
@@ -1497,6 +1500,23 @@ async function pump() {
   if (exit) await quit();
 }
 
+/**
+ * 有新版本时在后台升级，下次启动生效；JADE_AUTO_UPDATE=off 时只提示。
+ * 每天最多查一次 npm；仓库里的开发版和 npm link 既不提示也不升级
+ */
+async function checkForUpdate() {
+  const install = detectInstall();
+  if (install.kind === "dev") return;
+  const latest = await newerVersion(home).catch(() => undefined);
+  if (!latest) return;
+  const manual = () => screen.log(dim(`[jade ${latest} is available (you have ${VERSION}); run jade update]`));
+  if (!autoUpdateEnabled()) return manual();
+  const result = await autoUpdate(home, latest, { install }).catch(() => undefined);
+  if (result?.status === "installed") screen.log(dim(`[jade ${latest} was installed in the background; restart jade to use it]`));
+  else if (result?.status === "failed") screen.log(yellow(`[automatic update to jade ${latest} failed (see ${display(cwd, result.log)}); run jade update]`));
+  else if (result?.why !== "busy") manual();
+}
+
 // ---------- 开始 ----------
 
 if (resumeId) {
@@ -1516,6 +1536,7 @@ if (tui) {
   // 之后由输入框驱动：onSubmit → pump
   ready = true;
   for (const text of [...(first ? [first] : []), ...early.splice(0)]) onSubmit(text);
+  void checkForUpdate();
 } else {
   // -p 也能用自定义命令和插件的命令（内置命令需要交互，不在这里处理）
   const name = first?.startsWith("/") ? first.slice(1).split(/\s+/)[0]!.toLowerCase() : undefined;
