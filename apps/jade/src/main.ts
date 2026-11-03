@@ -38,6 +38,7 @@ import { isRateLimit, providerFromEnv, providerInfo, RateGate, rpmFromEnv, switc
 import { discardIfEmpty, SessionIndex } from "./sessions.ts";
 import { lastTurnChanges, UNDO_KEY, type Checkpoint, type UndoState } from "./tools/checkpoint.ts";
 import { display } from "./tools/fs.ts";
+import { SEARCH_PROVIDERS } from "./tools/web.ts";
 import type { ApproveSubagent, SubagentApproval } from "./tools/task.ts";
 import type { Check } from "./plugins/checks.ts";
 import { bold, dim, green, plainScreen, red, yellow, type CommandInfo, type Screen } from "./ui/screen.ts";
@@ -70,15 +71,13 @@ const COMMANDS: CommandInfo[] = [
   { name: "clear", about: "start a new session (the current one stays resumable)" },
   { name: "undo", about: "restore every file the agent changed in its last turn (run again to go further back)" },
   { name: "retry", about: "request the model again after a failed request, without sending another message" },
-  { name: "usage", about: "token usage of this session, including sub-agents and compaction" },
   { name: "resume", args: "[id]", about: "pick a recent session in this directory and switch to it" },
-  { name: "rules", about: `"always allow" rules of this session` },
-  { name: "plugins", about: "built-in and installed plugins: their tools, hooks and commands" },
-  { name: "hooks", about: "execution order of every extension point" },
+  { name: "plugins", about: "built-in and installed plugins: their tools, hooks and commands, and the hook execution order" },
+  { name: "search", about: "set up web search services (TinyFish, AnySearch, Tavily, Exa, Firecrawl, Jina)" },
   { name: "exit", about: "quit (the session stays resumable)" },
 ];
 /** 运行中也立即执行的命令（不碰运行时，或者只读；/mode 运行中先记在 pendingMode） */
-const INSTANT = new Set(["help", "model", "mode", "usage", "rules", "hooks", "plugins", "exit", "quit"]);
+const INSTANT = new Set(["help", "model", "mode", "plugins", "exit"]);
 /** 内置插件提供的命令（/memory 在 jade/memory 里，等等）：名字保留给它们，自定义命令不能占用 */
 const BUILTIN_PLUGIN_COMMANDS = ["memory", "checks", "mcp", "skills", "compact"];
 
@@ -172,6 +171,9 @@ const badSavedMode = savedMode && !(MODES as readonly string[]).includes(savedMo
 if (savedMode && !badSavedMode) opts.mode ??= savedMode as Mode;
 
 const tui = Boolean(process.stdin.isTTY && process.stdout.isTTY) && opts.print === undefined;
+// 终端界面依赖 ink 和 react，加载要几百毫秒，只在真的用到时才导入；现在就开始加载，和下面读配置、跑 git 同时进行
+const tuiModule = tui ? import("./ui/tui.tsx") : undefined;
+const branchFound = tui ? gitBranch(cwd) : undefined;
 if (!hasProvider() && !tui) {
   console.error(
     `jade: no model is configured.\n\n` +
@@ -223,7 +225,7 @@ const bundled = (pick: (b: PluginBundle) => string[]) =>
   foundPlugins.flatMap((f) => (pluginInfos.get(f.dir) ? pick(pluginInfos.get(f.dir)!.bundle).map((dir) => ({ plugin: f.name, dir, layer: f.layer })) : []));
 
 /** 自定义命令（$JADE_HOME/commands、.jade/commands、插件带的 commands/）；和内置命令同名的不生效 */
-const builtinNames = new Set([...COMMANDS.map((c) => c.name), ...BUILTIN_PLUGIN_COMMANDS, "quit", "sessions"]);
+const builtinNames = new Set([...COMMANDS.map((c) => c.name), ...BUILTIN_PLUGIN_COMMANDS]);
 const customLoaded = await loadCommands({ home, root: repo, cwd: realPath(cwd), plugins: bundled((b) => b.commands) });
 const shadowed = customLoaded.filter((c) => builtinNames.has(c.name));
 const customs = new Map(customLoaded.filter((c) => !builtinNames.has(c.name)).map((c) => [c.name, c]));
@@ -232,10 +234,9 @@ const ALL_COMMANDS: CommandInfo[] = [
   ...[...customs.values()].map((c) => ({ name: c.name, args: c.args, about: `${c.description} (${c.plugin ? `plugin ${c.plugin}` : c.layer})` })),
 ];
 
-// 终端界面依赖 ink 和 react，加载要几百毫秒，只在真的用到时才导入
-const screen: Screen = tui
-  ? (await import("./ui/tui.tsx")).tuiScreen({
-      status: { cwd: shortPath(cwd), branch: await gitBranch(cwd), model: modelLabel(), mode: opts.mode ?? "ask" },
+const screen: Screen = tuiModule
+  ? (await tuiModule).tuiScreen({
+      status: { cwd: shortPath(cwd), branch: await branchFound, model: modelLabel(), mode: opts.mode ?? "ask" },
       version: VERSION,
       commands: ALL_COMMANDS,
       history: await inputs.load(),
@@ -311,10 +312,11 @@ function retrying(inner: Provider) {
       waiting = false;
     },
     onRetry: ({ attempt, retries, delayMs, error }) => {
-      const why = isRateLimit(error) ? "rate limited" : clip(error.message.replace(/\s+/g, " "), 160);
-      screen.log(yellow(`[${why} · retry ${attempt}/${retries} in ${seconds(delayMs)}]`));
+      const why = isRateLimit(error) ? "rate limited" : clip(error.message.replace(/\s+/g, " "), tui ? 60 : 160);
+      // 终端界面只在状态行显示，不在对话里每次重试刷一行；重试用完仍然失败时照常报错
+      if (!tui) screen.log(yellow(`[${why} · retry ${attempt}/${retries} in ${seconds(delayMs)}]`));
       waiting = true;
-      screen.busy(`Waiting to retry (${attempt}/${retries}, ${seconds(delayMs)})`);
+      screen.busy(`Waiting to retry (${why} · ${attempt}/${retries}, ${seconds(delayMs)})`);
     },
   });
 }
@@ -567,8 +569,6 @@ async function flushPendingMode() {
 const view = transcript({ screen, cwd, store, contextWindow: () => contextWindow, compactAt: () => compactAt(), canRetry: () => canRetry() });
 rt.subscribe(view.onNotice);
 
-const percent = (part: number, whole: number) => (whole > 0 ? `${Math.round((part / whole) * 100)}%` : "—");
-
 // ---------- 审批 ----------
 
 type Call = { toolUseId: string; name: string; input: unknown; reason?: string };
@@ -759,6 +759,10 @@ function showPlugins() {
     lines.push(`${bold(p.info.name ?? p.name)}${p.info.version ? ` ${p.info.version}` : ""} ${dim(`${p.layer} · ${display(cwd, p.dir)}`)}`);
     lines.push(`  carries   ${carried(p.info.bundle)}`);
   }
+  lines.push("", bold("Hook execution order"));
+  for (const p of ["context.project", "context.build", "model.before", "model.after", "tool.before", "tool.gate", "tool.after", "turn.continue", "event", "session.start", "session.end"]) {
+    lines.push(`  ${p.padEnd(16)} ${rt.hookOrder(p).join(" → ") || dim("(none)")}`);
+  }
   screen.log(lines.join("\n"));
 }
 
@@ -894,6 +898,58 @@ async function switchSession(id?: string) {
     screen.log(dim("Starting a new session instead."));
     await switchSession();
   }
+}
+
+/**
+ * 用新的插件实例继续当前会话：工具和系统提示词按现在的配置重新生成（例如 /search 改了搜索服务），对话内容不变。
+ * 只在空闲时调用（/search 不是 INSTANT 命令）
+ */
+async function reloadSession() {
+  await flushPendingMode();
+  const next = await makeJade(settings().mode);
+  jade.shutdown();
+  await rt.detach();
+  jade = next;
+  try {
+    rt = await Runtime.resume({ store, provider, plugins: jade.plugins, sessionId });
+  } catch (err) {
+    screen.log(red(`[error] could not reload the session: ${errorText(err)}; starting a new one`));
+    rt = await Runtime.create({ store, provider, plugins: jade.plugins });
+    sessionId = rt.state.sessionId;
+    view.reset();
+    screen.status({ session: sessionId });
+  }
+  rt.subscribe(view.onNotice);
+  await guarded(() => rt.recover());
+}
+
+/** /search：设置或去掉某个搜索服务的 API key（写进 $JADE_HOME/.env），当前会话立即生效 */
+async function configureSearch() {
+  const on = SEARCH_PROVIDERS.filter((p) => process.env[p.env]);
+  const name = await screen.select(
+    on.length ? `Web search is on (${on.map((p) => p.name).join(", ")}; tried in order, the next one takes over on failure)` : "Web search is off",
+    SEARCH_PROVIDERS.map((p) => ({ label: `${p.name}${process.env[p.env] ? " ✓" : ""}`, value: p.name, hint: p.signup })),
+  );
+  const p = SEARCH_PROVIDERS.find((x) => x.name === name);
+  if (!p) return;
+  if (process.env[p.env]) {
+    const choice = await screen.select(p.name, [
+      { label: "Change the API key…", value: "set" as const },
+      { label: "Remove", value: "off" as const, hint: `removes ${p.env} from ${envFile}` },
+    ]);
+    if (!choice) return;
+    if (choice === "off") {
+      await updateEnvFile(envFile, { [p.env]: undefined });
+      await reloadSession();
+      screen.log(dim(`${p.name} removed.${on.length > 1 ? "" : " Web search is off."}`));
+      return;
+    }
+  }
+  const key = (await screen.input(`${p.name} API key`, { mask: true }))?.trim();
+  if (!key) return;
+  await updateEnvFile(envFile, { [p.env]: key });
+  await reloadSession();
+  screen.log(green(`Web search is on with ${p.name}: web_search uses it, and web_fetch falls back to it when a page cannot be fetched directly.`));
 }
 
 /** 从这个目录最近的会话里选一个；取消或没有时返回 undefined */
@@ -1111,7 +1167,6 @@ async function resumeSession(): Promise<boolean> {
   return true;
 }
 
-/** /memory：不带参数时列出记忆，可以删掉一条或新加一条；带参数时记下这段话 */
 // ---------- 命令 ----------
 
 
@@ -1140,6 +1195,7 @@ async function command(input: string): Promise<boolean> {
       if (!(MODES as readonly string[]).includes(m)) screen.log(red(`unknown mode ${m}`));
       else await setMode(m as Mode);
       screen.log(`mode: ${settings().mode}${pendingMode ? dim(" (from the next tool call)") : ""}`);
+      if (settings().rules.length) screen.log(dim(`always allowed in this session:\n${settings().rules.map((r) => `  ${describeRule(r)}`).join("\n")}`));
       break;
     }
     case "undo":
@@ -1151,39 +1207,20 @@ async function command(input: string): Promise<boolean> {
     case "clear":
       await switchSession();
       break;
-    case "resume":
-    case "sessions": {
+    case "resume": {
       const id = rest[0] ? await findSession(rest[0]) : await pickSession(sessionId);
       if (!id) break;
       if (id === sessionId) screen.log(dim("That is the current session."));
       else await switchSession(id);
       break;
     }
-    case "hooks":
-      for (const p of ["context.project", "context.build", "model.before", "model.after", "tool.before", "tool.gate", "tool.after", "turn.continue", "event", "session.start", "session.end"]) {
-        screen.log(`${p.padEnd(16)} ${rt.hookOrder(p).join(" → ") || dim("(none)")}`);
-      }
-      break;
     case "plugins":
       showPlugins();
       break;
-    case "rules":
-      screen.log(settings().rules.length ? settings().rules.map(describeRule).join("\n") : dim("(none)"));
-      break;
-    case "usage":
-      screen.log(
-        `input ${view.usage.inputTokens}  output ${view.usage.outputTokens}  cache read ${view.usage.cacheReadTokens}  cache write ${view.usage.cacheWriteTokens}  ` +
-          `cache hit ${percent(view.usage.cacheReadTokens, view.usage.inputTokens)}`,
-      );
-      screen.log(
-        dim(
-          `context window ${contextWindow} (${{ env: "JADE_CONTEXT_WINDOW", model: `known for ${modelLabel()}`, default: "default for unknown models" }[contextWindowInfo().source]}), ` +
-            `compacts at ${compactAt()}${compactTokens !== undefined ? " (JADE_COMPACT_TOKENS)" : ""}`,
-        ),
-      );
+    case "search":
+      await configureSearch();
       break;
     case "exit":
-    case "quit":
       return false;
     default: {
       const custom = customs.get(cmd!.toLowerCase());

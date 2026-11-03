@@ -489,6 +489,17 @@ export function policy(opts: PolicyOptions): Policy {
     }
     return outside ? "outside" : "inside";
   };
+  /**
+   * auto 模式下审查放行过的"工具 + 主机"，本会话里之后访问同一个主机不再审。
+   * URL 带出数据要对方主机由攻击者控制，审查已经认可了这个主机，再逐个 URL 审收益很小、每次却要多等一次模型。
+   * 只在内存里：恢复会话后重新审一次；每个决定照样记在 tool.decided 里（I-5）
+   */
+  const reviewedSites = new Set<string>();
+  const reviewedSite = (call: GatedToolCall) => {
+    const url = (call.input as { url?: unknown } | null)?.url;
+    const host = call.tool.effect === "read" && typeof url === "string" ? hostOf(url) : undefined;
+    return host ? `${call.name} ${host}` : undefined;
+  };
   /** 把 classifyBash 的结果变成决定 */
   const bashGate = (r: "inside" | "outside" | undefined): GateResult | undefined =>
     r === undefined ? undefined : { decision: r === "outside" ? "ask" : "allow" };
@@ -606,9 +617,12 @@ export function policy(opts: PolicyOptions): Policy {
             const result = self.decide(call, settings);
             // 决定记在 tool.decided 里（I-5），重建时不会再审一遍
             if (settings.mode !== "auto" || result.decision !== "ask" || !opts.review) return result;
+            const site = reviewedSite(call);
+            if (site && reviewedSites.has(site)) return { decision: "allow", reason: `${hostOf(String((call.input as { url: string }).url))} was already approved in this session` };
             const { usage, ...verdict } = await opts.review(call, ctx.signal);
             // 审查调用不经过 model.responded，用量只能记在这里（和压缩一样），界面据此计入会话用量
             if (usage) await ctx.emit("reviewed", { toolUseId: call.toolUseId, usage });
+            if (site && verdict.decision === "allow") reviewedSites.add(site);
             return verdict;
           },
         },

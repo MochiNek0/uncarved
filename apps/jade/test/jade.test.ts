@@ -636,6 +636,29 @@ describe("policy", () => {
     expect(reviewed).toEqual(["bun test"]);
   });
 
+  test("auto mode reviews each web host once per session", async () => {
+    const reviewed: string[] = [];
+    const web = webTools({ env: {} }).tools;
+    const p = policy({
+      cwd,
+      review: async (call) => {
+        const url = String((call.input as { url: string }).url);
+        reviewed.push(url);
+        return url.includes("evil") ? { decision: "ask", reason: "suspicious" } : { decision: "allow", reason: "public page" };
+      },
+    });
+    const gate = p.plugin.hooks!.find((h) => "kind" in h && h.kind === "gate")! as { fn: (c: unknown, ctx: unknown) => Promise<{ decision: string }> };
+    const run = (mode: PolicyMode, url: string) =>
+      gate.fn({ toolUseId: "t", name: "web_fetch", input: { url }, tool: web[0]! }, { derived: { [POLICY_KEY]: { mode, rules: [] } }, signal: new AbortController().signal });
+    expect((await run("auto", "https://www.ip.cn/a")).decision).toBe("allow");
+    expect((await run("auto", "https://www.ip.cn/b?x=1")).decision).toBe("allow");
+    // 没放行的主机下次还审；ask 模式照常问
+    expect((await run("auto", "https://evil.example/x")).decision).toBe("ask");
+    expect((await run("auto", "https://evil.example/y")).decision).toBe("ask");
+    expect((await run("ask", "https://www.ip.cn/c")).decision).toBe("ask");
+    expect(reviewed).toEqual(["https://www.ip.cn/a", "https://evil.example/x", "https://evil.example/y"]);
+  });
+
   test("the reviewer sees the user's request and falls back to asking when it cannot decide", async () => {
     const userMsg = (text: string): Message => ({ role: "user", content: [{ kind: "text", text, origin: { by: "user" }, trust: "trusted" }] });
     const messages: Message[] = [userMsg("run the tests and fix what fails")];

@@ -62,7 +62,7 @@ jade --cwd <dir>          # 指定工作目录
 jade plugin <命令>         # 安装、更新、卸载、停用插件，见下文「插件」
 ```
 
-会话里输入 `/` 可以看到全部命令，常用的有 `/model`、`/mode`、`/undo`、`/compact`、`/resume`、`/memory`。`@` 引用文件，`esc` 中断，连按两次 `ctrl+c` 退出。jade 工作时可以继续输入，消息会排队，当前这一轮结束后发送。
+会话里输入 `/` 可以看到全部命令，常用的有 `/model`、`/mode`、`/undo`、`/compact`、`/resume`、`/memory`，`/search` 填入搜索服务的 API key 开启联网搜索（TinyFish、AnySearch、Tavily、Exa、Firecrawl、Jina，都有免费额度；配了多个时按顺序互为备用；`web_fetch` 直接下载失败时也会经它们读网页）。`@` 引用文件，`esc` 中断，连按两次 `ctrl+c` 退出。jade 工作时可以继续输入，消息会排队，当前这一轮结束后发送。
 
 - **权限模式**：
   - `ask`（默认）：改动和命令先问。
@@ -180,7 +180,7 @@ jade plugin disable jade/web                 # 停用插件，包括内置插件
 - 只带 skills、命令、MCP 服务的 Claude Code 插件（`.claude-plugin/plugin.json`）也能直接安装；它们的 hooks 和 agents 还不支持。
 - jade 自己的功能（文件工具、shell、web、记忆、子 Agent、skills、MCP、编辑后检查、压缩……）也是插件，可以停用，也可以由第三方插件代替；只有负责审批的 `jade/policy` 不能。
 - 插件可以是 TypeScript/JavaScript 模块（`index.ts`），也可以是任何语言写的独立进程（在 `plugin.json` 里写启动命令，经 stdio 用 JSON-RPC 通信）。
-- `/plugins` 查看插件的状态，`/hooks` 查看各扩展点的执行顺序。插件在启动时加载，装了、改了要重启 jade。
+- `/plugins` 查看插件的状态和各扩展点的执行顺序。插件在启动时加载，装了、改了要重启 jade。
 
 开发插件见 [docs/plugins.md](docs/plugins.md)，示例在 [examples/plugins](examples/plugins)。
 

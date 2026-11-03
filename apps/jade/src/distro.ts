@@ -276,6 +276,8 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
   const toolNames = new Set(allTools.map((t) => t.name));
   const webNames = kept.has("jade/web") ? web.map((t) => t.name) : [];
   const at = builtin.findIndex((p) => p.id === "jade/prompts");
+  // 子 Agent 的提示词和主 Agent 的同时生成：两者都要跑几个 git 命令
+  const subPrompts = kept.has("jade/task") ? prompts({ cwd, home: opts.home, role: "subagent", today: opts.today, web: webNames }) : undefined;
   if (at >= 0) {
     builtin[at] = await prompts({
       cwd,
@@ -290,7 +292,7 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
       model: opts.model,
     });
   }
-  if (kept.has("jade/task")) subSystem.plugin = await prompts({ cwd, home: opts.home, role: "subagent", today: opts.today, web: webNames });
+  if (subPrompts) subSystem.plugin = await subPrompts;
 
   const builtins: BuiltinState[] = BUILTINS.map((b) => {
     if (kept.has(b.id)) return { ...b, state: "on" as const };

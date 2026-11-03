@@ -106,12 +106,14 @@ export async function prompts(opts: PromptsOptions): Promise<Plugin> {
   const web = opts.web?.length ? opts.web.join(" and ") : undefined;
   const sub = web ? SUBAGENT.replace("list_dir, glob and grep.", `list_dir, glob, grep, ${web}.`) : SUBAGENT;
   const system: SystemSegment[] = [segment(opts.role === "subagent" ? sub : main, "trusted")];
+  // 和环境信息里的 git 命令同时跑
+  const rootFound = opts.role !== "subagent" ? repoRoot(opts.cwd) : undefined;
   system.push(segment(await environment(opts), "trusted"));
 
-  if (opts.role !== "subagent") {
+  if (rootFound) {
     const user = await instructions(opts.home, opts.home, "user");
     if (user) system.push(segment(`# User instructions (${user.source.path})\n\n${user.text}`, "trusted", user.source));
-    const root = realPath(await repoRoot(opts.cwd));
+    const root = realPath(await rootFound);
     for (const dir of ancestry(root, realPath(opts.cwd))) {
       const project = await instructions(root, dir, "project");
       if (!project) continue;
@@ -206,19 +208,24 @@ async function environment(opts: PromptsOptions): Promise<string> {
             : "- Opening a file for the user only shows it to them; you cannot see how it looks. Open it at most once per turn, after your last change to it, then end your turn: tell the user what you changed and ask them to check. Do not claim it displays correctly.",
         ]
       : []),
-    ...(opts.role !== "subagent" ? [`- Web tools: ${opts.web?.length ? opts.web.join(", ") : "none (web_search needs TAVILY_API_KEY)"}`] : []),
+    ...(opts.role !== "subagent"
+      ? [`- Web tools: ${opts.web?.length ? opts.web.join(", ") : "none"}${opts.web?.includes("web_search") ? "" : " (web_search is off; the user can turn it on with /search)"}`]
+      : []),
     `- Today: ${opts.today ?? localDate()}`,
   ];
-  const branch = await git(opts.cwd, ["rev-parse", "--abbrev-ref", "HEAD"]);
+  // 三个 git 命令同时跑：Windows 上每启动一次 git 要几十毫秒，启动时会串起来等
+  const [branch, status, entries] = await Promise.all([
+    git(opts.cwd, ["rev-parse", "--abbrev-ref", "HEAD"]),
+    git(opts.cwd, ["status", "--short"]),
+    // 让模型一开始就知道仓库的大致样子，不用先盲猜语言、到处 ls
+    topLevel(opts.cwd),
+  ]);
   if (branch) {
     lines.push(`- Git branch: ${branch}`);
-    const status = await git(opts.cwd, ["status", "--short"]);
     lines.push(`- Git status at session start: ${status ? `\n${status.split("\n").slice(0, 30).join("\n")}` : "clean"}`);
   } else {
     lines.push("- Not a git repository");
   }
-  // 让模型一开始就知道仓库的大致样子，不用先盲猜语言、到处 ls
-  const entries = await topLevel(opts.cwd);
   if (entries.length > 0) {
     const shown = entries.slice(0, MAX_ENTRIES).join(" ");
     const more = entries.length > MAX_ENTRIES ? ` … (${entries.length - MAX_ENTRIES} more)` : "";

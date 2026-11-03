@@ -17,4 +17,20 @@ if (!process.versions.bun) {
   });
 }
 
+// ink 只用 es-toolkit 的 throttle，却从 es-toolkit/compat 的总入口导入，Node 要解析、加载一千多个文件，
+// 终端界面因此要多等一两百毫秒才出来。这里把它指到 throttle 所在的那一个文件（Bun 加载得快，不用管）
+if (!process.versions.bun) {
+  const { registerHooks } = await import("node:module");
+  const { existsSync } = await import("node:fs");
+  registerHooks?.({
+    resolve(specifier, context, next) {
+      const resolved = next(specifier, context);
+      if (specifier !== "es-toolkit/compat" || !/[\\/]ink[\\/]/.test(context.parentURL || "") || !resolved.url.endsWith("/compat/index.mjs")) return resolved;
+      const throttle = new URL("function/throttle.mjs", resolved.url);
+      // es-toolkit 换了目录结构时照常加载总入口
+      return existsSync(throttle) ? { ...resolved, url: throttle.href } : resolved;
+    },
+  });
+}
+
 await import("../dist/main.js");

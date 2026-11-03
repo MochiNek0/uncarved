@@ -4,13 +4,14 @@
 // 1. --version / --help
 // 2. 对着本地模拟的 /chat/completions 跑一轮 -p：模型先调用 glob、grep、bash，再回答；检查工具结果
 // 3. jade plugin add 一个 .tgz（Node 下走 npm），再 plugin list
+// 4. 网页转文本（web_fetch 用的 htmlToMarkdown）
 import assert from "node:assert/strict";
 import { execFile, execSync } from "node:child_process";
 import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const repo = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 // JADE_BIN 可以指向别处安装的 jade（例如从 tarball 装的），验证发布出去的包
@@ -88,6 +89,11 @@ try {
   assert.equal(add.code, 0, add.stderr + add.stdout);
   const list = await jade(["plugin", "list"]);
   assert.match(list.stdout, /jade-smoke-plugin/);
+
+  // 4. web_fetch 的网页转文本在 Node 下也能用（以前用的 Bun 的 HTMLRewriter，Node 里没有）
+  const { htmlToMarkdown } = await import(pathToFileURL(path.join(path.dirname(bin), "..", "dist", "tools", "web.js")).href);
+  const page = htmlToMarkdown(`<html><head><title>T &amp; t</title></head><body><h1>Hi</h1><p>a <a href="/x">link</a> &#20013;</p><script>no()</script></body></html>`, "https://e.com/");
+  assert.deepEqual(page, { title: "T & t", text: "# Hi\n\na [link](https://e.com/x) 中" });
 
   if (process.env.SMOKE_VERBOSE) console.log(results, list.stdout);
   console.log(`jade node smoke ok${hasBash ? "" : " (bash not available, skipped its check)"}`);

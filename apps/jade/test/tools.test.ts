@@ -211,6 +211,50 @@ describe("web_fetch", () => {
     for (const h of ["example.com", "8.8.8.8", "172.32.0.1", "2606:4700::1111"]) expect(isPrivateHost(h)).toBe(false);
   });
 
+  test("fetches directly first and asks a search service only when blocked, failing or thin", async () => {
+    const seen: string[] = [];
+    const longText = "word ".repeat(100);
+    const impl = (async (url: string | URL | Request) => {
+      const u = String(url);
+      seen.push(u);
+      if (u === "https://api.tavily.com/extract") return Response.json({ results: [{ raw_content: "# Via Tavily" }] });
+      if (u === "https://example.com/ok") return html(`<p>${longText}</p>`)();
+      if (u === "https://example.com/blocked") return new Response("Just a moment", { status: 403 });
+      if (u === "https://example.com/spa") return html(`<div id="root"></div><noscript>enable JS</noscript>`)();
+      return new Response("not here", { status: 404 });
+    }) as typeof fetch;
+    const { tools } = webTools({ env: { TAVILY_API_KEY: "t" }, fetch: impl, lookup: publicLookup });
+    // 直接能读：不用服务
+    expect((await exec(tools, "web_fetch", { url: "https://example.com/ok" })).text).toBe(`URL: https://example.com/ok\n\n${longText.trim()}`);
+    // 404：不用服务
+    expect((await exec(tools, "web_fetch", { url: "https://example.com/gone" })).text).toStartWith("HTTP 404");
+    expect(seen).toEqual(["https://example.com/ok", "https://example.com/gone"]);
+    // 被拦、只拿到 JS 外壳：交给服务
+    expect((await exec(tools, "web_fetch", { url: "https://example.com/blocked" })).text).toBe("URL: https://example.com/blocked\nFetched via: tavily\n\n# Via Tavily");
+    expect((await exec(tools, "web_fetch", { url: "https://example.com/spa" })).text).toContain("Fetched via: tavily");
+    expect(seen.slice(2)).toEqual(["https://example.com/blocked", "https://api.tavily.com/extract", "https://example.com/spa", "https://api.tavily.com/extract"]);
+  });
+
+  test("keeps the thin page when no service can read it either", async () => {
+    const impl = (async (url: string | URL | Request) =>
+      String(url).startsWith("https://r.jina.ai/") ? new Response("rate limited", { status: 429 }) : html("<p>short</p>")()) as typeof fetch;
+    const { tools } = webTools({ env: { JINA_API_KEY: "j" }, fetch: impl, lookup: publicLookup });
+    const r = await exec(tools, "web_fetch", { url: "https://example.com/short" });
+    expect(r.isError).toBe(false);
+    expect(r.text).toBe("URL: https://example.com/short\n\nshort");
+  });
+
+  test("names the cause when every way of fetching fails", async () => {
+    const impl = (async (url: string | URL | Request) => {
+      if (String(url).startsWith("https://r.jina.ai/")) return new Response("rate limited", { status: 429 });
+      throw new TypeError("fetch failed", { cause: Object.assign(new Error("getaddrinfo ENOTFOUND wttr.in"), { code: "ENOTFOUND" }) });
+    }) as typeof fetch;
+    const { tools } = webTools({ env: { JINA_API_KEY: "j" }, fetch: impl, lookup: publicLookup });
+    const r = await exec(tools, "web_fetch", { url: "https://wttr.in/Seoul" });
+    expect(r.isError).toBe(true);
+    expect(r.text).toBe("Could not fetch https://wttr.in/Seoul:\n- direct: fetch failed (getaddrinfo ENOTFOUND wttr.in)\n- jina: Jina reader returned HTTP 429: rate limited");
+  });
+
   test("htmlToMarkdown drops empty links and decodes numeric entities", () => {
     expect(htmlToMarkdown(`<p><a href="/x"><img src="i.png"></a>&#20013;&#x6587; &amp; more</p>`).text).toBe("中文 & more");
   });
@@ -220,7 +264,25 @@ describe("web_search", () => {
   test("is only provided when a search service is configured", () => {
     expect(webTools({ env: {} }).tools.map((t) => t.name)).toEqual(["web_fetch"]);
     expect(webTools({ env: { TAVILY_API_KEY: "k" } }).tools.map((t) => t.name)).toEqual(["web_fetch", "web_search"]);
+    expect(webTools({ env: { EXA_API_KEY: "k" } }).tools.map((t) => t.name)).toEqual(["web_fetch", "web_search"]);
+    // JADE_SEARCH 只列了没有 key 的服务：没有搜索
+    expect(webTools({ env: { JADE_SEARCH: "exa", TAVILY_API_KEY: "k" } }).tools.map((t) => t.name)).toEqual(["web_fetch"]);
     expect(() => webTools({ env: { JADE_SEARCH: "bing", TAVILY_API_KEY: "k" } })).toThrow("JADE_SEARCH");
+    expect(() => webTools({ env: { TAVILY_API_KEY: "k", JADE_SEARCH_RESULTS: "50" } })).toThrow("JADE_SEARCH_RESULTS");
+  });
+
+  test("falls back to the next service in JADE_SEARCH order", async () => {
+    const seen: string[] = [];
+    const impl = (async (url: string | URL | Request) => {
+      const u = String(url);
+      seen.push(new URL(u).host);
+      if (u.startsWith("https://api.exa.ai")) return new Response("no credit", { status: 402 });
+      return Response.json({ code: 0, data: { results: [{ title: "A", url: "https://a.example", content: "from anysearch" }] } });
+    }) as typeof fetch;
+    const { tools } = webTools({ env: { JADE_SEARCH: "exa, anysearch", EXA_API_KEY: "e", ANYSEARCH_API_KEY: "a", TAVILY_API_KEY: "t" }, fetch: impl });
+    const r = await exec(tools, "web_search", { query: "q" });
+    expect(r.text).toBe("1. A\n   https://a.example\n   from anysearch");
+    expect(seen).toEqual(["api.exa.ai", "api.anysearch.com"]);
   });
 
   test("queries Tavily and formats the results", async () => {
@@ -234,9 +296,9 @@ describe("web_search", () => {
         results: [{ title: "Bun", url: "https://bun.sh", content: "Bun is a fast\n JavaScript runtime" }],
       });
     }) as typeof fetch;
-    const { tools } = webTools({ env: { TAVILY_API_KEY: "tvly-k" }, fetch: impl });
-    const r = await exec(tools, "web_search", { query: "bun version", max_results: 50 });
-    expect(body).toMatchObject({ query: "bun version", max_results: 10 });
+    const { tools } = webTools({ env: { TAVILY_API_KEY: "tvly-k", JADE_SEARCH_RESULTS: "15" }, fetch: impl });
+    const r = await exec(tools, "web_search", { query: "bun version" });
+    expect(body).toMatchObject({ query: "bun version", max_results: 15 });
     expect(auth).toBe("Bearer tvly-k");
     expect(r.text).toBe("Summary from tavily: Bun 1.4 is current.\n\n1. Bun\n   https://bun.sh\n   Bun is a fast JavaScript runtime");
   });

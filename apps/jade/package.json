@@ -47,6 +47,7 @@
     "@uncarved/provider-openai-compat": "workspace:*",
     "@uncarved/provider-openai-responses": "workspace:*",
     "@uncarved/store-jsonl": "workspace:*",
+    "htmlparser2": "^10.0.0",
     "ink": "7.1.1",
     "picomatch": "^4.0.3",
     "react": "^19.2.0",

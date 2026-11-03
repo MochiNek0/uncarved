@@ -270,7 +270,7 @@ hook 挂在扩展点上，分三种：
 
 - **jade 自己的权限策略也是一个 `tool.gate`。** gate 取最严格的结果，所以插件可以让调用变严（`deny`、`ask`），但不能放宽 jade 的决定：插件返回 `allow`，jade 的策略返回 `ask`，结果仍然是 `ask`。没意见时返回 `abstain`。`deny` 时 `reason` 会交给模型，请写清楚为什么、模型应该怎么做。
 - **每个 hook 拿到的是一份拷贝。** 直接修改参数对象不会影响别的插件，transform 要把结果返回出去。
-- **执行顺序**：先按 `order` 从小到大，相同时 jade 内置的插件在前、用户层其次、项目层最后，再相同时按加载顺序。`/hooks` 显示每个扩展点上的实际顺序。
+- **执行顺序**：先按 `order` 从小到大，相同时 jade 内置的插件在前、用户层其次、项目层最后，再相同时按加载顺序。`/plugins` 的最后列出每个扩展点上的实际顺序。
 - **`context.build` 加系统提示词时**，追加到 `system` 的末尾，每段要带 `stability`、`origin`、`trust`：
 
   ```ts
@@ -487,9 +487,8 @@ jade 发给插件的请求：
 
 ## 调试
 
-- `/plugins`：内置插件的状态；已加载的插件、来源，以及各自提供的工具、hook、命令、代替的内置插件、带的内容；进程外插件的运行状态，退出了的还显示最后的 stderr。
+- `/plugins`：内置插件的状态；已加载的插件、来源，以及各自提供的工具、hook、命令、代替的内置插件、带的内容；进程外插件的运行状态，退出了的还显示最后的 stderr；最后是每个扩展点上 hook 的执行顺序。
 - `jade plugin list`：不启动会话也能看装了什么，以及哪些插件读不了（`broken`）。
-- `/hooks`：每个扩展点上 hook 的执行顺序。
 - hook 出错时，界面上显示 `[hook error] 插件 id at 扩展点: 错误信息`。
 - 会话日志在 `$JADE_HOME/sessions/<会话 id>.jsonl`，插件的 `record`、`emit` 都在里面。
 - 想在测试里跑插件，可以像 jade 自己的测试那样，用 `loadPlugin` 加载插件目录，传给 `createJade({ extensions })`，再用一个按脚本回复的假 provider 驱动对话。见 [`test/plugins.test.ts`](../test/plugins.test.ts)。
