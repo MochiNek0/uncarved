@@ -25,8 +25,8 @@ import {
 import stringWidth from "string-width";
 import wrapAnsi from "wrap-ansi";
 import { mentionAt, mentionText, rankPaths } from "../mentions.ts";
-import { edit, empty, layout, type EditState } from "./editor.ts";
-import { markdownStream, type MdLine } from "./markdown.ts";
+import { edit, empty, layout, moveRow, offsetAt, type EditState } from "./editor.ts";
+import { expandTabs, markdownStream, type MdLine } from "./markdown.ts";
 import {
   dim,
   type Choice,
@@ -93,9 +93,9 @@ interface UiState {
 /** 对话最多保留这么多行（折行前），超出时丢掉最早的一段 */
 const MAX_LINES = 10_000;
 
-/** 按显示宽度折行，保留颜色；每一项是屏幕上的一行 */
+/** 按显示宽度折行，保留颜色；每一项是屏幕上的一行。制表符先换成空格：按 0 列算宽度会对不齐、超宽 */
 const wrap = (text: string, width: number) =>
-  wrapAnsi(text, width, { hard: true, trim: false }).split("\n");
+  wrapAnsi(expandTabs(text), width, { hard: true, trim: false }).split("\n");
 
 /**
  * 对话里的一项：普通的一行，或者可以点击展开、收起的一段。
@@ -341,6 +341,13 @@ class Store {
     );
   }
 
+  /** 展开或收起最后一个可折叠的项（Ctrl+O）；start、view 同 toggle */
+  toggleLatest(start: number, view: number) {
+    for (let r = this.#owners.length - 1; r >= 0; r--) {
+      if (foldable(this.#owners[r]!, this.#width)) return this.toggle(r, start, view);
+    }
+  }
+
   /** 往上（正数）或往下滚 n 行，不超过 max */
   scrollBy(n: number, max: number) {
     const scroll = Math.max(0, Math.min(max, this.state.scroll + n));
@@ -370,9 +377,29 @@ const MOUSE_OFF = "\x1b[?1006l\x1b[?1000l";
 const CURSOR_BLINK = "\x1b[5 q\x1b[?12h";
 const CURSOR_RESET = "\x1b[0 q";
 
+/** 工作超过这么久后结束，或者这时弹出要用户选择的对话框，用户多半去做别的了：提醒一下 */
+const NOTIFY_AFTER = 10_000;
+/** 支持 OSC 9 桌面通知的终端；其他终端只响铃（不认识的 OSC 9 在有的终端里会弹别的东西） */
+const OSC9_TERMINALS = new Set(["iTerm.app", "WezTerm", "ghostty"]);
+
+/** 响铃，支持的终端再发一条桌面通知。JADE_NOTIFY=off 关闭 */
+function notifier(stdout: NodeJS.WriteStream, env = process.env): (message: string) => void {
+  if (env.JADE_NOTIFY === "off") return () => {};
+  const osc9 = OSC9_TERMINALS.has(env.TERM_PROGRAM ?? "");
+  return (message) =>
+    stdout.write(osc9 ? `\x1b]9;jade: ${message.replace(/[\x00-\x1f\x7f]/g, " ")}\x07` : "\x07");
+}
+
 export function tuiScreen(opts: TuiOptions): Screen {
   const stdout = opts.io?.stdout ?? process.stdout;
   const store = new Store(opts.status);
+  const notify = notifier(stdout);
+  /** 已经工作了很久（见 NOTIFY_AFTER） */
+  const longBusy = () => {
+    const since = store.state.busy?.since;
+    return since !== undefined && Date.now() - since >= NOTIFY_AFTER;
+  };
+  let doneTimer: ReturnType<typeof setTimeout> | undefined;
 
   /**
    * 正在进行的思考：一开始就作为一项放进对话（可以点击展开），之后的增量攒起来，每隔一小段时间改写一次那一项。
@@ -412,7 +439,7 @@ export function tuiScreen(opts: TuiOptions): Screen {
     const lines = live.text.split("\n");
     const rest = all ? "" : lines.pop()!;
     if (all && lines.at(-1) === "") lines.pop();
-    appendMd(lines.flatMap((l) => md.push(l)));
+    appendMd(lines.flatMap((l) => md.push(expandTabs(l))));
     if (all) {
       appendMd(md.flush());
       md = markdownStream();
@@ -526,9 +553,15 @@ export function tuiScreen(opts: TuiOptions): Screen {
     },
     busy(label) {
       const current = store.state.busy;
-      if (label === undefined) store.update({ busy: undefined });
-      else
-        store.update({ busy: { label, since: current?.since ?? Date.now() } });
+      if (label === undefined) {
+        // 稍等一下再提醒：排队的消息接着开始时（马上又 busy）不算结束
+        if (longBusy()) doneTimer ??= setTimeout(() => notify("done"), 300);
+        store.update({ busy: undefined });
+        return;
+      }
+      clearTimeout(doneTimer);
+      doneTimer = undefined;
+      store.update({ busy: { label, since: current?.since ?? Date.now() } });
     },
     status(info) {
       store.update({ status: { ...store.state.status, ...info } });
@@ -536,14 +569,16 @@ export function tuiScreen(opts: TuiOptions): Screen {
     queued(items) {
       store.update({ queued: [...items] });
     },
-    select: <T,>(title: string, choices: Choice<T>[], o?: { body?: string }) =>
-      ask<T | undefined>({
+    select: <T,>(title: string, choices: Choice<T>[], o?: { body?: string }) => {
+      if (longBusy()) notify(title);
+      return ask<T | undefined>({
         kind: "select",
         title,
         body: o?.body,
         choices: choices as Choice<unknown>[],
         resolve: () => {},
-      }),
+      });
+    },
     input: (title, o) =>
       ask<string | undefined>({
         kind: "input",
@@ -558,6 +593,7 @@ export function tuiScreen(opts: TuiOptions): Screen {
       store.clear();
     },
     async close() {
+      clearTimeout(doneTimer);
       flushLive(true);
       store.update({ live: undefined, busy: undefined, progress: [] }, true);
       // 等最后一帧画完再卸载；卸载时 Ink 退出备用屏幕
@@ -576,7 +612,13 @@ export function tuiScreen(opts: TuiOptions): Screen {
  * SGR 鼠标事件（Ink 去掉了开头的 ESC）：按钮号、列、行（从 1 开始），M 是按下、m 是松开。
  * 按钮号去掉 Shift/Alt/Ctrl 位后 0 是左键，64 是滚轮向上，65 向下
  */
-const MOUSE = /^\[<(\d+);\d+;(\d+)([Mm])$/;
+const MOUSE = /^\[<(\d+);(\d+);(\d+)([Mm])$/;
+/** 解析鼠标事件：button 是去掉 Shift/Alt/Ctrl 位的按钮号，press 表示按下；x、y 是屏幕上的列和行（从 0 开始） */
+function mouseEvent(input: string): { button: number; press: boolean; x: number; y: number } | undefined {
+  const m = MOUSE.exec(input);
+  if (!m) return undefined;
+  return { button: Number(m[1]) & ~0b11100, press: m[4] === "M", x: Number(m[2]) - 1, y: Number(m[3]) - 1 };
+}
 const WHEEL_LINES = 3;
 /** 终端矮于这么多行时标题只占一行 */
 const COMPACT_ROWS = 24;
@@ -659,14 +701,15 @@ function App({
 
   useInput((input, key) => {
     if (key.ctrl && input === "l") return setRedraws((n) => n + 1);
-    const mouse = MOUSE.exec(input);
+    // 展开或收起最近的一项（工具结果、思考、检查报告），鼠标点不了时也能看完整内容
+    if (key.ctrl && input === "o") return store.toggleLatest(start, view);
+    const mouse = mouseEvent(input);
     if (mouse) {
-      const button = Number(mouse[1]) & ~0b11100;
-      if (button === 64) store.scrollBy(WHEEL_LINES, max);
-      else if (button === 65) store.scrollBy(-WHEEL_LINES, max);
-      else if (button === 0 && mouse[3] === "M") {
+      if (mouse.button === 64) store.scrollBy(WHEEL_LINES, max);
+      else if (mouse.button === 65) store.scrollBy(-WHEEL_LINES, max);
+      else if (mouse.button === 0 && mouse.press) {
         // 点在对话区里已经完成的输出上：展开或收起那一项
-        const i = Number(mouse[2]) - 1 - top;
+        const i = mouse.y - top;
         if (i >= 0 && i < shown.length && start + i < done.length)
           store.toggle(start + i, start, view);
       }
@@ -943,8 +986,8 @@ function StatusBar({ status, width }: { status: StatusInfo; width: number }) {
         ]
       : []),
     {
-      text: "PgUp/PgDn scroll · click ▸ to expand · shift+drag to select",
-      short: "click ▸ to expand",
+      text: "PgUp/PgDn scroll · click ▸ or ctrl+o to expand · shift+drag to select",
+      short: "ctrl+o to expand",
       shortAt: 10,
       dropAt: 9,
       dim: true,
@@ -1034,6 +1077,9 @@ function editKey(s: EditState, input: string, key: Key): EditState | undefined {
   return text ? edit.insert(s, text) : undefined;
 }
 
+/** 可编辑文本在屏幕上的位置：第一个字符的列 x、第一行可见行的行 y、可见的是折行后的第 first 行起的 rows 行 */
+type Placement = { x: number; y: number; first: number; rows: number } | undefined;
+
 /** 渲染可编辑文本并把终端光标放到输入位置（输入法的候选框跟着它） */
 function EditableText({
   state,
@@ -1043,7 +1089,10 @@ function EditableText({
   placeholder,
   active,
   maxRows = Infinity,
+  place,
 }: {
+  /** 每次渲染时写入文字的位置，点击换算光标用 */
+  place?: { current: Placement };
   state: EditState;
   width: number;
   prefix: string;
@@ -1081,6 +1130,7 @@ function EditableText({
       ? origin(ref.current)
       : undefined;
   const position = at && { x: at.x + prefix.length + col, y: at.y + row };
+  if (place) place.current = at && { x: at.x + prefix.length, y: at.y, first, rows: rows.length };
   const [, recheck] = useReducer((n: number) => n + 1, 0);
   useEffect(() => {
     if (!at || !ref.current) return;
@@ -1159,7 +1209,12 @@ function Prompt({
   const browsing = useRef(-1);
   const draft = useRef("");
   const lastCtrlC = useRef(0);
+  const lastEsc = useRef(0);
+  /** 输入框文字在屏幕上的位置，点击时换算光标位置用（见 EditableText 的 place） */
+  const place = useRef<Placement>(undefined);
   const { columns, rows } = useScreenSize();
+  /** 输入框里文字的宽度：边框、内边距和前面的 "› " 之外 */
+  const textWidth = Math.max(10, columns - 5) - 2;
   /** 补全菜单、搜索结果最多显示几项；输入框最多几行 */
   const menuRows = roomFor(rows, MENTION_ROWS);
   const inputRows = roomFor(rows, 10);
@@ -1256,17 +1311,27 @@ function Prompt({
     setState(s);
     setSelected(0);
     setNotice(undefined);
+    lastEsc.current = 0;
   };
-  const submit = (text: string) => {
-    if (!text.trim()) return;
+  const remember = (text: string) => {
     history.current = [
       ...history.current.filter((h) => h !== text),
       text,
     ].slice(-100);
     browsing.current = -1;
+  };
+  const submit = (text: string) => {
+    if (!text.trim()) return;
+    remember(text);
     set(empty);
     onSubmit();
     handlers.submit(text);
+  };
+  /** 清空输入；清掉的内容放进（本次运行的）历史，按 ↑ 能找回来 */
+  const discard = () => {
+    const text = current().value;
+    if (text.trim()) remember(text);
+    set(empty);
   };
   /** 用选中的路径替换正在输入的 @ 引用；目录不加空格，接着补全里面的文件 */
   const complete = (p: string) => {
@@ -1345,14 +1410,30 @@ function Prompt({
           : undefined;
       if (key.ctrl && input === "c") {
         if (busy) return handlers.interrupt();
-        if (state.value) return set(empty);
+        if (state.value) return discard();
         if (Date.now() - lastCtrlC.current < 2000) return handlers.exit();
         lastCtrlC.current = Date.now();
         return setNotice("Press Ctrl+C again to exit");
       }
       if (key.escape) {
         if (busy) return handlers.interrupt();
-        return set(empty);
+        if (!state.value) return;
+        // 误按一下 Esc 不清掉写了半天的内容：连按两次才清空
+        if (Date.now() - lastEsc.current < 1500) return discard();
+        setNotice("Press Esc again to clear the input");
+        lastEsc.current = Date.now();
+        return;
+      }
+      // 点击输入框里的文字：光标移到点的位置
+      const mouse = mouseEvent(input);
+      if (mouse) {
+        const at = place.current;
+        if (!at || mouse.button !== 0 || !mouse.press) return;
+        const row = mouse.y - at.y;
+        if (row < 0 || row >= at.rows) return;
+        const cursor = offsetAt(state.value, textWidth, at.first + row, mouse.x - at.x);
+        if (cursor !== undefined) setState({ ...state, cursor });
+        return;
       }
       // 文字和回车在同一块里到达（输入很快时终端可能合并）：插入文字后发送
       if (
@@ -1388,7 +1469,9 @@ function Prompt({
       if (key.upArrow) {
         const { menu, selected } = derive();
         if (menu) return setSelected((selected - 1 + menu) % menu);
-        if (!edit.onFirstLine(state)) return setState(edit.up(state));
+        // 按折行后的屏幕行移动：一大段没有换行的文字也能上下走，到了第一行才翻历史
+        const up = moveRow(state, textWidth, -1);
+        if (up) return setState(up);
         if (browsing.current + 1 < history.current.length) {
           if (browsing.current === -1) draft.current = state.value;
           recall(browsing.current + 1);
@@ -1398,7 +1481,8 @@ function Prompt({
       if (key.downArrow) {
         const { menu, selected } = derive();
         if (menu) return setSelected((selected + 1) % menu);
-        if (!edit.onLastLine(state)) return setState(edit.down(state));
+        const down = moveRow(state, textWidth, 1);
+        if (down) return setState(down);
         if (browsing.current >= 0) recall(browsing.current - 1);
         return;
       }
@@ -1443,6 +1527,7 @@ function Prompt({
             }
             active={active}
             maxRows={inputRows}
+            place={place}
           />
         )}
       </Box>
@@ -1563,16 +1648,14 @@ function SelectDialog({
   const selected = Math.min(getSelected(), Math.max(0, n - 1));
   // 终端矮时少显示几项，加上预览一起不超过终端的高度
   const visible = roomFor(rows, VISIBLE);
-  // 预览（例如要写入的文件）过长时截断：整个界面高过终端时 Ink 会每帧清屏重画
-  const lines = dialog.body?.split("\n") ?? [];
+  // 预览（例如要写入的文件）过长时截断：整个界面高过终端时 Ink 会每帧清屏重画，底部的选项和提示也会被裁掉。
+  // 按折行后的屏幕行数截断（一行长代码会占好几行），每一行单独显示、不再折行
+  const lines = !dialog.body ? [] : wrap(dialog.body, Math.max(1, columns - 4));
   const room = Math.max(3, rows - Math.min(n, visible) - 16);
   const body =
     lines.length > room
-      ? [
-          ...lines.slice(0, room),
-          dim(`… ${lines.length - room} more lines`),
-        ].join("\n")
-      : dialog.body;
+      ? [...lines.slice(0, room - 1), dim(`… ${lines.length - room + 1} more lines`)]
+      : lines;
   useInput((input, key) => {
     const items = filtered();
     const n = items.length;
@@ -1623,7 +1706,11 @@ function SelectDialog({
       <Text bold wrap="truncate-end">
         {dialog.title}
       </Text>
-      {body ? <Text>{body}</Text> : null}
+      {body.map((l, i) => (
+        <Text key={i} wrap="truncate-end">
+          {l || " "}
+        </Text>
+      ))}
       {filtering ? (
         <Text wrap="truncate-end">
           <Text color="cyan">filter› </Text>

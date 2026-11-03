@@ -149,6 +149,34 @@ describe("fs tools", () => {
     expect(await readFile(path.join(cwd, "w.txt"), "utf8")).toBe("1\r\n2\r\n");
   });
 
+  test("edit_file turning one line into several in a CRLF file adds CRLF lines", async () => {
+    const { cwd } = await workspace();
+    await writeFile(path.join(cwd, "w.txt"), "one\r\ntwo\r\n");
+    const tools = fsTools(cwd);
+    await run(tools, "read_file", { path: "w.txt" });
+    expect((await run(tools, "edit_file", { path: "w.txt", old_string: "one", new_string: "one\nhalf" })).isError).toBe(false);
+    expect(await readFile(path.join(cwd, "w.txt"), "utf8")).toBe("one\r\nhalf\r\ntwo\r\n");
+  });
+
+  test("edit_file matches LF text across mixed line endings", async () => {
+    const { cwd } = await workspace();
+    await writeFile(path.join(cwd, "m.txt"), "a\r\nb\nc\r\nd\r\n");
+    const tools = fsTools(cwd);
+    await run(tools, "read_file", { path: "m.txt" });
+    const r = await run(tools, "multi_edit", { path: "m.txt", edits: [{ old_string: "a\nb\nc", new_string: "x\ny" }] });
+    expect(r.isError).toBe(false);
+    expect(await readFile(path.join(cwd, "m.txt"), "utf8")).toBe("x\r\ny\r\nd\r\n");
+  });
+
+  test("edit_file keeps LF in an LF file even when old_string has CRLF", async () => {
+    const { cwd } = await workspace();
+    await writeFile(path.join(cwd, "l.txt"), "a\nb\n");
+    const tools = fsTools(cwd);
+    await run(tools, "read_file", { path: "l.txt" });
+    expect((await run(tools, "edit_file", { path: "l.txt", old_string: "a\r\nb", new_string: "x\ny" })).isError).toBe(false);
+    expect(await readFile(path.join(cwd, "l.txt"), "utf8")).toBe("x\ny\n");
+  });
+
   test("bash reports exit code and output, streaming it as progress", async () => {
     const { cwd } = await workspace();
     const progress: unknown[] = [];
@@ -797,6 +825,30 @@ describe("jade session", () => {
     expect(requests[0]!.tools.map((t) => t.name)).toContain("task");
   });
 
+  test("ask_user runs without approval, also in plan mode, and returns the answers", async () => {
+    const asked: string[] = [];
+    const { rt, requests } = await setup(
+      [
+        call(use("q1", "ask_user", { questions: [{ question: "Which database?", options: [{ label: "SQLite" }, { label: "Postgres" }] }] })),
+        reply("ok"),
+      ],
+      { mode: "plan", askUser: async (qs) => (asked.push(...qs.map((q) => q.question)), ["Postgres"]) },
+    );
+    expect(requests.length).toBe(0);
+    await rt.send(msg("add storage"));
+    expect(asked).toEqual(["Which database?"]);
+    const result = requests[1]!.messages.at(-1)!.content[0]!;
+    expect(result.kind === "tool_result" && result.content.map((c) => (c.kind === "text" ? c.text : "")).join("")).toBe("Q: Which database?\nA: Postgres");
+    expect(requests[0]!.system[0]!.text).toContain("ask with ask_user");
+  });
+
+  test("without askUser there is no ask_user tool and the prompt does not mention it", async () => {
+    const { rt, requests } = await setup([reply("hi")]);
+    await rt.send(msg("hello"));
+    expect(requests[0]!.tools.map((t) => t.name)).not.toContain("ask_user");
+    expect(requests[0]!.system[0]!.text).not.toContain("ask_user");
+  });
+
   test("identical calls in one response run once; repeated failures get a note", async () => {
     const { rt, requests } = await setup([
       call(use("u1", "read_file", { path: "missing.txt" }), use("u2", "read_file", { path: "missing.txt" })),
@@ -810,6 +862,37 @@ describe("jade session", () => {
     expect(dup).toContain("identical to an earlier call");
     // 下一次回复里再发同一个调用会执行，第二次失败时提醒模型
     expect(resultText(requests[2]!.messages.at(-1)!.content[0]!)).toContain("This exact call has now failed 2 times");
+  });
+
+  test("repeated failures: an edit in between restarts the count; compaction resets repeat notes", async () => {
+    const responses = { calls: 0 };
+    const hooks = repeats({ responses }).hooks!;
+    const fn = (kind: string) => (hooks.find((h) => h.kind === kind) as unknown as { fn: (x: unknown) => unknown }).fn;
+    const gate = fn("gate");
+    const after = fn("transform") as (o: unknown) => { content: Block[] } | undefined;
+    const observe = fn("observe");
+    let n = 0;
+    const run = (name: string, input: unknown, isError: boolean, effect = "external") => {
+      responses.calls++;
+      const call = { toolUseId: `t${++n}`, name, input };
+      gate({ ...call, tool: { effect } });
+      const r = after({ call, content: [{ kind: "text", text: "out", origin: { by: "tool", name } }], isError });
+      const last = r?.content.at(-1);
+      return last?.kind === "text" ? last.text : "";
+    };
+    const test = { command: "bun test" };
+    expect(run("bash", test, true)).not.toContain("failed");
+    // 修了代码再跑：不算连续失败
+    run("edit_file", { path: "a.ts" }, false, "write");
+    expect(run("bash", test, true)).not.toContain("has now failed");
+    // 什么都没改又跑一遍
+    expect(run("bash", test, true)).toContain("has now failed 2 times");
+
+    expect(run("read_file", { path: "a.ts" }, false, "read")).not.toContain("already ran earlier");
+    expect(run("read_file", { path: "a.ts" }, false, "read")).toContain("already ran earlier");
+    // 压缩之后之前的结果可能已经不在上下文里
+    observe({ type: "derived.recorded", data: { key: "jade/compact", value: {} } });
+    expect(run("read_file", { path: "a.ts" }, false, "read")).not.toContain("already ran earlier");
   });
 
   test("repeat notes: a command repeated with nothing else run in between, but not when its output changed", async () => {
@@ -1167,7 +1250,10 @@ describe("jade session", () => {
     expect((main.messages[0]!.content[0] as { text: string }).text).toContain("SUMMARY");
     expect(main.messages.length).toBeLessThan(rt.state.messages.length);
     const compacted = rt.state.derived[DERIVED_KEY] as CompactState;
-    expect(compacted.summary).toBe("SUMMARY");
+    expect(compacted.summary).toStartWith("SUMMARY");
+    // 用户的原话原样带上
+    expect(compacted.summary).toContain("verbatim:\n> first");
+    expect(compacted.summary).toContain("read a file again before editing it");
     expect((await events(store, rt.state.sessionId, "jade/compact/compacted")).length).toBe(1);
 
     // 恢复后直接使用日志里的摘要，不再调用总结
@@ -1196,6 +1282,24 @@ describe("jade session", () => {
     expect(child.at(-1)!.seq).toBe(d.child!.seq);
     // 子 Agent 只有只读工具，提示词是子 Agent 的
     expect(requests[1]!.tools.map((t) => t.name).sort()).toEqual(["glob", "grep", "list_dir", "read_file", "web_fetch"]);
+  });
+
+  test("a sub-agent that runs out of steps is asked for its report", async () => {
+    const { cwd, rt, store, requests } = await setup([
+      call(use("u1", "task", { description: "survey", prompt: "survey the repo" })),
+      // 子 Agent 用完 40 步都在调用工具
+      ...Array.from({ length: 40 }, (_, i) => call(use(`r${i}`, "glob", { pattern: `*.${i}` }))),
+      reply("report: nothing found"),
+      reply("done"),
+    ]);
+    await writeFile(path.join(cwd, "a.txt"), "x");
+    await rt.send(msg("survey"));
+    const [completed] = await events(store, rt.state.sessionId, "tool.completed");
+    const d = completed!.data as EventDataMap["tool.completed"];
+    expect((d.content[0] as { text: string }).text).toBe("report: nothing found");
+    expect(d.isError).toBeFalsy();
+    const wrapUp = requests[41]!.messages.at(-1)!.content[0] as { text: string };
+    expect(wrapUp.text).toContain("reached your step limit");
   });
 
   test("sub-agent calls that need approval are passed to the host", async () => {

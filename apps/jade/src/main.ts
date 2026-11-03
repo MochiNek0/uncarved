@@ -40,6 +40,7 @@ import { lastTurnChanges, UNDO_KEY, type Checkpoint, type UndoState } from "./to
 import { display } from "./tools/fs.ts";
 import { SEARCH_PROVIDERS } from "./tools/web.ts";
 import type { ApproveSubagent, SubagentApproval } from "./tools/task.ts";
+import type { Question } from "./tools/ask.ts";
 import type { Check } from "./plugins/checks.ts";
 import { bold, dim, green, plainScreen, red, yellow, type CommandInfo, type Screen } from "./ui/screen.ts";
 import { configurator } from "./ui/configure.ts";
@@ -82,8 +83,11 @@ const INSTANT = new Set(["help", "model", "mode", "plugins", "exit"]);
 const BUILTIN_PLUGIN_COMMANDS = ["memory", "checks", "mcp", "skills", "compact"];
 
 const KEYS = `Keys: enter send · \\ or alt+enter new line · ↑↓ history · @ reference a file · esc interrupt (twice to also clear queued messages) · shift+tab cycle ask/auto/plan · ctrl+c twice to exit
-      mouse wheel or PgUp/PgDn scroll the conversation · ctrl+home/ctrl+end jump to the top/bottom · shift+drag selects text
+      mouse wheel or PgUp/PgDn scroll the conversation · ctrl+home/ctrl+end jump to the top/bottom · click ▸ expands an item (ctrl+o the latest one) · click in the input moves the cursor · shift+drag selects text
 While jade is working you can keep typing: messages are queued and sent when the current turn ends.`;
+
+/** 终端界面启动时最多等 MCP 服务连接这么久，没连上的在后台接着连 */
+const MCP_STARTUP_WAIT_MS = 5000;
 
 /** 回复被输出上限截断后，自动让模型接着做的次数（每条用户消息） */
 const MAX_CONTINUES = 3;
@@ -174,6 +178,9 @@ const tui = Boolean(process.stdin.isTTY && process.stdout.isTTY) && opts.print =
 // 终端界面依赖 ink 和 react，加载要几百毫秒，只在真的用到时才导入；现在就开始加载，和下面读配置、跑 git 同时进行
 const tuiModule = tui ? import("./ui/tui.tsx") : undefined;
 const branchFound = tui ? gitBranch(cwd) : undefined;
+// provider 要动态导入 SDK（一百多毫秒），和终端界面一起加载；出错时在下面创建界面之后再报
+const providerEarly = hasProvider() ? providerFromEnv() : undefined;
+providerEarly?.catch(() => {});
 if (!hasProvider() && !tui) {
   console.error(
     `jade: no model is configured.\n\n` +
@@ -217,10 +224,12 @@ const repo = realPath(await repoRoot(cwd));
 const foundPlugins = (await discoverPlugins({ home, root: repo, cwd: realPath(cwd) })).filter((f) => !disabledPlugins.has(f.name));
 /** 不执行代码就能读到的插件信息（带的 skills、命令、MCP 配置）；读不了的插件在 loadPlugins 里报告 */
 const pluginInfos = new Map<string, PluginInfo>();
-for (const f of foundPlugins) {
-  const info = await inspectPlugin(f.dir).catch(() => undefined);
-  if (info) pluginInfos.set(f.dir, info);
-}
+await Promise.all(
+  foundPlugins.map(async (f) => {
+    const info = await inspectPlugin(f.dir).catch(() => undefined);
+    if (info) pluginInfos.set(f.dir, info);
+  }),
+);
 const bundled = (pick: (b: PluginBundle) => string[]) =>
   foundPlugins.flatMap((f) => (pluginInfos.get(f.dir) ? pick(pluginInfos.get(f.dir)!.bundle).map((dir) => ({ plugin: f.name, dir, layer: f.layer })) : []));
 
@@ -281,7 +290,7 @@ if (!hasProvider()) {
   }
 } else {
   try {
-    provider.set(retrying(await providerFromEnv()));
+    provider.set(retrying(await providerEarly!));
   } catch (err) {
     await screen.close();
     fail(errorText(err));
@@ -329,11 +338,15 @@ const index = new SessionIndex(path.join(home, "index.jsonl"));
 
 /** 正在结束进程外插件：这时它们退出是预期的，不提示 */
 let pluginsClosing = false;
-const pluginSources = await loadPlugins();
-const skillsLoaded = await loadSkills({ home, root: repo, cwd: realPath(cwd), plugins: bundled((b) => b.skills) });
+// 插件、skill、MCP 服务同时加载：MCP 服务启动可能要好几秒。确认对话框一个接一个：MCP 的排在插件的后面
+const pluginsLoading = loadPlugins();
+const mcpConnecting = connectMcp(pluginsLoading);
+const skillsLoading = loadSkills({ home, root: repo, cwd: realPath(cwd), plugins: bundled((b) => b.skills) });
+const pluginSources = await pluginsLoading;
+const skillsLoaded = await skillsLoading;
 for (const w of skillsLoaded.warnings) screen.log(yellow(`[warning] ${w}`));
 const skills = skillsLoaded.skills;
-const mcpClients = await connectMcp();
+const mcpClients = await mcpConnecting;
 /**
  * 运行中切换的权限模式：这一轮正占着日志，写不进去。关卡先按它判断（下一个工具调用就生效），
  * 这一轮结束后再记进日志（flushPendingMode）
@@ -365,6 +378,8 @@ const makeJade = (mode?: Mode) =>
     skills,
     compactTokens: compactAt,
     approveSubagent,
+    // 不能交互时（-p）没有人回答，不提供这个工具
+    askUser: screen.interactive ? askUser : undefined,
     sharedRules: (): AllowRule[] => [...settings().rules, ...pendingRules],
     pendingMode: () => pendingMode,
     // auto 模式的审查用当前的模型；rt 换会话时跟着换，所以每次取
@@ -450,9 +465,12 @@ async function closePlugins() {
 
 /**
  * 连接 mcp.json 里配置的 MCP 服务。项目层（随仓库分发）的服务第一次启动前要用户确认，按配置内容记在 trust.jsonl；
- * 连不上的跳过并提示，不影响启动。所有服务并发连接
+ * 连不上的跳过并提示，不影响启动。所有服务并发连接，不用确认的立即开始连。
+ * 启动时最多等 MCP_STARTUP_WAIT_MS：还没连上的在后台接着连，它们的工具从下一个会话（/clear）开始提供
+ * （一个会话里的工具列表不变，否则提示缓存失效）。
+ * dialogsAfter：在它完成之后才弹确认框，不和插件的确认框同时出现
  */
-async function connectMcp(): Promise<McpClient[]> {
+async function connectMcp(dialogsAfter: Promise<unknown>): Promise<McpClient[]> {
   const plugins = foundPlugins.flatMap((f) => {
     const mcp = pluginInfos.get(f.dir)?.bundle.mcp;
     return mcp ? [{ plugin: f.name, dir: f.dir, layer: f.layer, file: mcp.file, servers: mcp.servers }] : [];
@@ -460,11 +478,13 @@ async function connectMcp(): Promise<McpClient[]> {
   const { servers, warnings } = await loadMcpConfig({ home, root: repo, cwd: realPath(cwd), plugins });
   for (const w of warnings) screen.log(yellow(`[warning] ${w}`));
   const clients: McpClient[] = [];
+  const connecting: Promise<unknown>[] = [];
   for (const entry of servers) {
     if (entry.config.disabled) continue;
     if (entry.layer === "project") {
       const hash = mcpTrustHash(repo, entry);
       if (!(await trust.has(hash))) {
+        if (tui) await dialogsAfter.catch(() => {});
         const ok = tui
           ? ((await screen.select(
               `MCP server "${entry.name}" from ${display(cwd, entry.file)} is new or changed. Start it?`,
@@ -482,21 +502,31 @@ async function connectMcp(): Promise<McpClient[]> {
         await trust.add({ hash, path: entry.file, at: new Date().toISOString() });
       }
     }
-    clients.push(
-      new McpClient(entry, {
-        cwd,
-        onDisconnect: (c, why) => {
-          if (!pluginsClosing) screen.log(yellow(`[warning] MCP server ${c.name} disconnected: ${why}. jade reconnects on its next tool call; /mcp shows details`));
-        },
-      }),
-    );
+    const client = new McpClient(entry, {
+      cwd,
+      onDisconnect: (c, why) => {
+        if (!pluginsClosing) screen.log(yellow(`[warning] MCP server ${c.name} disconnected: ${why}. jade reconnects on its next tool call; /mcp shows details`));
+      },
+    });
+    clients.push(client);
+    connecting.push(client.connect().catch((err) => screen.log(yellow(`[warning] MCP server ${client.name} is unavailable: ${errorText(err)}`))));
   }
   if (clients.length === 0) return clients;
   screen.busy(`Connecting to ${clients.length} MCP server${clients.length > 1 ? "s" : ""}`);
-  await Promise.all(
-    clients.map((c) => c.connect().catch((err) => screen.log(yellow(`[warning] MCP server ${c.name} is unavailable: ${errorText(err)}`)))),
-  );
+  const all = Promise.all(connecting);
+  // 不能交互时（-p）只运行这一次，没有"下一个会话"，照常等到每个服务连上或超时
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  if (tui) await Promise.race([all, new Promise<void>((resolve) => (timer = setTimeout(resolve, MCP_STARTUP_WAIT_MS)))]);
+  else await all;
+  clearTimeout(timer);
   screen.busy(undefined);
+  for (const c of clients.filter((x) => x.status === "connecting")) {
+    screen.log(dim(`[MCP server ${c.name} is still starting; its tools are available from the next session (/clear) once it is connected]`));
+    void c.connect().then(
+      () => screen.log(dim(`[MCP server ${c.name} connected; its tools are available from the next session (/clear)]`)),
+      () => {},
+    );
+  }
   return clients;
 }
 
@@ -524,7 +554,8 @@ let sessionId = rt.state.sessionId;
 
 // 权限设置记在日志里（derived），关卡从那里读，恢复会话后仍然有效
 // 主会话不会是 readonly（只给子 Agent 用；旧会话里记的 readonly 由关卡换成 plan）
-const settings = () => jade.policy.settings(rt.state.derived) as PolicySettings & { mode: Mode };
+// 只取这一项：rt.state 每次都拷贝整段历史，而这里调用得很频繁（子 Agent 的每次关卡判断都会调用）
+const settings = () => jade.policy.settings({ [POLICY_KEY]: rt.derived(POLICY_KEY) }) as PolicySettings & { mode: Mode };
 const saveSettings = async (next: PolicySettings) => {
   await rt.record(POLICY_KEY, next);
   pendingMode = undefined;
@@ -594,9 +625,9 @@ async function ask(c: Call, who: string, remember: (rule: AllowRule) => Promise<
   );
   if (answer === "always") await remember(rule);
   const approved = answer === "yes" || answer === "always";
-  const reason = approved
-    ? undefined
-    : (answer === "no" ? await screen.input("What should jade do instead? (optional)") : undefined) || "The user rejected this action.";
+  const said = !approved && answer === "no" ? (await screen.input("What should jade do instead? (optional)"))?.trim() : undefined;
+  // 带上"用户拒绝了"这层前提，否则模型可能把用户的话当成命令的输出
+  const reason = approved ? undefined : said ? `The user rejected this action and said: ${said}` : "The user rejected this action.";
   // 主 Agent 的调用的结果之后接在这一行后面
   screen.log(approved ? green(`✓ ${who}${head}`) : red(`✗ ${who}${head}`) + dim(reason ? ` — ${clip(reason, 200)}` : ""), {
     id: c.toolUseId,
@@ -635,8 +666,37 @@ function approveSubagent(...[c, signal]: Parameters<ApproveSubagent>): Promise<S
   return turn;
 }
 
+/** ask_user：逐个问题让用户选一项，或者选"其他"自己输入；任何一个问题取消就算没有回答 */
+async function askUser(questions: Question[], signal: AbortSignal): Promise<string[] | undefined> {
+  if (!screen.interactive) return undefined;
+  const OTHER = -1;
+  const run = subagentAsking.then(async () => {
+    const answers: string[] = [];
+    for (const [i, q] of questions.entries()) {
+      signal.throwIfAborted();
+      const title = questions.length > 1 ? `${q.question} (${i + 1}/${questions.length})` : q.question;
+      const choice = await abortable(
+        screen.select(title, [
+          ...q.options.map((o, k) => ({ label: o.label, value: k, hint: o.description })),
+          { label: "Other (type your answer)", value: OTHER },
+        ]),
+        signal,
+      );
+      if (choice === undefined) return undefined;
+      const answer = choice === OTHER ? (await abortable(screen.input(q.question), signal))?.trim() : q.options[choice]!.label;
+      if (!answer) return undefined;
+      answers.push(answer);
+      screen.log(dim(`  ${q.question} → `) + answer);
+    }
+    return answers;
+  });
+  subagentAsking = run.catch(() => {});
+  return run;
+}
+
 /** 编辑后检查的确认记录：同一个目录里的同一条命令只问一次，记在 trust.jsonl */
 const checkHash = (c: Check) => createHash("sha256").update(`jade-check\0${c.cwd}\0${c.command}`).digest("hex");
+const confirmedChecks = new Set<string>();
 
 /**
  * 编辑后检查的命令第一次运行前问用户：它会执行仓库里的代码（node_modules 里的 tsc、配置里的命令）。
@@ -644,7 +704,12 @@ const checkHash = (c: Check) => createHash("sha256").update(`jade-check\0${c.cwd
  */
 async function approveCheck(c: Check, signal: AbortSignal): Promise<boolean> {
   const hash = checkHash(c);
-  if (await trust.has(hash)) return true;
+  // 每批修改都会问一次：确认过的记在内存里，不用每次重读、解析整份 trust.jsonl
+  if (confirmedChecks.has(hash)) return true;
+  if (await trust.has(hash)) {
+    confirmedChecks.add(hash);
+    return true;
+  }
   if (settings().mode === "yolo") return true;
   if (!screen.interactive) return false;
   const run = subagentAsking.then(() => {
@@ -663,8 +728,10 @@ async function approveCheck(c: Check, signal: AbortSignal): Promise<boolean> {
   });
   subagentAsking = run.catch(() => {});
   const ok = (await run) ?? false;
-  if (ok) await trust.add({ hash, path: c.cwd, at: new Date().toISOString() });
-  else screen.log(dim(`[${c.name} will not run in this session; /checks on to ask again]`));
+  if (ok) {
+    await trust.add({ hash, path: c.cwd, at: new Date().toISOString() });
+    confirmedChecks.add(hash);
+  } else screen.log(dim(`[${c.name} will not run in this session; /checks on to ask again]`));
   return ok;
 }
 
@@ -1070,7 +1137,7 @@ async function say(text: string) {
 }
 
 /** 上一轮在模型回复之前就失败了：最后一条消息还没有回复 */
-const canRetry = () => rt.state.phase === "idle" && rt.state.messages.at(-1)?.role === "user";
+const canRetry = () => rt.phase === "idle" && rt.state.messages.at(-1)?.role === "user";
 
 async function retry() {
   if (!canRetry()) return screen.log(dim("Nothing to retry: the last message already has a reply."));

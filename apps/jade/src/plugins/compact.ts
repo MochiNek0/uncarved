@@ -182,6 +182,8 @@ export function compactor(opts: CompactOptions): Compactor {
     // 最新的任务清单在被压缩的部分里时，原样带上，模型不必凭摘要重建
     const todos = latestTodos(messages.slice(cut)) ? undefined : latestTodos(messages.slice(0, cut));
     if (todos?.length) summary += `\n\nTodo list at the time of compaction:\n${renderTodos(todos)}`;
+    // 用户的原话和改过的文件也原样带上：只靠总结，压缩几轮后要求和约束容易走样
+    summary += appendix(messages.slice(0, cut));
 
     // 保留部分里已经清理过的输出继续保持清理，否则投影反而变大
     const next: CompactState = { upTo: cut, summary, ...(prev?.trimUpTo && prev.trimUpTo > cut ? { trimUpTo: prev.trimUpTo } : {}) };
@@ -197,7 +199,7 @@ export function compactor(opts: CompactOptions): Compactor {
     },
     plugin: {
       id,
-      version: "0.2.0",
+      version: "0.2.1",
       kernel: "^0.1",
       needs: ["transform:context.project", "observe:event", "log:record", "log:emit"],
       hooks: [
@@ -238,6 +240,43 @@ function cutPoint(messages: Message[], from: number, keep: number): number | und
     best = k;
   }
   return best;
+}
+
+const WRITE_TOOLS = new Set(["write_file", "edit_file", "multi_edit"]);
+/** 摘要后面附的用户原话的总长度上限 */
+const MAX_USER_CHARS = 6000;
+const MAX_USER_MESSAGE_CHARS = 1500;
+
+/** 被压缩部分里用户的原话（第一条和最近的几条）和成功修改过的文件 */
+function appendix(messages: Message[]): string {
+  const said: string[] = [];
+  const ok = new Set<string>();
+  const files: string[] = [];
+  for (const m of messages) {
+    for (const b of m.content) if (b.kind === "tool_result" && !b.isError) ok.add(b.toolUseId);
+  }
+  for (const m of messages) {
+    const text = m.content.flatMap((b) => (b.kind === "text" && b.origin.by === "user" ? [b.text.trim()] : [])).join("\n");
+    if (text) said.push(text.length > MAX_USER_MESSAGE_CHARS ? `${text.slice(0, MAX_USER_MESSAGE_CHARS)}…` : text);
+    for (const b of m.content) {
+      if (b.kind !== "tool_use" || !WRITE_TOOLS.has(b.name) || !ok.has(b.id)) continue;
+      const p = (b.input as { path?: unknown } | null)?.path;
+      if (typeof p === "string" && !files.includes(p)) files.push(p);
+    }
+  }
+  // 超出上限时保留第一条（通常是任务本身）和尽量多的最近几条
+  const kept: string[] = [];
+  let size = said[0]?.length ?? 0;
+  for (let i = said.length - 1; i > 0 && size + said[i]!.length <= MAX_USER_CHARS; i--) {
+    kept.unshift(said[i]!);
+    size += said[i]!.length;
+  }
+  const skipped = said.length - 1 - kept.length;
+  const quoted = said.length ? [said[0]!, ...(skipped > 0 ? [`(${skipped} more message${skipped > 1 ? "s" : ""} omitted)`] : []), ...kept] : [];
+  let out = "";
+  if (quoted.length) out += `\n\nThe user's messages in the compacted part, verbatim:\n${quoted.map((t) => `> ${t.replaceAll("\n", "\n> ")}`).join("\n")}`;
+  if (files.length) out += `\n\nFiles changed in the compacted part:\n${files.map((f) => `- ${f}`).join("\n")}`;
+  return `${out}\n\nFile contents from the compacted part are no longer in context: read a file again before editing it.`;
 }
 
 function transcript(messages: Message[]): string {

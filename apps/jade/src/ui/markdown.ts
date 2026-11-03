@@ -47,7 +47,8 @@ export function markdownStream(): MarkdownStream {
         fence = undefined;
         return [];
       }
-      return [`  ${line}`];
+      // 左边一条竖线和正文分开；长行折行后续行也带竖线
+      return [hanging(dim("┃ "), line, dim("┃ "))];
     }
     if (table) {
       if (line.includes("|") && line.trim()) {
@@ -70,7 +71,7 @@ export function markdownStream(): MarkdownStream {
     const m = line.match(FENCE);
     if (m) {
       fence = m[1]!;
-      return m[2] ? [dim(`  ${m[2]}`)] : [];
+      return m[2] ? [dim(`┃ ${m[2]}`)] : [];
     }
     if (splitCells(line).length > 1) {
       candidate = line;
@@ -106,35 +107,73 @@ function renderLine(line: string): MdLine {
     return heading[1]!.length === 1 ? bold(underline(text)) : bold(text);
   }
   const quote = line.match(/^\s*>\s?(.*)$/);
-  if (quote) return dim("│ ") + inline(quote[1]!);
+  if (quote) return hanging(dim("│ "), inline(quote[1]!), dim("│ "));
   const item = line.match(/^(\s*)([-*+])\s+(\[[ xX]\]\s+)?(.*)$/);
+  // 列表项折行时续行和正文对齐
   if (item) {
     const box = item[3] ? (item[3][1] === " " ? "☐ " : "☑ ") : "";
-    return `${item[1]}${box ? "" : cyan("• ")}${box}${inline(item[4]!)}`;
+    return hanging(`${item[1]}${box ? "" : cyan("• ")}${box}`, inline(item[4]!));
   }
   const ordered = line.match(/^(\s*)(\d+[.)])\s+(.*)$/);
-  if (ordered) return `${ordered[1]}${cyan(ordered[2]!)} ${inline(ordered[3]!)}`;
+  if (ordered) return hanging(`${ordered[1]}${cyan(ordered[2]!)} `, inline(ordered[3]!));
   return inline(line);
 }
 
-/** 行内格式：`代码`、**粗体**、*斜体*、~~删除线~~、[链接](url)、反斜杠转义。代码里的内容原样显示 */
+/**
+ * 行内格式：`代码`、**粗体**、*斜体*、~~删除线~~、[链接](url)、反斜杠转义。代码里的内容原样显示。
+ * 行内代码先换成占位符，粗体、斜体处理完再换回来，"**用 `foo()` 实现**" 这样跨过代码的粗体才认得出
+ */
 export function inline(text: string): string {
+  const codes: string[] = [];
   return text
-    .split(/(`+[^`]*?`+)/)
-    .map((part, i) => {
-      if (i % 2 === 1) return cyan(part.replace(/^`+ ?|`+$/g, "").replace(/ $/, ""));
-      return part
-        .replace(/\\([\\`*_{}[\]()#+\-.!|~<>])/g, (_, c: string) => `\0${c.charCodeAt(0)}\0`)
-        .replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (_, label: string, url: string) =>
-          label === url ? underline(url) : `${underline(label)}${dim(` (${url})`)}`,
-        )
-        .replace(/<(https?:\/\/[^>\s]+)>/g, (_, url: string) => underline(url))
-        .replace(/\*\*(?=\S)(.+?)(?<=\S)\*\*|(?<![\w])__(?=\S)(.+?)(?<=\S)__(?![\w])/g, (_, a?: string, b?: string) => bold(a ?? b!))
-        .replace(/(?<![*\w])\*(?=[^\s*])(.+?)(?<=[^\s*])\*(?![*\w])|(?<![_\w])_(?=[^\s_])(.+?)(?<=[^\s_])_(?![_\w])/g, (_, a?: string, b?: string) => italic(a ?? b!))
-        .replace(/~~(?=\S)(.+?)(?<=\S)~~/g, (_, s: string) => strike(s))
-        .replace(/\0(\d+)\0/g, (_, c: string) => String.fromCharCode(Number(c)));
+    .replace(/`+[^`]*?`+/g, (code) => `\x01${codes.push(cyan(code.replace(/^`+ ?|`+$/g, "").replace(/ $/, ""))) - 1}\x01`)
+    .replace(/\\([\\`*_{}[\]()#+\-.!|~<>])/g, (_, c: string) => `\0${c.charCodeAt(0)}\0`)
+    .replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (_, label: string, url: string) =>
+      label === url ? underline(url) : `${underline(label)}${dim(` (${url})`)}`,
+    )
+    .replace(/<(https?:\/\/[^>\s]+)>/g, (_, url: string) => underline(url))
+    .replace(/\*\*(?=\S)(.+?)(?<=\S)\*\*|(?<![\w])__(?=\S)(.+?)(?<=\S)__(?![\w])/g, (_, a?: string, b?: string) => bold(a ?? b!))
+    .replace(/(?<![*\w])\*(?=[^\s*])(.+?)(?<=[^\s*])\*(?![*\w])|(?<![_\w])_(?=[^\s_])(.+?)(?<=[^\s_])_(?![_\w])/g, (_, a?: string, b?: string) => italic(a ?? b!))
+    .replace(/~~(?=\S)(.+?)(?<=\S)~~/g, (_, s: string) => strike(s))
+    .replace(/\0(\d+)\0/g, (_, c: string) => String.fromCharCode(Number(c)))
+    .replace(/\x01(\d+)\x01/g, (_, i: string) => codes[Number(i)]!);
+}
+
+/** 制表符换成空格，按 stop 列一个制表位对齐（按显示宽度算，忽略颜色）。终端按 8 列显示 tab，按 0 列算宽度会对不齐、超宽 */
+export function expandTabs(text: string, stop = 4): string {
+  if (!text.includes("\t")) return text;
+  return text
+    .split("\n")
+    .map((line) => {
+      if (!line.includes("\t")) return line;
+      let out = "";
+      let col = 0;
+      const parts = line.split("\t");
+      parts.forEach((p, i) => {
+        out += p;
+        col += stringWidth(p);
+        if (i < parts.length - 1) {
+          const n = stop - (col % stop);
+          out += " ".repeat(n);
+          col += n;
+        }
+      });
+      return out;
     })
-    .join("");
+    .join("\n");
+}
+
+/** 折行时续行缩进到 head 之后（列表项的正文、代码块的竖线）；rest 是续行开头显示的内容，宽度和 head 相同 */
+function hanging(head: string, body: string, rest = " ".repeat(stringWidth(head))): MdLine {
+  return {
+    render: (width) => {
+      const room = Math.max(1, width - stringWidth(head));
+      return wrapAnsi(expandTabs(body), room, { hard: true, trim: false })
+        .split("\n")
+        // 折行处留下的行尾空格看不见，去掉免得多占一列
+        .map((r, i) => (i === 0 ? head : rest) + r.trimEnd());
+    },
+  };
 }
 
 /** 按没转义、不在行内代码里的 | 拆开一行 */

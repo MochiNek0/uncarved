@@ -126,8 +126,8 @@ describe("edit-time checks", () => {
     const report = textOf(results[1]!.content);
     expect(report).toContain("1 problem in the files you changed");
     expect(report).toContain("bad a");
-    expect(report).toContain("1 problem in other files, which may predate your edits");
-    expect(report).not.toContain("old problem");
+    expect(report).toContain("1 problem in other files. This is the first check in this session");
+    expect(report).toContain("old problem");
 
     // 第三次请求：a.ts 修好了，other.ts 多了一个问题
     const third = textOf((s.requests[2]!.messages.at(-1)!.content[0] as Extract<Block, { kind: "tool_result" }>).content);
@@ -142,8 +142,48 @@ describe("edit-time checks", () => {
 
     // 恢复会话：从日志里取结果，不重新检查
     const resumed = await Runtime.resume({ store, provider: s.provider, plugins: make(), sessionId: rt.state.sessionId });
-    expect(Object.keys((resumed.state.derived[CHECKS_KEY] as { results: object }).results)).toEqual(["w2", "w3"]);
+    // 每份报告单独一个 key，日志里不整份重记
+    expect(Object.keys(resumed.state.derived).filter((k) => k.startsWith(`${CHECKS_KEY}/result/`))).toEqual([`${CHECKS_KEY}/result/w2`, `${CHECKS_KEY}/result/w3`]);
+    expect(events.filter((e) => e.type === "derived.recorded").map((e) => (e.data as { key: string }).key)).toEqual([
+      `${CHECKS_KEY}/result/w2`,
+      `${CHECKS_KEY}/others`,
+      `${CHECKS_KEY}/result/w3`,
+      `${CHECKS_KEY}/others`,
+    ]);
     expect(runs).toHaveLength(2);
+  });
+
+  test("reads reports that older versions recorded under the single jade/checks key", async () => {
+    const { root, home } = await tsProject();
+    let runs = 0;
+    const run: RunCommand = async () => (runs++, { code: 0, output: "", timedOut: false });
+    const tools: Plugin = { id: "test/tools", version: "0.1.0", kernel: "^0.1", tools: fsTools(root) };
+    // 老版本留下的记录
+    const legacy: Plugin = {
+      id: "test/legacy",
+      version: "0.1.0",
+      kernel: "^0.1",
+      needs: ["transform:context.project", "log:record"],
+      hooks: [
+        {
+          kind: "transform",
+          point: "context.project",
+          fn: async (messages, ctx) => {
+            if (!ctx.derived[CHECKS_KEY]) await ctx.record(CHECKS_KEY, { results: { w1: "OLD REPORT" }, others: {} });
+            return messages;
+          },
+        },
+      ],
+    };
+    const end = { content: [{ kind: "text" as const, text: "ok", origin: MODEL, trust: "trusted" as const }], stopReason: "end" as const };
+    const s = scripted([{ content: [use("w1", "write_file", { path: "a.ts", content: "x" })], stopReason: "tool_use" }, end]);
+    const c = checks({ cwd: root, root, home, run, approve: async () => true, which: () => null });
+    const rt = await Runtime.create({ store: new MemoryLogStore(), provider: s.provider, plugins: [tools, legacy, c.plugin] });
+    await rt.send(msg("1"));
+    // w1 在老记录里已经检查过：不重跑，老报告照样附在它的结果后面
+    expect(runs).toBe(0);
+    const w1 = s.requests[1]!.messages.flatMap((m) => m.content).find((b) => b.kind === "tool_result" && b.toolUseId === "w1") as Extract<Block, { kind: "tool_result" }>;
+    expect(textOf(w1.content)).toContain("OLD REPORT");
   });
 
   test("a declined check is not run again in the session; a failing check without problems is reported once", async () => {

@@ -7,6 +7,13 @@ if (!process.versions.bun && (major < 22 || (major === 22 && minor < 18))) {
   process.exit(1);
 }
 
+// --version 不用加载整个程序（导入全部依赖要一两百毫秒）。只看第一个参数，和 main.js 按顺序处理参数的结果一样
+if (process.argv[2] === "-v" || process.argv[2] === "--version") {
+  const { readFileSync } = await import("node:fs");
+  console.log(JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version);
+  process.exit(0);
+}
+
 // 加载 .ts 插件时，部分 Node 版本会打印 type stripping 的 ExperimentalWarning，会弄乱终端界面。
 // 只去掉这一条，其他警告照常按 Node 的格式输出
 if (!process.versions.bun) {

@@ -82,8 +82,25 @@ export async function text(stream: AsyncIterable<Uint8Array>): Promise<string> {
   return out + decoder.decode();
 }
 
-/** 在 PATH 里找可执行文件，找不到返回 undefined。Windows 上按 PATHEXT 补扩展名；带路径分隔符时只检查那个文件 */
+/** which 的结果，按 PATH 和 PATHEXT 记；找不到的过一会儿再查（会话中途装上的工具能用上） */
+const found = new Map<string, { file: string | undefined; at: number }>();
+const MISS_TTL_MS = 30_000;
+
+/**
+ * 在 PATH 里找可执行文件，找不到返回 undefined。Windows 上按 PATHEXT 补扩展名；带路径分隔符时只检查那个文件。
+ * 结果会记住：编辑后检查每批修改都要找 ruff、go，每次同步扫一遍 PATH 要几毫秒，期间事件循环停住
+ */
 export function which(bin: string): string | undefined {
+  if (bin.includes("/") || (process.platform === "win32" && bin.includes("\\"))) return lookup(bin);
+  const key = `${bin}\0${process.env.PATH ?? process.env.Path ?? ""}\0${process.env.PATHEXT ?? ""}`;
+  const hit = found.get(key);
+  if (hit && (hit.file !== undefined || Date.now() - hit.at < MISS_TTL_MS)) return hit.file;
+  const file = lookup(bin);
+  found.set(key, { file, at: Date.now() });
+  return file;
+}
+
+function lookup(bin: string): string | undefined {
   const win = process.platform === "win32";
   const exts = win ? ["", ...(process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean)] : [""];
   const ok = (file: string) => {

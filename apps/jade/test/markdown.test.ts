@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import stringWidth from "string-width";
-import { markdownStream, renderMarkdown } from "../src/ui/markdown.ts";
+import { expandTabs, markdownStream, renderMarkdown } from "../src/ui/markdown.ts";
 
 const strip = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
 const md = (text: string, width = 80) => renderMarkdown(text, width).map(strip);
@@ -26,7 +26,24 @@ describe("markdown", () => {
 
   test("a line with | is a table only when a delimiter row follows", () => {
     expect(md("a | b\nplain")).toEqual(["a | b", "plain"]);
-    expect(md("```\nx | y\n```")).toEqual(["  x | y"]);
+    expect(md("```\nx | y\n```")).toEqual(["┃ x | y"]);
+  });
+
+  test("code blocks have a gutter that continues on wrapped lines; list items wrap with a hanging indent", () => {
+    expect(md("```ts\nconst abcdefgh = 1\n```", 12)).toEqual(["┃ ts", "┃ const", "┃ abcdefgh =", "┃  1"]);
+    expect(md("- one two three four", 10)).toEqual(["• one two", "  three", "  four"]);
+    expect(md("12. one two three", 10)).toEqual(["12. one", "    two", "    three"]);
+  });
+
+  test("bold and italic span inline code", () => {
+    expect(md("**use `foo()` here** and *a `b` c*")).toEqual(["use foo() here and a b c"]);
+    // 代码里的 * 仍然原样显示
+    expect(md("`**not bold**`")).toEqual(["**not bold**"]);
+  });
+
+  test("tabs expand to tab stops by display width", () => {
+    expect(expandTabs("a\tb\n中\tx\n\t\ty")).toBe("a   b\n中  x\n        y");
+    expect(md("```\nif x {\n\treturn\n}\n```")).toEqual(["┃ if x {", "┃     return", "┃ }"]);
   });
 
   test("formats headings, lists, inline code and links but leaves identifiers alone", () => {

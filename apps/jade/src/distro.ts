@@ -20,13 +20,16 @@ import { repeats } from "./plugins/repeats.ts";
 import { fsTools } from "./tools/fs.ts";
 import { Checkpoints } from "./tools/checkpoint.ts";
 import { shellTools } from "./tools/shell.ts";
-import { taskTool, type ApproveSubagent } from "./tools/task.ts";
+import { taskTool, type ApproveSubagent, type SubagentControl } from "./tools/task.ts";
 import { todoTool } from "./tools/todo.ts";
+import { askUserTool, type AskUser } from "./tools/ask.ts";
 import { webTools } from "./tools/web.ts";
 import { screenshotTool } from "./tools/screenshot.ts";
 import { visionFromEnv } from "./provider.ts";
 
 const READ_ONLY = new Set(["read_file", "list_dir", "glob", "grep"]);
+/** 子 Agent 一轮最多调用模型的次数（子 Agent 的提示词里写的是同一个数） */
+const SUBAGENT_STEPS = 40;
 
 export interface JadeOptions {
   cwd: string;
@@ -56,6 +59,8 @@ export interface JadeOptions {
   lookup?: (hostname: string) => Promise<string[]>;
   /** 截图用的浏览器；不给时按 JADE_BROWSER 和常见安装位置找，null 表示不提供截图工具 */
   browser?: string | null;
+  /** ask_user 工具向用户提问；不给就不提供这个工具 */
+  askUser?: AskUser;
   /** 子 Agent 要用户批准的调用（例如 web_fetch）交给宿主；不给就拒绝 */
   approveSubagent?: ApproveSubagent;
   /** 子 Agent 也遵守的"总是允许"规则（主会话的），每次判断时取 */
@@ -191,6 +196,7 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
     });
   }
   if (!off("jade/todo")) add({ id: "jade/todo", version: "0.1.0", kernel: "^0.1", tools: [todoTool()] });
+  if (!off("jade/ask") && opts.askUser) add({ id: "jade/ask", version: "0.1.0", kernel: "^0.1", tools: [askUserTool(opts.askUser)] });
 
   let memory: Memory | undefined;
   if (!off("jade/memory")) {
@@ -385,10 +391,14 @@ function accept(made: { source: LoadedPlugin; plugin: JadePlugin }[], existing: 
   return { accepted, rejected };
 }
 
-/** 子 Agent 的插件：只读工具（含 web 工具）、子 Agent 提示词、只读策略（加上主会话的规则）、步数上限。每次调用返回新实例 */
-function subagent(opts: JadeOptions, system: { plugin?: Plugin }, available: () => { fs: boolean; web: Tool[]; mcp: McpClient[] }): () => Plugin[] {
+/** 子 Agent 的插件：只读工具（含 web 工具）、子 Agent 提示词、只读策略（加上主会话的规则）、压缩、步数上限。每次调用返回新实例 */
+function subagent(
+  opts: JadeOptions,
+  system: { plugin?: Plugin },
+  available: () => { fs: boolean; web: Tool[]; mcp: McpClient[] },
+): (control: SubagentControl) => Plugin[] {
   // 有哪些工具要到组装完成才知道，所以每次调用时再取
-  return () => {
+  return (control) => {
     const { fs, web, mcp } = available();
     const tools: Plugin = {
       id: "jade/tools-readonly",
@@ -397,6 +407,9 @@ function subagent(opts: JadeOptions, system: { plugin?: Plugin }, available: () 
       tools: [...(fs ? fsTools(opts.cwd).filter((t) => READ_ONLY.has(t.name)) : []), ...web, ...mcpTools(mcp, { readOnly: true })],
     };
     const pol = policy({ cwd: opts.cwd, mode: "readonly", id: "jade/policy-subagent", rules: opts.sharedRules });
-    return [tools, ...(system.plugin ? [system.plugin] : []), pol.plugin, budget({ maxSteps: 40, id: "jade/budget-subagent" })];
+    // 大范围调研时读的文件多：没有压缩会撑爆上下文，前面的调研全部白做
+    const compact = compactor({ provider: opts.provider, thresholdTokens: opts.compactTokens, id: "jade/compact-subagent" }).plugin;
+    const steps = budget({ maxSteps: () => (control.wrapUp ? 1 : SUBAGENT_STEPS), id: "jade/budget-subagent" });
+    return [tools, ...(system.plugin ? [system.plugin] : []), pol.plugin, compact, steps];
   };
 }

@@ -17,6 +17,8 @@ import { globMatcher, run } from "../sys.ts";
 
 const MAX_LINES = 2000;
 const MAX_LINE_CHARS = 2000;
+/** 一次 read_file 返回的文本上限（约 25k token） */
+const MAX_READ_CHARS = 100_000;
 const MAX_GLOB = 500;
 const MAX_IMAGE_BYTES = 5_000_000;
 const MAX_PDF_BYTES = 10_000_000;
@@ -98,7 +100,8 @@ export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
     name: "read_file",
     description:
       "Read a UTF-8 text file, an image (png, jpg, gif, webp) or a PDF. Text is returned as lines prefixed with their 1-based line number and a tab. " +
-      `At most ${MAX_LINES} lines are returned per call; use offset (1-based start line) and limit to page through larger files.`,
+      `At most ${MAX_LINES} lines (about ${MAX_READ_CHARS / 1000}k characters) are returned per call; use offset (1-based start line) and limit to page through larger files. ` +
+      `Lines longer than ${MAX_LINE_CHARS} characters are cut and marked "[line truncated]"; do not copy a cut line into edit_file.`,
     inputSchema: {
       type: "object",
       properties: { path: str, offset: int, limit: int },
@@ -147,10 +150,20 @@ export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
       const start = Math.max(1, offset);
       const slice = lines.slice(start - 1, start - 1 + Math.min(limit, MAX_LINES));
       if (slice.length === 0) return { content: `(file has ${lines.length} lines; offset ${start} is past the end)`, isError: true };
-      const body = slice
-        .map((l, i) => `${start + i}\t${l.length > MAX_LINE_CHARS ? l.slice(0, MAX_LINE_CHARS) + "…" : l}`)
-        .join("\n");
-      const end = start + slice.length - 1;
+      // 按整行截断到 MAX_READ_CHARS：压缩过的代码、lock 文件一次就能占掉大半个上下文
+      const out: string[] = [];
+      let size = 0;
+      for (const [i, l] of slice.entries()) {
+        const row = `${start + i}\t${l.length > MAX_LINE_CHARS ? `${l.slice(0, MAX_LINE_CHARS)}… [line truncated: ${l.length} characters]` : l}`;
+        if (out.length > 0 && size + row.length + 1 > MAX_READ_CHARS) break;
+        out.push(row);
+        size += row.length + 1;
+      }
+      const body = out.join("\n");
+      const end = start + out.length - 1;
+      if (out.length < slice.length) {
+        return { content: `${body}\n(output capped at about ${MAX_READ_CHARS} characters: showing lines ${start}-${end} of ${lines.length}; continue with offset ${end + 1})` };
+      }
       return { content: end < lines.length ? `${body}\n(showing lines ${start}-${end} of ${lines.length})` : body };
     },
   };
@@ -171,12 +184,14 @@ export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
     // 写入完整内容，重复执行结果相同
     idempotent: true,
     async execute(input, ctx) {
-      const { path: p, content } = input as { path: string; content: string };
+      const { path: p, content: given } = input as { path: string; content: string };
       const full = at(p);
       const info = await statOrUndefined(full);
       if (info?.isDirectory()) return { content: `${display(cwd, full)} is a directory`, isError: true };
       // 同样内容重复写入（崩溃后重跑）不算覆盖别人的修改
       const before = info ? await readFile(full, "utf8") : null;
+      // read_file 不显示换行风格和 BOM：覆盖已有文件时沿用原来的，否则整个文件每一行都算改了
+      const content = before === null ? given : keepStyle(before, given);
       const problem = info && before !== null && before !== content ? await staleness(ctx, full, info, before) : undefined;
       if (problem) return { content: problem, isError: true };
       await mkdir(path.dirname(full), { recursive: true });
@@ -341,19 +356,37 @@ export function applyEditsToText(text: string, edits: Edit[], shown: string): st
   return { text: next };
 }
 
+/** text 里多数换行是 CRLF 时返回 "\r\n"，多数是 LF 时返回 "\n"，一样多或没有换行时返回 fallback */
+function eolOf(text: string, fallback: string): string {
+  const crlf = text.split("\r\n").length - 1;
+  const lf = text.split("\n").length - 1 - crlf;
+  return crlf > lf ? "\r\n" : lf > crlf ? "\n" : fallback;
+}
+
+/** 原文件主要用 CRLF、新内容只有 LF 时换成 CRLF；原文件有 BOM、新内容没有时补上 */
+export function keepStyle(before: string, content: string): string {
+  let out = content;
+  if (eolOf(before, "\n") === "\r\n" && !out.includes("\r\n")) out = out.replaceAll("\n", "\r\n");
+  if (before.startsWith("﻿") && !out.startsWith("﻿")) out = `﻿${out}`;
+  return out;
+}
+
+const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
 /** 在 text 上做一次替换；失败时返回原因 */
 function replaceIn(text: string, { old_string, new_string, replace_all }: Edit, shown: string): { text: string; count: number } | string {
   if (old_string === new_string) return "old_string and new_string are identical";
   if (old_string === "") return "old_string must not be empty; use write_file to create a file";
-  // 文件是 CRLF 时，模型给的 LF 文本也能匹配
-  const crlf = text.includes("\r\n") && !old_string.includes("\r\n");
-  const from = crlf ? old_string.replaceAll("\n", "\r\n") : old_string;
-  const to = crlf ? new_string.replaceAll("\n", "\r\n") : new_string;
-  const count = text.split(from).length - 1;
+  // read_file 不显示换行风格：old_string 里的换行匹配 LF 和 CRLF，CRLF 文件、换行混用的文件都能对上
+  const pattern = new RegExp(old_string.split(/\r?\n/).map(escapeRegExp).join("\\r?\\n"), "g");
+  const count = text.match(pattern)?.length ?? 0;
   if (count === 0) return `old_string not found in ${shown}${nearMiss(text, old_string)}`;
   if (count > 1 && !replace_all) return `old_string occurs ${count} times in ${shown}; add context to make it unique or set replace_all`;
+  // new_string 的换行沿用被替换那段的；那段只有一行时沿用整个文件的，单行改成多行也不会混进 LF
+  const fileEol = eolOf(text, "\n");
+  const to = (matched: string) => (new_string.includes("\r\n") ? new_string : new_string.replaceAll("\n", eolOf(matched, fileEol)));
   // 用函数作替换值，new_string 里的 $& $1 等不会被当成替换模式
-  return { text: replace_all ? text.replaceAll(from, () => to) : text.replace(from, () => to), count: replace_all ? count : 1 };
+  return { text: text.replace(replace_all ? pattern : new RegExp(pattern.source), to), count: replace_all ? count : 1 };
 }
 
 /**

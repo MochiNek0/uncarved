@@ -61,7 +61,7 @@ export function grepTool(cwd: string, opts: GrepOptions = {}): Tool {
     name: "grep",
     description:
       "Search file contents with a regular expression (JavaScript syntax). Searches path (a file or directory, default: the working directory), " +
-      `optionally only files matching the glob include (e.g. "**/*.ts"). Skips files ignored by git, binary files and .git/node_modules. ` +
+      `optionally only files matching the glob include (e.g. "*.ts" matches at any depth; "src/**/*.ts" limits it to src). Skips files ignored by git, binary files and .git/node_modules. ` +
       `output_mode: "content" (default) returns "file:line:text" for matches and "file-line-text" for context lines, at most ${MAX_MATCHES} matches; ` +
       `"files" returns only the paths of matching files; "count" returns "file:count". ` +
       `context (0-${MAX_CONTEXT}) adds that many lines before and after each match in content mode.`,
@@ -232,7 +232,8 @@ async function ripgrep(rg: string, s: Search): Promise<Found | undefined | "miss
 // ---------- JS ----------
 
 async function jsGrep(s: Search): Promise<Found> {
-  const filter = s.include ? globMatcher(s.include) : undefined;
+  // 和 ripgrep 的 --glob 一致：不含 / 的模式（"*.ts"）匹配任意深度的文件名
+  const filter = s.include ? globMatcher(s.include.includes("/") ? s.include : `**/${s.include}`) : undefined;
   const files: FileHits[] = [];
   let matches = 0;
   const single = (await stat(s.root)).isFile();

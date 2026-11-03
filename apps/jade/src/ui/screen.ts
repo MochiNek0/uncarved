@@ -73,17 +73,23 @@ export interface Screen {
 
 // ---------- 颜色 ----------
 
-const colors = Boolean(process.stdout.isTTY);
-const paint = (code: string) => (s: string) => (colors ? `\x1b[${code}m${s}\x1b[0m` : s);
-export const dim = paint("2");
-export const red = paint("31");
-export const green = paint("32");
-export const yellow = paint("33");
-export const cyan = paint("36");
-export const bold = paint("1");
-export const italic = paint("3");
-export const underline = paint("4");
-export const strike = paint("9");
+// 设了 NO_COLOR（非空）时不输出颜色，见 https://no-color.org
+const colors = Boolean(process.stdout.isTTY) && !process.env.NO_COLOR;
+/**
+ * 每种样式用自己的关闭码，不用 \x1b[0m 全部重置：粗体里套着行内代码、链接时，后面的文字仍是粗体。
+ * 里面出现同一个关闭码（例如 dim 里套 bold，两者都用 22 关闭）时紧接着重新打开外层的样式
+ */
+const paint = (open: string, close: string) => (s: string) =>
+  colors ? `\x1b[${open}m${s.replaceAll(`\x1b[${close}m`, `\x1b[${close}m\x1b[${open}m`)}\x1b[${close}m` : s;
+export const dim = paint("2", "22");
+export const red = paint("31", "39");
+export const green = paint("32", "39");
+export const yellow = paint("33", "39");
+export const cyan = paint("36", "39");
+export const bold = paint("1", "22");
+export const italic = paint("3", "23");
+export const underline = paint("4", "24");
+export const strike = paint("9", "29");
 
 // ---------- 纯文本实现 ----------
 

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -50,6 +50,13 @@ describe.each(variants)("grep (%s)", (_name, rg) => {
     expect((await exec(tools, "grep", { pattern: "foo", path: "a.ts", context: 1 })).text).toBe(
       ["a.ts-1-one", "a.ts:2:foo two", "a.ts-3-three", "--", "a.ts-5-five", "a.ts:6:foo six"].join("\n"),
     );
+  });
+
+  test("include without a slash matches files at any depth", async () => {
+    const { cwd, tools } = await repo();
+    await mkdir(path.join(cwd, "src", "deep"), { recursive: true });
+    await writeFile(path.join(cwd, "src", "deep", "c.ts"), "foo deep\n");
+    expect((await exec(tools, "grep", { pattern: "foo", include: "*.ts", output_mode: "files" })).text).toBe(["a.ts", "src/deep/c.ts"].join("\n"));
   });
 
   test("JavaScript-only syntax such as lookbehind still works", async () => {
@@ -104,6 +111,39 @@ describe("edit hints and multi_edit", () => {
     expect(bad.isError).toBe(true);
     expect(bad.text).toStartWith("edit 2 of 2: old_string not found");
     expect(await readFile(file, "utf8")).toBe("a = 10\nc = 2\n");
+  });
+});
+
+describe("line endings and large files", () => {
+  test("write_file keeps CRLF and BOM of the file it overwrites", async () => {
+    const cwd = await workspace();
+    const tools = fsTools(cwd);
+    const file = path.join(cwd, "a.txt");
+    await writeFile(file, "﻿one\r\ntwo\r\n");
+    await exec(tools, "read_file", { path: "a.txt" });
+    await exec(tools, "write_file", { path: "a.txt", content: "one\nthree\n" });
+    expect(await readFile(file, "utf8")).toBe("﻿one\r\nthree\r\n");
+  });
+
+  test("edit_file matches LF text in a file with mixed line endings", async () => {
+    const cwd = await workspace();
+    const tools = fsTools(cwd);
+    const file = path.join(cwd, "a.txt");
+    await writeFile(file, "a\r\nb\nc\n");
+    await exec(tools, "read_file", { path: "a.txt" });
+    const r = await exec(tools, "edit_file", { path: "a.txt", old_string: "b\nc", new_string: "b\nd" });
+    expect(r.isError).toBe(false);
+    expect(await readFile(file, "utf8")).toBe("a\r\nb\nd\n");
+  });
+
+  test("read_file caps the total size and marks cut lines", async () => {
+    const cwd = await workspace();
+    const tools = fsTools(cwd);
+    await writeFile(path.join(cwd, "big.txt"), `${"x".repeat(3000)}\n${Array.from({ length: 1500 }, () => "y".repeat(100)).join("\n")}\n`);
+    const r = await exec(tools, "read_file", { path: "big.txt" });
+    expect(r.text.split("\n")[0]).toEndWith("… [line truncated: 3000 characters]");
+    expect(r.text.length).toBeLessThan(110_000);
+    expect(r.text).toMatch(/output capped at about 100000 characters: showing lines 1-\d+ of 1501; continue with offset \d+\)$/);
   });
 });
 

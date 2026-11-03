@@ -1,10 +1,11 @@
 // 重复调用插件：模型常常把同一个调用原样再发一遍。
 //
 // 同一次回复里参数完全相同的调用直接拒绝，不用让用户再批准一次；
-// 同一个调用连续失败时，在结果后面提醒模型它已经失败过几次，别再原样重试；
+// 同一个调用连续失败、其间什么都没变时，在结果后面提醒模型它已经失败过几次，别再原样重试
+// （改了文件再跑同一条测试命令是正常的"修了再验证"，从头计数）；
 // 同一个调用已经成功执行过，之后什么都没变（没有执行过只读之外的调用，用户也没有发新消息），
 // 再执行一遍结果也完全一样时，在结果后面提醒模型这是重复的（反复读同一个文件、反复打开同一个网页）。
-// 不拒绝：结果可能已经被压缩掉了，也可能是在等外面的东西变化，只提醒。
+// 不拒绝：也可能是在等外面的东西变化，只提醒。压缩插件清理或总结了历史后，之前的结果可能已经不在上下文里，都不算重复。
 // 打开文件给用户看（start、xdg-open……）会弹出新窗口：这一轮里打开过、之后什么都没改，再打开就直接拒绝。
 // write_file 之后什么都没改又读回同一个文件，提醒模型内容就是它写的那些。
 // 这些记录只在本进程内：恢复会话后从零开始，最多多重试一轮。
@@ -12,6 +13,7 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
 import type { Block, LogEvent, Plugin } from "uncarved";
+import { DERIVED_KEY as COMPACT_KEY } from "./compact.ts";
 
 export interface RepeatsOptions {
   /** 模型调用的次数，每次调用模型前加一（见 distro） */
@@ -50,9 +52,9 @@ export function repeats(opts: RepeatsOptions): Plugin {
   const cwd = opts.cwd ?? process.cwd();
   /** 本次回复里已经出现的调用；mutates：其中有只读之外、也不是打开文件的调用 */
   let current = { calls: -1, keys: new Set<string>(), mutates: false };
-  /** 调用 → 连续失败的次数；成功一次就清掉 */
-  const failures = new Map<string, number>();
-  /** 每执行成功一个只读之外的调用、用户每发一条消息就加一 */
+  /** 调用 → 连续失败的次数和最近一次失败时的 version；成功一次就清掉 */
+  const failures = new Map<string, { n: number; version: number }>();
+  /** 每执行成功一个只读之外的调用、用户每发一条消息、历史每压缩一次就加一 */
   let version = 0;
   /** 调用 → 上次成功执行后的 version 和结果 */
   const succeeded = new Map<string, { version: number; result: string }>();
@@ -68,7 +70,7 @@ export function repeats(opts: RepeatsOptions): Plugin {
   const note = (text: string): Block => ({ kind: "text", text: `[Note from jade] ${text}`, origin: { by: "plugin", id }, trust: "trusted" });
   return {
     id,
-    version: "0.3.0",
+    version: "0.3.1",
     kernel: "^0.1",
     needs: ["gate:tool.gate", "transform:tool.after", "observe:event"],
     hooks: [
@@ -127,8 +129,10 @@ export function repeats(opts: RepeatsOptions): Plugin {
               "Do not repeat it: use what you already have, or end your turn and tell the user where things stand.";
             return { ...outcome, content: [...outcome.content, note(text)] };
           }
-          const n = (failures.get(k) ?? 0) + 1;
-          failures.set(k, n);
+          const prev = failures.get(k);
+          // 上次失败之后改过东西（修了代码再跑测试），重新计数
+          const n = prev && prev.version === version ? prev.n + 1 : 1;
+          failures.set(k, { n, version });
           if (n < WARN_AFTER) return;
           const text = `This exact call has now failed ${n} times. Do not repeat it unchanged: change the approach, or tell the user what is blocking you.`;
           return { ...outcome, content: [...outcome.content, note(text)] };
@@ -137,8 +141,10 @@ export function repeats(opts: RepeatsOptions): Plugin {
       {
         kind: "observe",
         point: "event",
-        // 用户发了新消息，可能就是要再来一遍（"再打开看看"），之前的记录都不算了
+        // 用户发了新消息，可能就是要再来一遍（"再打开看看"），之前的记录都不算了；
+        // 压缩之后模型可能已经看不到之前的结果，重新执行不算重复
         fn: (e: LogEvent) => {
+          if (e.type === "derived.recorded" && (e as LogEvent<"derived.recorded">).data.key === COMPACT_KEY) version++;
           if (e.type === "input.received" && (e as LogEvent<"input.received">).data.kind === "message") {
             version++;
             opened.clear();

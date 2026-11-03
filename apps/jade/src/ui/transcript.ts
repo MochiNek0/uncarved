@@ -7,7 +7,7 @@ import { readAll, type Block, type EventDataMap, type LogEvent, type LogStore, t
 import type { ShellProgress } from "../tools/shell.ts";
 import type { TaskProgress } from "../tools/task.ts";
 import { renderTodos, type Todo } from "../tools/todo.ts";
-import { callDetails, clip, detailsOf, summarize } from "./render.ts";
+import { callDetails, clip, detailsOf, editDiff, summarize } from "./render.ts";
 import { bold, cyan, dim, green, red, yellow, type Screen } from "./screen.ts";
 
 export type Notice = Parameters<Parameters<Runtime["subscribe"]>[0]>[0];
@@ -67,15 +67,20 @@ export function transcript(opts: TranscriptOptions): Transcript {
     }
   }
 
-  /** 服务端报过缓存命中数。有的服务只在命中时才带这个字段，报过一次之后没带就是没命中 */
-  let reportsCache = false;
+  /**
+   * 报过缓存命中数的 provider/模型。有的服务只在命中时才带这个字段，报过一次之后没带就是没命中；
+   * 换了服务或模型要重新看，否则从报缓存的服务换到不报的，会一直显示 0%
+   */
+  let reportsCache: string | undefined;
   /** 上下文用量：最近一次回复的输入加输出，就是下一次请求的大致起点；以及这次输入的缓存命中率 */
-  function showContext(u: Usage | undefined) {
+  function showContext(e: LogEvent<"model.responded">) {
+    const u = e.data.usage;
     if (u?.inputTokens === undefined) return;
-    if (u.cacheReadTokens !== undefined) reportsCache = true;
+    const by = e.origin.by === "model" ? `${e.origin.provider}/${e.origin.model}` : "";
+    if (u.cacheReadTokens !== undefined) reportsCache = by;
     screen.status({
       context: { used: u.inputTokens + (u.outputTokens ?? 0), limit: opts.contextWindow(), compactAt: opts.compactAt?.() },
-      cache: reportsCache && u.inputTokens > 0 ? (u.cacheReadTokens ?? 0) / u.inputTokens : undefined,
+      cache: reportsCache === by && u.inputTokens > 0 ? (u.cacheReadTokens ?? 0) / u.inputTokens : undefined,
     });
   }
 
@@ -127,7 +132,9 @@ export function transcript(opts: TranscriptOptions): Transcript {
   const tasks = new Map<string, string>();
   /** 调用行省略了的参数（例如很长的命令），结果出来后放在折叠内容的最前面 */
   const calls = new Map<string, string>();
-  const progress = (id: string, line: string, o?: { output?: boolean }) => {
+  /** 修改文件的调用执行前算好的 diff */
+  const diffs = new Map<string, NonNullable<ReturnType<typeof editDiff>>>();
+  const progress =(id: string, line: string, o?: { output?: boolean }) => {
     running.add(id);
     screen.progress(id, line, o);
   };
@@ -145,7 +152,7 @@ export function transcript(opts: TranscriptOptions): Transcript {
     echo: (text) => screen.log(text.startsWith("/") ? cyan(`› ${text}`) : `\n${bold(`› ${text.replace(/\n/g, "\n  ")}`)}`),
     reset() {
       for (const k of Object.keys(usage) as (keyof Usage)[]) usage[k] = 0;
-      reportsCache = false;
+      reportsCache = undefined;
       toolNames.clear();
       quiet.clear();
       for (const id of running) screen.progress(id, undefined);
@@ -153,6 +160,7 @@ export function transcript(opts: TranscriptOptions): Transcript {
       steps.clear();
       tasks.clear();
       calls.clear();
+      diffs.clear();
       self.lastEnd = undefined;
     },
   };
@@ -237,7 +245,7 @@ export function transcript(opts: TranscriptOptions): Transcript {
       case "model.responded": {
         const d = e.data as EventDataMap["model.responded"];
         void countUsage(e);
-        showContext(d.usage);
+        showContext(e as LogEvent<"model.responded">);
         if (!replaying) finishSpeed(d.usage);
         for (const b of d.content) if (b.kind === "tool_use") toolNames.set(b.id, b.name);
         // 不支持流式的 provider、重新显示历史：一次送出最终文本，和流式输出一样排版
@@ -255,6 +263,11 @@ export function transcript(opts: TranscriptOptions): Transcript {
         const full = callDetails(name, d.input);
         if (full) calls.set(d.toolUseId, full);
         if (d.decision === "ask") return;
+        // 修改文件的调用：执行前按文件当时的内容算出 diff，结果出来后接在后面（重新显示历史时文件已经变了，不算）
+        if (d.decision === "allow" && !replaying) {
+          const diff = editDiff(cwd, name, d.input);
+          if (diff) diffs.set(d.toolUseId, diff);
+        }
         const head = `${bold(name)}(${summarize(cwd, name, d.input)})`;
         if (d.decision === "deny") screen.log(red(`✗ ${head}`) + dim(d.reason ? ` — ${clip(d.reason, 200)}` : ""), { id: d.toolUseId, details: full });
         else {
@@ -282,9 +295,19 @@ export function transcript(opts: TranscriptOptions): Transcript {
         tasks.delete(d.toolUseId);
         const call = calls.get(d.toolUseId);
         calls.delete(d.toolUseId);
+        const diff = diffs.get(d.toolUseId);
+        diffs.delete(d.toolUseId);
         if (quiet.delete(d.toolUseId) && !d.isError) return;
         const text = textOf(d.content).trim();
         const lines = text.split("\n");
+        // 改了文件：结果行后面是增删的行数，展开看完整的 diff
+        if (diff && !d.isError) {
+          const extra = lines.length > 1 ? [detailsOf(lines.slice(1), (s) => s, MAX_DETAIL_LINES)] : [];
+          screen.amend(d.toolUseId, dim(`⎿ ${clip(lines[0] ?? "", 160)} `) + `${green(`+${diff.added}`)} ${red(`-${diff.removed}`)}`, {
+            details: [...extra, diff.text.replace(/^/gm, "    ")].join("\n"),
+          });
+          return;
+        }
         // 结果接在调用的那一行后面；摘要省略了内容时，把完整结果（和子 Agent 调用过的工具）折叠起来，点击展开
         const shown = d.isError ? 4 : 1;
         const width = d.isError ? 200 : 160;
@@ -306,6 +329,7 @@ export function transcript(opts: TranscriptOptions): Transcript {
         doneProgress(d.toolUseId);
         tasks.delete(d.toolUseId);
         calls.delete(d.toolUseId);
+        diffs.delete(d.toolUseId);
         screen.amend(d.toolUseId, yellow("⎿ interrupted before finishing; not retried"));
         return;
       }
@@ -375,7 +399,7 @@ export function transcript(opts: TranscriptOptions): Transcript {
     if (!show) {
       for (const e of events) {
         await countUsage(e);
-        if (e.type === "model.responded") showContext((e as LogEvent<"model.responded">).data.usage);
+        if (e.type === "model.responded") showContext(e as LogEvent<"model.responded">);
       }
       return;
     }

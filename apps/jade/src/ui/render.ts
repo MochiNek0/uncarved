@@ -1,11 +1,12 @@
 // 宿主显示用的纯函数：工具调用的一行摘要、审批时的预览、折叠的工具结果。不依赖运行时和界面状态。
 
+import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { PendingCall } from "uncarved";
 import { applyEditsToText, display, type Edit } from "../tools/fs.ts";
-import { renderDiff } from "./diff.ts";
+import { diffLines, diffStats, renderDiff } from "./diff.ts";
 import { dim, green, red, yellow } from "./screen.ts";
 
 export const clip = (s: string, n: number) => (s.length > n ? s.slice(0, n) + "…" : s);
@@ -24,6 +25,7 @@ export function summarize(cwd: string, name: string, input: unknown): string {
   if (name === "task") return String(i.description ?? "");
   if (name === "bash_output" || name === "kill_shell") return String(i.id ?? "");
   if (name === "todo_write") return `${Array.isArray(i.todos) ? i.todos.length : 0} items`;
+  if (name === "ask_user") return Array.isArray(i.questions) && i.questions.length === 1 ? clip(String(i.questions[0]?.question ?? ""), 120) : `${Array.isArray(i.questions) ? i.questions.length : 0} questions`;
   if (name === "web_fetch") return clip(String(i.url ?? ""), 120);
   if (name === "web_search") return clip(String(i.query ?? ""), 120);
   if (name === "memory") return `${i.action} ${i.scope}: ${clip(String(i.text ?? ""), 120)}`;
@@ -74,6 +76,38 @@ export async function preview(c: PendingCall, cwd: string): Promise<string> {
   if (c.name === "memory") return `${i.action === "remove" ? red("- ") : green("+ ")}${String(i.text ?? "")}`;
   return dim(clip(JSON.stringify(c.input, null, 2), 2000));
 }
+
+/**
+ * 修改文件的调用（edit_file、multi_edit、write_file）执行前后的差异，对话里显示在结果后面。
+ * 要在工具执行之前调用（读的是修改前的文件），同步读文件：执行前的事件通知是同步的，等异步读完文件可能已经改了。
+ * 不是修改文件的调用、替换不成立时返回 undefined
+ */
+export function editDiff(cwd: string, name: string, input: unknown): { added: number; removed: number; text: string } | undefined {
+  if (name !== "edit_file" && name !== "multi_edit" && name !== "write_file") return undefined;
+  const i = (input ?? {}) as Record<string, unknown>;
+  if (typeof i.path !== "string") return undefined;
+  const file = path.resolve(cwd, i.path);
+  let before: string | undefined;
+  try {
+    before = readFileSync(file, "utf8");
+  } catch {}
+  let after: string;
+  if (name === "write_file") {
+    after = String(i.content ?? "");
+  } else {
+    if (before === undefined) return undefined;
+    const edits = (name === "edit_file" ? [i] : Array.isArray(i.edits) ? i.edits : []) as unknown as Edit[];
+    const r = applyEditsToText(before, edits, display(cwd, file));
+    if (typeof r === "string") return undefined;
+    after = r.text;
+  }
+  const lines = diffLines(before ?? "", after);
+  const { added, removed } = diffStats(lines);
+  return { added, removed, text: renderDiff(before ?? "", after, MAX_DIFF_LINES, lines) };
+}
+
+/** 对话里折叠的 diff 最多显示这么多行 */
+const MAX_DIFF_LINES = 400;
 
 /** 工具结果展开后的内容：缩进的全部行，超过 max 行时截断 */
 export function detailsOf(lines: string[], color: (s: string) => string, max: number): string {

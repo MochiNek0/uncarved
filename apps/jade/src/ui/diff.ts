@@ -110,8 +110,7 @@ export function diffStats(lines: DiffLine[]): DiffStats {
  * 显示用：每行前面是行号（新增行用新文件的行号，其余用旧文件的），段与段之间用 ⋯ 分开。
  * 超过 maxLines 行时截断
  */
-export function renderDiff(before: string, after: string, maxLines = 60): string {
-  const lines = diffLines(before, after);
+export function renderDiff(before: string, after: string, maxLines = 60, lines = diffLines(before, after)): string {
   const parts = hunks(lines);
   if (parts.length === 0) return dim("  (no changes)");
   const width = String(lines.reduce((w, l) => Math.max(w, l.old ?? 0, l.new ?? 0), 0)).length;

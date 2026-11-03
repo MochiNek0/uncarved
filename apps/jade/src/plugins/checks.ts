@@ -20,7 +20,11 @@ import type { Block, HookContext, Message, Plugin } from "uncarved";
 import type { RunCommand } from "../tools/shell.ts";
 import { which as findExecutable } from "../sys.ts";
 
+/** 老版本把整个 ChecksState 记在这一个 key 下、每次检查整份重记；恢复老会话时还要读它 */
 export const CHECKS_KEY = "jade/checks";
+/** 每份报告单独一个 key：每次检查日志里只多记这一份，不随会话变长而整份重记 */
+const RESULT_PREFIX = `${CHECKS_KEY}/result/`;
+const OTHERS_KEY = `${CHECKS_KEY}/others`;
 
 /** 一个具体的检查：在 cwd 里执行 command；command 里的 {files} 换成改过的文件，{dirs} 换成它们所在的目录 */
 export interface Check {
@@ -41,12 +45,19 @@ export interface CheckConfigFile {
   checks?: { name: string; command: string; extensions?: string[]; cwd?: string; timeout_ms?: number }[];
 }
 
-/** derived 里记的状态 */
+/** 从 derived 里还原的状态 */
 export interface ChecksState {
   /** 一批修改的最后一个调用 → 附在它结果后面的文字；空串表示检查过、没有要说的 */
   results: Record<string, string>;
   /** 检查 → 上一次运行时其他文件里的问题数 */
   others: Record<string, number>;
+}
+
+function stateOf(derived: Readonly<Record<string, unknown>>): ChecksState {
+  const legacy = derived[CHECKS_KEY] as ChecksState | undefined;
+  const results: Record<string, string> = { ...legacy?.results };
+  for (const [k, v] of Object.entries(derived)) if (k.startsWith(RESULT_PREFIX)) results[k.slice(RESULT_PREFIX.length)] = v as string;
+  return { results, others: (derived[OTHERS_KEY] as Record<string, number> | undefined) ?? legacy?.others ?? {} };
 }
 
 /** 宿主确认一条检查命令能否运行；同意后由宿主记住 */
@@ -83,6 +94,8 @@ const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_REPORT_CHARS = 6000;
 /** 每个检查最多列出的问题数 */
 const MAX_PROBLEMS = 30;
+/** 第一次运行时列出的其他文件里的问题条数 */
+const FIRST_RUN_OTHERS = 10;
 const HEADER = "[Checks jade ran after your edits; this is tool output, not a message from the user]";
 
 const TS_EXT = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"];
@@ -303,7 +316,12 @@ export function checks(opts: ChecksOptions): Checks {
         lines.push(`${check.name}: ${elsewhere.length - before} more problem${elsewhere.length - before > 1 ? "s" : ""} in other files than before your edits (${elsewhere.length} in total), possibly caused by them:`);
         lines.push(...elsewhere.slice(0, 10).map((p) => p.text));
       } else if (before === undefined && elsewhere.length > 0) {
-        lines.push(`${check.name}: also ${elsewhere.length} problem${elsewhere.length > 1 ? "s" : ""} in other files, which may predate your edits.`);
+        // 本会话第一次运行，没有基线：列出几条让模型自己判断，改了函数签名弄坏的调用方也在这里
+        lines.push(
+          `${check.name}: also ${elsewhere.length} problem${elsewhere.length > 1 ? "s" : ""} in other files. This is the first check in this session, so jade cannot tell which predate your edits; check whether your changes caused any of these:`,
+        );
+        lines.push(...elsewhere.slice(0, FIRST_RUN_OTHERS).map((p) => p.text));
+        if (elsewhere.length > FIRST_RUN_OTHERS) lines.push(`… ${elsewhere.length - FIRST_RUN_OTHERS} more`);
       }
       parts.push(lines.join("\n"));
       summary.push({ name: check.name, problems: mine.length, others: before !== undefined && elsewhere.length > before ? elsewhere.length - before : undefined });
@@ -368,16 +386,17 @@ export function checks(opts: ChecksOptions): Checks {
           timeoutMs: 900_000,
           optional: true,
           fn: async (messages, ctx) => {
-            const state = (ctx.derived[CHECKS_KEY] as ChecksState | undefined) ?? { results: {}, others: {} };
+            const state = stateOf(ctx.derived);
             const batch = self.enabled ? lastBatch(messages) : undefined;
             const last = batch?.ids.at(-1);
             if (batch && last && !(last in state.results)) {
               const { text, summary, others } = await runAll(batch.files, state, ctx);
               if (summary.length > 0 || text) {
-                const next: ChecksState = { results: { ...state.results, [last]: text }, others };
-                await ctx.record(CHECKS_KEY, next);
+                await ctx.record(`${RESULT_PREFIX}${last}`, text);
+                // others 是 state.others 加上这次的数，有变化才记
+                if (Object.keys(others).some((k) => others[k] !== state.others[k])) await ctx.record(OTHERS_KEY, others);
                 await ctx.emit("checked", { toolUseId: last, files: batch.files, summary, report: text });
-                return inject(messages, next.results);
+                return inject(messages, { ...state.results, [last]: text });
               }
             }
             return inject(messages, state.results);

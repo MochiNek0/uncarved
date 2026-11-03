@@ -143,7 +143,11 @@ export function shellTools(opts: ShellOptions): ShellTools {
           proc.exited,
         ]);
         signal.throwIfAborted();
-        const parts = [timedOut ? `Timed out after ${timeout}ms (killed)` : `Exit code ${code}`];
+        const parts = [
+          timedOut
+            ? `Timed out after ${timeout}ms (killed). If it needs longer, raise timeout_ms (max ${MAX_TIMEOUT_MS / 1000}s); for servers and watchers use run_in_background.`
+            : `Exit code ${code}`,
+        ];
         if (stdout) parts.push(`<stdout>\n${stdout}\n</stdout>`);
         if (stderr) parts.push(`<stderr>\n${stderr}\n</stderr>`);
         return { content: parts.join("\n"), isError: timedOut || code !== 0 };

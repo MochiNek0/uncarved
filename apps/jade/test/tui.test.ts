@@ -13,7 +13,7 @@ import {
   updateEnvFile,
 } from "../src/index.ts";
 import { configurator } from "../src/ui/configure.ts";
-import { edit, layout } from "../src/ui/editor.ts";
+import { edit, layout, moveRow, offsetAt } from "../src/ui/editor.ts";
 import type { Screen } from "../src/ui/screen.ts";
 import { fitSegments, tail, tuiScreen, type TuiHandlers } from "../src/ui/tui.tsx";
 
@@ -74,6 +74,21 @@ describe("editor", () => {
       col: 0,
     });
     expect(layout("", 0, 4)).toEqual({ rows: [""], row: 0, col: 0 });
+  });
+
+  test("up and down move by wrapped screen rows and keep the display column", () => {
+    // 中文占两列：从 abcd 末尾（第 4 列）往上是第二个字之后，不是第四个字之后
+    expect(moveRow({ value: "中文中文\nabcd", cursor: 9 }, 20, -1)).toEqual({ value: "中文中文\nabcd", cursor: 2 });
+    expect(moveRow({ value: "中文中文\nabcd", cursor: 2 }, 20, 1)?.cursor).toBe(9);
+    // 没有换行的长文字折成几行，也能上下移动；到第一行、最后一行时交给调用方翻历史
+    const long = { value: "abcdefghij", cursor: 7 };
+    expect(moveRow(long, 4, -1)?.cursor).toBe(3);
+    expect(moveRow({ ...long, cursor: 3 }, 4, -1)).toBeUndefined();
+    expect(moveRow(long, 4, 1)?.cursor).toBe(10);
+    expect(moveRow({ ...long, cursor: 10 }, 4, 1)).toBeUndefined();
+    expect(offsetAt("ab\ncd", 10, 1, 1)).toBe(4);
+    expect(offsetAt("ab\ncd", 10, 1, 9)).toBe(5);
+    expect(offsetAt("ab\ncd", 10, 2, 0)).toBeUndefined();
   });
 });
 
@@ -683,5 +698,67 @@ describe("terminal UI", () => {
     await sleep(80);
     expect(output()).toContain("fresh");
     expect(output()).not.toContain("old stuff");
+  });
+
+  test("a long preview in an approval dialog is cut by screen rows, so the choices and key hints stay visible", async () => {
+    const { screen, type, output, resize, clear } = setup();
+    resize(80, 30);
+    await sleep(250);
+    clear();
+    // 每行折成两行屏幕行：按逻辑行截断时底部的选项和提示被裁掉了
+    const body = Array.from({ length: 14 }, (_, i) => `${i} ${"x".repeat(105)}`).join("\n");
+    const picked = screen.select(
+      "Allow edit_file(a.ts)?",
+      [
+        { label: "Yes", value: 1 },
+        { label: "Yes, and always allow", value: 2 },
+        { label: "No", value: 3 },
+      ],
+      { body },
+    );
+    await until(output, "enter confirm");
+    expect(output()).toContain("3. No");
+    expect(output()).toContain("more lines");
+    await type("\r");
+    expect(await picked).toBe(1);
+  });
+
+  test("clicking in the input moves the cursor there", async () => {
+    const { type, calls } = setup();
+    await type("hello world");
+    // 100×40：输入框的文字在第 37 行，"› " 之后从第 5 列开始；点第 7 列是第 3 个字符前
+    await type("\x1b[<0;7;37M");
+    await type("\x1b[<0;7;37m");
+    await type("X");
+    await type("\r");
+    expect(calls.submit).toEqual(["heXllo world"]);
+  });
+
+  test("ctrl+o expands and collapses the latest foldable item", async () => {
+    const { screen, type, output, clear } = setup();
+    screen.log("● bash(ls)", { id: "t1", details: "    hidden-1" });
+    screen.log("plain line");
+    await sleep(80);
+    expect(output()).not.toContain("hidden-1");
+    await type("\x0f");
+    expect(output()).toContain("hidden-1");
+    clear();
+    await type("\x0f");
+    expect(output()).not.toContain("hidden-1");
+  });
+
+  test("esc clears the input only when pressed twice, and the cleared text can be recalled", async () => {
+    const { type, output, calls } = setup();
+    await type("a long draft");
+    await type("\x1b");
+    await sleep(50);
+    await until(output, "Press Esc again to clear");
+    await type("\x1b");
+    await sleep(50);
+    await type("\r");
+    expect(calls.submit).toEqual([]);
+    await type("\x1b[A");
+    await type("\r");
+    expect(calls.submit).toEqual(["a long draft"]);
   });
 });

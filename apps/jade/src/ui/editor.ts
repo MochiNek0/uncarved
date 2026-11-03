@@ -92,6 +92,55 @@ function charWidth(ch: string): number {
   return w;
 }
 
+/** 光标可以停的每个位置（码点边界）在折行后的行和列，和 layout 的折法一致 */
+function stops(value: string, width: number): { i: number; row: number; col: number }[] {
+  width = Math.max(2, width);
+  const out: { i: number; row: number; col: number }[] = [];
+  let row = 0;
+  let w = 0;
+  let i = 0;
+  // 正好停在满行末尾时算下一行开头（同 layout）
+  const stop = (at: number) => out.push(w >= width ? { i: at, row: row + 1, col: 0 } : { i: at, row, col: w });
+  for (const ch of value) {
+    if (ch === "\n") {
+      stop(i);
+      row++;
+      w = 0;
+    } else {
+      const cw = charWidth(ch);
+      if (w + cw > width) {
+        row++;
+        w = 0;
+      }
+      stop(i);
+      w += cw;
+    }
+    i += ch.length;
+  }
+  stop(value.length);
+  return out;
+}
+
+/** 折行后第 row 行里最接近第 col 列（不超过它）的光标位置；没有这一行时返回 undefined */
+export function offsetAt(value: string, width: number, row: number, col: number): number | undefined {
+  const inRow = stops(value, width).filter((s) => s.row === row);
+  if (inRow.length === 0) return undefined;
+  return (inRow.findLast((s) => s.col <= col) ?? inRow[0]!).i;
+}
+
+/**
+ * 按折行后的屏幕行上下移动光标，保持显示列（中文占两列）。已经在第一行 / 最后一行时返回 undefined，
+ * 由调用方去翻历史
+ */
+export function moveRow(s: EditState, width: number, by: -1 | 1): EditState | undefined {
+  const all = stops(s.value, width);
+  const here = all.find((x) => x.i === s.cursor) ?? all.at(-1)!;
+  const target = here.row + by;
+  if (target < 0 || target > all.at(-1)!.row) return undefined;
+  const cursor = offsetAt(s.value, width, target, here.col);
+  return cursor === undefined ? undefined : { ...s, cursor };
+}
+
 /** 按显示宽度折行（按字符折，不按词），并算出光标位置。width 至少为 2 */
 export function layout(value: string, cursor: number, width: number): Layout {
   width = Math.max(2, width);

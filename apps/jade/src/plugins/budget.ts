@@ -3,8 +3,8 @@
 import type { Plugin, State } from "uncarved";
 
 export interface BudgetOptions {
-  /** 一轮最多调用模型的次数，默认 100 */
-  maxSteps?: number;
+  /** 一轮最多调用模型的次数，默认 100；传函数时每次判断时取值 */
+  maxSteps?: number | (() => number);
   id?: string;
 }
 
@@ -20,7 +20,7 @@ export function stepsThisTurn(s: State): number {
 }
 
 export function budget(opts: BudgetOptions = {}): Plugin {
-  const max = opts.maxSteps ?? 100;
+  const max = typeof opts.maxSteps === "function" ? opts.maxSteps : () => (opts.maxSteps as number | undefined) ?? 100;
   return {
     id: opts.id ?? "jade/budget",
     version: "0.1.0",
@@ -30,7 +30,7 @@ export function budget(opts: BudgetOptions = {}): Plugin {
       {
         kind: "gate",
         point: "turn.continue",
-        fn: (s) => (stepsThisTurn(s) >= max ? { decision: "deny" } : { decision: "abstain" }),
+        fn: (s) => (stepsThisTurn(s) >= max() ? { decision: "deny" } : { decision: "abstain" }),
       },
     ],
   };

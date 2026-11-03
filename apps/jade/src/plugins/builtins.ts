@@ -17,6 +17,7 @@ export const BUILTINS: readonly BuiltinInfo[] = [
   { id: "jade/shell", about: "bash, bash_output, kill_shell" },
   { id: "jade/web", about: "web_fetch, web_search" },
   { id: "jade/todo", about: "todo_write" },
+  { id: "jade/ask", about: "ask_user (the agent asks you clarifying questions)" },
   { id: "jade/memory", about: "memory tool, memories in the system prompt, /memory" },
   { id: "jade/task", about: "task tool (read-only sub-agents)" },
   { id: "jade/skills", about: "skill tool, skill list in the system prompt, /skills" },
