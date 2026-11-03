@@ -11,6 +11,7 @@ import {
   UntrustedPlugin,
   loadProjectPlugin,
   loadProjectPluginFactory,
+  subsetPlugin,
   type Plugin,
   type ConfirmTrust,
   type Provider,
@@ -111,6 +112,26 @@ test("绕过加载器、直接注册的项目层插件被拒绝", async () => {
   const loaded = await loadProjectPlugin(root, { trust: new MemoryTrustStore(), confirm: async () => true });
   await expect(
     Runtime.create({ store: new MemoryLogStore(), provider, plugins: [{ ...loaded }] }),
+  ).rejects.toBeInstanceOf(UntrustedPlugin);
+});
+
+test("已确认插件的子集仍算已确认；伪造插件的子集不算", async () => {
+  const root = await writePlugin("subset");
+  const loaded = await loadProjectPlugin(root, { trust: new MemoryTrustStore(), confirm: async () => true });
+  const withHooks: Plugin = {
+    ...loaded,
+    needs: ["gate:tool.gate", "observe:event"],
+    hooks: [
+      { kind: "gate", point: "tool.gate", fn: () => ({ decision: "abstain" }) },
+      { kind: "observe", point: "event", fn: () => {} },
+    ],
+  };
+  // 原对象加上 hook 已经不是确认过的那个对象；从确认过的对象取子集才行
+  const sub = subsetPlugin(loaded, { hooks: (h) => h.point === "tool.gate" });
+  await Runtime.create({ store: new MemoryLogStore(), provider, plugins: [sub] });
+  expect(subsetPlugin(withHooks, { hooks: (h) => h.point === "tool.gate" }).hooks?.map((h) => h.point)).toEqual(["tool.gate"]);
+  await expect(
+    Runtime.create({ store: new MemoryLogStore(), provider, plugins: [subsetPlugin(withHooks, {})] }),
   ).rejects.toBeInstanceOf(UntrustedPlugin);
 });
 

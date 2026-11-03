@@ -18,10 +18,12 @@ import type { Screen } from "../src/ui/screen.ts";
 import { fitSegments, tail, tuiScreen, type TuiHandlers } from "../src/ui/tui.tsx";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-/** 等到输出里出现 text，最多 ms 毫秒：界面按定时器刷新，机器忙时固定等一小段时间不一定够 */
-async function until(output: () => string, text: string, ms = 2000) {
-  for (const end = Date.now() + ms; !output().includes(text) && Date.now() < end; ) await sleep(10);
-  expect(output()).toContain(text);
+/** 等到输出里出现 text（或匹配正则），最多 ms 毫秒：界面按定时器刷新，机器忙时固定等一小段时间不一定够 */
+async function until(output: () => string, text: string | RegExp, ms = 2000) {
+  const found = () => (typeof text === "string" ? output().includes(text) : text.test(output()));
+  for (const end = Date.now() + ms; !found() && Date.now() < end; ) await sleep(10);
+  if (typeof text === "string") expect(output()).toContain(text);
+  else expect(output()).toMatch(text);
 }
 const strip = (s: string) =>
   s.replace(/\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[78]/g, "");
@@ -473,6 +475,63 @@ describe("terminal UI", () => {
     expect(output()).toContain("•••••••••");
   });
 
+  test("aborting a dialog's signal closes it and returns undefined", async () => {
+    const { screen, type, output } = setup();
+    const ac = new AbortController();
+    const picked = screen.select("Allow bash(rm x)?", [{ label: "Yes", value: "yes" }], { signal: ac.signal });
+    await sleep(80);
+    expect(output()).toContain("Allow bash(rm x)?");
+    ac.abort();
+    expect(await picked).toBeUndefined();
+    // 对话框关掉之后键盘回到输入框
+    const key = screen.input("Name", { signal: AbortSignal.abort() });
+    expect(await key).toBeUndefined();
+    await type("hi");
+    await sleep(50);
+    expect(output()).toContain("hi");
+  });
+
+  test("a suggestion shows as ghost text: → or tab takes it, ctrl+→ takes a word, typing filters it, esc drops it", async () => {
+    const { screen, type, output, calls, clear } = setup();
+    screen.suggest("run the tests\nsecond line is ignored");
+    await until(output, "run the tests");
+    expect(output()).not.toContain("second line");
+    // 输入对得上时只显示剩下的部分，对不上时不显示
+    await type("run");
+    await until(output, "› run the tests");
+    clear();
+    await type("x");
+    await sleep(50);
+    expect(output()).not.toContain("the tests");
+    await type("\x7f");
+    await until(output, "the tests");
+    // Ctrl+→ 接受一个词，→ 接受剩下的全部
+    await type("\x1b[1;5C");
+    await type("\x1b[C");
+    await type("\r");
+    expect(calls.submit).toEqual(["run the tests"]);
+    // Tab 也能接受；Esc 丢弃
+    screen.suggest("next one");
+    await until(output, "next one");
+    await type("\t");
+    await type("\r");
+    expect(calls.submit.at(-1)).toBe("next one");
+    screen.suggest("dropped");
+    await until(output, "dropped");
+    await type("\x1b");
+    await sleep(50);
+    clear();
+    await type("d");
+    await sleep(50);
+    expect(output()).not.toContain("ropped");
+  });
+
+  test("plugins' status bar segments are shown", async () => {
+    const { screen, output } = setup();
+    screen.status({ plugins: [{ plugin: "ci", text: "CI passing" }] });
+    await until(output, "CI passing");
+  });
+
   test("long choice lists scroll with the selection", async () => {
     const { screen, type, output, clear } = setup();
     const picked = screen.select(
@@ -541,7 +600,7 @@ describe("terminal UI", () => {
   test("thinking shows where the model is in one row and can be expanded while it is still thinking", async () => {
     const { screen, type, output, clear } = setup();
     screen.stream("thinking", "step one\nstep two\nstep th");
-    await until(output, "✻ Thinking 0s · step th ▸");
+    await until(output, /✻ Thinking \ds · step th ▸/);
     expect(output()).not.toContain("step one");
     // 很长的一行只显示末尾，跟着模型往前走
     screen.stream("thinking", `ree ${"x".repeat(200)} latest words`);
@@ -549,17 +608,19 @@ describe("terminal UI", () => {
     // 思考中就能点开：对话区第 1 行在屏幕第 6 行
     clear();
     await type("\x1b[<0;5;6M");
-    await until(output, "✻ Thinking 0s ▾");
+    await type("\x1b[<0;5;6m");
+    await until(output, /✻ Thinking \ds ▾/);
     expect(output()).toContain("step one");
     // 展开着的时候新内容接着出现
     clear();
     screen.stream("thinking", "\nstep four");
     await until(output, "step four");
     screen.endStream();
-    await until(output, "✻ Thought for 0s ▾");
+    await until(output, /✻ Thought for \ds ▾/);
     clear();
     await type("\x1b[<0;5;6M");
-    await until(output, "✻ Thought for 0s ▸");
+    await type("\x1b[<0;5;6m");
+    await until(output, /✻ Thought for \ds ▸/);
     expect(output()).not.toContain("step one");
   });
 
@@ -605,6 +666,7 @@ describe("terminal UI", () => {
     expect(output()).not.toContain("out-1");
     clear();
     await type("\x1b[<0;5;6M");
+    await type("\x1b[<0;5;6m");
     expect(output()).toContain("out-1");
     // 找不到那一项时另起一行
     screen.amend("missing", "⎿ orphan");
@@ -670,11 +732,42 @@ describe("terminal UI", () => {
     // 点击展开的内容也能收起；点普通的行没有反应
     clear();
     await type("\x1b[<0;5;8M");
+    await type("\x1b[<0;5;8m");
     expect(output()).not.toContain("hidden-1");
     expect(output()).toContain("▸");
     clear();
     await type("\x1b[<0;5;6M");
+    await type("\x1b[<0;5;6m");
     expect(output()).not.toContain("hidden-1");
+  });
+
+  test("dragging selects text without shift and copies it; a click or ctrl+c clears it without side effects", async () => {
+    const { screen, type, raw, calls, clear } = setup();
+    screen.log("hello world");
+    screen.log("second line", { details: "    hidden-1" });
+    await sleep(80);
+    const copied = () => [...raw().matchAll(/\x1b\]52;c;([A-Za-z0-9+/=]*)\x07/g)].map((m) => Buffer.from(m[1]!, "base64").toString("utf8"));
+    // 对话区第 1 行在屏幕第 6 行，左边空一列：从 "world" 拖到下一行的 "second" 末尾
+    await type("\x1b[<0;8;6M");
+    await type("\x1b[<32;10;7M");
+    await type("\x1b[<32;7;7M");
+    expect(raw()).toContain("\x1b[7m");
+    await type("\x1b[<0;7;7m");
+    expect(copied()).toEqual(["world\nsecond"]);
+    expect(raw()).toContain("Copied 12 characters to the clipboard");
+    // 拖动结束时不展开那一项
+    expect(raw()).not.toContain("hidden-1");
+    // 有选中的文字时 Ctrl+C 只取消选中：不中断、不提示退出
+    await type("\x03");
+    await type("\x03");
+    expect(calls.interrupt).toBe(0);
+    expect(calls.exit).toBe(0);
+    // 再点一下（没有拖动）照常展开
+    clear();
+    await type("\x1b[<0;5;7M");
+    await type("\x1b[<0;5;7m");
+    expect(raw()).toContain("hidden-1");
+    expect(copied()).toEqual([]);
   });
 
   test("clicks still land on the right line during the full repaint after startup", async () => {
@@ -683,6 +776,7 @@ describe("terminal UI", () => {
     // 启动后 100ms 起有一帧整帧重画（上下各垫一行），这时候点击换算的行号曾经差一行
     await sleep(120);
     await type("\x1b[<0;5;6M");
+    await type("\x1b[<0;5;6m");
     await sleep(100);
     expect(output()).toContain("hidden-1");
   });

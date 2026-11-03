@@ -16,9 +16,10 @@ import type { Choice } from "../ui/screen.ts";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { spawnPlugin, type StdioPlugin } from "@uncarved/plugin-stdio";
-import { definePlugin, loadProjectPluginFactory, type Awaitable, type Plugin, type TrustStore } from "uncarved";
+import { definePlugin, loadProjectPluginFactory, type Awaitable, type Message, type Plugin, type TrustStore, type Usage } from "uncarved";
 import { projectDirs } from "../commands.ts";
 import type { RunCommand } from "../tools/shell.ts";
+import type { Question } from "../tools/ask.ts";
 
 export const JADE_VERSION: string = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")).version;
 
@@ -41,6 +42,26 @@ export interface JadePluginContext {
   definePlugin: <T extends JadePluginDraft>(draft: T) => T & JadePlugin;
   /** 用 jade 的 shell 执行命令，超时或中断时连同子进程一起结束；找不到 shell 时没有 */
   run?: RunCommand;
+  /**
+   * 用当前配置的模型发一次请求：不带工具，不记进会话，和会话共用限速和重试；用户切换模型后用新的。
+   * 返回回复的文字；onText 收到流式输出的片段，拿到想要的内容后可以用 signal 中止
+   */
+  complete(req: CompleteRequest, signal: AbortSignal): Promise<CompleteResult>;
+  /** 设置状态栏上本插件的那一段文字（一行，过长时截断，窗口窄时先被去掉）；undefined 去掉 */
+  status(text: string | undefined): void;
+}
+
+export interface CompleteRequest {
+  system?: string;
+  prompt: string;
+  onText?(delta: string): void;
+}
+
+export interface CompleteResult {
+  text: string;
+  /** 实际回复的模型 */
+  model: string;
+  usage?: Usage;
 }
 
 /** 斜杠命令和用户交互用的界面。非交互运行（-p）时 select / input 直接返回 undefined */
@@ -83,9 +104,51 @@ export interface PluginCommand {
   run(args: string, ctx: PluginCommandContext): Awaitable<PluginCommandResult>;
 }
 
+/** 宿主请用户批准的一个工具调用 */
+export interface ApprovalRequest {
+  /** 显示给用户的一行，例如 "bash(npm test)"；子 Agent 的调用以 "sub-agent " 开头 */
+  title: string;
+  tool: string;
+  input: unknown;
+  /** 和终端里一样的预览（diff、命令），不带颜色 */
+  preview: string;
+  /** 为什么要问，例如 auto 模式下审查转给用户的理由 */
+  reason?: string;
+}
+
+/**
+ * 在终端之外回答用户该回答的问题（例如经聊天机器人发到手机上）。宿主同时等终端和所有 responder，
+ * 用最先给出的回答，然后中止其余的（signal）。返回 undefined 表示这次不回答，宿主继续等别的。
+ * 只有用户层的插件能提供：它能替用户批准操作
+ */
+export interface Responder {
+  /** message：用户拒绝时说的话，会转告模型 */
+  approve?(req: ApprovalRequest, signal: AbortSignal): Promise<{ approved: boolean; message?: string } | undefined>;
+  /** ask_user 的问题：每个问题一个回答 */
+  ask?(questions: Question[], signal: AbortSignal): Promise<string[] | undefined>;
+}
+
+/**
+ * 预测用户的下一条消息，在输入框里显示成灰字（→ 或 Tab 接受，Ctrl+→ 接受一个词，Esc 丢弃）。
+ * 只在终端界面里、一轮正常结束后调用；出错、中断、子 Agent、jade -p 都不调用。
+ * 返回整条文字，或者流式返回片段；只显示第一行。用户提交新输入或按 Esc 时 signal 中止
+ */
+export interface Suggester {
+  next(ctx: { sessionId: string; messages: Message[] }, signal: AbortSignal): Promise<string | undefined> | AsyncIterable<string>;
+}
+
 /** jade 的插件：内核的 Plugin，外加 jade 认识的扩展字段 */
 export interface JadePlugin extends Plugin {
   commands?: PluginCommand[];
+  /** 见 Responder；项目层插件的会被忽略 */
+  responder?: Responder;
+  /** 见 Suggester；多个插件都提供时只用第一个 */
+  suggest?: Suggester;
+  /**
+   * 用户输入的消息发给模型之前（斜杠命令、宿主自己发的话不经过）：返回新的文字代替原文，返回 undefined 不改，
+   * 返回空字符串不发送。多个插件按加载顺序依次处理；改动会在对话里提示用户
+   */
+  beforeSend?(text: string, ctx: { sessionId: string; signal: AbortSignal }): Awaitable<string | undefined>;
   /**
    * 代替的内置插件的 id（例如 "jade/web"）：被代替的内置插件不再加载，它的工具名可以由本插件提供。
    * jade/policy 不能代替
@@ -98,8 +161,8 @@ export type JadePluginDraft = Omit<JadePlugin, "kernel" | "needs"> & { kernel?: 
 
 export type JadePluginFactory = (ctx: JadePluginContext) => Awaitable<JadePlugin>;
 
-/** 宿主（createJade）提供的那部分上下文 */
-export type HostContext = Omit<JadePluginContext, "dir" | "layer">;
+/** 宿主（createJade）提供的那部分上下文；status 由加载器按插件的目录名转给宿主 */
+export type HostContext = Omit<JadePluginContext, "dir" | "layer" | "status"> & { status(plugin: string, text: string | undefined): void };
 
 /** plugin.json，可以没有 */
 export interface PluginJson {
@@ -208,7 +271,7 @@ export async function loadPlugin(found: FoundPlugin, opts: LoadOptions): Promise
   if (info.kind === "content") return { ...found, kind: "content", entry: "", info };
 
   const entry = info.entry!;
-  const ctx = (host: HostContext): JadePluginContext => ({ ...host, dir: found.dir, layer: found.layer });
+  const ctx = (host: HostContext): JadePluginContext => ({ ...host, dir: found.dir, layer: found.layer, status: (text) => host.status(found.name, text) });
 
   if (found.layer === "project") {
     // 内核负责：先哈希整个目录、确认，再 import；检查 import 不越出插件目录

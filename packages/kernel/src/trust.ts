@@ -8,7 +8,9 @@ import { readdir, readFile, realpath } from "node:fs/promises";
 import { isBuiltin } from "node:module";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import type { HookSpec } from "./hooks.ts";
 import type { Plugin } from "./plugin.ts";
+import type { Tool } from "./types.ts";
 
 export interface TrustRecord {
   /** 插件目录内容的哈希，见 hashDir */
@@ -81,6 +83,20 @@ export async function requireTrust(
   const grant: TrustGrant = Object.freeze({ hash, path: p });
   grants.add(grant);
   return grant;
+}
+
+/**
+ * 插件的一个子集：只留下 keep 选中的工具和 hook，其余字段不变。例如宿主只把第三方插件的工具级 hook 交给子 Agent。
+ * 只能去掉、不能加入，所以已确认的项目层插件的子集仍然算已确认（运行的仍是确认过的代码）
+ */
+export function subsetPlugin(plugin: Plugin, keep: { tools?: (t: Tool) => boolean; hooks?: (h: HookSpec) => boolean }): Plugin {
+  const p: Plugin = {
+    ...plugin,
+    tools: plugin.tools?.filter((t) => keep.tools?.(t) ?? true),
+    hooks: plugin.hooks?.filter((h) => keep.hooks?.(h) ?? true),
+  };
+  if (confirmed.has(plugin)) confirmed.add(p);
+  return p;
 }
 
 /** 凭确认结果把插件标记为项目层，Runtime 只接受这样标记过的项目层插件 */

@@ -9,6 +9,7 @@ import { readdir, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { stripVTControlCharacters } from "node:util";
 import { JsonlLogStore, JsonlTrustStore } from "@uncarved/store-jsonl";
 import {
   readAll,
@@ -29,6 +30,7 @@ import { describeServer, loadMcpConfig, McpClient, mcpTrustHash } from "./mcp.ts
 import { loadSkills } from "./skills.ts";
 import { hasProvider, loadEnvFile, parseTokens, updateEnvFile } from "./config.ts";
 import { createJade, type Jade } from "./distro.ts";
+import { firstAnswer } from "./respond.ts";
 import { describeRule, MODES, POLICY_KEY, type AllowRule, type Mode, type PolicySettings } from "./plugins/policy.ts";
 import { compactThreshold, contextWindowFromEnv, contextWindowInfo, isContextOverflow } from "./context.ts";
 import { InputHistory } from "./history.ts";
@@ -258,6 +260,7 @@ const screen: Screen = tuiModule
         interrupt: () => ready && interrupt(),
         exit: () => (ready ? void quit() : process.exit(130)),
         files: () => mentionCandidates(cwd),
+        dismissSuggestion: () => ready && clearSuggestion(),
         cycleMode: () => ready && cycleMode(),
       },
     })
@@ -363,9 +366,23 @@ function currentModel(): { name: string; via: string } | undefined {
   const api = { anthropic: "the Anthropic API", openai: "the OpenAI Responses API", "openai-compat": "an OpenAI-compatible API" }[info.kind];
   return { name: info.model, via: host ? `${api} at ${host}` : api };
 }
+/** 插件用 ctx.status 设置的状态栏段落，按插件的目录名 */
+const pluginStatus = new Map<string, string>();
+/** 第几套插件实例；换会话之后旧实例设置的状态不再显示 */
+let jadeGeneration = 0;
+function setPluginStatus(plugin: string, text: string | undefined) {
+  const line = text === undefined ? "" : stripVTControlCharacters(String(text)).replace(/\s+/g, " ").trim();
+  if (line) pluginStatus.set(plugin, clip(line, 40));
+  else pluginStatus.delete(plugin);
+  screen.status({ plugins: [...pluginStatus].map(([p, t]) => ({ plugin: p, text: t })) });
+}
+
 /** 每个会话用一套新的插件实例：插件里有按会话记的状态（例如压缩、重复调用的计数） */
-const makeJade = (mode?: Mode) =>
-  createJade({
+const makeJade = (mode?: Mode) => {
+  const generation = ++jadeGeneration;
+  pluginStatus.clear();
+  screen.status({ plugins: [] });
+  return createJade({
     cwd,
     home,
     store,
@@ -387,7 +404,9 @@ const makeJade = (mode?: Mode) =>
     approveCheck: process.env.JADE_CHECKS === "off" ? undefined : approveCheck,
     checkConfirmed: (c) => trust.has(checkHash(c)),
     checksUnavailable: process.env.JADE_CHECKS === "off" ? "Edit-time checks are turned off by JADE_CHECKS=off." : undefined,
+    onStatus: (plugin, text) => generation === jadeGeneration && setPluginStatus(plugin, text),
   });
+};
 
 let jade: Jade = await makeJade(opts.mode);
 for (const w of jade.warnings) screen.log(yellow(`[warning] ${w}`));
@@ -604,36 +623,66 @@ rt.subscribe(view.onNotice);
 
 type Call = { toolUseId: string; name: string; input: unknown; reason?: string };
 
-/** 问用户是否允许一个调用；选了"总是允许"时交给 remember 记下规则 */
-async function ask(c: Call, who: string, remember: (rule: AllowRule) => Promise<void> | void): Promise<SubagentApproval> {
+/**
+ * 问用户是否允许一个调用；选了"总是允许"时交给 remember 记下规则。
+ * 插件的 responder（例如发到手机上）和终端同时等，用先到的回答
+ */
+async function ask(c: Call, who: string, remember: (rule: AllowRule) => Promise<void> | void, signal?: AbortSignal): Promise<SubagentApproval> {
   const head = `${c.name}(${summarize(cwd, c.name, c.input)})`;
-  if (!screen.interactive) {
+  const remote = jade.responders.filter((r) => r.responder.approve);
+  const unavailable = (): SubagentApproval => {
     screen.log(red(`✗ ${who}${head} denied: not running interactively`));
     return { approved: false, reason: "The user is not available to approve this action." };
-  }
+  };
+  if (!screen.interactive && !remote.length) return unavailable();
   const rule = jade.policy.ruleFor(c);
   const always = rule.command !== undefined ? "this exact command" : describeRule(rule);
-  const answer = await screen.select(
-    `Allow ${who}${head}?`,
-    [
-      { label: "Yes", value: "yes" as const },
-      { label: `Yes, and always allow ${always} in this session`, value: "always" as const },
-      { label: "No, and tell jade what to do instead", value: "no" as const },
-    ],
-    // 关卡给了理由的（例如 auto 模式下审查转给用户的），说明为什么要问
-    { body: (c.reason ? `${yellow(c.reason)}\n\n` : "") + (await preview(c, cwd)) },
+  // 关卡给了理由的（例如 auto 模式下审查转给用户的），说明为什么要问
+  const body = (c.reason ? `${yellow(c.reason)}\n\n` : "") + (await preview(c, cwd));
+  const request = { title: `${who}${head}`, tool: c.name, input: c.input, preview: stripVTControlCharacters(body), reason: c.reason };
+  type Reply = { approved: boolean; message?: string; always?: boolean; tell?: boolean };
+  const { value, by } = await firstAnswer<Reply>(
+    screen.interactive
+      ? async (s) => {
+          const answer = await screen.select(
+            `Allow ${who}${head}?`,
+            [
+              { label: "Yes", value: "yes" as const },
+              { label: `Yes, and always allow ${always} in this session`, value: "always" as const },
+              { label: "No, and tell jade what to do instead", value: "no" as const },
+            ],
+            { body, signal: s },
+          );
+          return { approved: answer === "yes" || answer === "always", always: answer === "always", tell: answer === "no" };
+        }
+      : undefined,
+    remote.map((r) => ({
+      plugin: r.plugin,
+      run: async (s) => {
+        const reply = await r.responder.approve!(request, s);
+        if (reply !== undefined && typeof reply?.approved !== "boolean") throw new Error("approve must return { approved: boolean } or undefined");
+        return reply;
+      },
+    })),
+    { signal, onError: responderFailed },
   );
-  if (answer === "always") await remember(rule);
-  const approved = answer === "yes" || answer === "always";
-  const said = !approved && answer === "no" ? (await screen.input("What should jade do instead? (optional)"))?.trim() : undefined;
+  if (!value) return unavailable();
+  if (value.always) await remember(rule);
+  const said = (value.tell ? (await screen.input("What should jade do instead? (optional)", { signal })) : value.message)?.trim();
+  const approved = value.approved;
   // 带上"用户拒绝了"这层前提，否则模型可能把用户的话当成命令的输出
   const reason = approved ? undefined : said ? `The user rejected this action and said: ${said}` : "The user rejected this action.";
+  const via = by ? dim(` (via ${by})`) : "";
   // 主 Agent 的调用的结果之后接在这一行后面
-  screen.log(approved ? green(`✓ ${who}${head}`) : red(`✗ ${who}${head}`) + dim(reason ? ` — ${clip(reason, 200)}` : ""), {
+  screen.log((approved ? green(`✓ ${who}${head}`) : red(`✗ ${who}${head}`)) + via + dim(reason ? ` — ${clip(reason, 200)}` : ""), {
     id: c.toolUseId,
     details: callDetails(c.name, c.input),
   });
   return { approved, reason };
+}
+
+function responderFailed(plugin: string, err: unknown) {
+  screen.log(yellow(`[warning] plugin ${plugin}: responder failed: ${err instanceof Error ? err.message : String(err)}`));
 }
 
 async function approvePending() {
@@ -659,36 +708,51 @@ let subagentAsking: Promise<unknown> = Promise.resolve();
 function approveSubagent(...[c, signal]: Parameters<ApproveSubagent>): Promise<SubagentApproval> {
   const turn = subagentAsking.then(() => {
     signal.throwIfAborted();
-    // 中断时不再等用户回答；对话框由用户自己关掉
-    return abortable(ask(c, "sub-agent ", (rule) => void pendingRules.push(rule)), signal);
+    // 中断时不再等用户回答，对话框和插件那边的请求一起关掉
+    return ask(c, "sub-agent ", (rule) => void pendingRules.push(rule), signal);
   });
   subagentAsking = turn.catch(() => {});
   return turn;
 }
 
-/** ask_user：逐个问题让用户选一项，或者选"其他"自己输入；任何一个问题取消就算没有回答 */
+/** ask_user：逐个问题让用户选一项，或者选"其他"自己输入；任何一个问题取消就算没有回答。插件的 responder 和终端同时等 */
 async function askUser(questions: Question[], signal: AbortSignal): Promise<string[] | undefined> {
-  if (!screen.interactive) return undefined;
+  const remote = jade.responders.filter((r) => r.responder.ask);
+  if (!screen.interactive && !remote.length) return undefined;
   const OTHER = -1;
-  const run = subagentAsking.then(async () => {
+  const local = async (s: AbortSignal) => {
     const answers: string[] = [];
     for (const [i, q] of questions.entries()) {
-      signal.throwIfAborted();
       const title = questions.length > 1 ? `${q.question} (${i + 1}/${questions.length})` : q.question;
-      const choice = await abortable(
-        screen.select(title, [
-          ...q.options.map((o, k) => ({ label: o.label, value: k, hint: o.description })),
-          { label: "Other (type your answer)", value: OTHER },
-        ]),
-        signal,
+      const choice = await screen.select(
+        title,
+        [...q.options.map((o, k) => ({ label: o.label, value: k, hint: o.description })), { label: "Other (type your answer)", value: OTHER }],
+        { signal: s },
       );
       if (choice === undefined) return undefined;
-      const answer = choice === OTHER ? (await abortable(screen.input(q.question), signal))?.trim() : q.options[choice]!.label;
+      const answer = choice === OTHER ? (await screen.input(q.question, { signal: s }))?.trim() : q.options[choice]!.label;
       if (!answer) return undefined;
       answers.push(answer);
       screen.log(dim(`  ${q.question} → `) + answer);
     }
     return answers;
+  };
+  const run = subagentAsking.then(async () => {
+    const { value, by } = await firstAnswer<string[]>(
+      screen.interactive ? local : undefined,
+      remote.map((r) => ({
+        plugin: r.plugin,
+        run: async (s) => {
+          const answers = await r.responder.ask!(questions, s);
+          const ok = answers === undefined || (Array.isArray(answers) && answers.length === questions.length && answers.every((x) => typeof x === "string" && x.trim()));
+          if (!ok) throw new Error(`ask must return one non-empty answer per question (${questions.length}) or undefined`);
+          return answers;
+        },
+      })),
+      { signal, onError: responderFailed },
+    );
+    if (value && by) questions.forEach((q, i) => screen.log(dim(`  ${q.question} → `) + value[i] + dim(` (via ${by})`)));
+    return value;
   });
   subagentAsking = run.catch(() => {});
   return run;
@@ -1134,6 +1198,64 @@ async function say(text: string) {
   content.push(...refs.blocks);
   await drive({ kind: "message", content });
   await offerPlan();
+  if (view.lastEnd === "end" && queue.length === 0) void suggestNext();
+}
+
+/** 用户输入的消息：先交给插件的 beforeSend（可能改写或不发），再发出 */
+async function sendTyped(text: string) {
+  for (const { plugin, fn } of jade.beforeSend) {
+    try {
+      // 插件卡住时不能一直不发：30 秒后按原文发出
+      const signal = AbortSignal.timeout(30_000);
+      const next = await abortable(Promise.resolve(fn(text, { sessionId, signal })), signal);
+      if (next === undefined || next === text) continue;
+      if (typeof next !== "string") throw new Error("beforeSend must return a string or undefined");
+      if (!next.trim()) return screen.log(dim(`[plugin ${plugin} did not send the message]`));
+      screen.log(dim(`[plugin ${plugin} changed the message]`), { details: next });
+      text = next;
+    } catch (err) {
+      screen.log(yellow(`[warning] plugin ${plugin}: beforeSend failed, the message is sent as typed: ${errorText(err)}`));
+    }
+  }
+  await say(text);
+}
+
+// ---------- 预测下一条消息 ----------
+
+/** 正在进行的预测；提交新输入、按 Esc、开始新的预测时中止 */
+let suggesting: AbortController | undefined;
+
+function clearSuggestion() {
+  suggesting?.abort();
+  suggesting = undefined;
+  screen.suggest(undefined);
+}
+
+/** 一轮正常结束后让插件预测用户的下一条消息，显示在输入框里（只在终端界面里） */
+async function suggestNext() {
+  const s = jade.suggester;
+  if (!s || !tui) return;
+  clearSuggestion();
+  const ac = new AbortController();
+  suggesting = ac;
+  try {
+    const r = s.suggest.next({ sessionId, messages: structuredClone(rt.state.messages) }, ac.signal);
+    if (r && typeof (r as AsyncIterable<string>)[Symbol.asyncIterator] === "function") {
+      let text = "";
+      for await (const part of r as AsyncIterable<string>) {
+        if (ac.signal.aborted) return;
+        text += part;
+        screen.suggest(text);
+      }
+    } else {
+      const text = await r;
+      if (!ac.signal.aborted && typeof text === "string") screen.suggest(text);
+    }
+  } catch (err) {
+    if (!ac.signal.aborted) screen.log(yellow(`[warning] plugin ${s.plugin}: suggest failed: ${errorText(err)}`));
+  } finally {
+    if (suggesting === ac) suggesting = undefined;
+  }
 }
 
 /** 上一轮在模型回复之前就失败了：最后一条消息还没有回复 */
@@ -1327,6 +1449,7 @@ const queue: string[] = [];
 const echo = view.echo;
 
 function onSubmit(text: string) {
+  clearSuggestion();
   const name = text.startsWith("/") ? text.slice(1).split(/\s+/)[0]! : undefined;
   if (name !== undefined && (INSTANT.has(name) || instantPlugin(name))) {
     // 只读命令和 /model 不碰运行时状态，运行中也直接执行
@@ -1368,7 +1491,7 @@ async function pump() {
         } catch (err) {
           screen.log(red(`[error] ${errorText(err)}`));
         }
-      } else await say(text);
+      } else await sendTyped(text);
     }
   });
   if (exit) await quit();
@@ -1401,7 +1524,7 @@ if (tui) {
   await occupy(async () => {
     const skill = name !== undefined && !custom ? skillCommands.get(name) : undefined;
     const text = custom ? expandCommand(custom, args) : skill ? skillMessage(skill.name, args) : name !== undefined && !builtinNames.has(name) && jade.commands.has(name) ? await pluginCommand(name, args) : first;
-    if (text) await say(text);
+    if (text) await (name === undefined ? sendTyped(text) : say(text));
   });
   await leave();
   await closePlugins();

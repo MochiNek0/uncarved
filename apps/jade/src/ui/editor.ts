@@ -84,7 +84,7 @@ export interface Layout {
 
 /** 单个字符的显示宽度；每次按键都要把整段输入过一遍，stringWidth 较慢，ASCII 直接算，其余缓存 */
 const widths = new Map<string, number>();
-function charWidth(ch: string): number {
+export function charWidth(ch: string): number {
   const c = ch.charCodeAt(0);
   if (c >= 0x20 && c < 0x7f) return 1;
   let w = widths.get(ch);

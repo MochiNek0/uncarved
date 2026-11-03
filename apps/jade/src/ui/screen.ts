@@ -12,6 +12,8 @@ export interface Choice<T> {
 }
 
 export interface StatusInfo {
+  /** 插件用 ctx.status 设置的段落（已经是一行、截断过） */
+  plugins?: { plugin: string; text: string }[];
   cwd: string;
   branch?: string;
   model: string;
@@ -62,10 +64,12 @@ export interface Screen {
   status(info: Partial<StatusInfo>): void;
   /** 排队等待发送的输入 */
   queued(items: string[]): void;
-  /** 让用户从几项里选一项；取消时返回 undefined */
-  select<T>(title: string, choices: Choice<T>[], opts?: { body?: string }): Promise<T | undefined>;
-  /** 让用户输入一行；取消时返回 undefined */
-  input(title: string, opts?: { initial?: string; mask?: boolean; placeholder?: string }): Promise<string | undefined>;
+  /** 插件预测的下一条消息，终端界面在输入框里显示成灰字；undefined 去掉。纯文本输出不显示 */
+  suggest(text: string | undefined): void;
+  /** 让用户从几项里选一项；取消时返回 undefined。signal 中止时关掉对话框，也返回 undefined */
+  select<T>(title: string, choices: Choice<T>[], opts?: { body?: string; signal?: AbortSignal }): Promise<T | undefined>;
+  /** 让用户输入一行；取消时返回 undefined。signal 同 select */
+  input(title: string, opts?: { initial?: string; mask?: boolean; placeholder?: string; signal?: AbortSignal }): Promise<string | undefined>;
   /** 清空已经显示的对话（开始新会话时） */
   clear(): void;
   close(): Promise<void>;
@@ -111,9 +115,16 @@ export function plainScreen(opts: { interactive: boolean }): Screen {
     if (!atLineStart) write("\n");
     write(s + "\n");
   };
-  const ask = async (q: string) => {
+  /** 中止时返回 undefined */
+  const ask = async (q: string, signal?: AbortSignal) => {
     rl ??= createInterface({ input: process.stdin, output: process.stdout, terminal: true });
-    return (await rl.question(q)).trim();
+    try {
+      return (await rl.question(q, { signal })).trim();
+    } catch (err) {
+      if (!signal?.aborted) throw err;
+      write("\n");
+      return undefined;
+    }
   };
 
   return {
@@ -155,17 +166,21 @@ export function plainScreen(opts: { interactive: boolean }): Screen {
     busy: () => {},
     status: () => {},
     queued: () => {},
+    suggest: () => {},
     async select(title, choices, o) {
       if (!opts.interactive) return undefined;
       line(yellow(title));
       if (o?.body) line(o.body);
       choices.forEach((c, i) => line(`  ${i + 1}. ${c.label}${c.hint ? dim(`  ${c.hint}`) : ""}`));
-      const n = Number(await ask(`Choose 1-${choices.length} (empty to cancel): `));
+      if (o?.signal?.aborted) return undefined;
+      const n = Number(await ask(`Choose 1-${choices.length} (empty to cancel): `, o?.signal));
       return Number.isInteger(n) && n >= 1 && n <= choices.length ? choices[n - 1]!.value : undefined;
     },
     async input(title, o) {
       if (!opts.interactive) return undefined;
-      return (await ask(`${title}${o?.initial ? ` [${o.initial}]` : ""}: `)) || o?.initial || "";
+      if (o?.signal?.aborted) return undefined;
+      const answer = await ask(`${title}${o?.initial ? ` [${o.initial}]` : ""}: `, o?.signal);
+      return answer === undefined ? undefined : answer || o?.initial || "";
     },
     clear: () => {},
     async close() {

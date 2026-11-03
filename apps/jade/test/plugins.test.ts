@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { MemoryLogStore, MemoryTrustStore, readAll, Runtime, type Block, type ModelRequest, type ModelResponse, type Provider } from "uncarved";
 import { createJade, discoverPlugins, loadPlugin, type FoundPlugin, type LoadedPlugin } from "../src/index.ts";
+import type { HostContext } from "../src/plugins/loader.ts";
 
 const MODEL = { by: "model", provider: "scripted", model: "scripted-1" } as const;
 type Step = Omit<ModelResponse, "model">;
@@ -200,6 +201,139 @@ describe("in-process plugins", () => {
     expect([...jade.commands].filter(([, c]) => !c.builtin).map(([k]) => k)).toEqual(["ok"]);
     // 剩下的插件能正常组成运行时
     await Runtime.create({ store: new MemoryLogStore(), provider: s.provider, plugins: jade.plugins });
+  });
+
+  test("sub-agents run third-party tool hooks, but not their tools or other hooks", async () => {
+    const { cwd, home } = await dirs();
+    await writeFile(path.join(cwd, "a.txt"), "token=SECRET\n");
+    let turns = 0;
+    const plugin = {
+      id: "x/redact",
+      version: "1.0.0",
+      kernel: "^0.1",
+      needs: ["transform:tool.after", "observe:model.after"],
+      tools: [{ name: "x_tool", description: "", inputSchema: { type: "object" }, effect: "read", concurrency: "safe", idempotent: true, execute: async () => ({ content: "" }) }],
+      hooks: [
+        {
+          kind: "transform",
+          point: "tool.after",
+          fn: (o: { content: Block[] }) => ({ ...o, content: o.content.map((b) => (b.kind === "text" ? { ...b, text: b.text.replaceAll("SECRET", "[redacted]") } : b)) }),
+        },
+        { kind: "observe", point: "model.after", fn: () => void turns++ },
+      ],
+    };
+    const loaded: LoadedPlugin = {
+      name: "redact",
+      dir: path.join(home, "plugins", "redact"),
+      layer: "user",
+      kind: "module",
+      entry: "index.ts",
+      info: { kind: "module", entry: "index.ts", json: {}, bundle: { skills: [], commands: [], unsupported: [] } },
+      create: async () => plugin as never,
+    };
+    const s = scripted([
+      { content: [use("t", "task", { description: "read", prompt: "read a.txt" })], stopReason: "tool_use" },
+      { content: [use("r", "read_file", { path: "a.txt" })], stopReason: "tool_use" },
+      reply("the token is [redacted]"),
+      reply("done"),
+    ]);
+    const store = new MemoryLogStore();
+    const jade = await createJade({ cwd, home, store, provider: s.provider, env: {}, extensions: [loaded], mode: "yolo", browser: null });
+    const rt = await Runtime.create({ store, provider: s.provider, plugins: jade.plugins });
+    await rt.send(msg("go"));
+    // 子 Agent 读到的文件内容也脱敏了
+    expect(resultText(s.requests[2]!)).toContain("token=[redacted]");
+    expect(resultText(s.requests[2]!)).not.toContain("SECRET");
+    // 插件的工具只给主 Agent；observe hook 只看到主 Agent 的两次回复
+    expect(s.requests[0]!.tools.map((t) => t.name)).toContain("x_tool");
+    expect(s.requests[1]!.tools.map((t) => t.name)).not.toContain("x_tool");
+    expect(turns).toBe(2);
+    jade.shutdown();
+  });
+
+  test("a plugin can call the current model with ctx.complete, outside the session", async () => {
+    const { cwd, home } = await dirs();
+    let complete: ((...a: Parameters<HostContext["complete"]>) => ReturnType<HostContext["complete"]>) | undefined;
+    const loaded: LoadedPlugin = {
+      name: "asker",
+      dir: path.join(home, "plugins", "asker"),
+      layer: "user",
+      kind: "module",
+      entry: "index.ts",
+      info: { kind: "module", entry: "index.ts", json: {}, bundle: { skills: [], commands: [], unsupported: [] } },
+      create: async (host) => ((complete = host.complete), { id: "x/asker", version: "1.0.0", kernel: "^0.1" }) as never,
+    };
+    const s = scripted([reply("next: run the tests")]);
+    const store = new MemoryLogStore();
+    await createJade({ cwd, home, store, provider: s.provider, env: {}, extensions: [loaded] });
+    const res = await complete!({ system: "predict", prompt: "the chat so far" }, new AbortController().signal);
+    expect(res).toMatchObject({ text: "next: run the tests", model: "scripted-1" });
+    expect(s.requests[0]!.tools).toEqual([]);
+    expect(s.requests[0]!.system.map((x) => x.text)).toEqual(["predict"]);
+    expect(s.requests[0]!.messages[0]!.content[0]).toMatchObject({ kind: "text", text: "the chat so far" });
+  });
+
+  test("suggest, beforeSend and ctx.status are collected; only the first suggest is used", async () => {
+    const { cwd, home } = await dirs();
+    const statuses: [string, string | undefined][] = [];
+    const fake = (name: string, extra: (host: HostContext) => Record<string, unknown>): LoadedPlugin => ({
+      name,
+      dir: path.join(home, "plugins", name),
+      layer: "user",
+      kind: "module",
+      entry: "index.ts",
+      info: { kind: "module", entry: "index.ts", json: {}, bundle: { skills: [], commands: [], unsupported: [] } },
+      create: async (host) => ({ id: `x/${name}`, version: "1.0.0", kernel: "^0.1", ...extra(host) }) as never,
+    });
+    const next = async () => "run the tests";
+    const jade = await createJade({
+      cwd,
+      home,
+      store: new MemoryLogStore(),
+      provider: scripted([]).provider,
+      env: {},
+      onStatus: (p, t) => void statuses.push([p, t]),
+      extensions: [
+        fake("ghost", () => ({ suggest: { next } })),
+        fake("ghost2", () => ({ suggest: { next } })),
+        fake("bad", () => ({ suggest: { next: "nope" }, beforeSend: 1 })),
+        fake("upper", (host) => (host.status("upper", "ready"), { beforeSend: (t: string) => t.toUpperCase() })),
+      ],
+    });
+    expect(jade.suggester?.plugin).toBe("x/ghost");
+    expect(jade.warnings.find((w) => w.includes("x/ghost2"))).toContain("x/ghost already provides it");
+    expect(jade.warnings.filter((w) => w.includes("plugin bad")).join("\n")).toContain("suggest is ignored");
+    expect(jade.warnings.filter((w) => w.includes("plugin bad")).join("\n")).toContain("beforeSend is ignored");
+    expect(jade.beforeSend.map((b) => b.plugin)).toEqual(["x/upper"]);
+    expect(await jade.beforeSend[0]!.fn("hi", { sessionId: "s", signal: new AbortController().signal })).toBe("HI");
+    expect(statuses).toEqual([["upper", "ready"]]);
+  });
+
+  test("only user plugins can provide a responder", async () => {
+    const { cwd, home } = await dirs();
+    const fake = (name: string, layer: "user" | "project", responder: unknown): LoadedPlugin => ({
+      name,
+      dir: path.join(home, "plugins", name),
+      layer,
+      kind: "module",
+      entry: "index.ts",
+      info: { kind: "module", entry: "index.ts", json: {}, bundle: { skills: [], commands: [], unsupported: [] } },
+      create: async () => ({ id: `x/${name}`, version: "1.0.0", kernel: "^0.1", responder }) as never,
+    });
+    const approve = async () => ({ approved: true });
+    const jade = await createJade({
+      cwd,
+      home,
+      store: new MemoryLogStore(),
+      provider: scripted([]).provider,
+      env: {},
+      extensions: [fake("phone", "user", { approve }), fake("repo", "project", { approve }), fake("broken", "user", { approve: "yes" })],
+    });
+    expect(jade.responders.map((r) => r.plugin)).toEqual(["x/phone"]);
+    expect(jade.warnings.find((w) => w.includes("plugin repo"))).toContain("only user plugins can answer approvals");
+    expect(jade.warnings.find((w) => w.includes("plugin broken"))).toContain("must be functions");
+    // 被忽略的插件其余部分照常加载
+    expect(jade.extensions.map((e) => e.plugin.id)).toEqual(["x/phone", "x/repo", "x/broken"]);
   });
 });
 

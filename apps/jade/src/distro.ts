@@ -4,7 +4,7 @@
 // 用户可以停用内置插件（$JADE_HOME/plugins.json），第三方插件可以用 replaces 代替内置插件；jade/policy 两者都不行。
 
 import path from "node:path";
-import { checkCompat, definePlugin, type LogStore, type ModelRequest, type Plugin, type Provider, type Tool } from "uncarved";
+import { checkCompat, definePlugin, subsetPlugin, type LogStore, type ModelRequest, type Plugin, type Provider, type Tool } from "uncarved";
 import { budget } from "./plugins/budget.ts";
 import { BUILTINS, BUILTIN_IDS, REQUIRED_IDS } from "./plugins/builtins.ts";
 import { checks as checksPlugin, type ApproveCheck, type Check, type Checks } from "./plugins/checks.ts";
@@ -13,7 +13,7 @@ import { Memory, memoryTool } from "./memory.ts";
 import { mcpTools, type McpClient } from "./mcp.ts";
 import { skillTool, skillsPrompt, type Skill } from "./skills.ts";
 import { compactor, type Compactor } from "./plugins/compact.ts";
-import { COMMAND_NAME, JADE_VERSION, type HostContext, type JadePlugin, type LoadedPlugin, type PluginCommand } from "./plugins/loader.ts";
+import { COMMAND_NAME, JADE_VERSION, type HostContext, type JadePlugin, type LoadedPlugin, type PluginCommand, type Responder, type Suggester } from "./plugins/loader.ts";
 import { policy, type AllowRule, type Mode, type Policy, type PolicyOptions } from "./plugins/policy.ts";
 import { prompts, realPath, repoRoot } from "./plugins/prompts.ts";
 import { repeats } from "./plugins/repeats.ts";
@@ -28,6 +28,8 @@ import { screenshotTool } from "./tools/screenshot.ts";
 import { visionFromEnv } from "./provider.ts";
 
 const READ_ONLY = new Set(["read_file", "list_dir", "glob", "grep"]);
+/** 子 Agent 也执行的第三方插件 hook */
+const TOOL_HOOKS: ReadonlySet<string> = new Set(["tool.gate", "tool.before", "tool.after"]);
 /** 子 Agent 一轮最多调用模型的次数（子 Agent 的提示词里写的是同一个数） */
 const SUBAGENT_STEPS = 40;
 
@@ -82,6 +84,8 @@ export interface JadeOptions {
   mcp?: McpClient[];
   /** loadSkills 找到的 skill */
   skills?: Skill[];
+  /** 插件用 ctx.status 设置状态栏上自己的那一段；plugin 是插件的目录名，text 为 undefined 时去掉 */
+  onStatus?(plugin: string, text: string | undefined): void;
 }
 
 export interface BuiltinState {
@@ -111,6 +115,12 @@ export interface Jade {
   extensions: { source: LoadedPlugin; plugin: JadePlugin }[];
   /** 插件（内置的和第三方的）提供的斜杠命令，按小写的名字 */
   commands: Map<string, { plugin: string; command: PluginCommand; builtin: boolean }>;
+  /** 用户层第三方插件提供的 responder，宿主问用户时和终端一起等 */
+  responders: { plugin: string; responder: Responder }[];
+  /** 预测下一条消息的插件（只用第一个提供 suggest 的） */
+  suggester?: { plugin: string; suggest: Suggester };
+  /** 用户消息发出前依次处理它的插件 */
+  beforeSend: { plugin: string; fn: NonNullable<JadePlugin["beforeSend"]> }[];
   /** 主会话的工具；宿主用 read_file / list_dir 读取 @ 引用的文件 */
   tools: Tool[];
   /** 宿主退出时调用：杀掉后台 shell */
@@ -138,7 +148,7 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
   // run 也给插件和编辑后检查用，所以 jade/shell 停用时也创建，只是不把工具交给模型
   const shell = shellTools({ cwd });
   const root = await repoRoot(cwd);
-  const host: HostContext = { jade: JADE_VERSION, cwd: realPath(cwd), root: realPath(root), home: opts.home, definePlugin, run: shell.run };
+  const host: HostContext = { jade: JADE_VERSION, cwd: realPath(cwd), root: realPath(root), home: opts.home, definePlugin, run: shell.run, complete: completer(provider), status: (plugin, text) => opts.onStatus?.(plugin, text) };
 
   // 第三方插件先创建：要先知道它们代替哪些内置插件
   const made = await createExtensions(opts.extensions ?? [], host, disabled, warnings);
@@ -209,8 +219,15 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
   const kept = new Set<string>();
   /** 子 Agent 的提示词，组装完成后生成 */
   const subSystem: { plugin?: Plugin } = {};
+  /** 第三方插件（项目层和用户层），组装完成后填上 */
+  let thirdParty: Plugin[] = [];
   if (!off("jade/task")) {
-    const subagentPlugins = subagent(opts, subSystem, () => ({ fs: kept.has("jade/fs"), web: kept.has("jade/web") ? web : [], mcp: kept.has("jade/mcp") ? mcp : [] }));
+    const subagentPlugins = subagent(opts, subSystem, () => ({
+      fs: kept.has("jade/fs"),
+      web: kept.has("jade/web") ? web : [],
+      mcp: kept.has("jade/mcp") ? mcp : [],
+      extensions: thirdParty,
+    }));
     add({ id: "jade/task", version: "0.1.0", kernel: "^0.1", tools: [taskTool({ store, provider, plugins: subagentPlugins, approve: opts.approveSubagent })] });
   }
 
@@ -306,7 +323,10 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
     return by ? { ...b, state: "replaced" as const, by } : { ...b, state: "disabled" as const };
   });
 
-  const plugins = [...builtin, ...(opts.projectPlugins ?? []), ...added.map((a) => a.plugin)];
+  thirdParty = [...(opts.projectPlugins ?? []), ...added.map((a) => a.plugin)];
+  const suggesters = added.flatMap(({ plugin }) => (plugin.suggest ? [{ plugin: plugin.id, suggest: plugin.suggest }] : []));
+  for (const extra of suggesters.slice(1)) warnings.push(`plugin ${extra.plugin}: suggest is ignored: plugin ${suggesters[0]!.plugin} already provides it`);
+  const plugins = [...builtin, ...thirdParty];
   const commands = new Map<string, { plugin: string; command: PluginCommand; builtin: boolean }>();
   for (const p of [...builtin, ...added.map((a) => a.plugin)] as JadePlugin[]) {
     const isBuiltin = BUILTIN_IDS.has(p.id) && builtin.includes(p);
@@ -327,6 +347,9 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
     builtins,
     extensions: added,
     commands,
+    responders: added.flatMap(({ plugin }) => (plugin.responder ? [{ plugin: plugin.id, responder: plugin.responder }] : [])),
+    suggester: suggesters[0],
+    beforeSend: added.flatMap(({ plugin }) => (plugin.beforeSend ? [{ plugin: plugin.id, fn: plugin.beforeSend.bind(plugin) }] : [])),
     tools: allTools,
     shutdown: shell.shutdown,
     warnings,
@@ -362,6 +385,22 @@ async function createExtensions(sources: LoadedPlugin[], host: HostContext, disa
     });
     // 原地修改而不是复制：内核只认加载器返回的那个项目层插件对象（宪法 7.1）
     if (plugin.commands) plugin.commands = commands;
+    if (plugin.responder !== undefined) {
+      const r = plugin.responder as Partial<Record<string, unknown>> | null;
+      const ok = typeof r === "object" && r !== null && ["approve", "ask"].every((k) => r[k] === undefined || typeof r[k] === "function");
+      // 项目层插件随仓库来，不能替用户批准它自己要做的事
+      if (source.layer === "project") warnings.push(`${where}: responder is ignored: only user plugins can answer approvals`);
+      else if (!ok) warnings.push(`${where}: responder is ignored: approve and ask must be functions`);
+      if (source.layer === "project" || !ok) delete plugin.responder;
+    }
+    if (plugin.beforeSend !== undefined && typeof plugin.beforeSend !== "function") {
+      warnings.push(`${where}: beforeSend is ignored: it must be a function`);
+      delete plugin.beforeSend;
+    }
+    if (plugin.suggest !== undefined && typeof (plugin.suggest as { next?: unknown } | null)?.next !== "function") {
+      warnings.push(`${where}: suggest is ignored: it needs a next function`);
+      delete plugin.suggest;
+    }
     out.push({ source, plugin });
   }
   return out;
@@ -395,11 +434,11 @@ function accept(made: { source: LoadedPlugin; plugin: JadePlugin }[], existing: 
 function subagent(
   opts: JadeOptions,
   system: { plugin?: Plugin },
-  available: () => { fs: boolean; web: Tool[]; mcp: McpClient[] },
+  available: () => { fs: boolean; web: Tool[]; mcp: McpClient[]; extensions: Plugin[] },
 ): (control: SubagentControl) => Plugin[] {
   // 有哪些工具要到组装完成才知道，所以每次调用时再取
   return (control) => {
-    const { fs, web, mcp } = available();
+    const { fs, web, mcp, extensions } = available();
     const tools: Plugin = {
       id: "jade/tools-readonly",
       version: "0.1.0",
@@ -410,6 +449,27 @@ function subagent(
     // 大范围调研时读的文件多：没有压缩会撑爆上下文，前面的调研全部白做
     const compact = compactor({ provider: opts.provider, thresholdTokens: opts.compactTokens, id: "jade/compact-subagent" }).plugin;
     const steps = budget({ maxSteps: () => (control.wrapUp ? 1 : SUBAGENT_STEPS), id: "jade/budget-subagent" });
-    return [tools, ...(system.plugin ? [system.plugin] : []), pol.plugin, compact, steps];
+    // 第三方插件只带工具级的 hook（拦截、改写参数、给结果脱敏），子 Agent 读到的内容也经过它们；
+    // 不带它们的工具、提示词和 observe hook（例如按轮次触发的功能不该被子 Agent 触发）
+    const tooling = extensions
+      .map((p) => subsetPlugin(p, { tools: () => false, hooks: (h) => TOOL_HOOKS.has(h.point) }))
+      .filter((p) => p.hooks?.length);
+    return [tools, ...(system.plugin ? [system.plugin] : []), pol.plugin, compact, steps, ...tooling];
+  };
+}
+
+/** 插件上下文的 complete：用会话的 provider 发一次不带工具的请求 */
+function completer(provider: Provider): HostContext["complete"] {
+  const origin = { by: "plugin", id: "jade/extension" } as const;
+  return async (req, signal) => {
+    const res = await provider.complete(
+      {
+        system: req.system ? [{ text: req.system, stability: "stable", origin, trust: "trusted" }] : [],
+        messages: [{ role: "user", content: [{ kind: "text", text: req.prompt, origin, trust: "untrusted" }] }],
+        tools: [],
+      },
+      { signal, onDelta: req.onText && ((d) => void (d.kind === "text" && req.onText!(d.text))) },
+    );
+    return { text: res.content.flatMap((b) => (b.kind === "text" ? [b.text] : [])).join(""), model: res.model, usage: res.usage };
   };
 }

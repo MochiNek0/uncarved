@@ -16,6 +16,8 @@ import {
   type Key,
 } from "ink";
 import {
+  createContext,
+  useContext,
   useEffect,
   useReducer,
   useRef,
@@ -25,7 +27,7 @@ import {
 import stringWidth from "string-width";
 import wrapAnsi from "wrap-ansi";
 import { mentionAt, mentionText, rankPaths } from "../mentions.ts";
-import { edit, empty, layout, moveRow, offsetAt, type EditState } from "./editor.ts";
+import { charWidth, edit, empty, layout, moveRow, offsetAt, type EditState } from "./editor.ts";
 import { expandTabs, markdownStream, type MdLine } from "./markdown.ts";
 import {
   dim,
@@ -56,6 +58,8 @@ export interface TuiHandlers {
   files?(): Promise<string[]>;
   /** Shift+Tab：切换到下一个权限模式 */
   cycleMode?(): void;
+  /** 用户按 Esc 丢弃了输入框里的灰字建议 */
+  dismissSuggestion?(): void;
 }
 
 type Dialog =
@@ -88,6 +92,8 @@ interface UiState {
   queued: string[];
   dialogs: Dialog[];
   status: StatusInfo;
+  /** 插件预测的下一条消息，输入框里显示成灰字（见 ghostOf） */
+  suggestion?: string;
 }
 
 /** 对话最多保留这么多行（折行前），超出时丢掉最早的一段 */
@@ -367,9 +373,12 @@ export interface TuiOptions {
   io?: { stdin: NodeJS.ReadStream; stdout: NodeJS.WriteStream };
 }
 
-/** 开关鼠标事件上报（SGR 格式），用来接收滚轮和点击；开着时终端里选中文字要按住 Shift */
-const MOUSE_ON = "\x1b[?1000h\x1b[?1006h";
-const MOUSE_OFF = "\x1b[?1006l\x1b[?1000l";
+/**
+ * 开关鼠标事件上报（SGR 格式），用来接收滚轮、点击和按住左键拖动（1002）。
+ * 开着时终端自己不再处理点击，所以对话区的文字由 jade 自己选中和复制（见 Selection）
+ */
+const MOUSE_ON = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+const MOUSE_OFF = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 /**
  * 光标样式：闪烁的竖线（DECSCUSR 5，再加上 ATT610 的"开始闪烁"给只认它的终端），一眼能看出输入框有焦点；
  * 退出时还原成终端自己的默认样式。光标什么时候显示仍由 Ink 管（只有输入框或输入对话框有焦点时才显示）
@@ -447,11 +456,15 @@ export function tuiScreen(opts: TuiOptions): Screen {
     store.update({ live: rest || !all ? { text: rest, pending: md.pending() } : undefined });
   };
 
-  const ask = <T,>(dialog: Dialog) =>
+  /** signal 中止时关掉对话框，返回 undefined */
+  const ask = <T,>(dialog: Dialog, signal?: AbortSignal) =>
     new Promise<T>((resolve) => {
+      if (signal?.aborted) return resolve(undefined as T);
+      const close = () => d.resolve(undefined);
       const d = {
         ...dialog,
         resolve: (v: unknown) => {
+          signal?.removeEventListener("abort", close);
           store.update(
             { dialogs: store.state.dialogs.filter((x) => x !== d) },
             true,
@@ -459,6 +472,7 @@ export function tuiScreen(opts: TuiOptions): Screen {
           resolve(v as T);
         },
       } as Dialog;
+      signal?.addEventListener("abort", close, { once: true });
       store.update({ dialogs: [...store.state.dialogs, d] }, true);
     });
 
@@ -468,6 +482,7 @@ export function tuiScreen(opts: TuiOptions): Screen {
   const instance = render(
     <App
       store={store}
+      copy={(text) => stdout.write(osc52(text))}
       version={opts.version}
       commands={opts.commands}
       handlers={opts.handlers}
@@ -569,23 +584,32 @@ export function tuiScreen(opts: TuiOptions): Screen {
     queued(items) {
       store.update({ queued: [...items] });
     },
-    select: <T,>(title: string, choices: Choice<T>[], o?: { body?: string }) => {
-      if (longBusy()) notify(title);
-      return ask<T | undefined>({
-        kind: "select",
-        title,
-        body: o?.body,
-        choices: choices as Choice<unknown>[],
-        resolve: () => {},
-      });
+    suggest(text) {
+      store.update({ suggestion: text?.split("\n")[0]!.trim() || undefined });
     },
-    input: (title, o) =>
-      ask<string | undefined>({
-        kind: "input",
-        title,
-        ...o,
-        resolve: () => {},
-      }),
+    select: <T,>(title: string, choices: Choice<T>[], o?: { body?: string; signal?: AbortSignal }) => {
+      if (longBusy()) notify(title);
+      return ask<T | undefined>(
+        {
+          kind: "select",
+          title,
+          body: o?.body,
+          choices: choices as Choice<unknown>[],
+          resolve: () => {},
+        },
+        o?.signal,
+      );
+    },
+    input: (title, { signal, ...o } = {}) =>
+      ask<string | undefined>(
+        {
+          kind: "input",
+          title,
+          ...o,
+          resolve: () => {},
+        },
+        signal,
+      ),
     clear() {
       clearTimeout(thinking?.timer);
       thinking = undefined;
@@ -620,6 +644,103 @@ function mouseEvent(input: string): { button: number; press: boolean; x: number;
   return { button: Number(m[1]) & ~0b11100, press: m[4] === "M", x: Number(m[2]) - 1, y: Number(m[3]) - 1 };
 }
 const WHEEL_LINES = 3;
+/**
+ * 输入框里要显示的灰字：已经输入的是建议的开头、光标在末尾、没有打开补全菜单时，显示建议剩下的部分。
+ * 输入的和建议对不上时不显示，删回去对得上时又出现
+ */
+function ghostOf(suggestion: string | undefined, state: EditState, menu: boolean): string | undefined {
+  if (!suggestion || menu || state.cursor !== state.value.length || !suggestion.startsWith(state.value)) return undefined;
+  return suggestion.slice(state.value.length) || undefined;
+}
+
+/** 按住左键拖动时的按钮号（左键 0 加上移动位 32） */
+const DRAG = 32;
+/** "已复制"的提示显示多久 */
+const COPIED_MS = 2000;
+
+// ---------- 选中文字 ----------
+
+/** 对话区里的位置：row 是整个对话（已完成的加上正在输出的）的第几行，col 按显示宽度（中文占两列） */
+type Point = { row: number; col: number };
+/** anchor 是按下左键的位置，focus 是拖到的位置；两端都包含在内 */
+type Selection = { anchor: Point; focus: Point };
+
+const same = (a: Point, b: Point) => a.row === b.row && a.col === b.col;
+
+/** 第 row 行选中的列 [from, to)；这一行不在选区里时 undefined */
+function selectedCols(s: Selection, row: number): [number, number] | undefined {
+  const { anchor: a, focus: f } = s;
+  const [first, last] = a.row < f.row || (a.row === f.row && a.col <= f.col) ? [a, f] : [f, a];
+  if (row < first.row || row > last.row) return undefined;
+  return [row === first.row ? first.col : 0, row === last.row ? last.col + 1 : Infinity];
+}
+
+/** ANSI 转义序列（CSI，和以 BEL 或 ST 结束的 OSC，例如超链接） */
+const ANSI = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/y;
+const INVERSE = "\x1b[7m";
+const INVERSE_OFF = "\x1b[27m";
+
+/**
+ * 逐个走过一行里的字符：visit 收到每个字符和它是否落在列 [from, to) 里（宽字符跨进去一半也算）。
+ * 转义序列原样交给 escape
+ */
+function walk(line: string, from: number, to: number, visit: (ch: string, inside: boolean) => void, escape?: (seq: string) => void) {
+  let col = 0;
+  for (let i = 0; i < line.length; ) {
+    ANSI.lastIndex = i;
+    const m = ANSI.exec(line);
+    if (m) {
+      escape?.(m[0]);
+      i += m[0].length;
+      continue;
+    }
+    const ch = String.fromCodePoint(line.codePointAt(i)!);
+    const w = charWidth(ch);
+    visit(ch, col < to && col + Math.max(w, 1) > from);
+    col += w;
+    i += ch.length;
+  }
+}
+
+/** 给一行里选中的部分加上反色；中间的转义序列可能关掉反色，之后重新打开 */
+function highlight(line: string, from: number, to: number): string {
+  let out = "";
+  let on = false;
+  walk(
+    line,
+    from,
+    to,
+    (ch, inside) => {
+      if (inside !== on) out += inside ? INVERSE : INVERSE_OFF;
+      on = inside;
+      out += ch;
+    },
+    (seq) => (out += seq + (on ? INVERSE : "")),
+  );
+  return out + (on ? INVERSE_OFF : "");
+}
+
+/** 选中的纯文字：每行去掉行尾空白，用换行连起来（自动折行的地方也是换行） */
+function selectedText(s: Selection, row: (i: number) => string | undefined): string {
+  const lines: string[] = [];
+  const { anchor: a, focus: f } = s;
+  for (let r = Math.min(a.row, f.row); r <= Math.max(a.row, f.row); r++) {
+    const [from, to] = selectedCols(s, r)!;
+    let text = "";
+    walk(row(r) ?? "", from, to, (ch, inside) => void (inside && (text += ch)));
+    lines.push(text.trimEnd());
+  }
+  return lines.join("\n");
+}
+
+/** OSC 52：让终端把文字放进系统剪贴板（Windows Terminal、iTerm2、kitty、WezTerm 等支持） */
+const osc52 = (text: string) => `\x1b]52;c;${Buffer.from(text, "utf8").toString("base64")}\x07`;
+
+/**
+ * 输入框和对话框用：有选中的文字时 Ctrl+C 只取消选中（很多人选完习惯按 Ctrl+C 复制），
+ * 不中断模型、不清空输入、不取消对话框
+ */
+const SelectionContext = createContext<{ active(): boolean; clear(): void }>({ active: () => false, clear: () => {} });
 /** 终端矮于这么多行时标题只占一行 */
 const COMPACT_ROWS = 24;
 
@@ -632,12 +753,15 @@ const roomFor = (rows: number, max: number) =>
 
 function App({
   store,
+  copy,
   version,
   commands,
   handlers,
   history,
 }: {
   store: Store;
+  /** 把选中的文字放进剪贴板 */
+  copy(text: string): void;
   version: string;
   commands: CommandInfo[];
   handlers: TuiHandlers;
@@ -684,6 +808,31 @@ function App({
   ];
   const page = Math.max(1, view - 2);
 
+  // 选中文字：按下左键记下位置，拖动时更新，松开时复制；点一下（没拖动）还是展开或收起那一项。
+  // 几个事件可能在同一块输入里连着到达，来不及重画，所以另外用 ref 记着最新的值
+  const [selection, setSelectionState] = useState<Selection>();
+  const selected = useRef<Selection>(undefined);
+  const pressed = useRef<Point>(undefined);
+  const setSelection = (s: Selection | undefined) => {
+    selected.current = s;
+    setSelectionState(s);
+  };
+  const [selectionApi] = useState(() => ({ active: () => selected.current !== undefined, clear: () => setSelection(undefined) }));
+  // 宽度变了，行重新折过，原来的位置对不上了
+  useEffect(() => setSelection(undefined), [width]);
+  const rowAt = (i: number) => (i < done.length ? done[i] : live[i - done.length]);
+  // 复制之后在输入框下面提示一会儿
+  const [copied, setCopied] = useState<string>();
+  const copiedTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  useEffect(() => () => clearTimeout(copiedTimer.current), []);
+  const copySelection = (s: Selection) => {
+    const text = selectedText(s, rowAt);
+    copy(text);
+    clearTimeout(copiedTimer.current);
+    setCopied(`Copied ${[...text].length} characters to the clipboard`);
+    copiedTimer.current = setTimeout(() => setCopied(undefined), COPIED_MS);
+  };
+
   // Ink 增量渲染只用相对光标移动，第一帧起点一旦偏了（启动时终端尺寸还没稳定、窗口缩放、别的输出插进来），
   // 之后每帧都会画错行。启动后、尺寸变化后和按 Ctrl+L 时让一帧比终端高，Ink 会清屏从左上角整帧重画（包在同步输出里），下一帧再恢复
   const [redraws, setRedraws] = useState(0);
@@ -705,16 +854,34 @@ function App({
     if (key.ctrl && input === "o") return store.toggleLatest(start, view);
     const mouse = mouseEvent(input);
     if (mouse) {
+      // 对话区里的位置；clamp 时拖出对话区停在第一行或最后一行，否则在对话区外返回 undefined
+      const at = (clamp: boolean): Point | undefined => {
+        const i = mouse.y - top;
+        if (!clamp && (i < 0 || i >= shown.length)) return undefined;
+        return { row: start + Math.min(Math.max(i, 0), shown.length - 1), col: Math.max(0, mouse.x - 1) };
+      };
       if (mouse.button === 64) store.scrollBy(WHEEL_LINES, max);
       else if (mouse.button === 65) store.scrollBy(-WHEEL_LINES, max);
       else if (mouse.button === 0 && mouse.press) {
-        // 点在对话区里已经完成的输出上：展开或收起那一项
-        const i = mouse.y - top;
-        if (i >= 0 && i < shown.length && start + i < done.length)
-          store.toggle(start + i, start, view);
+        if (selected.current) setSelection(undefined);
+        pressed.current = at(false);
+      } else if (mouse.button === DRAG && pressed.current) {
+        setSelection({ anchor: pressed.current, focus: at(true)! });
+      } else if (mouse.button === 0 && !mouse.press && pressed.current) {
+        const p = pressed.current;
+        pressed.current = undefined;
+        const s = selected.current;
+        if (s && !same(s.anchor, s.focus)) copySelection(s);
+        else {
+          if (s) setSelection(undefined);
+          // 点在对话区里已经完成的输出上：展开或收起那一项
+          if (p.row < done.length) store.toggle(p.row, start, view);
+        }
       }
       return;
     }
+    // 按别的键取消选中；Ctrl+C 由输入框和对话框处理（见 SelectionContext）
+    if (selected.current && !(key.ctrl && input === "c")) setSelection(undefined);
     // 选择框自己用 PgUp/PgDn 翻选项
     if (dialog?.kind === "select") return;
     if (key.pageUp) store.scrollBy(page, max);
@@ -727,6 +894,7 @@ function App({
   // 重画那一帧上下各垫一行空白：终端把顶上那行滚出去后，看到的和平时逐行一样，所以不会闪。
   // 只做纵向裁剪：每行都已按宽度折好或截断，横向裁剪会让 Ink 每帧对每一行再切一遍 ANSI 字符串
   return (
+    <SelectionContext.Provider value={selectionApi}>
     <Box
       flexDirection="column"
       width={columns}
@@ -750,11 +918,14 @@ function App({
           overflowY="hidden"
           paddingX={1}
         >
-          {shown.map((l, i) => (
-            <Text key={i} wrap="truncate-end">
-              {l || " "}
-            </Text>
-          ))}
+          {shown.map((l, i) => {
+            const cols = selection && selectedCols(selection, start + i);
+            return (
+              <Text key={i} wrap="truncate-end">
+                {cols ? highlight(l || " ", ...cols) : l || " "}
+              </Text>
+            );
+          })}
           {scrolled ? (
             <Text dimColor wrap="truncate-end">
               {`── ↓ ${scroll} more lines · wheel / PgDn to scroll · ctrl+end to jump to the bottom ──`}
@@ -785,11 +956,18 @@ function App({
             busy={Boolean(state.busy)}
             active={!dialog}
             onSubmit={() => store.scrollBy(-max, max)}
+            flash={copied}
+            suggestion={state.suggestion}
+            onDismiss={() => {
+              store.update({ suggestion: undefined });
+              handlers.dismissSuggestion?.();
+            }}
           />
           <StatusBar status={state.status} width={Math.max(10, columns - 2)} />
         </Box>
       </Box>
     </Box>
+    </SelectionContext.Provider>
   );
 }
 
@@ -985,8 +1163,10 @@ function StatusBar({ status, width }: { status: StatusInfo; width: number }) {
           },
         ]
       : []),
+    // 插件的段落：比提示晚、比缓存早去掉
+    ...(status.plugins ?? []).map((p) => ({ text: p.text, dropAt: 7.5, dim: true })),
     {
-      text: "PgUp/PgDn scroll · click ▸ or ctrl+o to expand · shift+drag to select",
+      text: "PgUp/PgDn scroll · click ▸ or ctrl+o to expand · drag to select and copy",
       short: "ctrl+o to expand",
       shortAt: 10,
       dropAt: 9,
@@ -1090,9 +1270,12 @@ function EditableText({
   active,
   maxRows = Infinity,
   place,
+  ghost,
 }: {
   /** 每次渲染时写入文字的位置，点击换算光标用 */
   place?: { current: Placement };
+  /** 接在文字后面的灰字（光标在末尾时） */
+  ghost?: string;
   state: EditState;
   width: number;
   prefix: string;
@@ -1141,10 +1324,10 @@ function EditableText({
   return (
     <Box ref={ref} flexDirection="column">
       {active ? <CursorAt position={position} /> : null}
-      {state.value === "" && placeholder ? (
+      {state.value === "" && (ghost || placeholder) ? (
         <Text wrap="truncate-end">
           <Text color="cyan">{prefix}</Text>
-          <Text dimColor>{placeholder}</Text>
+          <Text dimColor>{ghost || placeholder}</Text>
         </Text>
       ) : (
         rows.map((r, i) => (
@@ -1157,6 +1340,7 @@ function EditableText({
                   : " ".repeat(prefix.length)}
             </Text>
             {r}
+            {ghost && first + i === all.rows.length - 1 ? <Text dimColor>{ghost}</Text> : null}
           </Text>
         ))
       )}
@@ -1192,6 +1376,9 @@ function Prompt({
   busy,
   active,
   onSubmit,
+  flash,
+  suggestion,
+  onDismiss,
 }: {
   commands: CommandInfo[];
   handlers: TuiHandlers;
@@ -1200,7 +1387,14 @@ function Prompt({
   active: boolean;
   /** 提交后对话区回到底部 */
   onSubmit(): void;
+  /** 临时显示在输入框右上角的提示（例如"已复制"） */
+  flash?: string;
+  /** 插件预测的下一条消息 */
+  suggestion?: string;
+  /** 按 Esc 丢弃建议 */
+  onDismiss(): void;
 }) {
+  const selection = useContext(SelectionContext);
   const [current, setState] = useLive<EditState>(empty);
   const [getSelected, setSelected] = useLive(0);
   const [getNotice, setNotice] = useLive<string | undefined>(undefined);
@@ -1401,6 +1595,7 @@ function Prompt({
 
   useInput(
     (input, key) => {
+      if (key.ctrl && input === "c" && selection.active()) return selection.clear();
       const search = getSearch();
       if (search) return searchKey(search, input, key);
       const state = current();
@@ -1408,6 +1603,14 @@ function Prompt({
         return history.current.length
           ? setSearch({ query: "", index: 0 })
           : undefined;
+      // 灰字建议：→ 或 Tab 接受全部，Ctrl+→（macOS 上 Option+→）接受一个词，Esc 丢弃
+      const ghost = ghostOf(suggestion, state, derive().menu > 0);
+      if (ghost) {
+        const take = (part: string) => set({ value: state.value + part, cursor: state.value.length + part.length });
+        if (key.escape) return onDismiss();
+        if ((key.rightArrow || key.tab) && !key.ctrl && !key.meta && !key.shift) return take(ghost);
+        if ((key.rightArrow && (key.ctrl || key.meta)) || (key.meta && input === "f")) return take(/^\s*\S+/.exec(ghost)![0]);
+      }
       if (key.ctrl && input === "c") {
         if (busy) return handlers.interrupt();
         if (state.value) return discard();
@@ -1516,6 +1719,7 @@ function Prompt({
         ) : (
           <EditableText
             state={state}
+            ghost={ghostOf(suggestion, state, derive().menu > 0)}
             width={Math.max(10, columns - 5)}
             prefix="› "
             placeholder={
@@ -1609,6 +1813,12 @@ function Prompt({
       ) : notice ? (
         <Text color="yellow"> {notice}</Text>
       ) : null}
+      {/* 压在输入框上边框的右边，不占行，出现和消失时下面的内容不跳 */}
+      {flash ? (
+        <Box position="absolute" top={0} right={2}>
+          <Text color="green"> {flash} </Text>
+        </Box>
+      ) : null}
     </Box>
   );
 }
@@ -1631,6 +1841,7 @@ function SelectDialog({
 }: {
   dialog: Extract<Dialog, { kind: "select" }>;
 }) {
+  const selection = useContext(SelectionContext);
   const [getSelected, setSelected] = useLive(0);
   const [getQuery, setQuery] = useLive("");
   const { rows, columns } = useScreenSize();
@@ -1657,6 +1868,7 @@ function SelectDialog({
       ? [...lines.slice(0, room - 1), dim(`… ${lines.length - room + 1} more lines`)]
       : lines;
   useInput((input, key) => {
+    if (key.ctrl && input === "c" && selection.active()) return selection.clear();
     const items = filtered();
     const n = items.length;
     const selected = Math.min(getSelected(), Math.max(0, n - 1));
@@ -1758,6 +1970,7 @@ function InputDialog({
 }: {
   dialog: Extract<Dialog, { kind: "input" }>;
 }) {
+  const selection = useContext(SelectionContext);
   const initial = dialog.initial ?? "";
   const [current, setState] = useLive<EditState>({
     value: initial,
@@ -1769,6 +1982,7 @@ function InputDialog({
     setState(edit.insert(current(), text.replace(/\r?\n/g, ""))),
   );
   useInput((input, key) => {
+    if (key.ctrl && input === "c" && selection.active()) return selection.clear();
     const state = current();
     if (key.return) return dialog.resolve(state.value.trim());
     if (key.escape || (key.ctrl && input === "c"))
