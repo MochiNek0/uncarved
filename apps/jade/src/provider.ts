@@ -363,8 +363,10 @@ export async function providerFromEnv(env: Env = process.env): Promise<Provider>
       const all = [...PROVIDER_KINDS, ...plugged.keys()];
       throw new Error(`JADE_PROVIDER must be one of ${all.join(", ")}, got ${JSON.stringify(kind)} (no plugin provides it)`);
     }
-    // 限速、空闲超时这些 jade 自己的设置写错时同样在这里报错
+    // 限速、空闲超时这些 jade 自己的设置写错时同样在这里报错。空闲超时只对 OpenAI 和 OpenAI 兼容服务生效（见 README），
+    // 插件的服务要用的话自己从 env 读
     rpmFromEnv(env);
+    idleTimeoutFromEnv(env);
     const made = await found.def.create(env);
     if (!made || typeof made.complete !== "function") throw new Error(`plugin ${found.plugin}: provider ${kind} must return an object with a complete function`);
     return made;

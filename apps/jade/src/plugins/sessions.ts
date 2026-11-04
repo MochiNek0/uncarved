@@ -2,10 +2,12 @@
 // 它们只用第三方插件也拿得到的接口（插件上下文的 checkpoints，命令上下文的 session、ui、note），
 // 停用或代替这两个内置插件时命令一起消失。
 
+import path from "node:path";
 import type { JadePlugin, JadePluginContext, PluginCommand, SessionControl } from "./loader.ts";
 import { ago, matchSession } from "../sessions.ts";
 import { lastTurnChanges, UNDO_KEY, type Checkpoint, type UndoState } from "../tools/checkpoint.ts";
 import { display } from "../tools/fs.ts";
+import { realPath } from "./prompts.ts";
 import { dim, green } from "../ui/screen.ts";
 
 /** 命令要的 session 不在（instant 命令或宿主没给）时的错误 */
@@ -72,11 +74,15 @@ export function undoPlugin({ checkpoints, cwd }: Pick<JadePluginContext, "checkp
       const files = new Map<string, Checkpoint>();
       for (const cp of cps) files.set(cp.path, cp);
       // 只有最新一次写入之后的内容能和文件现在的样子比较
+      // cwd 是解析过符号链接的；jade/fs 记下的路径没解析过。恢复前就算好显示的名字：恢复时会删掉 agent 新建的文件
+      // 文件可能已经不在了（agent 删掉的）：解析它所在的目录
+      const shown = new Map([...files.keys()].map((p) => [p, display(cwd, path.join(realPath(path.dirname(p)), path.basename(p)))]));
+      const show = (p: string) => shown.get(p) ?? display(cwd, p);
       const latest = new Map<string, Checkpoint>();
       for (const cp of cps) if (!latest.has(cp.path)) latest.set(cp.path, cp);
       const changed: string[] = [];
-      for (const cp of latest.values()) if (!(await checkpoints.unchangedSince(cp))) changed.push(display(cwd, cp.path));
-      const list = [...files.values()].map((cp) => `  ${cp.before === null ? "delete " : "restore"} ${display(cwd, cp.path)}`).join("\n");
+      for (const cp of latest.values()) if (!(await checkpoints.unchangedSince(cp))) changed.push(show(cp.path));
+      const list = [...files.values()].map((cp) => `  ${cp.before === null ? "delete " : "restore"} ${show(cp.path)}`).join("\n");
       if (files.size > 1 || changed.length > 0) {
         const ok = await ui.select(
           changed.length > 0
@@ -93,7 +99,7 @@ export function undoPlugin({ checkpoints, cwd }: Pick<JadePluginContext, "checkp
       for (const cp of cps) await checkpoints.restore(cp);
       await s.record(UNDO_KEY, { undone: [...undone, ...cps.map((c) => c.toolUseId)] } satisfies UndoState);
       const what = [...files.values()].map((cp) =>
-        cp.before === null ? `deleted ${display(cwd, cp.path)} (you had created it)` : `restored ${display(cwd, cp.path)} to its content before your changes`,
+        cp.before === null ? `deleted ${show(cp.path)} (you had created it)` : `restored ${show(cp.path)} to its content before your changes`,
       );
       note(`The user undid your changes from your last turn: ${what.join("; ")}. Read these files again before changing them.`);
       return green(`Undid ${cps.length} change${cps.length > 1 ? "s" : ""} from the last turn:`) + "\n" + dim(list);

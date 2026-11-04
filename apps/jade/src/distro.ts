@@ -508,6 +508,11 @@ function accept(made: { source: LoadedPlugin; plugin: JadePlugin }[], existing: 
       rejected.push(`${where} is skipped: another plugin already has the id ${m.plugin.id}`);
       continue;
     }
+    // jade、jade/… 留给内置插件：会话里记的键按 id 划分（jade/undo 的撤销记录等），代替内置插件用 replaces，不用它的 id
+    if (m.plugin.id === "jade" || m.plugin.id.startsWith("jade/")) {
+      rejected.push(`${where} is skipped: the id ${m.plugin.id} is reserved for jade's built-in plugins (use replaces to stand in for one)`);
+      continue;
+    }
     const clash = (m.plugin.tools ?? []).find((t) => toolNames.has(t.name));
     if (clash) {
       rejected.push(`${where} is skipped: tool ${clash.name} already exists`);

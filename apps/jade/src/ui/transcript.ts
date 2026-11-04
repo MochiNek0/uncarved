@@ -9,7 +9,7 @@ import type { TaskProgress } from "../tools/task.ts";
 import { renderTodos, type Todo } from "../tools/todo.ts";
 import type { ToolRenderer } from "../plugins/loader.ts";
 import type { PendingCall } from "uncarved";
-import { clip, detailsOf, preview, summarize } from "./render.ts";
+import { clip, clipStyled, detailsOf, preview, summarize } from "./render.ts";
 import { bold, cyan, dim, green, red, yellow, type Screen } from "./screen.ts";
 
 export type Notice = Parameters<Parameters<Runtime["subscribe"]>[0]>[0];

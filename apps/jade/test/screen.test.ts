@@ -57,3 +57,24 @@ test("safeScreen filters every piece of text before it reaches the screen", asyn
   expect(seen).toContainEqual(["status", { plugins: [{ plugin: "p", text: "ab" }], branch: "ab" }]);
   expect(seen).toContainEqual(["select", "ab", [{ label: "ab", value: 1, hint: "ab" }], { body: "ab" }]);
 });
+
+test("safeScreen keeps escape sequences that are split across stream chunks, and a lone CR in the input box is a line break", () => {
+  const seen: unknown[] = [];
+  const rec = (name: string) => (...args: unknown[]) => void seen.push([name, ...args]);
+  const inner = { interactive: true, stream: rec("stream"), endStream: rec("endStream"), draft: { text: () => "", insert: rec("insert"), set: rec("set") } } as unknown as Screen;
+  const s = safeScreen(inner);
+  s.stream("text", "a\x1b[3");
+  s.stream("text", "1mred");
+  // 拆开的清屏序列也整个去掉，不留下 [2J
+  s.stream("text", "b\x1b");
+  s.stream("text", "[2Jc");
+  // 到结束都没写完的丢掉
+  s.stream("text", "d\x1b]0;tit");
+  s.endStream();
+  s.stream("text", "e");
+  expect(seen).toEqual([["stream", "text", "a"], ["stream", "text", "\x1b[31mred"], ["stream", "text", "b"], ["stream", "text", "c"], ["stream", "text", "d"], ["endStream"], ["stream", "text", "e"]]);
+  seen.length = 0;
+  s.draft!.set("line1\rline2");
+  s.draft!.insert("x\r\ny");
+  expect(seen).toEqual([["set", "line1\nline2"], ["insert", "x\ny"]]);
+});

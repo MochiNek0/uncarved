@@ -236,6 +236,8 @@ const bundled = (pick: (b: PluginBundle) => string[]) =>
 
 /** 自定义命令（$JADE_HOME/commands、.jade/commands、插件带的 commands/）；和内置命令同名的不生效 */
 const builtinNames = new Set([...COMMANDS.map((c) => c.name), ...BUILTIN_PLUGIN_COMMANDS]);
+/** 宿主自己处理的命令（/help、/model 等）：插件的同名命令永远不生效 */
+const hostNames = new Set(COMMANDS.map((c) => c.name));
 const customLoaded = await loadCommands({ home, root: repo, cwd: realPath(cwd), plugins: bundled((b) => b.commands) });
 const shadowed = customLoaded.filter((c) => builtinNames.has(c.name));
 const customs = new Map(customLoaded.filter((c) => !builtinNames.has(c.name)).map((c) => [c.name, c]));
@@ -446,10 +448,23 @@ if (!hasProvider()) {
     provider.set(retrying(await providerFromEnv()));
     contextWindow = contextWindowFromEnv();
   } catch (err) {
-    await closePlugins();
-    await screen.close();
-    // 例如提供这个服务的插件没加载成功：原因在插件的警告里（终端界面已经关了，写进错误信息）
-    fail([errorText(err), ...jade.warnings.map((w) => `[warning] ${w}`)].join("\n"));
+    // 例如提供这个服务的插件被删掉、停用或者没加载成功：原因在插件的警告里。
+    // 终端界面里直接进 /model 换一个服务，不然用户只能手改 .env
+    // 插件的警告在下面重新创建插件之后显示
+    if (tui) {
+      screen.log(red(`[error] ${errorText(err)}`));
+      screen.log("Choose another model with /model.");
+      if (!(await configure.provider())) {
+        await closePlugins();
+        await screen.close();
+        process.exit(2);
+      }
+    } else {
+      await closePlugins();
+      await screen.close();
+      // 终端界面已经关了，警告写进错误信息
+      fail([errorText(err), ...jade.warnings.map((w) => `[warning] ${w}`)].join("\n"));
+    }
   }
   screen.status({ model: modelLabel() });
 }
@@ -476,8 +491,10 @@ for (const [name, { plugin, command: c, builtin }] of jade.commands) {
     builtinPluginCommands.push({ name: c.name, args: c.args, about: c.description ?? "" });
     continue;
   }
-  if (builtinNames.has(name) || customs.has(name) || skillCommands.has(name)) {
-    const what = builtinNames.has(name) ? "a built-in command" : customs.has(name) ? "a custom command" : "a skill";
+  // 内置插件的命令名（/clear、/undo…）在 jade.commands 里内置插件优先：这里还是第三方的，说明那个内置插件被代替或停用了，
+  // 第三方插件可以提供它
+  if (hostNames.has(name) || customs.has(name) || skillCommands.has(name)) {
+    const what = hostNames.has(name) ? "a built-in command" : customs.has(name) ? "a custom command" : "a skill";
     screen.log(yellow(`[warning] command /${c.name} of plugin ${plugin} is ignored: ${what} has that name`));
     continue;
   }
@@ -853,8 +870,8 @@ function skillMessage(name: string, args: string): string {
   return `Use the "${name}" skill${args.trim() ? ` for this: ${args.trim()}` : "."}`;
 }
 
-/** 正在执行的插件命令；esc 中断它 */
-let commandAbort: AbortController | undefined;
+/** 正在执行的插件命令；esc 中断它们。instant 的命令可以在另一个命令的模型回合里执行，所以可能同时有几个 */
+const commandAborts = new Set<AbortController>();
 /** 插件命令经 session 发起的换会话、重试：命令被 esc 中断后也要等它收尾，再处理下一条输入 */
 let sessionWork: Promise<unknown> | undefined;
 
@@ -866,7 +883,7 @@ async function pluginCommand(name: string, args: string): Promise<string | undef
     return undefined;
   }
   const ac = new AbortController();
-  commandAbort = ac;
+  commandAborts.add(ac);
   try {
     const result = await abortable(
       Promise.resolve(
@@ -906,9 +923,12 @@ async function pluginCommand(name: string, args: string): Promise<string | undef
     if (!ac.signal.aborted) screen.log(red(`[error] /${found.command.name} (plugin ${found.plugin}): ${errorText(err)}`));
     return undefined;
   } finally {
-    await sessionWork?.catch(() => {});
-    sessionWork = undefined;
-    if (commandAbort === ac) commandAbort = undefined;
+    // instant 的命令没有 session，不会发起 sessionWork；运行中的是别的命令发起的，不能替它等、替它清掉
+    if (!found.command.instant) {
+      await sessionWork?.catch(() => {});
+      sessionWork = undefined;
+    }
+    commandAborts.delete(ac);
   }
 }
 
@@ -1023,7 +1043,7 @@ function interrupt() {
   const again = interruptPending || Date.now() - interruptedAt < SECOND_ESC_MS;
   interruptedAt = Date.now();
   interruptPending = true;
-  commandAbort?.abort(new Error("interrupted by user"));
+  for (const ac of commandAborts) ac.abort(new Error("interrupted by user"));
   rt.abort("interrupted by user");
   screen.busy("Interrupting");
   if (queue.length === 0) return;
@@ -1458,7 +1478,7 @@ function instantPlugin(name: string): boolean {
   const found = jade.commands.get(n);
   if (!found?.command.instant) return false;
   if (found.builtin) return true;
-  return !builtinNames.has(n) && !customs.has(n) && !skillCommands.has(n);
+  return !hostNames.has(n) && !customs.has(n) && !skillCommands.has(n);
 }
 
 async function pump() {
@@ -1531,7 +1551,7 @@ if (tui) {
   const custom = name !== undefined ? customs.get(name) : undefined;
   await occupy(async () => {
     const skill = name !== undefined && !custom ? skillCommands.get(name) : undefined;
-    const text = custom ? expandCommand(custom, args) : skill ? skillMessage(skill.name, args) : name !== undefined && !builtinNames.has(name) && jade.commands.has(name) ? await pluginCommand(name, args) : first;
+    const text = custom ? expandCommand(custom, args) : skill ? skillMessage(skill.name, args) : name !== undefined && !hostNames.has(name) && jade.commands.has(name) && !jade.commands.get(name)!.builtin ? await pluginCommand(name, args) : first;
     if (text) await (name === undefined ? sendTyped(text) : say(text));
   });
   await leave();
