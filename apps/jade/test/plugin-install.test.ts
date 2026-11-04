@@ -58,7 +58,8 @@ describe("jade plugin add / update / remove", () => {
     const r = await addPlugin("./src", { pluginsDir, cwd: work });
     expect(r.name).toBe("hello-plugin");
     expect(r.info.kind).toBe("module");
-    expect(await readdir(r.dir)).toEqual(["index.ts", "plugin.json"]);
+    // readdir 在 Linux、macOS 上不按名字排序
+    expect((await readdir(r.dir)).sort()).toEqual(["index.ts", "plugin.json"]);
     expect((await readRecords(pluginsDir))["hello-plugin"]).toMatchObject({ kind: "local", source: src, version: "1.0.0" });
     // 没有留下临时目录
     expect((await readdir(pluginsDir)).filter((n) => n.startsWith(".staging"))).toEqual([]);

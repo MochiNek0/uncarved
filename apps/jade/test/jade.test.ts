@@ -360,10 +360,10 @@ describe("fs tools", () => {
   test("coreutils are on PATH (Git Bash on Windows is started without its launcher)", async () => {
     const { cwd } = await workspace();
     const shell = shellTools({ cwd });
-    const r = await shell.run!("echo hi | cat | grep -c hi; find --version | head -1", { timeoutMs: 20_000 });
+    // -maxdepth 是 Unix 的 find 才有的（GNU 和 macOS 的 BSD find 都有）：Windows 自带的 find.exe 会报参数格式错
+    const r = await shell.run!("echo hi | cat | grep -c hi; find . -maxdepth 0", { timeoutMs: 20_000 });
     expect(r.code).toBe(0);
-    expect(r.output).toStartWith("1\n");
-    expect(r.output).toContain("GNU findutils");
+    expect(r.output.trim()).toBe("1\n.");
   }, 30_000);
 
   test("background shells return at once; bash_output reads new output; kill_shell stops them", async () => {
@@ -1151,7 +1151,8 @@ describe("jade session", () => {
     git("add", ".");
     git("commit", "-q", "-m", "two");
     expect(line(await system())).toEndWith("… (7 more)");
-  });
+    // 要跑好几次 git：Windows 的 CI 上超过默认的 5 秒
+  }, 30_000);
 
   test("the system prompt names the configured model, read on every request", async () => {
     const { cwd, home } = await workspace();
