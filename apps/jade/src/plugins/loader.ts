@@ -386,7 +386,7 @@ export interface LoadedPlugin extends FoundPlugin {
   /** 创建一套实例，每个会话调用一次；进程外插件只有一个进程，每次返回同一个对象。只有内容的插件没有 */
   create?(host: HostContext): Promise<JadePlugin>;
   /**
-   * 用户层插件模块导出的模型服务（export const providers），用 JADE_PROVIDER=<kind> 选择。
+   * 插件模块导出的模型服务（export const providers），用 JADE_PROVIDER=<kind> 选择；只认用户层的，项目层的读出来只为提示。
    * 不属于哪套插件实例：加载时就读到，启动时注册一次，所有会话共用。还没检查，见 collectProviders
    */
   providers?: unknown;
@@ -488,7 +488,12 @@ export async function loadPlugin(found: FoundPlugin & { info?: PluginInfo }, opt
   if (found.layer === "project") {
     // 内核负责：先哈希整个目录、确认，再 import；检查 import 不越出插件目录
     const make = await loadProjectPluginFactory(found.dir, { trust: opts.trust, confirm: opts.confirm, entry });
-    return { ...base, kind: "module", entry, info, create: async (host) => (await make(ctx(host))) as JadePlugin };
+    // 内核刚 import 过入口模块：用和它相同的 URL 再 import 只取缓存，不会再执行。
+    // 项目层插件导出的 providers 不认，读出来是为了提示用户（见 collectProviders），而不是静默忽略
+    const root = path.resolve(found.dir);
+    const rel = path.relative(root, path.resolve(root, entry)).split(path.sep).join("/");
+    const mod = (await import(pathToFileURL(path.join(root, rel)).href)) as { providers?: unknown };
+    return { ...base, kind: "module", entry, info, providers: mod.providers, create: async (host) => (await make(ctx(host))) as JadePlugin };
   }
 
   const file = path.resolve(found.dir, entry);

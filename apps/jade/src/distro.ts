@@ -13,7 +13,7 @@ import { Memory, memoryTool } from "./memory.ts";
 import { mcpTools, type McpClient } from "./mcp.ts";
 import { skillTool, skillsPrompt, type Skill } from "./skills.ts";
 import { compactor, type Compactor } from "./plugins/compact.ts";
-import { COMMAND_NAME, DISPOSE_TIMEOUT_MS, JADE_VERSION, KEY_SPEC, RESERVED_KEYS, type HostContext, type InputControl, type PluginKey, type ToolRenderer, type JadePlugin, type LoadedPlugin, type PluginCommand, type PluginProvider, type Responder, type Suggester } from "./plugins/loader.ts";
+import { COMMAND_NAME, DISPOSE_TIMEOUT_MS, JADE_VERSION, KEY_SPEC, RESERVED_KEYS, type HostContext, type InputControl, type PluginKey, type ToolRenderer, type JadePlugin, type LoadedPlugin, type PluginCommand, type Responder, type Suggester } from "./plugins/loader.ts";
 import { policy, type AllowRule, type Mode, type Policy, type PolicyOptions } from "./plugins/policy.ts";
 import { prompts, realPath, repoRoot } from "./plugins/prompts.ts";
 import { repeats } from "./plugins/repeats.ts";
@@ -27,7 +27,7 @@ import { askUserTool, type AskUser } from "./tools/ask.ts";
 import { webTools } from "./tools/web.ts";
 import { screenshotTool } from "./tools/screenshot.ts";
 import { askRenderers, fsRenderers, memoryRenderers, shellRenderers, taskRenderers, todoRenderers, webRenderers } from "./ui/renderers.ts";
-import { PROVIDER_KIND, SETTING_ENV, visionFromEnv, type ProviderSetting } from "./provider.ts";
+import { visionFromEnv } from "./provider.ts";
 
 const READ_ONLY = new Set(["read_file", "list_dir", "glob", "grep"]);
 /** 子 Agent 也执行的第三方插件 hook */
@@ -491,7 +491,6 @@ async function createExtensions(sources: LoadedPlugin[], host: HostContext, warn
   return out;
 }
 
-/** 插件服务的配置项：格式不对、用了 jade 自己的变量、重复、第二个 model 的跳过并警告 */
 /**
  * 调用第三方插件实例的 dispose，限时 DISPOSE_TIMEOUT_MS；返回要告诉用户的问题，没有时 undefined。
  * 进程外插件的进程在会话之间共用，不在这里结束（见 LoadedPlugin.close）
@@ -511,52 +510,6 @@ async function disposeInstance(source: LoadedPlugin, plugin: JadePlugin): Promis
   } finally {
     clearTimeout(timer);
   }
-}
-
-/**
- * 插件模块导出的模型服务（LoadedPlugin.providers）：检查后返回要注册的服务和要告诉用户的问题。
- * 只认用户层插件：服务能看到全部对话和 API key。不用创建插件实例，所以宿主可以先注册服务、配置好模型，再创建插件
- */
-export function collectProviders(sources: LoadedPlugin[]): { providers: { plugin: string; def: PluginProvider }[]; warnings: string[] } {
-  const warnings: string[] = [];
-  const providers = sources.flatMap((source) => {
-    if (source.providers === undefined) return [];
-    const where = `plugin ${source.id} (${source.layer})`;
-    if (source.layer === "project") {
-      warnings.push(`${where}: providers are ignored: only user plugins can provide model services`);
-      return [];
-    }
-    if (!Array.isArray(source.providers)) {
-      warnings.push(`${where}: providers is ignored: it must be an array`);
-      return [];
-    }
-    return (source.providers as PluginProvider[])
-      .filter((d) => {
-        const ok = d && typeof d.kind === "string" && PROVIDER_KIND.test(d.kind) && typeof d.model === "function" && typeof d.create === "function";
-        if (!ok) warnings.push(`${where}: provider ${JSON.stringify(d?.kind)} is ignored: it needs a kind of letters, digits, - and _, and model and create functions`);
-        else if (d.settings !== undefined) d.settings = providerSettings(d.settings, `${where}: provider ${d.kind}`, warnings);
-        return ok;
-      })
-      .map((def) => ({ plugin: source.id, def }));
-  });
-  return { providers, warnings };
-}
-
-function providerSettings(raw: unknown, where: string, warnings: string[]): ProviderSetting[] {
-  if (!Array.isArray(raw)) {
-    warnings.push(`${where}: settings are ignored: they must be an array`);
-    return [];
-  }
-  const out: ProviderSetting[] = [];
-  for (const x of raw as Partial<ProviderSetting>[]) {
-    const env = x?.env;
-    if (typeof env !== "string" || !SETTING_ENV.test(env) || env.startsWith("JADE_") || typeof x.label !== "string") {
-      warnings.push(`${where}: setting ${JSON.stringify(env)} is ignored: it needs an env name of capital letters, digits and _ (not JADE_…) and a label`);
-    } else if (out.some((o) => o.env === env)) warnings.push(`${where}: setting ${env} is ignored: it is listed twice`);
-    else if (x.model && out.some((o) => o.model)) warnings.push(`${where}: setting ${env} is ignored: only one setting can be the model`);
-    else out.push(x as ProviderSetting);
-  }
-  return out;
 }
 
 /** 按顺序检查第三方插件的 id 和工具名不和已有的（留下的内置插件、排在前面的第三方插件）重复 */
