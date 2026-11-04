@@ -161,6 +161,13 @@ describe("jade plugin CLI", () => {
     expect(text).toMatch(/jade\/policy .* required/);
     expect(text).toMatch(/x\/hello \(hello\/\) 1\.0\.0 module .* disabled/);
     expect(text).toContain("copied by hand");
+    // 代替关系从清单读出来，不用执行代码
+    await files(path.join(home, "plugins", "web"), { "index.js": "throw new Error('must not run');", "plugin.json": JSON.stringify({ id: "me/web", version: "1.0.0", replaces: ["jade/fs", "jade/web"] }) });
+    out.length = 0;
+    expect(await pluginCli(["list"], o)).toBe(0);
+    expect(plain()).toMatch(/jade\/fs .* replaced by me\/web/);
+    expect(plain()).toMatch(/jade\/web .* disabled/);
+    expect(plain()).toContain("replaces: jade/fs, jade/web");
     // 卸载时一起去掉它的停用记录
     expect(await pluginCli(["remove", "hello"], o)).toBe(0);
     expect((await readPluginSettings(home)).disabled).toEqual(["jade/web"]);
@@ -250,14 +257,15 @@ describe("plugins that carry skills, commands and MCP servers", () => {
 
 describe("built-in plugins", () => {
   const provider: Provider = { id: "none", complete: () => Promise.reject(new Error("unused")) };
-  const fakePlugin = (name: string, plugin: { id: string }): LoadedPlugin => ({
+  /** replaces 写在清单里（info），其余的是实例 */
+  const fakePlugin = (name: string, { replaces, ...plugin }: { id: string; replaces?: string[] } & Record<string, unknown>): LoadedPlugin => ({
     name,
     id: plugin.id,
     dir: path.join(os.tmpdir(), name),
     layer: "user",
     kind: "module",
     entry: "index.ts",
-    info: { kind: "module", entry: "index.ts", json: {}, bundle: { skills: [], commands: [], unsupported: [] } },
+    info: { kind: "module", entry: "index.ts", replaces, json: { id: plugin.id, replaces }, bundle: { skills: [], commands: [], unsupported: [] } },
     create: async () => ({ version: "1.0.0", kernel: "^0.1", ...plugin }) as never,
   });
   const tool = (name: string) => ({
@@ -350,6 +358,32 @@ describe("built-in plugins", () => {
     expect(jade.warnings.join("\n")).toContain("tool read_file already exists");
     // 能用这个清单创建运行时：没有重复的 id 和工具名
     await Runtime.create({ store: new MemoryLogStore(), provider, plugins: jade.plugins });
+    jade.shutdown();
+  });
+
+  test("replaces is read from plugin.json without running code; on the instance it is ignored", async () => {
+    const work = await tmp("jade-replaces-");
+    const write = async (name: string, json: unknown, code = true) =>
+      files(path.join(work, name), { "plugin.json": JSON.stringify(json), ...(code ? { "index.js": "throw new Error('must not run');" } : { "skills/x/SKILL.md": "---\nname: x\ndescription: d\n---\n" }) });
+    await write("ok", { id: "me/web", version: "1.0.0", replaces: ["jade/web"] });
+    await write("bad", { id: "me/bad", replaces: "jade/web" });
+    await write("content", { id: "me/kit", replaces: ["jade/skills"] }, false);
+    expect((await inspectPlugin(path.join(work, "ok"))).replaces).toEqual(["jade/web"]);
+    await expect(inspectPlugin(path.join(work, "bad"))).rejects.toThrow('"replaces" must be an array of built-in plugin ids');
+    await expect(inspectPlugin(path.join(work, "content"))).rejects.toThrow('"replaces" needs a plugin with code');
+
+    // 实例上写的 replaces 不算：jade/web 照常加载，并提示写到 plugin.json 里
+    const cwd = await tmp("jade-replaces-cwd-");
+    const jade = await createJade({
+      cwd,
+      home: cwd,
+      store: new MemoryLogStore(),
+      provider,
+      env: {},
+      extensions: [{ ...fakePlugin("old", { id: "me/old" }), create: async () => ({ id: "me/old", version: "1.0.0", kernel: "^0.1", replaces: ["jade/web"] }) as never }],
+    });
+    expect(jade.builtins.find((b) => b.id === "jade/web")).toMatchObject({ state: "on" });
+    expect(jade.warnings).toContain('plugin me/old (user): replaces is ignored: write it in plugin.json instead ("replaces": ["jade/…"])');
     jade.shutdown();
   });
 });

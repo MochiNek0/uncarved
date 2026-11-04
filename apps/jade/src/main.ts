@@ -946,7 +946,7 @@ function showPlugins() {
     if (hooks.length) lines.push(`  hooks     ${hooks.join(", ")}`);
     if (cmds.length) lines.push(`  commands  ${cmds.join(", ")}`);
     if (keys.length) lines.push(`  keys      ${keys.map((k) => k.key).join(", ")}`);
-    if (plugin.replaces?.length) lines.push(`  replaces  ${plugin.replaces.join(", ")}`);
+    if (source.info.replaces?.length) lines.push(`  replaces  ${source.info.replaces.join(", ")}`);
     if (carried(source.info.bundle)) lines.push(`  carries   ${carried(source.info.bundle)}`);
     if (exit && source.process!.stderr.length) lines.push(dim(source.process!.stderr.map((l) => `  │ ${clip(l, 200)}`).join("\n")));
   }

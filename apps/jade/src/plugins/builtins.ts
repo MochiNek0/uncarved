@@ -1,6 +1,6 @@
 // jade 自带的插件。内核之外的功能都以插件的形式提供，和第三方插件用同一套接口：
 // 每个都可以在 $JADE_HOME/plugins.json 里停用（jade plugin disable <id>），
-// 或者由第三方插件用 replaces 代替。jade/policy 负责审批，不能停用或代替，第三方插件只能用 gate hook 让它更严格。
+// 或者由第三方插件在 plugin.json 里用 replaces 代替。jade/policy 负责审批，不能停用或代替，第三方插件只能用 gate hook 让它更严格。
 
 export interface BuiltinInfo {
   id: string;
