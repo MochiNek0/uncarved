@@ -21,6 +21,10 @@ import { projectDirs } from "../commands.ts";
 import type { RunCommand } from "../tools/shell.ts";
 import type { Question } from "../tools/ask.ts";
 import type { Checkpoint } from "../tools/checkpoint.ts";
+import type { ProviderDef } from "../provider.ts";
+
+/** 插件提供的模型服务，见 provider.ts 的 ProviderDef */
+export type PluginProvider = ProviderDef;
 
 export const JADE_VERSION: string = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")).version;
 
@@ -196,6 +200,11 @@ export interface JadePlugin extends Plugin {
   responder?: Responder;
   /** 见 Suggester；多个插件都提供时只用第一个 */
   suggest?: Suggester;
+  /**
+   * 模型服务，用 JADE_PROVIDER=<kind> 选择。只认用户层插件（服务能看到全部对话和 API key）；
+   * 只在启动时读一次，之后的会话共用，所以不要依赖按会话的状态
+   */
+  providers?: PluginProvider[];
   /**
    * 用户输入的消息发给模型之前（斜杠命令、宿主自己发的话不经过）：返回新的文字代替原文，返回 undefined 不改，
    * 返回空字符串不发送。多个插件按加载顺序依次处理；改动会在对话里提示用户

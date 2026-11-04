@@ -182,6 +182,75 @@ export const PROVIDER_KINDS: readonly ProviderKind[] = ["openai-compat", "openai
 
 type Env = Record<string, string | undefined>;
 
+export const isBuiltinKind = (kind: string): kind is ProviderKind => (PROVIDER_KINDS as readonly string[]).includes(kind);
+
+/** 插件提供的模型服务（JadePlugin.providers），用 JADE_PROVIDER=<kind> 选择 */
+export interface ProviderDef {
+  /** JADE_PROVIDER 的值：字母、数字、-、_，不能和内置的 openai-compat、openai、anthropic 重名 */
+  kind: string;
+  /** 当前配置的模型名（状态栏、/model 显示，上下文窗口按它推断）；env 是 jade 的环境变量（含 $JADE_HOME/.env） */
+  model(env: Env): string;
+  /** 系统提示词里告诉模型它经什么服务运行，例如 "the Foo API at api.foo.com"；不给时是 "the <kind> provider" */
+  via?(env: Env): string;
+  /** 按 env 创建 Provider（uncarved 的接口）；缺配置时抛错，信息直接显示给用户。jade 在外面包一层重试和限速 */
+  create(env: Env): Provider | Promise<Provider>;
+  /** /model 里列出可选的模型；不给时 /model 不能列出模型 */
+  listModels?(env: Env): Promise<string[]>;
+  /** 服务的配置项：/model 添加这个服务时依次询问，写进 $JADE_HOME/.env；不给时只能手动写 .env */
+  settings?: ProviderSetting[];
+}
+
+/** 插件服务的一个配置项，对应一个环境变量 */
+export interface ProviderSetting {
+  /** 环境变量名，大写字母、数字、_，例如 "FOO_API_KEY"；不能是 JADE_ 开头的 */
+  env: string;
+  /** /model 里显示的名字，例如 "API key" */
+  label: string;
+  /** 输入时遮住（密钥）；留空时沿用已有的值 */
+  secret?: boolean;
+  /** 这一项是模型名：/model 从 listModels 里选、换模型时只改它。最多一项 */
+  model?: boolean;
+  /** 不能为空 */
+  required?: boolean;
+  /** 输入框里的提示文字 */
+  placeholder?: string;
+}
+
+export const SETTING_ENV = /^[A-Z][A-Z0-9_]*$/;
+
+export const PROVIDER_KIND = /^[a-z0-9][a-z0-9_-]*$/i;
+
+/** 插件注册的服务；只在启动时注册一次，整个进程共用 */
+const plugged = new Map<string, { plugin: string; def: ProviderDef }>();
+
+/** 注册插件提供的服务；返回要告诉用户的问题（名字不合法、和内置的或先注册的重名） */
+export function registerProviders(list: { plugin: string; def: ProviderDef }[]): string[] {
+  const warnings: string[] = [];
+  for (const { plugin, def } of list) {
+    const kind = def.kind;
+    const taken = plugged.get(kind);
+    if (isBuiltinKind(kind)) warnings.push(`plugin ${plugin}: provider ${kind} is ignored: it is a built-in provider`);
+    else if (taken) warnings.push(`plugin ${plugin}: provider ${kind} is ignored: plugin ${taken.plugin} already provides it`);
+    else plugged.set(kind, { plugin, def });
+  }
+  return warnings;
+}
+
+/** JADE_PROVIDER 选的服务由哪个插件提供；内置的或没有插件提供时 undefined */
+export function pluginProvider(kind: string): { plugin: string; def: ProviderDef } | undefined {
+  return plugged.get(kind);
+}
+
+/** 注册了的插件服务，按注册顺序 */
+export function pluginProviders(): { plugin: string; def: ProviderDef }[] {
+  return [...plugged.values()];
+}
+
+/** 测试用 */
+export function clearProviders(): void {
+  plugged.clear();
+}
+
 /** JADE_EFFORT 可取的值；openai-compat 没有统一的字段，用 OPENAI_COMPAT_EXTRA_BODY 自己设 */
 export const EFFORTS: Record<ProviderKind, readonly string[] | undefined> = {
   anthropic: ["low", "medium", "high", "xhigh", "max"],
@@ -216,7 +285,8 @@ export function idleTimeoutFromEnv(env: Env = process.env): number | undefined {
  */
 export function visionFromEnv(env: Env = process.env): boolean {
   const text = env.JADE_VISION?.trim().toLowerCase();
-  if (!text) return providerKind(env) !== "openai-compat";
+  // 插件的服务也算不能看：不知道它的模型支不支持
+  if (!text) return providerKind(env) === "openai" || providerKind(env) === "anthropic";
   if (["1", "true", "on", "yes"].includes(text)) return true;
   if (["0", "false", "off", "no"].includes(text)) return false;
   throw new Error(`JADE_VISION must be on or off, got ${JSON.stringify(env.JADE_VISION)}`);
@@ -227,6 +297,8 @@ export function effortFromEnv(env: Env = process.env): string | undefined {
   const effort = env.JADE_EFFORT;
   if (!effort) return undefined;
   const kind = providerKind(env);
+  // 插件的服务自己从 env 里读、自己检查
+  if (!isBuiltinKind(kind)) return effort;
   const allowed = EFFORTS[kind];
   if (!allowed) throw new Error(`JADE_EFFORT is not supported for the ${kind} provider; set it in OPENAI_COMPAT_EXTRA_BODY instead`);
   if (!allowed.includes(effort)) throw new Error(`JADE_EFFORT must be one of ${allowed.join(", ")} for the ${kind} provider, got ${JSON.stringify(effort)}`);
@@ -234,21 +306,20 @@ export function effortFromEnv(env: Env = process.env): string | undefined {
 }
 
 /** JADE_PROVIDER 指定时用它；否则按 OPENAI_API_KEY、OPENAI_COMPAT_BASE_URL、ANTHROPIC_API_KEY 的顺序 */
-export function providerKind(env: Env = process.env): ProviderKind {
+/**
+ * 当前配置的服务：内置的三种之一，或者 JADE_PROVIDER 写的插件服务的名字。
+ * 写了没有插件提供的名字时也原样返回（插件可能还没加载），创建 provider 时才报错
+ */
+export function providerKind(env: Env = process.env): string {
   const named = env.JADE_PROVIDER;
-  if (named) {
-    if (!(PROVIDER_KINDS as readonly string[]).includes(named)) {
-      throw new Error(`JADE_PROVIDER must be one of ${PROVIDER_KINDS.join(", ")}, got ${JSON.stringify(named)}`);
-    }
-    return named as ProviderKind;
-  }
+  if (named) return named;
   if (env.OPENAI_API_KEY) return "openai";
   if (env.OPENAI_COMPAT_BASE_URL) return "openai-compat";
   return "anthropic";
 }
 
 export interface ProviderInfo {
-  kind: ProviderKind;
+  kind: string;
   model: string;
   baseURL?: string;
 }
@@ -258,7 +329,17 @@ export function providerInfo(env: Env = process.env): ProviderInfo {
   const kind = providerKind(env);
   if (kind === "openai") return { kind, model: env.OPENAI_MODEL ?? "gpt-5", baseURL: env.OPENAI_BASE_URL ?? "https://api.openai.com/v1" };
   if (kind === "openai-compat") return { kind, model: env.OPENAI_COMPAT_MODEL ?? "", baseURL: env.OPENAI_COMPAT_BASE_URL };
-  return { kind, model: env.ANTHROPIC_MODEL ?? "claude-opus-5-5", baseURL: env.ANTHROPIC_BASE_URL };
+  if (kind === "anthropic") return { kind, model: env.ANTHROPIC_MODEL ?? "claude-opus-5-5", baseURL: env.ANTHROPIC_BASE_URL };
+  return { kind, model: pluginModel(kind, env) };
+}
+
+/** 插件服务的模型名；插件还没注册或出错时为空 */
+function pluginModel(kind: string, env: Env): string {
+  try {
+    return String(plugged.get(kind)?.def.model(env) ?? "");
+  } catch {
+    return "";
+  }
 }
 
 /**
@@ -276,6 +357,18 @@ export function providerInfo(env: Env = process.env): ProviderInfo {
  */
 export async function providerFromEnv(env: Env = process.env): Promise<Provider> {
   const kind = providerKind(env);
+  if (!isBuiltinKind(kind)) {
+    const found = plugged.get(kind);
+    if (!found) {
+      const all = [...PROVIDER_KINDS, ...plugged.keys()];
+      throw new Error(`JADE_PROVIDER must be one of ${all.join(", ")}, got ${JSON.stringify(kind)} (no plugin provides it)`);
+    }
+    // 限速、空闲超时这些 jade 自己的设置写错时同样在这里报错
+    rpmFromEnv(env);
+    const made = await found.def.create(env);
+    if (!made || typeof made.complete !== "function") throw new Error(`plugin ${found.plugin}: provider ${kind} must return an object with a complete function`);
+    return made;
+  }
   const maxTokens = env.JADE_MAX_TOKENS ? parseTokens("JADE_MAX_TOKENS", env.JADE_MAX_TOKENS) : undefined;
   const effort = effortFromEnv(env);
   // 写错时在这里就报错，不等到第一次请求
@@ -334,6 +427,10 @@ export function switchable(initial: Provider): SwitchableProvider {
 /** 服务提供的模型列表；不支持或出错时返回空数组 */
 export async function listModels(env: Env = process.env, fetchImpl: typeof fetch = fetch): Promise<string[]> {
   const kind = providerKind(env);
+  if (!isBuiltinKind(kind)) {
+    const list = plugged.get(kind)?.def.listModels;
+    return list ? list(env).then((m) => (Array.isArray(m) ? m.filter((x) => typeof x === "string") : []), () => []) : [];
+  }
   const info = providerInfo(env);
   const base = (info.baseURL ?? "https://api.anthropic.com").replace(/\/$/, "");
   const headers: Record<string, string> =

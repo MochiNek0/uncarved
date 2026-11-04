@@ -13,7 +13,7 @@ import { Memory, memoryTool } from "./memory.ts";
 import { mcpTools, type McpClient } from "./mcp.ts";
 import { skillTool, skillsPrompt, type Skill } from "./skills.ts";
 import { compactor, type Compactor } from "./plugins/compact.ts";
-import { COMMAND_NAME, JADE_VERSION, type HostContext, type JadePlugin, type LoadedPlugin, type PluginCommand, type Responder, type Suggester } from "./plugins/loader.ts";
+import { COMMAND_NAME, JADE_VERSION, type HostContext, type JadePlugin, type LoadedPlugin, type PluginCommand, type PluginProvider, type Responder, type Suggester } from "./plugins/loader.ts";
 import { policy, type AllowRule, type Mode, type Policy, type PolicyOptions } from "./plugins/policy.ts";
 import { prompts, realPath, repoRoot } from "./plugins/prompts.ts";
 import { repeats } from "./plugins/repeats.ts";
@@ -26,7 +26,7 @@ import { todoTool } from "./tools/todo.ts";
 import { askUserTool, type AskUser } from "./tools/ask.ts";
 import { webTools } from "./tools/web.ts";
 import { screenshotTool } from "./tools/screenshot.ts";
-import { visionFromEnv } from "./provider.ts";
+import { PROVIDER_KIND, SETTING_ENV, visionFromEnv, type ProviderSetting } from "./provider.ts";
 
 const READ_ONLY = new Set(["read_file", "list_dir", "glob", "grep"]);
 /** 子 Agent 也执行的第三方插件 hook */
@@ -124,6 +124,8 @@ export interface Jade {
   suggester?: { plugin: string; suggest: Suggester };
   /** 用户消息发出前依次处理它的插件 */
   beforeSend: { plugin: string; fn: NonNullable<JadePlugin["beforeSend"]> }[];
+  /** 用户层第三方插件提供的模型服务，宿主启动时注册 */
+  providers: { plugin: string; def: PluginProvider }[];
   /** 主会话的工具；宿主用 read_file / list_dir 读取 @ 引用的文件 */
   tools: Tool[];
   /** 宿主退出时调用：杀掉后台 shell */
@@ -356,6 +358,7 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
     responders: added.flatMap(({ plugin }) => (plugin.responder ? [{ plugin: plugin.id, responder: plugin.responder }] : [])),
     suggester: suggesters[0],
     beforeSend: added.flatMap(({ plugin }) => (plugin.beforeSend ? [{ plugin: plugin.id, fn: plugin.beforeSend.bind(plugin) }] : [])),
+    providers: added.flatMap(({ plugin }) => (plugin.providers ?? []).map((def) => ({ plugin: plugin.id, def }))),
     tools: allTools,
     shutdown: shell.shutdown,
     warnings,
@@ -399,6 +402,21 @@ async function createExtensions(sources: LoadedPlugin[], host: HostContext, disa
       else if (!ok) warnings.push(`${where}: responder is ignored: approve and ask must be functions`);
       if (source.layer === "project" || !ok) delete plugin.responder;
     }
+    if (plugin.providers !== undefined) {
+      const list = Array.isArray(plugin.providers) ? plugin.providers : [];
+      // 服务能看到全部对话和 API key：随仓库来的插件不能提供
+      if (source.layer === "project") {
+        warnings.push(`${where}: providers are ignored: only user plugins can provide model services`);
+        delete plugin.providers;
+      } else {
+        plugin.providers = list.filter((d) => {
+          const ok = d && typeof d.kind === "string" && PROVIDER_KIND.test(d.kind) && typeof d.model === "function" && typeof d.create === "function";
+          if (!ok) warnings.push(`${where}: provider ${JSON.stringify(d?.kind)} is ignored: it needs a kind of letters, digits, - and _, and model and create functions`);
+          else if (d.settings !== undefined) d.settings = providerSettings(d.settings, `${where}: provider ${d.kind}`, warnings);
+          return ok;
+        });
+      }
+    }
     if (plugin.beforeSend !== undefined && typeof plugin.beforeSend !== "function") {
       warnings.push(`${where}: beforeSend is ignored: it must be a function`);
       delete plugin.beforeSend;
@@ -408,6 +426,24 @@ async function createExtensions(sources: LoadedPlugin[], host: HostContext, disa
       delete plugin.suggest;
     }
     out.push({ source, plugin });
+  }
+  return out;
+}
+
+/** 插件服务的配置项：格式不对、用了 jade 自己的变量、重复、第二个 model 的跳过并警告 */
+function providerSettings(raw: unknown, where: string, warnings: string[]): ProviderSetting[] {
+  if (!Array.isArray(raw)) {
+    warnings.push(`${where}: settings are ignored: they must be an array`);
+    return [];
+  }
+  const out: ProviderSetting[] = [];
+  for (const x of raw as Partial<ProviderSetting>[]) {
+    const env = x?.env;
+    if (typeof env !== "string" || !SETTING_ENV.test(env) || env.startsWith("JADE_") || typeof x.label !== "string") {
+      warnings.push(`${where}: setting ${JSON.stringify(env)} is ignored: it needs an env name of capital letters, digits and _ (not JADE_…) and a label`);
+    } else if (out.some((o) => o.env === env)) warnings.push(`${where}: setting ${env} is ignored: it is listed twice`);
+    else if (x.model && out.some((o) => o.model)) warnings.push(`${where}: setting ${env} is ignored: only one setting can be the model`);
+    else out.push(x as ProviderSetting);
   }
   return out;
 }
