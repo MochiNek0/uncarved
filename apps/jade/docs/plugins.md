@@ -25,6 +25,8 @@ jade 的插件就是 [uncarved](../../../packages/kernel/README.md) 内核的插
 | [`protect-files`](../examples/plugins/protect-files/index.ts) | TypeScript，默认导出对象 | `tool.gate` 拦截修改，`ctx.emit` 在界面上提示 |
 | [`git-review`](../examples/plugins/git-review/index.ts) | TypeScript，工厂函数 | 工具、斜杠命令、用上下文里的 `run` 执行命令 |
 | [`redact-secrets`](../examples/plugins/redact-secrets) | Python，独立进程 | `tool.after` 改写工具输出 |
+| [`notes`](../examples/plugins/notes/index.ts) | TypeScript，工厂函数 | 工具和它的显示（`renderers`）、快捷键、`ctx.input`、`ctx.send`、`ctx.status`、斜杠命令 |
+| [`text-keys`](../examples/plugins/text-keys) | Python，独立进程 | 进程外插件的斜杠命令和快捷键（读、改输入框，替用户发送） |
 
 用户用 `jade plugin add` 安装插件，见[安装和发布](#安装和发布)。
 

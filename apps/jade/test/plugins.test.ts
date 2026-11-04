@@ -762,6 +762,83 @@ for await (const line of createInterface({ input: process.stdin })) {
       await Promise.all([user.close!(), repo.close!()]);
     }
   }, 20_000);
+
+  test("the notes example: a tool with its own display, keys on the input box, send and a command", async () => {
+    const { cwd, home } = await dirs();
+    const loaded = await loadPlugin({ name: "notes", dir: await install(home, "notes"), layer: "user" }, { trust: new MemoryTrustStore(), confirm: async () => false });
+    let text = "buy milk";
+    const sent: [string, string][] = [];
+    const statuses: string[] = [];
+    const jade = await createJade({
+      cwd,
+      home,
+      store: new MemoryLogStore(),
+      provider: scripted([]).provider,
+      env: {},
+      extensions: [loaded],
+      input: { text: () => text, insert: (t) => void (text += t), set: (t) => void (text = t) },
+      send: (p, t) => void sent.push([p, t]),
+      onStatus: (_p, t) => void statuses.push(t ?? ""),
+    });
+    expect(jade.warnings.filter((w) => w.includes("notes"))).toEqual([]);
+    expect(statuses).toEqual(["0 notes"]);
+    // ctrl+t：输入框里的文字记成一条笔记，清空输入框
+    await jade.keys.get("ctrl+t")!.key.run();
+    expect(await readFile(path.join(cwd, "NOTES.md"), "utf8")).toBe("- buy milk\n");
+    expect(text).toBe("");
+    expect(statuses.at(-1)).toBe("1 notes");
+    await jade.keys.get("ctrl+g")!.key.run();
+    expect(sent).toEqual([["notes", expect.stringContaining("NOTES.md")]]);
+    const ui = { interactive: false, log: () => {}, select: async () => undefined as never, input: async () => undefined };
+    const ctx = { sessionId: "s", cwd, signal: new AbortController().signal, derived: {}, ui, note: () => {} };
+    expect(await jade.commands.get("notes")!.command.run("", ctx)).toBe("- buy milk");
+
+    // 工具和它的显示：before 记下执行前的条数，result 显示前后的数量
+    const r = jade.renderers.get("add_note")!.renderer;
+    const input = { text: "call the bank about the card" };
+    expect(r.summary!(input)).toBe("call the bank about the card");
+    expect(await r.preview!(input)).toContain("+ call the bank");
+    const before = r.before!(input);
+    const tool = jade.extensions[0]!.plugin.tools!.find((t) => t.name === "add_note")!;
+    const out = await tool.execute(input, {} as never);
+    expect(r.result!({ input, text: String(out.content), isError: false, before })).toEqual({ line: "NOTES.md: 1 → 2 notes" });
+    jade.shutdown();
+  });
+
+  test.skipIf(!python)("the text-keys example: a Python plugin's commands and keys", async () => {
+    const { cwd, home } = await dirs();
+    const loaded = await loadPlugin({ name: "text-keys", dir: await install(home, "text-keys"), layer: "user" }, { trust: new MemoryTrustStore(), confirm: async () => false });
+    try {
+      let text = "hello world";
+      const sent: [string, string][] = [];
+      const jade = await createJade({
+        cwd,
+        home,
+        store: new MemoryLogStore(),
+        provider: scripted([]).provider,
+        env: {},
+        extensions: [loaded],
+        input: { text: () => text, insert: (t) => void (text += t), set: (t) => void (text = t) },
+        send: (p, t) => void sent.push([p, t]),
+      });
+      expect(jade.warnings.filter((w) => w.includes("text-keys"))).toEqual([]);
+      const ui = { interactive: false, log: () => {}, select: async () => undefined as never, input: async () => undefined };
+      const ctx = { sessionId: "s", cwd, signal: new AbortController().signal, derived: {}, ui, note: () => {} };
+      expect(await jade.commands.get("wc")!.command.run("one two three", ctx)).toBe("3 words, 13 characters");
+      expect(await jade.commands.get("explain")!.command.run("closures", ctx)).toEqual({ prompt: expect.stringContaining("closures") });
+      await jade.keys.get("alt+u")!.key.run();
+      expect(text).toBe("HELLO WORLD");
+      await jade.keys.get("alt+d")!.key.run();
+      expect(text).toMatch(/^HELLO WORLD\d{4}-\d\d-\d\d$/);
+      text = "what is here?";
+      await jade.keys.get("alt+s")!.key.run();
+      expect(sent).toEqual([["text-keys", "In this directory: what is here?"]]);
+      expect(text).toBe("");
+      jade.shutdown();
+    } finally {
+      await loaded.close!();
+    }
+  }, 20_000);
 });
 
 describe("tool renderers", () => {
