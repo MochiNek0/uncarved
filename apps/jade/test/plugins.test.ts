@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { cp, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { existsSync, realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -179,6 +179,8 @@ describe("in-process plugins", () => {
         fake("old", () => ({ id: "x/old", version: "1.0.0", kernel: "^9" })),
         fake("undeclared", () => ({ id: "x/u", version: "1.0.0", kernel: "^0.1", hooks: [{ kind: "observe", point: "event", fn: () => {} }] })),
         fake("clash-id", () => ({ id: "jade/policy", version: "1.0.0", kernel: "^0.1" })),
+        fake("bare-jade", () => ({ id: "jade", version: "1.0.0", kernel: "^0.1" })),
+        fake("jade-ns", () => ({ id: "jade/extra", version: "1.0.0", kernel: "^0.1" })),
         fake("clash-tool", () => ({ id: "x/t", version: "1.0.0", kernel: "^0.1", tools: [tool("read_file")] })),
         fake("good", () => ({
           id: "x/good",
@@ -195,6 +197,8 @@ describe("in-process plugins", () => {
     expect(warned("plugin old")).toContain("requires kernel ^9");
     expect(warned("plugin undeclared")).toContain("undeclared capabilities");
     expect(warned("plugin clash-id")).toContain("already has the id jade/policy");
+    expect(warned("plugin bare-jade")).toContain("the id jade is reserved");
+    expect(warned("plugin jade-ns")).toContain("the id jade/extra is reserved");
     expect(warned("plugin clash-tool")).toContain("tool read_file already exists");
     expect(jade.warnings.filter((w) => w.includes("plugin good")).length).toBe(2);
     expect(warned("x/dup")).toContain("x/good already provides it");
@@ -526,6 +530,28 @@ describe("session commands use the public SessionControl", () => {
     jade.shutdown();
   });
 
+  test("/undo shows paths relative to the project when jade runs from a linked directory", async () => {
+    const { cwd: real, home } = await dirs();
+    // 目录链接（Windows 上是 junction，不需要管理员权限）：jade/fs 记下的路径经过它，插件看到的 cwd 是解析过的
+    const cwd = path.join(path.dirname(real), `${path.basename(real)}-link`);
+    await symlink(real, cwd, "junction");
+    const store = new MemoryLogStore();
+    const s = scripted([{ content: [use("w", "write_file", { path: "a.txt", content: "1\n" }), use("v", "write_file", { path: "b.txt", content: "2\n" })], stopReason: "tool_use" }, reply("done")]);
+    const jade = await createJade({ cwd, home, store, provider: s.provider, env: {}, mode: "yolo" });
+    const rt = await Runtime.create({ store, provider: s.provider, plugins: jade.plugins });
+    await rt.send(msg("write them"));
+    const notes: string[] = [];
+    const bodies: string[] = [];
+    const session = control({ messages: () => structuredClone(rt.state.messages), record: (k, v) => rt.record(k, v) });
+    const yes = { ...ui, select: async (_t: string, _c: unknown, o?: { body?: string }) => (bodies.push(o?.body ?? ""), true) as never };
+    const ctx = { sessionId: rt.state.sessionId, cwd, signal: new AbortController().signal, derived: rt.state.derived, ui: yes, note: (t: string) => void notes.push(t), session };
+    const out = String(await jade.commands.get("undo")!.command.run("", ctx));
+    expect(bodies[0]).toContain("delete  a.txt");
+    expect(out).toContain("delete  b.txt");
+    expect(notes[0]).toContain("deleted a.txt (you had created it)");
+    jade.shutdown();
+  });
+
   test("/undo also restores files that a third-party tool saved through ctx.checkpoints", async () => {
     const { cwd, home } = await dirs();
     const file = path.join(cwd, "notes.txt");
@@ -598,6 +624,9 @@ describe("model services from plugins", () => {
       // 插件的服务默认不算能看图片
       expect(visionFromEnv(env)).toBe(false);
       await expect(providerFromEnv({ JADE_PROVIDER: "nope" })).rejects.toThrow(/openai-compat, openai, anthropic, foo.*no plugin provides it/);
+      // jade 自己的设置写错时同样报错
+      await expect(providerFromEnv({ ...env, JADE_RPM: "lots" })).rejects.toThrow(/JADE_RPM/);
+      await expect(providerFromEnv({ ...env, JADE_IDLE_TIMEOUT: "abc" })).rejects.toThrow(/JADE_IDLE_TIMEOUT/);
       // 没注册时 providerInfo 不报错（插件可能还没加载），只是没有模型名
       expect(providerInfo({ JADE_PROVIDER: "nope" })).toEqual({ kind: "nope", model: "" });
     } finally {

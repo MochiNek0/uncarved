@@ -102,6 +102,10 @@ export const strike = paint("9", "29");
 /** 转义序列（CSI、OSC、DCS 这类字符串、其余 ESC 开头的）和换行、制表符之外的控制字符（含 C1） */
 const CONTROL = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b[\]P^_X][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[^[\]P^_X]?|[\x00-\x08\x0b-\x1f\x7f-\x9f]/g;
 const SGR = /^\x1b\[[0-9;:]*m$/;
+/** 文字末尾还没写完的转义序列：单独的 ESC、没有结束字节的 CSI、没有结束符的 OSC/DCS 这类字符串 */
+const UNFINISHED = /\x1b(?:\[[0-?]*[ -/]*|[\]P^_X][^\x07\x1b]*)?$/;
+/** 最多为一个没写完的序列留这么多字符 */
+const MAX_HELD = 256;
 
 /**
  * 去掉可能搅乱终端的东西，只留颜色（SGR）、换行和制表符：插件、工具输出和模型的文字里可能有移动光标、清屏、
@@ -118,13 +122,30 @@ export function terminalSafe(text: string): string {
 export function safeScreen(screen: Screen): Screen {
   const s = terminalSafe;
   const opt = (v: string | undefined) => (v === undefined ? undefined : s(v));
+  const lf = (t: string) => t.replace(/\r\n?/g, "\n");
+  /** 流式文字末尾还没写完的转义序列，等下一段 */
+  let held: { kind: "text" | "thinking"; text: string } | undefined;
   return {
     interactive: screen.interactive,
     log: (text, o) => screen.log(s(text), o && { ...o, details: opt(o.details) }),
     amend: (id, text, o) => screen.amend(id, s(text), o && { ...o, details: opt(o.details) }),
     progress: (id, line, o) => screen.progress(id, opt(line), o),
-    stream: (kind, text) => screen.stream(kind, s(text)),
-    endStream: () => screen.endStream(),
+    stream: (kind, text) => {
+      // 上一段末尾没完的转义序列接到这一段前面再过滤，不然它被拆成两半，后一半当成文字显示出来
+      if (held && held.kind !== kind) held = undefined;
+      const whole = (held?.text ?? "") + text;
+      // 很长还没结束的（OSC 之类的字符串一直不给结束符）不再等，按现在的样子过滤
+      const found = whole.search(UNFINISHED);
+      const cut = found >= 0 && whole.length - found <= MAX_HELD ? found : -1;
+      held = cut >= 0 ? { kind, text: whole.slice(cut) } : undefined;
+      const shown = s(cut >= 0 ? whole.slice(0, cut) : whole);
+      if (shown) screen.stream(kind, shown);
+    },
+    endStream: () => {
+      // 到结束都没写完的序列不完整，丢掉
+      held = undefined;
+      screen.endStream();
+    },
     busy: (label) => screen.busy(opt(label)),
     status: (info) => {
       const out: Partial<StatusInfo> = { ...info };
@@ -141,7 +162,8 @@ export function safeScreen(screen: Screen): Screen {
         o && { ...o, body: opt(o.body) },
       ),
     input: (title, o) => screen.input(s(title), o && { ...o, initial: opt(o.initial), placeholder: opt(o.placeholder) }),
-    draft: screen.draft && { text: () => screen.draft!.text(), insert: (t) => screen.draft!.insert(s(t)), set: (t) => screen.draft!.set(s(t)) },
+    // 输入框里的 \r 是换行（旧 Mac 的换行符），不是进度条：先换成 \n，terminalSafe 才不会只留最后一段
+    draft: screen.draft && { text: () => screen.draft!.text(), insert: (t) => screen.draft!.insert(s(lf(t))), set: (t) => screen.draft!.set(s(lf(t))) },
     clear: () => screen.clear(),
     close: () => screen.close(),
   };

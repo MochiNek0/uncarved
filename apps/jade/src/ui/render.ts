@@ -8,6 +8,32 @@ import { dim } from "./screen.ts";
 
 export const clip = (s: string, n: number) => (s.length > n ? s.slice(0, n) + "…" : s);
 
+/**
+ * 带颜色（SGR 序列）的文字截到 n 个可见字符：序列不算长度、不会被切开；截断时在最后复位颜色，
+ * 不让没关上的颜色渗到后面的行
+ */
+export function clipStyled(s: string, n: number): string {
+  const sgr = /\x1b\[[0-9;:]*m/y;
+  let out = "";
+  let visible = 0;
+  let styled = false;
+  for (let i = 0; i < s.length; ) {
+    sgr.lastIndex = i;
+    const m = sgr.exec(s);
+    if (m) {
+      out += m[0];
+      styled = true;
+      i += m[0].length;
+      continue;
+    }
+    if (visible === n) return out + "…" + (styled ? "\x1b[0m" : "");
+    out += s[i];
+    visible++;
+    i++;
+  }
+  return out;
+}
+
 /** 家目录下的路径显示成 ~/… */
 export function shortPath(p: string): string {
   const rel = path.relative(os.homedir(), p);

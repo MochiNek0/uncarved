@@ -7,6 +7,7 @@ import type { ToolRenderer } from "../src/plugins/loader.ts";
 import type { Screen, StatusInfo } from "../src/ui/screen.ts";
 import { fsRenderers, shellRenderers, taskRenderers } from "../src/ui/renderers.ts";
 import { transcript, type TranscriptOptions } from "../src/ui/transcript.ts";
+import { clipStyled } from "../src/ui/render.ts";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -186,4 +187,12 @@ test("an edit shows +added -removed on its result line and the diff in its detai
   use("e2", "edit_file", { path: "a.ts", old_string: "missing", new_string: "x" });
   event("tool.completed", { toolUseId: "e2", isError: true, content: [{ kind: "text", text: "old_string not found" }] });
   expect(lines.get("e2")!.text).not.toContain("+");
+});
+
+test("clipStyled counts only visible characters and resets colors it cuts off", () => {
+  const g = (t: string) => `\x1b[32m${t}\x1b[39m`;
+  expect(clipStyled(g("ab") + g("cd"), 4)).toBe(g("ab") + g("cd"));
+  // 不在序列中间切开，截断后复位颜色
+  expect(clipStyled(g("abc") + g("def"), 4)).toBe(`${g("abc")}\x1b[32md…\x1b[0m`);
+  expect(clipStyled("abcdef", 3)).toBe("abc…");
 });
