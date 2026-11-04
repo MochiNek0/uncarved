@@ -23,7 +23,7 @@ import {
 } from "uncarved";
 import { realpathSync } from "node:fs";
 import { expandCommand, loadCommands } from "./commands.ts";
-import { discoverPlugins, inspectPlugin, loadPlugin, type LoadedPlugin, type PluginBundle, type PluginInfo, type SessionControl } from "./plugins/loader.ts";
+import { discoverPlugins, loadPlugin, resolvePlugins, type LoadedPlugin, type PluginBundle, type SessionControl } from "./plugins/loader.ts";
 import { readPluginSettings } from "./plugins/install.ts";
 import { PLUGIN_HELP, pluginCli, UsageError } from "./plugin-cli.ts";
 import { describeServer, loadMcpConfig, McpClient, mcpTrustHash } from "./mcp.ts";
@@ -36,7 +36,7 @@ import { compactThreshold, contextWindowFromEnv, contextWindowInfo, isContextOve
 import { InputHistory } from "./history.ts";
 import { attachMentions, mentionCandidates } from "./mentions.ts";
 import { repoRoot } from "./plugins/prompts.ts";
-import { isBuiltinKind, isRateLimit, pluginProvider, providerFromEnv, providerInfo, providerKind, RateGate, registerProviders, rpmFromEnv, switchable, unregisterProviders, withRetry } from "./provider.ts";
+import { isBuiltinKind, isRateLimit, pluginProvider, providerFromEnv, providerInfo, providerKind, RateGate, registerProviders, rpmFromEnv, switchable, withRetry } from "./provider.ts";
 import { ago, discardIfEmpty, matchSession, SessionIndex } from "./sessions.ts";
 import { display } from "./tools/fs.ts";
 import type { ApproveSubagent, SubagentApproval } from "./tools/task.ts";
@@ -218,21 +218,16 @@ const early: string[] = [];
 
 const inputs = new InputHistory(path.join(home, "history.jsonl"), cwd);
 
-/** $JADE_HOME/plugins.json 里停用的插件（目录名或 id）和内置插件（id） */
+/** $JADE_HOME/plugins.json 里停用的插件和内置插件（id） */
 const disabledPlugins = new Set((await readPluginSettings(home)).disabled);
 const repo = realPath(await repoRoot(cwd));
-/** 第三方插件目录；停用的不加载，也不读它们带的内容 */
-const foundPlugins = (await discoverPlugins({ home, root: repo, cwd: realPath(cwd) })).filter((f) => !disabledPlugins.has(f.name));
-/** 不执行代码就能读到的插件信息（带的 skills、命令、MCP 配置）；读不了的插件在 loadPlugins 里报告 */
-const pluginInfos = new Map<string, PluginInfo>();
-await Promise.all(
-  foundPlugins.map(async (f) => {
-    const info = await inspectPlugin(f.dir).catch(() => undefined);
-    if (info) pluginInfos.set(f.dir, info);
-  }),
-);
-const bundled = (pick: (b: PluginBundle) => string[]) =>
-  foundPlugins.flatMap((f) => (pluginInfos.get(f.dir) ? pick(pluginInfos.get(f.dir)!.bundle).map((dir) => ({ plugin: f.name, dir, layer: f.layer })) : []));
+/**
+ * 第三方插件：先只读清单，不执行代码。按 id 停用的、id 重复的在这里就去掉，不加载，也不读它们带的内容；
+ * 清单读不了的在 loadPlugins 里报告
+ */
+const resolved = await resolvePlugins(await discoverPlugins({ home, root: repo, cwd: realPath(cwd) }), disabledPlugins);
+const foundPlugins = resolved.plugins;
+const bundled = (pick: (b: PluginBundle) => string[]) => foundPlugins.flatMap((f) => pick(f.info.bundle).map((dir) => ({ plugin: f.id, dir, layer: f.layer })));
 
 /** 自定义命令（$JADE_HOME/commands、.jade/commands、插件带的 commands/）；和内置命令同名的不生效 */
 const builtinNames = new Set([...COMMANDS.map((c) => c.name), ...BUILTIN_PLUGIN_COMMANDS]);
@@ -371,7 +366,7 @@ function currentModel(): { name: string; via: string } | undefined {
   const api = { anthropic: "the Anthropic API", openai: "the OpenAI Responses API", "openai-compat": "an OpenAI-compatible API" }[info.kind];
   return { name: info.model, via: host ? `${api} at ${host}` : api };
 }
-/** 插件用 ctx.status 设置的状态栏段落，按插件的目录名 */
+/** 插件用 ctx.status 设置的状态栏段落，按插件的 id */
 const pluginStatus = new Map<string, string>();
 /** 第几套插件实例；换会话之后旧实例设置的状态不再显示 */
 let jadeGeneration = 0;
@@ -452,12 +447,6 @@ if (!hasProvider()) {
 }
 let jade: Jade = await makeJade(opts.mode);
 warn(jade.warnings);
-// 按 id 停用的插件：创建了实例才知道 id，它导出的模型服务在那之前已经注册了，这里去掉。停用了就不该再运行它的代码
-const owner = hasProvider() ? pluginProvider(providerKind())?.plugin : undefined;
-if (unregisterProviders(jade.disabledById).length && owner !== undefined && jade.disabledById.includes(owner)) {
-  await providerUnavailable(`JADE_PROVIDER=${providerKind()} is provided by plugin ${owner}, which is disabled`);
-  screen.status({ model: modelLabel() });
-}
 
 /** 选的模型服务用不了：终端界面里直接进 /model 换一个服务，不然用户只能手改 .env；不能交互时报错退出 */
 async function providerUnavailable(message: string): Promise<void> {
@@ -507,11 +496,13 @@ ALL_COMMANDS.splice(COMMANDS.length, 0, ...builtinPluginCommands);
  * 项目层的首次加载及内容变化后要用户确认（7.1）。加载失败的跳过并提示，不影响启动
  */
 async function loadPlugins(): Promise<LoadedPlugin[]> {
+  for (const { found, error } of resolved.broken) screen.log(yellow(`[skipped] plugin ${display(cwd, found.dir)}: ${errorText(error)}`));
+  for (const w of resolved.warnings) screen.log(yellow(`[skipped] ${w}`));
   const out: LoadedPlugin[] = [];
   for (const f of foundPlugins) {
     try {
-      const unsupported = pluginInfos.get(f.dir)?.bundle.unsupported ?? [];
-      if (unsupported.length) screen.log(dim(`[note] plugin ${f.name}: jade does not support its ${unsupported.join(" and ")} yet; they are ignored`));
+      const unsupported = f.info.bundle.unsupported;
+      if (unsupported.length) screen.log(dim(`[note] plugin ${f.id}: jade does not support its ${unsupported.join(" and ")} yet; they are ignored`));
       out.push(
         await loadPlugin(f, {
           trust,
@@ -529,7 +520,7 @@ async function loadPlugins(): Promise<LoadedPlugin[]> {
               },
             )) ?? false,
           onExit: (p, { code, signal }) => {
-            if (!pluginsClosing) screen.log(yellow(`[warning] plugin ${p.name} exited (${signal ?? `code ${code}`}); its hooks fail until jade restarts. /plugins shows its stderr`));
+            if (!pluginsClosing) screen.log(yellow(`[warning] plugin ${p.id} exited (${signal ?? `code ${code}`}); its hooks fail until jade restarts. /plugins shows its stderr`));
           },
         }),
       );
@@ -556,8 +547,8 @@ async function closePlugins() {
  */
 async function connectMcp(dialogsAfter: Promise<unknown>): Promise<McpClient[]> {
   const plugins = foundPlugins.flatMap((f) => {
-    const mcp = pluginInfos.get(f.dir)?.bundle.mcp;
-    return mcp ? [{ plugin: f.name, dir: f.dir, layer: f.layer, file: mcp.file, servers: mcp.servers }] : [];
+    const mcp = f.info.bundle.mcp;
+    return mcp ? [{ plugin: f.id, dir: f.dir, layer: f.layer, file: mcp.file, servers: mcp.servers }] : [];
   });
   const { servers, warnings } = await loadMcpConfig({ home, root: repo, cwd: realPath(cwd), plugins });
   for (const w of warnings) screen.log(yellow(`[warning] ${w}`));
@@ -983,7 +974,7 @@ function showPlugins() {
     if (exit && source.process!.stderr.length) lines.push(dim(source.process!.stderr.map((l) => `  │ ${clip(l, 200)}`).join("\n")));
   }
   for (const p of contentOnly) {
-    lines.push(`${bold(p.info.name ?? p.name)}${p.info.version ? ` ${p.info.version}` : ""} ${dim(`${p.layer} · ${display(cwd, p.dir)}`)}`);
+    lines.push(`${bold(p.id)}${p.info.version ? ` ${p.info.version}` : ""} ${dim(`${p.layer} · ${display(cwd, p.dir)}`)}`);
     lines.push(`  carries   ${carried(p.info.bundle)}`);
   }
   lines.push("", bold("Hook execution order"));

@@ -43,8 +43,11 @@ export interface JadePluginContext {
   /** 插件自己的目录 */
   dir: string;
   layer: PluginLayer;
-  /** 同 uncarved 的 definePlugin：补上 kernel 和 hooks 用到的 needs。项目层插件通常 import 不到 uncarved，用这个 */
-  definePlugin: <T extends JadePluginDraft>(draft: T) => T & JadePlugin;
+  /**
+   * 同 uncarved 的 definePlugin：补上 kernel 和 hooks 用到的 needs，另外 id、version 不写时用 plugin.json 里的。
+   * 项目层插件通常 import 不到 uncarved，用这个
+   */
+  definePlugin: <T extends ContextPluginDraft>(draft: T) => T & JadePlugin;
   /** 用 jade 的 shell 执行命令，超时或中断时连同子进程一起结束；找不到 shell 时没有 */
   run?: RunCommand;
   /**
@@ -298,16 +301,25 @@ export interface JadePlugin extends Plugin {
 /** definePlugin 的输入：kernel、needs 可以省略 */
 export type JadePluginDraft = Omit<JadePlugin, "kernel" | "needs"> & { kernel?: string; needs?: string[] };
 
+/** 插件上下文里 definePlugin 的输入：id、version 也可以省略，用 plugin.json 里的 */
+export type ContextPluginDraft = Omit<JadePluginDraft, "id" | "version"> & { id?: string; version?: string };
+
 export type JadePluginFactory = (ctx: JadePluginContext) => Awaitable<JadePlugin>;
 
-/** 宿主（createJade）提供的那部分上下文；status、send 由加载器按插件的目录名转给宿主，input、send 只转给用户层插件 */
-export type HostContext = Omit<JadePluginContext, "dir" | "layer" | "status" | "send"> & {
+/** 宿主（createJade）提供的那部分上下文；status、send 由加载器按插件的 id 转给宿主，input、send 只转给用户层插件 */
+export type HostContext = Omit<JadePluginContext, "dir" | "layer" | "status" | "send" | "definePlugin"> & {
+  definePlugin: <T extends JadePluginDraft>(draft: T) => T & JadePlugin;
   status(plugin: string, text: string | undefined): void;
   send?(plugin: string, text: string): void;
 };
 
-/** plugin.json，可以没有 */
+/** plugin.json；只带内容的插件可以没有 */
 export interface PluginJson {
+  /**
+   * 插件的 id，全局唯一，建议 "作者/名字"。有代码的插件必须写：jade 不执行代码就能认出插件（按 id 停用、检查重复），
+   * 插件实例的 id 必须和它相同。只带内容的插件不写时用目录名
+   */
+  id?: string;
   /** jade plugin add 安装时用作目录名；/plugins 显示 */
   name?: string;
   version?: string;
@@ -338,6 +350,8 @@ export interface PluginBundle {
 
 /** 不执行代码就能知道的插件信息 */
 export interface PluginInfo {
+  /** plugin.json 的 id；只带内容的插件可以没有（用目录名，见 pluginId） */
+  id?: string;
   name?: string;
   version?: string;
   description?: string;
@@ -356,7 +370,15 @@ export interface FoundPlugin {
   layer: PluginLayer;
 }
 
+/** 读过清单、确定了 id 的插件，还没有执行它的代码 */
+export interface ResolvedPlugin extends FoundPlugin {
+  id: string;
+  info: PluginInfo;
+}
+
 export interface LoadedPlugin extends FoundPlugin {
+  /** 插件的 id（plugin.json 的 id；只带内容的插件没写时是目录名）。实例的 id 必须和它相同 */
+  id: string;
   kind: PluginInfo["kind"];
   /** 模块入口（相对于插件目录），或者进程外插件的启动命令；只有内容的插件为空字符串 */
   entry: string;
@@ -412,18 +434,61 @@ async function scan(root: string, layer: PluginLayer, out: Map<string, FoundPlug
   }
 }
 
-export async function loadPlugin(found: FoundPlugin, opts: LoadOptions): Promise<LoadedPlugin> {
-  const info = await inspectPlugin(found.dir);
-  if (info.kind === "process") return loadProcess(found, info, opts);
-  if (info.kind === "content") return { ...found, kind: "content", entry: "", info };
+/**
+ * 读插件的清单，确定 id，不执行代码：去掉按 id 停用的、id 重复的（排在后面的跳过）、用了内置插件 id 的。
+ * 清单读不了的放进 broken，由宿主报告
+ */
+export async function resolvePlugins(
+  found: FoundPlugin[],
+  disabled: ReadonlySet<string>,
+): Promise<{ plugins: ResolvedPlugin[]; broken: { found: FoundPlugin; error: unknown }[]; warnings: string[] }> {
+  const read = await Promise.all(found.map((f) => inspectPlugin(f.dir).then((info) => ({ f, info }), (error: unknown) => ({ f, error }))));
+  const plugins: ResolvedPlugin[] = [];
+  const broken: { found: FoundPlugin; error: unknown }[] = [];
+  const warnings: string[] = [];
+  const seen = new Map<string, FoundPlugin>();
+  for (const r of read) {
+    if (!("info" in r)) {
+      broken.push({ found: r.f, error: r.error });
+      continue;
+    }
+    const id = pluginId(r.f, r.info);
+    if (disabled.has(id)) continue;
+    // jade、jade/… 留给内置插件：会话里记的键按 id 划分；代替内置插件用 replaces
+    if (id === "jade" || id.startsWith("jade/")) {
+      warnings.push(`plugin ${r.f.dir} is skipped: the id ${id} is reserved for jade's built-in plugins (use replaces to stand in for one)`);
+      continue;
+    }
+    const first = seen.get(id);
+    if (first) {
+      warnings.push(`plugin ${r.f.dir} is skipped: plugin ${first.dir} already has the id ${id}`);
+      continue;
+    }
+    seen.set(id, r.f);
+    plugins.push({ ...r.f, id, info: r.info });
+  }
+  return { plugins, broken, warnings };
+}
+
+/** 插件的 id：plugin.json 的 id；只带内容的插件没写时用目录名 */
+export function pluginId(found: FoundPlugin, info: PluginInfo): string {
+  return info.id ?? found.name;
+}
+
+/** 加载插件：读清单（宿主已经用 resolvePlugins 读过时直接用），项目层的先请用户确认，然后 import 模块或启动进程 */
+export async function loadPlugin(found: FoundPlugin & { info?: PluginInfo }, opts: LoadOptions): Promise<LoadedPlugin> {
+  const info = found.info ?? (await inspectPlugin(found.dir));
+  const base = { name: found.name, dir: found.dir, layer: found.layer, id: pluginId(found, info) };
+  if (info.kind === "process") return loadProcess(base, info, opts);
+  if (info.kind === "content") return { ...base, kind: "content", entry: "", info };
 
   const entry = info.entry!;
-  const ctx = (host: HostContext) => pluginContext(found, host);
+  const ctx = (host: HostContext) => pluginContext(base, info, host);
 
   if (found.layer === "project") {
     // 内核负责：先哈希整个目录、确认，再 import；检查 import 不越出插件目录
     const make = await loadProjectPluginFactory(found.dir, { trust: opts.trust, confirm: opts.confirm, entry });
-    return { ...found, kind: "module", entry, info, create: async (host) => (await make(ctx(host))) as JadePlugin };
+    return { ...base, kind: "module", entry, info, create: async (host) => (await make(ctx(host))) as JadePlugin };
   }
 
   const file = path.resolve(found.dir, entry);
@@ -431,7 +496,7 @@ export async function loadPlugin(found: FoundPlugin, opts: LoadOptions): Promise
   const exported = mod.default;
   if (typeof exported !== "function" && !isPlugin(exported)) throw new Error("default export is neither a plugin nor a function returning one");
   return {
-    ...found,
+    ...base,
     kind: "module",
     entry,
     info,
@@ -444,18 +509,23 @@ export async function loadPlugin(found: FoundPlugin, opts: LoadOptions): Promise
   };
 }
 
-/** 宿主给的上下文换成某个插件的：输入框和替用户发送只给用户层插件 */
-function pluginContext(found: FoundPlugin, { input, send, ...host }: HostContext): JadePluginContext {
+/** 宿主给的上下文换成某个插件的：输入框和替用户发送只给用户层插件；definePlugin 补上清单里的 id、version */
+function pluginContext(found: FoundPlugin & { id: string }, info: PluginInfo, { input, send, definePlugin, ...host }: HostContext): JadePluginContext {
   return {
     ...host,
-    ...(found.layer === "user" ? { input, send: send && ((text: string) => send(found.name, text)) } : {}),
+    ...(found.layer === "user" ? { input, send: send && ((text: string) => send(found.id, text)) } : {}),
+    definePlugin: <T extends ContextPluginDraft>(draft: T) => {
+      const version = draft.version ?? info.version;
+      if (version === undefined) throw new Error('the plugin has no version: add "version" to plugin.json');
+      return definePlugin({ ...draft, id: draft.id ?? found.id, version }) as T & JadePlugin;
+    },
     dir: found.dir,
     layer: found.layer,
-    status: (text) => host.status(found.name, text),
+    status: (text) => host.status(found.id, text),
   };
 }
 
-async function loadProcess(found: FoundPlugin, info: PluginInfo, opts: LoadOptions): Promise<LoadedPlugin> {
+async function loadProcess(found: FoundPlugin & { id: string }, info: PluginInfo, opts: LoadOptions): Promise<LoadedPlugin> {
   const json = info.json;
   // Windows 上相对路径的命令按 jade 的工作目录查找，而不是子进程的，所以先换成绝对路径
   const command = /^\.\.?[\\/]/.test(json.command!) ? path.resolve(found.dir, json.command!) : json.command!;
@@ -478,6 +548,10 @@ async function loadProcess(found: FoundPlugin, info: PluginInfo, opts: LoadOptio
       status.stderr.splice(0, Math.max(0, status.stderr.length - STDERR_LINES));
     },
   });
+  if (proc.id !== found.id) {
+    await proc.close().catch(() => {});
+    throw new Error(`its id ${JSON.stringify(proc.id)} (from initialize) does not match "id" in plugin.json (${found.id})`);
+  }
   // 原地加上而不是复制：内核只认 spawnPlugin 返回的那个项目层插件对象（宪法 7.1）
   if (proc.manifest.commands !== undefined) (proc as JadePlugin).commands = processCommands(proc);
   const loaded: LoadedPlugin = {
@@ -487,7 +561,7 @@ async function loadProcess(found: FoundPlugin, info: PluginInfo, opts: LoadOptio
     info,
     create: async (host) => {
       // 进程在会话之间共用，快捷键要用当前会话的输入框：每次创建时换成新的
-      if (proc.manifest.keys !== undefined) (proc as JadePlugin).keys = processKeys(proc, pluginContext(found, host));
+      if (proc.manifest.keys !== undefined) (proc as JadePlugin).keys = processKeys(proc, pluginContext(found, info, host));
       return proc;
     },
     close: () => proc.close(),
@@ -588,13 +662,23 @@ export async function inspectPlugin(dir: string): Promise<PluginInfo> {
   if (claude?.agents !== undefined || (await isDir(path.join(dir, "agents")))) bundle.unsupported.push("agents");
 
   const meta = {
+    id: json.id,
     name: str(json.name) ?? str(claude?.name) ?? str(pkg.name)?.replace(/^@[^/]+\//, ""),
     version: str(json.version) ?? str(claude?.version) ?? str(pkg.version),
     description: str(json.description) ?? str(claude?.description) ?? str(pkg.description),
   };
-  if (json.command !== undefined) return { ...meta, kind: "process", json, bundle };
+  const needsId = () => {
+    if (json.id === undefined) throw new Error('plugin.json: "id" is required for plugins with code, e.g. { "id": "me/my-plugin", "version": "1.0.0" }');
+  };
+  if (json.command !== undefined) {
+    needsId();
+    return { ...meta, kind: "process", json, bundle };
+  }
   const entry = json.entry ?? (await firstFile(dir, ENTRIES));
-  if (entry) return { ...meta, kind: "module", entry, json, bundle };
+  if (entry) {
+    needsId();
+    return { ...meta, kind: "module", entry, json, bundle };
+  }
   if (bundle.skills.length || bundle.commands.length || bundle.mcp) return { ...meta, kind: "content", json, bundle };
   throw new Error(`no ${ENTRIES.join(", ")}, no plugin.json, and no skills/, commands/ or mcp.json`);
 }
@@ -635,7 +719,9 @@ async function readPluginJson(dir: string): Promise<PluginJson> {
   const problem =
     typeof json !== "object" || json === null || Array.isArray(json)
       ? "must be an object"
-      : json.entry !== undefined && typeof json.entry !== "string"
+      : json.id !== undefined && (typeof json.id !== "string" || !PLUGIN_ID.test(json.id))
+        ? '"id" must be letters, digits, and . _ - @, in parts separated by /, e.g. "me/my-plugin"'
+        : json.entry !== undefined && typeof json.entry !== "string"
         ? '"entry" must be a string'
         : json.command !== undefined && (typeof json.command !== "string" || !json.command)
           ? '"command" must be a non-empty string'
@@ -658,6 +744,9 @@ async function firstFile(dir: string, names: string[]): Promise<string | undefin
 function isPlugin(v: unknown): v is JadePlugin {
   return typeof v === "object" && v !== null && typeof (v as Plugin).id === "string";
 }
+
+/** 插件 id：几段字母、数字和 . _ - @，用 / 分隔 */
+export const PLUGIN_ID = /^[\w.@-]+(\/[\w.@-]+)*$/;
 
 /** 斜杠命令名：字母数字开头，之后可以有 - 和 _ */
 export const COMMAND_NAME = /^[a-z0-9][a-z0-9_-]*$/i;

@@ -32,15 +32,20 @@ jade 的插件就是 [uncarved](../../../packages/kernel/README.md) 内核的插
 
 ## 五分钟上手
 
-在项目里新建 `.jade/plugins/hello/index.ts`：
+在项目里新建 `.jade/plugins/hello/`，放两个文件。`plugin.json` 写插件的身份：
+
+```json
+{ "id": "me/hello", "version": "1.0.0" }
+```
+
+`index.ts` 写插件做什么：
 
 ```ts
 import type { JadePluginFactory } from "@uncarved/jade";
 
 const factory: JadePluginFactory = ({ definePlugin }) =>
   definePlugin({
-    id: "me/hello",
-    version: "1.0.0",
+    // id、version 由 definePlugin 从 plugin.json 补上
     tools: [
       {
         name: "hello",
@@ -79,8 +84,8 @@ jade plugin add <来源> --project              # 装进 <仓库>/.jade/plugins�
 jade plugin list                              # 内置插件和装了的插件
 jade plugin update [名字…]                    # 按安装记录重新下载（git 看提交，npm 看版本）
 jade plugin remove <名字>
-jade plugin disable <名字|内置插件 id>         # 停用，例如 jade plugin disable jade/web
-jade plugin enable <名字|内置插件 id>
+jade plugin disable <id|目录名>               # 停用，例如 jade plugin disable jade/web
+jade plugin enable <id|目录名>
 ```
 
 - 安装时先下载到临时目录，确认是插件（有代码入口、`plugin.json` 或者 skills/命令/MCP 配置）之后才放到位，失败不会留下半个插件。
@@ -89,7 +94,8 @@ jade plugin enable <名字|内置插件 id>
 - 目录名依次取 `--name`、`plugin.json` 的 `name`、`.claude-plugin/plugin.json` 的 `name`、`package.json` 的 `name`（去掉作用域）、来源的最后一段。
 - 安装记录在插件目录的 `.installed.json` 里。直接复制进去的插件也能用，只是 `update` 不管它。
 - 自己用 `--project` 装的进程内插件不会在启动时再问一遍；别人拉取仓库后第一次加载时仍要确认。
-- 停用记录在 `$JADE_HOME/plugins.json`，只有用户自己能停用，仓库里的配置不能停用你的插件。
+- 停用记录在 `$JADE_HOME/plugins.json`，按插件的 id 记（给目录名时换成那个插件的 id），只有用户自己能停用，仓库里的配置不能停用你的插件。停用的插件不会被加载，它的代码一行也不会运行。
+- 卸载插件时，它的停用记录一起去掉。
 
 所以发布插件只要：把插件目录放进一个 git 仓库（或者仓库的子目录），或者发布成 npm 包。npm 包的入口按下面的规则找，**不看** `package.json` 的 `main`，请提供 `index.ts`/`index.js` 或者在 `plugin.json` 里写 `entry`。
 
@@ -109,10 +115,24 @@ jade plugin enable <名字|内置插件 id>
   2. `plugin.json` 写了 `entry`：用这个文件；
   3. 否则依次找 `index.ts`、`index.js`、`index.mjs`；
   4. 都没有，但有 `skills/`、`commands/` 或 `mcp.json`：只带内容的插件，见[带上 skills、命令和 MCP 服务](#带上-skills命令和-mcp-服务)。
+- **有代码的插件必须在 `plugin.json` 里写 `id`**，见下文[插件的身份](#插件的身份pluginjson-的-id)。
 - 插件在 jade 启动时加载，**改了插件要重启 jade 才生效**。
 - 加载或创建失败的插件会被跳过，启动时显示原因，不影响 jade 本身。常见原因有：入口找不到、内核版本不兼容、`needs` 没声明、`id` 或工具名和已有的重复。
 - 子 Agent（`task` 工具）只执行第三方插件的 `tool.gate`、`tool.before`、`tool.after` 这三种 hook（拦截、改写参数、给结果脱敏），不带它们的工具、其他 hook、`suggest` 和 `beforeSend`。所以给工具结果脱敏的插件对子 Agent 读到的内容同样生效，而按轮次触发的 observe hook 不会被子 Agent 触发。
 - `plugin.json` 还可以写 `name`、`version`、`description`，`jade plugin list` 和 `/plugins` 显示它们。
+
+### 插件的身份：`plugin.json` 的 `id`
+
+```json
+{ "id": "me/hello", "version": "1.0.0", "description": "say hello" }
+```
+
+jade 不执行插件的代码，只读 `plugin.json` 就要能认出插件：停用（`jade plugin disable me/hello`）、检查两个插件是不是同一个、状态栏、模型服务归属哪个插件，都按这个 id。所以：
+
+- 有代码的插件（进程内的模块、进程外的进程）**必须**写 `id`，否则不加载、也装不上。只带内容的插件可以不写，用目录名。
+- `id` 是几段字母、数字和 `.`、`_`、`-`、`@`，用 `/` 分隔，全局唯一，建议 `"作者/名字"`。`jade`、`jade/…` 留给内置插件。
+- 两个插件的 `id` 相同时，后发现的那个跳过（顺序：用户层在前，项目层从仓库根目录往下，同一层里按目录名）。
+- 插件实例的 `id` 必须和 `plugin.json` 的相同，不同就跳过。用 `ctx.definePlugin` 时可以不写 `id`、`version`，它从 `plugin.json` 补上；默认导出对象、或者用 `uncarved` 的 `definePlugin` 时要自己写，并且和 `plugin.json` 一致。进程外插件在 `initialize` 回复里给出的 `id` 也一样。
 
 ## 插件对象
 
@@ -120,7 +140,7 @@ jade plugin enable <名字|内置插件 id>
 
 ```ts
 interface JadePlugin {
-  id: string;            // 全局唯一，建议 "作者/名字"
+  id: string;            // 和 plugin.json 的 id 相同；用 ctx.definePlugin 时可以不写
   version: string;       // semver
   kernel: string;        // 兼容的内核版本，现在写 "^0.1"
   needs?: string[];      // 用到的内核能力，见下文
@@ -142,7 +162,7 @@ interface JadePlugin {
 - **`needs`**：插件用到的每个扩展点都要写成 `<种类>:<扩展点>`，例如 `"gate:tool.gate"`；用到 `ctx.record`、`ctx.emit` 还要写 `"log:record"`、`"log:emit"`。hook 用了没声明的扩展点，插件不加载；`record`/`emit` 没声明，调用时报错。
 - **`resume`**：恢复旧会话时，如果插件版本变了，jade 默认这样处理：补丁版本和小版本直接继续，主版本变化或者新增、删除了插件时询问用户。插件可以用这个字段覆盖对它自己的处理。
 
-手写 `kernel` 和 `needs` 容易漏，用 `definePlugin` 代劳：它把 `kernel` 填成当前内核的范围，把 hooks 用到的扩展点加进 `needs`。`log:record`、`log:emit` 推不出来，用到时仍要自己写。
+手写 `kernel` 和 `needs` 容易漏，用 `definePlugin` 代劳：它把 `kernel` 填成当前内核的范围，把 hooks 用到的扩展点加进 `needs`。`log:record`、`log:emit` 推不出来，用到时仍要自己写。工厂函数上下文里的 `ctx.definePlugin` 还会从 `plugin.json` 补上 `id` 和 `version`（`version` 也可以来自 `package.json`）。
 
 ```ts
 definePlugin({
@@ -178,7 +198,7 @@ export default factory;
 | `home` | jade 的数据目录（`$JADE_HOME`），插件可以在这里存自己的数据 |
 | `dir` | 插件自己的目录 |
 | `layer` | `"user"` 或 `"project"` |
-| `definePlugin` | 见上文 |
+| `definePlugin` | 见上文；`id`、`version` 不写时用 `plugin.json` 里的 |
 | `run` | `(command, { cwd?, timeoutMs, signal? }) => Promise<{ code, output, timedOut }>`：用 jade 的 shell 执行命令，超时或中断时连同子进程一起结束。找不到 shell 时没有这个字段 |
 | `complete` | `({ system?, prompt, onText? }, signal) => Promise<{ text, model, usage? }>`：用当前配置的模型发一次请求，见下文 |
 | `status` | `(text \| undefined) => void`：设置状态栏上本插件的那一段，见下文 |
@@ -195,11 +215,11 @@ export default factory;
 ```ts
 const factory: JadePluginFactory = (ctx) => {
   const timer = setInterval(() => ctx.status(clock()), 1000);
-  return ctx.definePlugin({ id: "me/clock", version: "1.0.0", dispose: () => clearInterval(timer) });
+  return ctx.definePlugin({ dispose: () => clearInterval(timer) });
 };
 ```
 
-- jade 不再用这个实例时调用一次：换会话（`/clear`、`/resume`）、重新加载、退出，以及创建了却没用上的实例（按 id 停用的、和别的插件 id 或工具名冲突被跳过的、`/resume` 失败时新建的那套）。
+- jade 不再用这个实例时调用一次：换会话（`/clear`、`/resume`）、重新加载、退出，以及创建了却没用上的实例（`id` 和 `plugin.json` 不一致的、和别的插件 id 或工具名冲突被跳过的、`/resume` 失败时新建的那套）。
 - 在会话收尾（`session.detached` 的 hook）**之后**调用，收尾时实例还能正常用。之后 `ctx.status`、`ctx.input`、`ctx.send` 不再起作用。
 - 可以是异步的。各插件的 `dispose` 同时进行，每个最多等 5 秒，超时或出错时显示警告，不影响换会话和退出。
 - 进程外插件没有 `dispose`：进程在会话之间共用，退出时 jade 发 `shutdown`。
@@ -261,7 +281,7 @@ ctx.input?.set("");            // 换掉全部文字（这里是清空），光�
 ctx.send?.("运行测试并修好失败的");  // 替用户提交
 ```
 
-- `send` 和用户在输入框里按回车一样：`/` 开头的是命令，消息先经过各插件的 [`beforeSend`](#改写用户消息beforesend)；模型正忙时排队。对话里会先显示 `[plugin <目录名> sent this for you]`。
+- `send` 和用户在输入框里按回车一样：`/` 开头的是命令，消息先经过各插件的 [`beforeSend`](#改写用户消息beforesend)；模型正忙时排队。对话里会先显示 `[plugin <id> sent this for you]`。
 - **只给用户层插件**：改输入框、发消息等于替用户说话，项目层插件的上下文里没有这两个字段。终端界面之外（`jade -p`、管道）也没有，所以用之前判断一下。
 - 什么时候调用都行（快捷键、定时器、后台连接里）。换会话后旧实例的调用不生效。
 
@@ -602,15 +622,16 @@ export const providers: PluginProvider[] = [{
   },
 }];
 
-// 插件本身照常是默认导出；只提供服务的插件也要有一个
-export default definePlugin({ id: "me/foo", version: "1.0.0" });
+// 插件本身照常是默认导出；只提供服务的插件也要有一个（id、version 来自 plugin.json）
+export default (ctx) => ctx.definePlugin({});
 ```
 
 - `env` 是 jade 的环境变量，包括 `$JADE_HOME/.env` 里的。服务自己的配置项（地址、密钥）由插件定名字，用户写进 `.env`。
 - **只认用户层插件**：服务能看到全部对话和 API key，项目层插件导出的 `providers` 被忽略。
 - **只在启动时读一次**：provider 是整个进程共用的（主会话、子 Agent、压缩、auto 模式的审查、`ctx.complete`），换会话不重建。它定义在模块里、拿不到插件实例，自然也不会依赖按会话的状态。
 - 工厂函数返回的插件对象里写 `providers` 不起作用，jade 会提示改成导出。
-- 停用插件后它的服务也不能用。按目录名停用（`jade plugin disable foo`）时插件根本不加载；按 id 停用（`jade plugin disable me/foo`）时，jade 要创建插件实例才知道 id，那之后才去掉它的服务，所以启动时会先用一下它的 `create`。选的正是这个服务时，终端界面里进 `/model` 换一个，`-p` 报错退出。推荐按目录名停用。
+- 停用插件后它的服务也不能用：停用的插件根本不加载。选的正是这个服务时，终端界面里进 `/model` 换一个，`-p` 报错退出。
+- 服务按插件的 `id` 归属，`/model` 和提示信息里显示的也是 `id`。
 - jade 在外面包一层重试和限速（`JADE_RPM`），压缩、子 Agent 也都经过它。要让重试正确工作，请求失败时抛 uncarved 的 `ProviderError`：能重试的设 `retryable: true`，限流时带上 `status: 429`。
 - `JADE_EFFORT`、`JADE_MAX_TOKENS` 不检查，插件愿意的话自己从 `env` 里读；`JADE_VISION` 不设时算不能看图片。
 - 选了插件的服务时，jade 等插件加载完才创建 provider，启动会比内置服务慢一点。`JADE_PROVIDER` 写的名字没有插件提供时，启动时报错并列出可选的服务。
@@ -683,6 +704,7 @@ definePlugin({
 
 ```json
 {
+  "id": "example/redact-secrets",
   "command": "python",
   "args": ["redact.py"],
   "env": { "LOG_LEVEL": "info" },
@@ -693,6 +715,7 @@ definePlugin({
 
 | 字段 | 说明 |
 |---|---|
+| `id` | 必填，见[插件的身份](#插件的身份pluginjson-的-id)。和 `initialize` 回复里的 `id` 不同时，jade 结束进程并跳过插件 |
 | `command` | 启动命令。`./`、`../` 开头的相对于插件目录 |
 | `args` | 参数 |
 | `env` | 额外的环境变量 |
@@ -812,7 +835,7 @@ jade 发给插件的请求：
 
 ## 发布前检查
 
-- [ ] `id` 全局唯一，带上作者前缀；改了行为就升 `version`，不兼容的改动升主版本。
+- [ ] `plugin.json` 写了 `id` 和 `version`；`id` 全局唯一，带上作者前缀；改了行为就升 `version`，不兼容的改动升主版本。
 - [ ] 每个工具的 `effect` 如实填写，`description` 写清楚什么时候该用。
 - [ ] 所有 hook 设了合理的 `timeoutMs`；不影响正确性的 transform 声明 `optional: true`。
 - [ ] `ctx.record`、`ctx.emit` 都 `await` 了。

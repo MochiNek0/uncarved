@@ -14,7 +14,7 @@ import {
   updatePlugins,
   type InstallRecord,
 } from "./plugins/install.ts";
-import { inspectPlugin, type PluginInfo } from "./plugins/loader.ts";
+import { inspectPlugin, pluginId, type PluginInfo } from "./plugins/loader.ts";
 import { bold, dim, green, red, terminalSafe, yellow } from "./ui/screen.ts";
 
 export const PLUGIN_HELP = `Usage: jade plugin <command>
@@ -31,8 +31,9 @@ export const PLUGIN_HELP = `Usage: jade plugin <command>
       --force                   replace a plugin with the same name
   update [name…] [--project]    fetch again what jade plugin add installed (all of them when no name is given)
   remove <name> [--project]     delete an installed plugin
-  disable <name|id>             stop loading a plugin, or a built-in plugin such as jade/web
-  enable <name|id>              undo disable
+  disable <id|name>             stop loading a plugin (by its id, or the name of its directory),
+                                or a built-in plugin such as jade/web
+  enable <id|name>              undo disable
 
 Plugins are loaded when jade starts; restart running sessions to pick up changes.`;
 
@@ -94,7 +95,7 @@ export async function pluginCli(argv: string[], o: PluginCliOptions): Promise<nu
       if (args.length !== 1) throw new UsageError("usage: jade plugin add <source> [--project] [--name <name>] [--path <dir>] [--link] [--force]");
       const r = await addPlugin(args[0]!, { pluginsDir: dir, cwd: o.cwd, name: flags.name, subdir: flags.path, link: flags.link, force: flags.force, log });
       if (flags.project && r.info.kind === "module") await trustProject(r.dir, o.trust);
-      out(green(`Installed ${bold(r.name)}${r.info.version ? ` ${r.info.version}` : ""} into ${r.dir}`) + dim(` (${origin(r.record)})`));
+      out(green(`Installed ${bold(pluginId({ name: r.name, dir: r.dir, layer: "user" }, r.info))}${r.info.version ? ` ${r.info.version}` : ""} into ${r.dir}`) + dim(` (${origin(r.record)})`));
       for (const line of await provides(r.dir, r.info)) out(`  ${line}`);
       if (r.info.bundle.unsupported.length) out(yellow(`  jade does not support the plugin's ${r.info.bundle.unsupported.join(" and ")} yet; they are ignored`));
       if (flags.project) out(dim("  Commit .jade/plugins to share it; others confirm it the first time jade loads it."));
@@ -128,24 +129,37 @@ export async function pluginCli(argv: string[], o: PluginCliOptions): Promise<nu
     case "rm":
     case "uninstall": {
       if (args.length !== 1) throw new UsageError("usage: jade plugin remove <name> [--project]");
+      // 停用记录按 id：删掉之前读出来
+      const info = await inspectPlugin(path.join(dir, args[0]!)).catch(() => undefined);
       if (!(await removePlugin(args[0]!, dir))) {
         err(red(`plugin ${args[0]} is not installed in ${dir}`));
         return 1;
       }
-      await setDisabled(o.home, args[0]!, false);
+      if (info) await setDisabled(o.home, pluginId({ name: args[0]!, dir, layer: "user" }, info), false);
       out(green(`Removed ${args[0]}.`));
       return 0;
     }
     case "disable":
     case "enable": {
-      if (args.length !== 1) throw new UsageError(`usage: jade plugin ${sub} <name|id>`);
-      const name = args[0]!;
-      if (sub === "disable" && REQUIRED_IDS.has(name)) {
-        err(red(`${name} cannot be disabled: it decides which tool calls need your approval. Plugins can only make it stricter, with gate hooks.`));
+      if (args.length !== 1) throw new UsageError(`usage: jade plugin ${sub} <id|name>`);
+      const arg = args[0]!;
+      if (sub === "disable" && REQUIRED_IDS.has(arg)) {
+        err(red(`${arg} cannot be disabled: it decides which tool calls need your approval. Plugins can only make it stricter, with gate hooks.`));
         return 1;
       }
-      if (!BUILTIN_IDS.has(name) && !(await knownPlugin(o, name)) && sub === "disable") {
-        err(yellow(`note: no built-in or installed plugin is called ${name}; it is disabled anyway in case it is a plugin id`));
+      // plugins.json 只记 id：给的是目录名时换成那个插件的 id
+      let name = arg;
+      if (!BUILTIN_IDS.has(arg)) {
+        const installed = await installedPlugins(o);
+        const byId = installed.find((p) => p.id === arg);
+        const byDir = installed.filter((p) => p.name === arg && p.id !== undefined);
+        if (!byId && byDir.length === 1) name = byDir[0]!.id!;
+        else if (!byId && byDir.length > 1) {
+          err(red(`several plugins are in a directory called ${arg} (${byDir.map((p) => p.id).join(", ")}); give the id instead`));
+          return 1;
+        } else if (!byId && sub === "disable") {
+          err(yellow(`note: no built-in or installed plugin has the id ${arg}; it is disabled anyway, in case a plugin with that id shows up`));
+        }
       }
       const changed = await setDisabled(o.home, name, sub === "disable");
       out(changed ? green(`${name} ${sub}d.`) + dim(" Restart jade to apply it.") : dim(`${name} is already ${sub}d.`));
@@ -188,9 +202,11 @@ async function list(o: PluginCliOptions, out: (t: string) => void) {
       } catch (e) {
         problem = e instanceof Error ? e.message : String(e);
       }
+      const id = info ? pluginId({ name, dir, layer: "user" }, info) : undefined;
       const version = info?.version ?? rec?.version;
-      const state = off.has(name) ? yellow(" disabled") : problem ? red(` broken: ${problem}`) : "";
-      out(`  ${bold(name)}${version ? ` ${version}` : ""}${info ? dim(` ${info.kind}`) : ""}${rec ? dim(` · ${origin(rec)}`) : dim(" · copied by hand")}${state}`);
+      const state = id !== undefined && off.has(id) ? yellow(" disabled") : problem ? red(` broken: ${problem}`) : "";
+      const where = id === name ? "" : dim(` (${name}/)`);
+      out(`  ${bold(id ?? name)}${where}${version ? ` ${version}` : ""}${info ? dim(` ${info.kind}`) : ""}${rec ? dim(` · ${origin(rec)}`) : dim(" · copied by hand")}${state}`);
       if (info?.description) out(dim(`    ${info.description}`));
       if (info) for (const line of await provides(path.join(dir, name), info)) out(dim(`    ${line}`));
     }
@@ -227,9 +243,16 @@ async function provides(dir: string, info: PluginInfo): Promise<string[]> {
   return lines;
 }
 
-async function knownPlugin(o: PluginCliOptions, name: string): Promise<boolean> {
-  for (const dir of [path.join(o.home, "plugins"), path.join(o.root, ".jade", "plugins")]) if ((await installedNames(dir)).includes(name)) return true;
-  return false;
+/** 用户层和项目层装了的插件：目录名和 id（清单读不了的没有 id） */
+async function installedPlugins(o: PluginCliOptions): Promise<{ name: string; id?: string }[]> {
+  const out: { name: string; id?: string }[] = [];
+  for (const dir of [path.join(o.home, "plugins"), path.join(o.root, ".jade", "plugins")]) {
+    for (const name of await installedNames(dir)) {
+      const info = await inspectPlugin(path.join(dir, name)).catch(() => undefined);
+      out.push({ name, id: info && pluginId({ name, dir, layer: "user" }, info) });
+    }
+  }
+  return out;
 }
 
 /** 自己用 --project 装的插件不用在启动时再确认一次（别人拉取仓库后第一次加载时仍要确认） */

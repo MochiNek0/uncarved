@@ -1,5 +1,6 @@
 // 示例：不让 Agent 改动某些文件。
-// 用到 tool.gate（拒绝调用）和 ctx.emit（在界面上提示）。默认导出一个对象，不需要上下文时这样写就够了。
+// 用到 tool.gate（拒绝调用）和 ctx.emit（在界面上提示）。默认导出一个对象，不需要上下文时这样写就够了；
+// 这时 id 要和 plugin.json 里的一致。
 
 import type { JadePlugin } from "@uncarved/jade";
 

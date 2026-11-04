@@ -46,7 +46,7 @@ export interface JadeOptions {
   projectPlugins?: Plugin[];
   /** 用 loadPlugin 加载的第三方插件（用户层和项目层），每次 createJade 创建一套新实例 */
   extensions?: LoadedPlugin[];
-  /** 停用的插件：内置插件的 id，或者第三方插件的 id（第三方插件按目录名停用由宿主在加载前处理） */
+  /** 停用的内置插件的 id（第三方插件由宿主在加载前按 id 筛掉，见 resolvePlugins） */
   disabled?: Iterable<string>;
   /** 压缩阈值；传函数时每次投影前取值 */
   compactTokens?: number | (() => number);
@@ -88,11 +88,11 @@ export interface JadeOptions {
   mcp?: McpClient[];
   /** loadSkills 找到的 skill */
   skills?: Skill[];
-  /** 插件用 ctx.status 设置状态栏上自己的那一段；plugin 是插件的目录名，text 为 undefined 时去掉 */
+  /** 插件用 ctx.status 设置状态栏上自己的那一段；plugin 是插件的 id，text 为 undefined 时去掉 */
   onStatus?(plugin: string, text: string | undefined): void;
   /** 终端界面的输入框，给用户层插件的 ctx.input；-p 时没有 */
   input?: InputControl;
-  /** 用户层插件的 ctx.send：替用户提交一行；plugin 是插件的目录名。-p 时没有 */
+  /** 用户层插件的 ctx.send：替用户提交一行；plugin 是插件的 id。-p 时没有 */
   send?(plugin: string, text: string): void;
 }
 
@@ -144,11 +144,6 @@ export interface Jade {
   shutdown(): void;
   /** 启动时要告诉用户的问题，例如找不到 shell */
   warnings: string[];
-  /**
-   * 按 id 停用而没有加进来的第三方插件（目录名）。创建了实例才知道 id，而它导出的模型服务在那之前已经注册了，
-   * 宿主据此去掉那些服务
-   */
-  disabledById: string[];
 }
 
 export async function createJade(opts: JadeOptions): Promise<Jade> {
@@ -173,8 +168,7 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
   const host: HostContext = { jade: JADE_VERSION, cwd: realPath(cwd), root: realPath(root), home: opts.home, definePlugin, run: shell.run, complete: completer(provider), status: (plugin, text) => opts.onStatus?.(plugin, text), checkpoints, input: opts.input, send: opts.send };
 
   // 第三方插件先创建：要先知道它们代替哪些内置插件
-  const disabledById: string[] = [];
-  const made = await createExtensions(opts.extensions ?? [], host, disabled, warnings, disabledById);
+  const made = await createExtensions(opts.extensions ?? [], host, warnings);
 
   // ---------- 内置插件（jade/prompts 最后创建：它要知道最终有哪些工具） ----------
   const built = new Map<string, JadePlugin>();
@@ -395,7 +389,6 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
     keys,
     renderers: new Map(([...builtin, ...added.map((a) => a.plugin)] as JadePlugin[]).flatMap((plugin) => (plugin.renderers ?? []).map((r) => [r.tool, { plugin: plugin.id, renderer: r }] as const))),
     beforeSend: added.flatMap(({ plugin }) => (plugin.beforeSend ? [{ plugin: plugin.id, fn: plugin.beforeSend.bind(plugin) }] : [])),
-    disabledById,
     dispose: () => (disposing ??= Promise.all(added.map(({ source, plugin }) => disposeInstance(source, plugin))).then((ws) => ws.filter((w): w is string => w !== undefined))),
     tools: allTools,
     shutdown: shell.shutdown,
@@ -407,7 +400,7 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
  * 创建第三方插件的实例。有问题的插件跳过并给出警告，而不是让整个 jade 起不来：工厂出错、内核不兼容、命令格式不对。
  * 只带内容（skills、命令、MCP 配置）的插件没有实例，由宿主处理
  */
-async function createExtensions(sources: LoadedPlugin[], host: HostContext, disabled: Set<string>, warnings: string[], disabledById: string[]) {
+async function createExtensions(sources: LoadedPlugin[], host: HostContext, warnings: string[]) {
   const out: { source: LoadedPlugin; plugin: JadePlugin }[] = [];
   /** 创建了却不用的实例也要收尾 */
   const discard = async (source: LoadedPlugin, plugin: JadePlugin) => {
@@ -416,10 +409,12 @@ async function createExtensions(sources: LoadedPlugin[], host: HostContext, disa
   };
   for (const source of sources) {
     if (!source.create) continue;
-    const where = `plugin ${source.name} (${source.layer})`;
+    const where = `plugin ${source.id} (${source.layer})`;
     let created: JadePlugin | undefined;
     try {
       created = await source.create(host);
+      // 清单里的 id 决定了停用、重复检查和状态栏，实例不能换成别的
+      if (created.id !== source.id) throw new Error(`its id ${JSON.stringify(created.id)} does not match "id" in plugin.json (use ctx.definePlugin, which fills it in)`);
       checkCompat(created);
     } catch (err) {
       warnings.push(`${where} is skipped: ${err instanceof Error ? err.message : String(err)}`);
@@ -430,11 +425,6 @@ async function createExtensions(sources: LoadedPlugin[], host: HostContext, disa
     if (plugin.dispose !== undefined && typeof plugin.dispose !== "function") {
       warnings.push(`${where}: dispose is ignored: it must be a function`);
       delete plugin.dispose;
-    }
-    if (disabled.has(plugin.id)) {
-      disabledById.push(source.name);
-      await discard(source, plugin);
-      continue;
     }
     if (plugin.replaces !== undefined && !(Array.isArray(plugin.replaces) && plugin.replaces.every((x) => typeof x === "string"))) {
       warnings.push(`${where} is skipped: "replaces" must be an array of plugin ids`);
@@ -508,7 +498,7 @@ async function createExtensions(sources: LoadedPlugin[], host: HostContext, disa
  */
 async function disposeInstance(source: LoadedPlugin, plugin: JadePlugin): Promise<string | undefined> {
   if (source.kind === "process" || typeof plugin.dispose !== "function") return undefined;
-  const where = `plugin ${source.name} (${source.layer})`;
+  const where = `plugin ${source.id} (${source.layer})`;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<"timeout">((resolve) => {
     timer = setTimeout(() => resolve("timeout"), DISPOSE_TIMEOUT_MS);
@@ -531,7 +521,7 @@ export function collectProviders(sources: LoadedPlugin[]): { providers: { plugin
   const warnings: string[] = [];
   const providers = sources.flatMap((source) => {
     if (source.providers === undefined) return [];
-    const where = `plugin ${source.name} (${source.layer})`;
+    const where = `plugin ${source.id} (${source.layer})`;
     if (source.layer === "project") {
       warnings.push(`${where}: providers are ignored: only user plugins can provide model services`);
       return [];
@@ -547,7 +537,7 @@ export function collectProviders(sources: LoadedPlugin[]): { providers: { plugin
         else if (d.settings !== undefined) d.settings = providerSettings(d.settings, `${where}: provider ${d.kind}`, warnings);
         return ok;
       })
-      .map((def) => ({ plugin: source.name, def }));
+      .map((def) => ({ plugin: source.id, def }));
   });
   return { providers, warnings };
 }
@@ -576,7 +566,7 @@ function accept(made: { source: LoadedPlugin; plugin: JadePlugin }[], existing: 
   const accepted: typeof made = [];
   const rejected: string[] = [];
   for (const m of made) {
-    const where = `plugin ${m.source.name} (${m.source.layer})`;
+    const where = `plugin ${m.source.id} (${m.source.layer})`;
     if (ids.has(m.plugin.id)) {
       rejected.push(`${where} is skipped: another plugin already has the id ${m.plugin.id}`);
       continue;
