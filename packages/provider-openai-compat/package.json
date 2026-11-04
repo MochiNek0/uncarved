@@ -1,6 +1,6 @@
 {
   "name": "@uncarved/provider-openai-compat",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "OpenAI-compatible Chat Completions provider for uncarved",
   "license": "MIT",
   "repository": {
