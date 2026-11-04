@@ -58,7 +58,8 @@ describe("parseProblems", () => {
     expect(out[2]!.text).toContain("Found 3 errors.");
     expect(parseProblems("error TS5083: Cannot read file 'x'.", cwd)).toEqual([{ text: "error TS5083: Cannot read file 'x'." }]);
     const win = parseProblems("C:\\proj\\src\\a.ts(1,1): error TS1005", cwd);
-    expect(win[0]!.file).toBe(path.resolve("C:\\proj\\src\\a.ts"));
+    // 只有 Windows 上它是绝对路径；别的系统上是相对 cwd 的
+    expect(win[0]!.file).toBe(path.resolve(cwd, "C:\\proj\\src\\a.ts"));
   });
 });
 
