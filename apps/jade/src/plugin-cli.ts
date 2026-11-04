@@ -175,26 +175,15 @@ export class UsageError extends Error {}
 async function list(o: PluginCliOptions, out: (t: string) => void) {
   const { disabled } = await readPluginSettings(o.home);
   const off = new Set(disabled);
-  out(bold("Built-in") + dim("  (jade plugin disable <id> turns one off)"));
-  const width = Math.max(...BUILTINS.map((b) => b.id.length)) + 2;
-  for (const b of BUILTINS) {
-    const state = b.required ? dim(" required") : off.has(b.id) ? yellow(" disabled") : "";
-    out(`  ${b.id.padEnd(width)}${dim(b.about)}${state}`);
-  }
+  // 先读清单（不执行代码）：内置插件那一栏要显示被谁代替
+  const layers = [];
   for (const [title, dir] of [
     ["User", path.join(o.home, "plugins")],
     ["Project", path.join(o.root, ".jade", "plugins")],
   ] as const) {
-    const names = await installedNames(dir);
-    out("");
-    out(bold(title) + dim(`  ${dir}`));
-    if (names.length === 0) {
-      out(dim("  (none)"));
-      continue;
-    }
     const records = await readRecords(dir);
-    for (const name of names) {
-      const rec = records[name];
+    const entries = [];
+    for (const name of await installedNames(dir)) {
       let info: PluginInfo | undefined;
       let problem: string | undefined;
       try {
@@ -203,6 +192,31 @@ async function list(o: PluginCliOptions, out: (t: string) => void) {
         problem = e instanceof Error ? e.message : String(e);
       }
       const id = info ? pluginId({ name, dir, layer: "user" }, info) : undefined;
+      entries.push({ name, info, problem, id, rec: records[name] });
+    }
+    layers.push({ title, dir, entries });
+  }
+  const replacedBy = new Map<string, string>();
+  for (const e of layers.flatMap((l) => l.entries)) {
+    if (e.id === undefined || off.has(e.id)) continue;
+    for (const b of e.info?.replaces ?? []) if (!replacedBy.has(b)) replacedBy.set(b, e.id);
+  }
+
+  out(bold("Built-in") + dim("  (jade plugin disable <id> turns one off)"));
+  const width = Math.max(...BUILTINS.map((b) => b.id.length)) + 2;
+  for (const b of BUILTINS) {
+    const by = replacedBy.get(b.id);
+    const state = b.required ? dim(" required") : off.has(b.id) ? yellow(" disabled") : by ? yellow(` replaced by ${by}`) : "";
+    out(`  ${b.id.padEnd(width)}${dim(b.about)}${state}`);
+  }
+  for (const { title, dir, entries } of layers) {
+    out("");
+    out(bold(title) + dim(`  ${dir}`));
+    if (entries.length === 0) {
+      out(dim("  (none)"));
+      continue;
+    }
+    for (const { name, info, problem, id, rec } of entries) {
       const version = info?.version ?? rec?.version;
       const state = id !== undefined && off.has(id) ? yellow(" disabled") : problem ? red(` broken: ${problem}`) : "";
       const where = id === name ? "" : dim(` (${name}/)`);
@@ -224,6 +238,7 @@ async function provides(dir: string, info: PluginInfo): Promise<string[]> {
   const lines: string[] = [];
   if (info.kind === "module") lines.push(`code: ${info.entry}`);
   if (info.kind === "process") lines.push(`process: ${[info.json.command, ...(info.json.args ?? [])].join(" ")}`);
+  if (info.replaces?.length) lines.push(`replaces: ${info.replaces.join(", ")}`);
   const skills: string[] = [];
   for (const d of info.bundle.skills) {
     for (const n of await readdir(d).catch(() => [] as string[])) {

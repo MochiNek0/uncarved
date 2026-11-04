@@ -16,7 +16,7 @@
 
 需要改变 jade 本身的行为（拦截、改写、审计）或者加斜杠命令时，再写插件。
 
-jade 的插件就是 [uncarved](../../../packages/kernel/README.md) 内核的插件，外加 jade 认识的 `commands`、`replaces`、`responder`、`suggest`、`beforeSend` 字段。为 uncarved 写的插件不用改就能在 jade 里用。
+jade 的插件就是 [uncarved](../../../packages/kernel/README.md) 内核的插件，外加 jade 认识的 `commands`、`responder`、`suggest`、`beforeSend` 字段。为 uncarved 写的插件不用改就能在 jade 里用。
 
 本文的完整示例在 [`examples/plugins`](../examples/plugins)：
 
@@ -132,6 +132,7 @@ jade 不执行插件的代码，只读 `plugin.json` 就要能认出插件：停
 - 有代码的插件（进程内的模块、进程外的进程）**必须**写 `id`，否则不加载、也装不上。只带内容的插件可以不写，用目录名。
 - `id` 是几段字母、数字和 `.`、`_`、`-`、`@`，用 `/` 分隔，全局唯一，建议 `"作者/名字"`。`jade`、`jade/…` 留给内置插件。
 - 两个插件的 `id` 相同时，后发现的那个跳过（顺序：用户层在前，项目层从仓库根目录往下，同一层里按目录名）。
+- 代替内置插件也写在这里（`"replaces": ["jade/web"]`），见[内置插件](#内置插件)。
 - 插件实例的 `id` 必须和 `plugin.json` 的相同，不同就跳过。用 `ctx.definePlugin` 时可以不写 `id`、`version`，它从 `plugin.json` 补上；默认导出对象、或者用 `uncarved` 的 `definePlugin` 时要自己写，并且和 `plugin.json` 一致。进程外插件在 `initialize` 回复里给出的 `id` 也一样。
 
 ## 插件对象
@@ -148,7 +149,6 @@ interface JadePlugin {
   tools?: Tool[];
   hooks?: HookSpec[];
   commands?: PluginCommand[];   // jade 的扩展：斜杠命令
-  replaces?: string[];          // jade 的扩展：代替的内置插件，例如 ["jade/web"]
   responder?: Responder;        // jade 的扩展：在终端之外回答审批和 ask_user，见下文
   suggest?: Suggester;          // jade 的扩展：预测下一条消息，输入框里显示成灰字，见下文
   beforeSend?(text, ctx): string | undefined;  // jade 的扩展：用户消息发出前改写，见下文
@@ -693,16 +693,18 @@ jade 自己的功能都是插件，和第三方插件用同一套接口（[`src/
 
 用户可以用 `jade plugin disable <id>` 停用其中任何一个（`jade/policy` 除外），停用后它的工具、提示词段落和命令都不再出现。
 
-插件用 `replaces` 代替内置插件：
+插件在 `plugin.json` 里用 `replaces` 代替内置插件：
+
+```json
+{ "id": "me/web", "version": "1.0.0", "replaces": ["jade/web"] }
+```
 
 ```ts
-definePlugin({
-  id: "me/web",
-  version: "1.0.0",
-  replaces: ["jade/web"],      // jade/web 不再加载
-  tools: [myWebFetch],         // 可以用 web_fetch 这个名字
-});
+// index.ts：jade/web 不再加载，可以用 web_fetch 这个名字
+export default (ctx) => ctx.definePlugin({ tools: [myWebFetch] });
 ```
+
+写在清单里，jade 不执行代码就知道谁代替了谁（`jade plugin list` 也能显示）。写在插件对象上的 `replaces` 不起作用，jade 会提示。只有带代码的插件可以写，进程外插件也一样写在 `plugin.json` 里。
 
 - 被代替的内置插件不加载，代替者可以提供同名的工具。
 - 代替者自己因为别的原因被跳过（例如另一个工具名冲突）时，被代替的内置插件照常加载。
@@ -728,6 +730,7 @@ definePlugin({
 | 字段 | 说明 |
 |---|---|
 | `id` | 必填，见[插件的身份](#插件的身份pluginjson-的-id)。和 `initialize` 回复里的 `id` 不同时，jade 结束进程并跳过插件 |
+| `replaces` | 代替的内置插件，见[内置插件](#内置插件) |
 | `command` | 启动命令。`./`、`../` 开头的相对于插件目录 |
 | `args` | 参数 |
 | `env` | 额外的环境变量 |
@@ -846,7 +849,7 @@ jade 发给插件的请求：
 
 | 扩展点 | 作用域 | 哪一层可用 | 冲突时 | 出错时 |
 |---|---|---|---|---|
-| 清单（`plugin.json`） | 进程 | 两层 | `id` 重复：后发现的跳过 | 格式不对、有代码却没写 `id`：跳过插件 |
+| 清单（`plugin.json`，包括 `replaces`） | 进程 | 两层 | `id` 重复：后发现的跳过 | 格式不对、有代码却没写 `id`、只带内容却写了 `replaces`：跳过插件 |
 | `providers`（模块导出） | 进程 | 仅用户层；项目层的给出警告 | `kind` 和内置服务同名或重复：跳过这个服务 | 格式不对：跳过这个服务；`create` 出错：`/model` 报错 |
 | 进程外插件的进程 | 进程 | 两层（项目层需确认） | — | 进程自己退出：警告一次，之后的调用按出错处理，不重启 |
 | 工厂函数 | 会话 | 两层 | — | 出错、返回的 `id` 和清单不一致、内核版本不满足：跳过插件 |
@@ -858,7 +861,7 @@ jade 发给插件的请求：
 | `responder` | 会话 | 仅用户层 | 和终端同时等，用最先给出的回答 | 视为不回答，警告 |
 | `suggest` | 会话 | 两层 | 只用第一个 | 不显示建议，警告 |
 | `beforeSend` | 会话（依次） | 两层 | 按加载顺序链式处理 | 跳过这个插件的改动，警告；30 秒超时 |
-| `replaces` | 会话 | 两层 | 可以代替的都代替；被跳过的插件声明的代替不算；`jade/policy` 不可代替 | 格式不对：跳过插件 |
+| 代替内置插件 | 每个会话按清单的 `replaces` 计算 | 两层 | 可以代替的都代替；被跳过的插件声明的代替不算；`jade/policy` 不可代替 | 代替不存在的内置插件：警告；写在插件对象上：不起作用，警告 |
 | `dispose` | 会话 | 两层（进程外插件没有） | — | 警告；5 秒超时 |
 | `ctx.status` | 会话 | 两层 | 按插件的 `id` 各占一段 | 会话结束后还调用：不起作用，警告一次 |
 | `ctx.input`、`ctx.send` | 会话 | 仅用户层，`jade -p` 时没有 | — | 会话开始前、结束后调用：不起作用，警告一次 |

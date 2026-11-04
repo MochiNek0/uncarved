@@ -95,24 +95,24 @@ describe("slash command names", () => {
     const cwd = realpathSync.native(await mkdtemp(path.join(os.tmpdir(), "jade-rules-")));
     const home = realpathSync.native(await mkdtemp(path.join(os.tmpdir(), "jade-rules-home-")));
     const provider: Provider = { id: "none", complete: () => Promise.reject(new Error("unused")) };
-    const fake = (name: string, extra: Record<string, unknown>): LoadedPlugin => ({
+    const fake = (name: string, replaces?: string[]): LoadedPlugin => ({
       name,
       id: `x/${name}`,
       dir: path.join(home, "plugins", name),
       layer: "user",
       kind: "module",
       entry: "index.ts",
-      info: { kind: "module", entry: "index.ts", json: {}, bundle: { skills: [], commands: [], unsupported: [] } },
-      create: async () => ({ id: `x/${name}`, version: "1.0.0", kernel: "^0.1", commands: [{ name: "undo", run: () => "mine" }], ...extra }) as never,
+      info: { kind: "module", entry: "index.ts", replaces, json: { id: `x/${name}`, replaces }, bundle: { skills: [], commands: [], unsupported: [] } },
+      create: async () => ({ id: `x/${name}`, version: "1.0.0", kernel: "^0.1", commands: [{ name: "undo", run: () => "mine" }] }) as never,
     });
     const make = (p: LoadedPlugin) => createJade({ cwd, home, store: new MemoryLogStore(), provider, env: {}, extensions: [p] });
 
-    const plain = await make(fake("plain", {}));
+    const plain = await make(fake("plain"));
     expect(plain.commands.get("undo")).toMatchObject({ plugin: "jade/undo", builtin: true });
     expect(plain.warnings).toContain("plugin x/plain: command /undo is ignored: plugin jade/undo already provides it");
     plain.shutdown();
 
-    const replacing = await make(fake("better-undo", { replaces: ["jade/undo"] }));
+    const replacing = await make(fake("better-undo", ["jade/undo"]));
     expect(replacing.commands.get("undo")).toMatchObject({ plugin: "x/better-undo", builtin: false });
     expect(replacing.builtins.find((b) => b.id === "jade/undo")).toMatchObject({ state: "replaced", by: "x/better-undo" });
     replacing.shutdown();

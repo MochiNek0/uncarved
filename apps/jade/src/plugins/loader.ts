@@ -303,11 +303,6 @@ export interface JadePlugin extends Plugin {
    * 之后 ctx.status、ctx.input、ctx.send 不再起作用。限时 DISPOSE_TIMEOUT_MS，出错或超时只显示警告
    */
   dispose?(): Awaitable<void>;
-  /**
-   * 代替的内置插件的 id（例如 "jade/web"）：被代替的内置插件不再加载，它的工具名可以由本插件提供。
-   * jade/policy 不能代替
-   */
-  replaces?: string[];
 }
 
 /** definePlugin 的输入：kernel、needs 可以省略 */
@@ -337,6 +332,11 @@ export interface PluginJson {
   name?: string;
   version?: string;
   description?: string;
+  /**
+   * 代替的内置插件的 id（例如 ["jade/web"]）：被代替的内置插件不再加载，它的工具名可以由本插件提供。
+   * 写在清单里，不执行代码就能知道；jade/policy 不能代替。只有带代码的插件可以写
+   */
+  replaces?: string[];
   /** 进程内插件的入口，默认依次找 index.ts、index.js、index.mjs */
   entry?: string;
   /** 进程外插件的启动命令；"./"、"../" 开头的相对于插件目录 */
@@ -368,6 +368,8 @@ export interface PluginInfo {
   name?: string;
   version?: string;
   description?: string;
+  /** plugin.json 的 replaces */
+  replaces?: string[];
   /** module：TS/JS 模块；process：plugin.json 写了 command；content：没有代码，只有 skills、命令、MCP 配置 */
   kind: "module" | "process" | "content";
   /** module 的入口文件（相对于插件目录） */
@@ -472,9 +474,9 @@ export async function resolvePlugins(
     }
     const id = pluginId(r.f, r.info);
     if (disabled.has(id)) continue;
-    // jade、jade/… 留给内置插件：会话里记的键按 id 划分；代替内置插件用 replaces
+    // jade、jade/… 留给内置插件：会话里记的键按 id 划分；代替内置插件用 plugin.json 的 replaces
     if (id === "jade" || id.startsWith("jade/")) {
-      warnings.push(`plugin ${r.f.dir} is skipped: the id ${id} is reserved for jade's built-in plugins (use replaces to stand in for one)`);
+      warnings.push(`plugin ${r.f.dir} is skipped: the id ${id} is reserved for jade's built-in plugins (use "replaces" in plugin.json to stand in for one)`);
       continue;
     }
     const first = seen.get(id);
@@ -693,6 +695,7 @@ export async function inspectPlugin(dir: string): Promise<PluginInfo> {
     name: str(json.name) ?? str(claude?.name) ?? str(pkg.name)?.replace(/^@[^/]+\//, ""),
     version: str(json.version) ?? str(claude?.version) ?? str(pkg.version),
     description: str(json.description) ?? str(claude?.description) ?? str(pkg.description),
+    replaces: json.replaces,
   };
   const needsId = () => {
     if (json.id === undefined) throw new Error('plugin.json: "id" is required for plugins with code, e.g. { "id": "me/my-plugin", "version": "1.0.0" }');
@@ -706,6 +709,7 @@ export async function inspectPlugin(dir: string): Promise<PluginInfo> {
     needsId();
     return { ...meta, kind: "module", entry, json, bundle };
   }
+  if (json.replaces !== undefined) throw new Error('plugin.json: "replaces" needs a plugin with code: the plugin stands in for the built-in plugin it replaces');
   if (bundle.skills.length || bundle.commands.length || bundle.mcp) return { ...meta, kind: "content", json, bundle };
   throw new Error(`no ${ENTRIES.join(", ")}, no plugin.json, and no skills/, commands/ or mcp.json`);
 }
@@ -748,6 +752,8 @@ async function readPluginJson(dir: string): Promise<PluginJson> {
       ? "must be an object"
       : json.id !== undefined && (typeof json.id !== "string" || !PLUGIN_ID.test(json.id))
         ? '"id" must be letters, digits, and . _ - @, in parts separated by /, e.g. "me/my-plugin"'
+        : json.replaces !== undefined && !strings(json.replaces)
+          ? '"replaces" must be an array of built-in plugin ids, e.g. ["jade/web"]'
         : json.entry !== undefined && typeof json.entry !== "string"
         ? '"entry" must be a string'
         : json.command !== undefined && (typeof json.command !== "string" || !json.command)

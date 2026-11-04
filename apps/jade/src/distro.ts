@@ -1,7 +1,7 @@
 // 组装发行版：内核之外的功能都是插件。内置插件（见 plugins/builtins.ts）和第三方插件用同一套接口，
 // 在这里拼成一份插件清单。宿主（main.ts）和测试都通过这里创建，内核本身不知道这些插件的存在。
 //
-// 用户可以停用内置插件（$JADE_HOME/plugins.json），第三方插件可以用 replaces 代替内置插件；jade/policy 两者都不行。
+// 用户可以停用内置插件（$JADE_HOME/plugins.json），第三方插件可以在 plugin.json 里用 replaces 代替内置插件；jade/policy 两者都不行。
 
 import path from "node:path";
 import { checkCompat, definePlugin, subsetPlugin, type LogStore, type ModelRequest, type Plugin, type Provider, type Tool } from "uncarved";
@@ -314,19 +314,20 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
   }
 
   // ---------- 代替关系：被代替的内置插件让位，代替者的工具名可以和它重复 ----------
-  const claims = (p: JadePlugin) => (p.replaces ?? []).filter((id) => BUILTIN_IDS.has(id) && !REQUIRED_IDS.has(id) && built.has(id));
+  // 代替关系写在清单里（plugin.json 的 replaces），不看实例
+  const claims = (m: Extension) => (m.source.info.replaces ?? []).filter((id) => BUILTIN_IDS.has(id) && !REQUIRED_IDS.has(id) && built.has(id));
   for (const { source, plugin } of made) {
-    for (const id of plugin.replaces ?? []) {
+    for (const id of source.info.replaces ?? []) {
       if (REQUIRED_IDS.has(id)) warnings.push(`plugin ${plugin.id} (${source.layer}): cannot replace ${id}; add a gate hook to make approvals stricter instead`);
       else if (!BUILTIN_IDS.has(id)) warnings.push(`plugin ${plugin.id} (${source.layer}): replaces unknown built-in plugin ${id}`);
     }
   }
   // 从"全部声明都生效"开始；被拒绝的插件声明的代替撤销，内置插件回来之后可能又拒绝别的插件，直到不再变化
-  let replaced = new Set(made.flatMap((m) => claims(m.plugin)));
+  let replaced = new Set(made.flatMap(claims));
   let result: ReturnType<typeof accept>;
   for (;;) {
     result = accept(made, [...built.values()].filter((p) => !replaced.has(p.id)));
-    const next = new Set(result.accepted.flatMap((m) => claims(m.plugin)));
+    const next = new Set(result.accepted.flatMap(claims));
     if (next.size === replaced.size) break;
     replaced = next;
   }
@@ -367,7 +368,7 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
 
   const builtins: BuiltinState[] = BUILTINS.map((b) => {
     if (kept.has(b.id)) return { ...b, state: "on" as const };
-    const by = added.find((a) => claims(a.plugin).includes(b.id))?.plugin.id;
+    const by = added.find((a) => claims(a).includes(b.id))?.plugin.id;
     return by ? { ...b, state: "replaced" as const, by } : { ...b, state: "disabled" as const };
   });
 
@@ -450,11 +451,7 @@ async function createExtensions(sources: LoadedPlugin[], host: HostContext, warn
     const plugin = created;
     // disposeInstance 只调用函数：不合格的不用删
     if (plugin.dispose !== undefined && typeof plugin.dispose !== "function") warnings.push(`${where}: dispose is ignored: it must be a function`);
-    if (plugin.replaces !== undefined && !(Array.isArray(plugin.replaces) && plugin.replaces.every((x) => typeof x === "string"))) {
-      warnings.push(`${where} is skipped: "replaces" must be an array of plugin ids`);
-      await discard(source, plugin);
-      continue;
-    }
+    if ("replaces" in plugin) warnings.push(`${where}: replaces is ignored: write it in plugin.json instead ("replaces": ["jade/…"])`);
     // 进程外插件的快捷键和命令按清单为这一套生成；模块插件的就在实例上
     const parts = source.adapters ? source.adapters(host) : plugin;
     const commands = listOf(parts.commands).filter((c): c is PluginCommand => {
@@ -545,7 +542,7 @@ function accept(made: Extension[], existing: Plugin[]) {
     }
     // jade、jade/… 留给内置插件：会话里记的键按 id 划分（jade/undo 的撤销记录等），代替内置插件用 replaces，不用它的 id
     if (m.plugin.id === "jade" || m.plugin.id.startsWith("jade/")) {
-      rejected.push(`${where} is skipped: the id ${m.plugin.id} is reserved for jade's built-in plugins (use replaces to stand in for one)`);
+      rejected.push(`${where} is skipped: the id ${m.plugin.id} is reserved for jade's built-in plugins (use "replaces" in plugin.json to stand in for one)`);
       continue;
     }
     const clash = (m.plugin.tools ?? []).find((t) => toolNames.has(t.name));
