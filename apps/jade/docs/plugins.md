@@ -266,7 +266,7 @@ keys: [
 ```
 
 - `key` 写成 `ctrl+<字母>` 或 `alt+<字母或数字>`，不分大小写。jade 自己用的键不能用：`ctrl+a/c/d/e/h/i/j/k/l/m/o/r/u/w` 和 `alt+f`。格式不对或用了保留键的会被忽略并提示；两个插件用了同一个键时，排在前面的生效。
-- 输入框有焦点时按下就调用 `run`，模型工作时也一样；弹出选择框、输入框时不响应。`run` 不阻塞界面，出错时在对话里显示警告。
+- 输入框有焦点时按下就调用 `run({ sessionId })`，模型工作时也一样；弹出选择框、输入框时不响应。`run` 不阻塞界面，出错时在对话里显示警告。
 - `/help` 列出插件的快捷键和 `description`。
 - 项目层插件也能提供快捷键，但它的上下文里没有 `input`、`send`。
 - 进程外插件也能提供，见[进程外插件的快捷键](#进程外插件的快捷键)。
@@ -596,7 +596,7 @@ definePlugin({
 - `JADE_EFFORT`、`JADE_MAX_TOKENS` 不检查，插件愿意的话自己从 `env` 里读；`JADE_VISION` 不设时算不能看图片。
 - 选了插件的服务时，jade 等插件加载完才创建 provider，启动会比内置服务慢一点。`JADE_PROVIDER` 写的名字没有插件提供时，启动时报错并列出可选的服务。
 - **`/model`**：声明了 `settings` 的服务出现在 "Add a model… → Another service…" 的列表里，选中后依次询问各项，再选模型；配置写进 `$JADE_HOME/.env`，并和内置服务一样记进 `models.json`，之后可以在 `/model` 里直接切换回来（类型和模型名以外的配置项都相同的算同一个服务）。没有声明模型名（`model: true`）的服务，`/model` 不能换它的模型。
-- 第一次运行、还没配置任何模型时，jade 先加载插件再进入配置流程，所以列表里也有插件提供的服务。这时还没有模型，插件的工厂函数里调用 `ctx.complete` 会失败。
+- 第一次运行、还没配置任何模型时，jade 先加载插件再进入配置流程，所以列表里也有插件提供的服务。配置好模型之后，jade 会把插件实例重新创建一遍，所以工厂函数里也可以调用 `ctx.complete`（用插件提供的模型服务时也一样）。
 - 进程外插件不能提供 `providers`。
 
 ## 带上 skills、命令和 MCP 服务
@@ -691,7 +691,7 @@ jade 发给插件的请求：
 | `initialize` | `{ kernel: "0.1.0" }` | 插件清单，见下文 |
 | `hook` | `{ hook, sessionId, payload }` | transform：只含要修改的字段的对象；gate：`{ decision, reason? }`；observe：`{}` |
 | `jade/command` | `{ name, args, sessionId, cwd }` | 见[进程外插件的斜杠命令](#进程外插件的斜杠命令) |
-| `jade/key` | `{ key, text? }` | 见[进程外插件的快捷键](#进程外插件的快捷键) |
+| `jade/key` | `{ key, sessionId, text? }` | 见[进程外插件的快捷键](#进程外插件的快捷键) |
 | `$/cancel`（通知，无需回复） | `{ id }` | — |
 | `shutdown` | `{}` | `{}`，然后退出 |
 
@@ -758,7 +758,7 @@ jade 发给插件的请求：
 { "keys": [{ "key": "ctrl+t", "description": "uppercase the input" }] }
 ```
 
-按下时 jade 发 `jade/key { key, text }`，`text` 是输入框里还没提交的文字。用户层插件可以回复：
+按下时 jade 发 `jade/key { key, sessionId, text }`，`text` 是输入框里还没提交的文字。进程在会话之间共用，换会话后状态不会清空，需要按会话区分时用 `sessionId`。用户层插件可以回复：
 
 - `{ "set": "..." }`：换掉输入框里的全部文字；
 - `{ "insert": "..." }`：在光标处插入；

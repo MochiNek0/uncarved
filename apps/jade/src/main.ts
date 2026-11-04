@@ -423,10 +423,16 @@ const makeJade = (mode?: Mode) => {
   });
 };
 
+const warn = (list: string[]) => {
+  for (const w of list) screen.log(yellow(`[warning] ${w}`));
+};
 let jade: Jade = await makeJade(opts.mode);
-for (const w of jade.warnings) screen.log(yellow(`[warning] ${w}`));
+// 还没有模型时（第一次运行、模型服务由插件提供）创建的插件实例，工厂函数里调用 ctx.complete 会失败：
+// 有了模型之后重新创建一遍，插件的警告只显示那一遍的
+const rebuild = !hasProvider() || pluginProviderPending;
+if (!rebuild) warn(jade.warnings);
 // 插件提供的模型服务：只在启动时注册一次，之后的会话共用（provider 是整个进程的）
-for (const w of registerProviders(jade.providers)) screen.log(yellow(`[warning] ${w}`));
+warn(registerProviders(jade.providers));
 if (!hasProvider()) {
   // 第一次运行：插件已经加载，/model 的服务列表里也有插件提供的
   screen.log(bold("Welcome to jade.") + " No model is configured yet; let's set one up.");
@@ -442,9 +448,15 @@ if (!hasProvider()) {
   } catch (err) {
     await closePlugins();
     await screen.close();
-    fail(errorText(err));
+    // 例如提供这个服务的插件没加载成功：原因在插件的警告里（终端界面已经关了，写进错误信息）
+    fail([errorText(err), ...jade.warnings.map((w) => `[warning] ${w}`)].join("\n"));
   }
   screen.status({ model: modelLabel() });
+}
+if (rebuild) {
+  jade.shutdown();
+  jade = await makeJade(opts.mode);
+  warn(jade.warnings);
 }
 if (badSavedMode) screen.log(yellow(`[warning] JADE_MODE=${badSavedMode} is not a mode (${MODES.join(", ")}); starting in ${opts.mode ?? "ask"}`));
 for (const c of shadowed) screen.log(yellow(`[warning] custom command ${display(cwd, c.file)} is ignored: /${c.name} is a built-in command`));
@@ -1224,7 +1236,7 @@ function pluginKey(spec: string): boolean {
   const found = jade.keys.get(spec);
   if (!found) return false;
   Promise.resolve()
-    .then(() => found.key.run())
+    .then(() => found.key.run({ sessionId }))
     .catch((err) => screen.log(yellow(`[warning] plugin ${found.plugin}: ${spec} failed: ${errorText(err)}`)));
   return true;
 }

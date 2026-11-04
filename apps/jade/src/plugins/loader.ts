@@ -117,7 +117,7 @@ export interface PluginKey {
   /** /help 里显示 */
   description?: string;
   /** 出错时在对话里显示警告。要改输入框、发消息用插件上下文的 input、send */
-  run(): Awaitable<void>;
+  run(ctx: { sessionId: string }): Awaitable<void>;
 }
 
 /**
@@ -517,7 +517,7 @@ function processCommands(proc: StdioPlugin): PluginCommand[] {
 }
 
 /**
- * 进程外插件在 initialize 的回复里声明的快捷键。按下时发 jade/key { key }，用户层插件还带上输入框的内容 text；
+ * 进程外插件在 initialize 的回复里声明的快捷键。按下时发 jade/key { key, sessionId }，用户层插件还带上输入框的内容 text；
  * 用户层插件可以回复 { set } 替换输入框、{ insert } 在光标处插入、{ send } 替用户发送，项目层插件的这些字段不起作用。
  * 键名等字段不对的由 createExtensions 统一提示
  */
@@ -529,9 +529,9 @@ function processKeys(proc: StdioPlugin, ctx: JadePluginContext): PluginKey[] {
     return {
       key: key as string,
       description: typeof k?.description === "string" ? k.description : undefined,
-      run: async () => {
+      run: async ({ sessionId }) => {
         const { input, send } = ctx;
-        const reply = (await proc.request("jade/key", { key, ...(input ? { text: input.text() } : {}) })) as Record<string, unknown> | null;
+        const reply = (await proc.request("jade/key", { key, sessionId, ...(input ? { text: input.text() } : {}) })) as Record<string, unknown> | null;
         if (typeof reply?.set === "string") input?.set(reply.set);
         if (typeof reply?.insert === "string") input?.insert(reply.insert);
         if (typeof reply?.send === "string") send?.(reply.send);

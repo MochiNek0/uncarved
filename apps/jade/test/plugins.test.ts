@@ -720,7 +720,7 @@ for await (const line of createInterface({ input: process.stdin })) {
   const result =
     msg.method === "initialize" ? { id: "x/" + process.env.NAME, version: "1.0.0", kernel: "^0.1", hooks: [], keys: [{ key: process.env.KEY, description: "shout" }] }
     : msg.method === "shutdown" ? {}
-    : msg.method === "jade/key" ? { set: String(p.text).toUpperCase() + " " + p.key, insert: "!", send: "seen " + p.text }
+    : msg.method === "jade/key" ? { set: String(p.text).toUpperCase() + " " + p.key + " " + p.sessionId, insert: "!", send: "seen " + p.text }
     : undefined;
   send(result ? { id: msg.id, result } : { id: msg.id, error: { code: -32601, message: "unknown " + msg.method } });
   if (msg.method === "shutdown") process.exit(0);
@@ -750,12 +750,12 @@ for await (const line of createInterface({ input: process.stdin })) {
         send: (p, t) => void sent.push([p, t]),
       });
       expect([...jade.keys].map(([k, v]) => `${k} ${v.plugin} ${v.key.description}`)).toEqual(["ctrl+t x/shout shout", "alt+r x/repo shout"]);
-      await jade.keys.get("ctrl+t")!.key.run();
-      expect(text).toBe("HI ctrl+t!");
+      await jade.keys.get("ctrl+t")!.key.run({ sessionId: "s1" });
+      expect(text).toBe("HI ctrl+t s1!");
       expect(sent).toEqual([["shout", "seen hi"]]);
       // 项目层：拿不到输入框的内容，回复里的 set、insert、send 不起作用
-      await jade.keys.get("alt+r")!.key.run();
-      expect(text).toBe("HI ctrl+t!");
+      await jade.keys.get("alt+r")!.key.run({ sessionId: "s1" });
+      expect(text).toBe("HI ctrl+t s1!");
       expect(sent).toHaveLength(1);
       jade.shutdown();
     } finally {
@@ -783,11 +783,11 @@ for await (const line of createInterface({ input: process.stdin })) {
     expect(jade.warnings.filter((w) => w.includes("notes"))).toEqual([]);
     expect(statuses).toEqual(["0 notes"]);
     // ctrl+t：输入框里的文字记成一条笔记，清空输入框
-    await jade.keys.get("ctrl+t")!.key.run();
+    await jade.keys.get("ctrl+t")!.key.run({ sessionId: "s1" });
     expect(await readFile(path.join(cwd, "NOTES.md"), "utf8")).toBe("- buy milk\n");
     expect(text).toBe("");
     expect(statuses.at(-1)).toBe("1 notes");
-    await jade.keys.get("ctrl+g")!.key.run();
+    await jade.keys.get("ctrl+g")!.key.run({ sessionId: "s1" });
     expect(sent).toEqual([["notes", expect.stringContaining("NOTES.md")]]);
     const ui = { interactive: false, log: () => {}, select: async () => undefined as never, input: async () => undefined };
     const ctx = { sessionId: "s", cwd, signal: new AbortController().signal, derived: {}, ui, note: () => {} };
@@ -826,12 +826,12 @@ for await (const line of createInterface({ input: process.stdin })) {
       const ctx = { sessionId: "s", cwd, signal: new AbortController().signal, derived: {}, ui, note: () => {} };
       expect(await jade.commands.get("wc")!.command.run("one two three", ctx)).toBe("3 words, 13 characters");
       expect(await jade.commands.get("explain")!.command.run("closures", ctx)).toEqual({ prompt: expect.stringContaining("closures") });
-      await jade.keys.get("alt+u")!.key.run();
+      await jade.keys.get("alt+u")!.key.run({ sessionId: "s1" });
       expect(text).toBe("HELLO WORLD");
-      await jade.keys.get("alt+d")!.key.run();
+      await jade.keys.get("alt+d")!.key.run({ sessionId: "s1" });
       expect(text).toMatch(/^HELLO WORLD\d{4}-\d\d-\d\d$/);
       text = "what is here?";
-      await jade.keys.get("alt+s")!.key.run();
+      await jade.keys.get("alt+s")!.key.run({ sessionId: "s1" });
       expect(sent).toEqual([["text-keys", "In this directory: what is here?"]]);
       expect(text).toBe("");
       jade.shutdown();
