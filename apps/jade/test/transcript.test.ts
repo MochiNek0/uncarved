@@ -3,8 +3,9 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { MemoryLogStore, type LogEvent } from "uncarved";
+import type { ToolRenderer } from "../src/plugins/loader.ts";
 import type { Screen, StatusInfo } from "../src/ui/screen.ts";
-import { transcript } from "../src/ui/transcript.ts";
+import { transcript, type TranscriptOptions } from "../src/ui/transcript.ts";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -66,14 +67,17 @@ test("cache hit rate: a missing field after a report means 0%, but a different m
 });
 
 /** 记下 log / amend / progress 的屏幕，用来看工具调用那一行和进度行 */
-function recording(cwd = "/") {
+function recording(cwd = "/", renderer?: TranscriptOptions["renderer"]) {
   const lines = new Map<string, { text: string; details?: string }>();
+  /** 不属于某个工具调用的输出（警告等） */
+  const logged: string[] = [];
   const progress = new Map<string, string>();
   const noop = () => {};
   const plain = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
   const screen = {
     interactive: false,
-    log: (text: string, o?: { id?: string; details?: string }) => o?.id && lines.set(o.id, { text: plain(text), details: o.details && plain(o.details) }),
+    log: (text: string, o?: { id?: string; details?: string }) =>
+      o?.id ? lines.set(o.id, { text: plain(text), details: o.details && plain(o.details) }) : logged.push(plain(text)),
     amend: (id: string, text: string, o?: { details?: string }) => {
       const l = lines.get(id)!;
       l.text += ` ${plain(text)}`;
@@ -85,13 +89,13 @@ function recording(cwd = "/") {
     busy: noop,
     status: noop,
   } as unknown as Screen;
-  const t = transcript({ screen, cwd, store: new MemoryLogStore(), contextWindow: () => 100_000, canRetry: () => false });
+  const t = transcript({ screen, cwd, store: new MemoryLogStore(), contextWindow: () => 100_000, canRetry: () => false, renderer });
   const event = (type: string, data: unknown) => t.onNotice({ type: "event", event: { type, data, origin: { by: "kernel" } } as unknown as LogEvent });
   const use = (id: string, name: string, input: unknown) => {
     event("model.responded", { content: [{ kind: "tool_use", id, name, input }], usage: {} });
     event("tool.decided", { toolUseId: id, input, decision: "allow", decidedBy: "policy" });
   };
-  return { t, event, use, lines, progress };
+  return { t, event, use, lines, progress, logged };
 }
 
 test("a long or multi-line command is shown in full when its call is expanded", () => {
@@ -124,6 +128,40 @@ test("each sub-agent keeps one progress line with its label and what it is doing
   event("tool.completed", { toolUseId: "t1", content: [{ kind: "text", text: "in a.ts" }], isError: false });
   expect(progress.has("t1")).toBe(false);
   expect(lines.get("t1")!.details).toContain("sub-agent ran 1 tool call:");
+});
+
+test("a plugin's renderer shows its tool's summary, preview and result; failures fall back to the default once warned", async () => {
+  let broken = false;
+  const renderer: ToolRenderer = {
+    tool: "deploy",
+    summary: (input) => {
+      if (broken) throw new Error("boom");
+      return `${(input as { env: string }).env}\nignored second line`;
+    },
+    preview: async (input) => `will deploy to ${(input as { env: string }).env}`,
+    result: ({ text, isError }) => (isError ? undefined : { line: `deployed (${text.length} chars)`, details: "step 1\nstep 2" }),
+  };
+  const { t, event, use, lines, logged } = recording("/", (tool) => (tool === "deploy" ? { plugin: "x/deploy", renderer } : undefined));
+  use("d1", "deploy", { env: "staging" });
+  expect(lines.get("d1")!.text).toBe("● deploy(staging)");
+  event("tool.completed", { toolUseId: "d1", content: [{ kind: "text", text: "ok\nlog" }], isError: false });
+  expect(lines.get("d1")!.text).toBe("● deploy(staging) ⎿ deployed (6 chars)");
+  expect(lines.get("d1")!.details).toBe("    step 1\n    step 2");
+  expect(await t.preview({ toolUseId: "d2", name: "deploy", input: { env: "prod" } } as never)).toBe("will deploy to prod");
+
+  // result 返回 undefined：默认显示
+  use("d3", "deploy", { env: "dev" });
+  event("tool.completed", { toolUseId: "d3", content: [{ kind: "text", text: "failed" }], isError: true });
+  expect(lines.get("d3")!.text).toBe("● deploy(dev) ⎿ failed");
+  // 出错：默认显示，同一个插件的同一个工具只提示一次
+  broken = true;
+  use("d4", "deploy", { env: "qa" });
+  use("d5", "deploy", { env: "qa" });
+  expect(lines.get("d4")!.text).toContain('deploy({"env":"qa"})');
+  expect(logged.filter((l) => l.includes("plugin x/deploy: showing deploy failed"))).toHaveLength(1);
+  // 没有 renderer 的工具不受影响
+  use("b1", "bash", { command: "ls" });
+  expect(lines.get("b1")!.text).toBe("● bash(ls)");
 });
 
 test("an edit shows +added -removed on its result line and the diff in its details, also without an approval", async () => {

@@ -132,6 +132,7 @@ interface JadePlugin {
   beforeSend?(text, ctx): string | undefined;  // jade 的扩展：用户消息发出前改写，见下文
   providers?: PluginProvider[]; // jade 的扩展：模型服务，用 JADE_PROVIDER 选择，见下文
   keys?: PluginKey[];           // jade 的扩展：快捷键，见下文
+  renderers?: ToolRenderer[];   // jade 的扩展：本插件的工具在对话里怎么显示，见下文
 }
 ```
 
@@ -319,6 +320,25 @@ interface ToolResult {
 
 - 预期之内的失败（文件不存在、命令返回非零）请返回 `isError: true` 和说明，而不是抛异常。抛出的异常也会作为错误结果交给模型，但说明往往不如自己写的清楚。
 - 结果会进入上下文，请控制长度：输出很长时截断，并告诉模型怎么拿到其余部分。
+
+### 工具在对话里的显示（renderers）
+
+默认情况下，jade 把调用显示成 `● 工具名(path 参数或参数的 JSON)`，审批时显示参数的 JSON，结果显示第一行。插件可以为自己的工具换一种显示，不影响发给模型的内容：
+
+```ts
+renderers: [{
+  tool: "deploy",
+  summary: (input) => input.env,                                  // ● deploy(staging)
+  preview: async (input) => `will deploy ${await headCommit()} to ${input.env}`,   // 审批时显示，可以多行、带颜色
+  result: ({ input, text, isError }) =>                           // ⎿ 后面的一行，details 点击展开
+    isError ? undefined : { line: `deployed to ${input.env}`, details: text },
+}],
+```
+
+- **只能为本插件 `tools` 里的工具注册**。jade 自己的、MCP 的、别的插件的工具的显示（尤其是审批时的预览）改不了，否则插件能让一条危险的命令在审批框里看起来无害。为别的工具注册的会被忽略并提示。
+- 三个函数都可以不写。返回 `undefined` 时用默认的显示；出错时也用默认的显示，并在对话里提示一次。
+- `summary` 只显示第一行，`result` 的 `line` 也只显示第一行；`details` 和 `preview` 可以多行。`summary`、`result` 要同步返回（对话按事件同步显示），`preview` 可以是异步的。
+- `jade -p` 的输出和恢复会话时重新显示的历史也用这些函数。`preview` 也是 [responder](#远程应答responder) 收到的 `preview`（去掉颜色）。
 
 ## Hook
 

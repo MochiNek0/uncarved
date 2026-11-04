@@ -45,7 +45,7 @@ import type { Check } from "./plugins/checks.ts";
 import { bold, dim, green, plainScreen, red, yellow, type CommandInfo, type Screen } from "./ui/screen.ts";
 import { configurator } from "./ui/configure.ts";
 import { reviewer } from "./plugins/review.ts";
-import { callDetails, clip, preview, shortPath, summarize } from "./ui/render.ts";
+import { callDetails, clip, shortPath } from "./ui/render.ts";
 import { transcript } from "./ui/transcript.ts";
 import { run, VERSION } from "./sys.ts";
 import { autoUpdate, autoUpdateEnabled, detectInstall, newerVersion, updateCli } from "./update.ts";
@@ -647,7 +647,7 @@ async function flushPendingMode() {
 
 // ---------- 渲染 ----------
 
-const view = transcript({ screen, cwd, store, contextWindow: () => contextWindow, compactAt: () => compactAt(), canRetry: () => canRetry() });
+const view = transcript({ screen, cwd, store, contextWindow: () => contextWindow, compactAt: () => compactAt(), canRetry: () => canRetry(), renderer: (tool) => jade.renderers.get(tool) });
 rt.subscribe(view.onNotice);
 
 // ---------- 审批 ----------
@@ -659,7 +659,7 @@ type Call = { toolUseId: string; name: string; input: unknown; reason?: string }
  * 插件的 responder（例如发到手机上）和终端同时等，用先到的回答
  */
 async function ask(c: Call, who: string, remember: (rule: AllowRule) => Promise<void> | void, signal?: AbortSignal): Promise<SubagentApproval> {
-  const head = `${c.name}(${summarize(cwd, c.name, c.input)})`;
+  const head = `${c.name}(${view.summary(c.name, c.input)})`;
   const remote = jade.responders.filter((r) => r.responder.approve);
   const unavailable = (): SubagentApproval => {
     screen.log(red(`✗ ${who}${head} denied: not running interactively`));
@@ -669,7 +669,7 @@ async function ask(c: Call, who: string, remember: (rule: AllowRule) => Promise<
   const rule = jade.policy.ruleFor(c);
   const always = rule.command !== undefined ? "this exact command" : describeRule(rule);
   // 关卡给了理由的（例如 auto 模式下审查转给用户的），说明为什么要问
-  const body = (c.reason ? `${yellow(c.reason)}\n\n` : "") + (await preview(c, cwd));
+  const body = (c.reason ? `${yellow(c.reason)}\n\n` : "") + (await view.preview(c));
   const request = { title: `${who}${head}`, tool: c.name, input: c.input, preview: stripVTControlCharacters(body), reason: c.reason };
   type Reply = { approved: boolean; message?: string; always?: boolean; tell?: boolean };
   const { value, by } = await firstAnswer<Reply>(

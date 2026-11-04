@@ -7,7 +7,8 @@ import { readAll, type Block, type EventDataMap, type LogEvent, type LogStore, t
 import type { ShellProgress } from "../tools/shell.ts";
 import type { TaskProgress } from "../tools/task.ts";
 import { renderTodos, type Todo } from "../tools/todo.ts";
-import { callDetails, clip, detailsOf, editDiff, summarize } from "./render.ts";
+import type { ToolRenderer } from "../plugins/loader.ts";
+import { callDetails, clip, detailsOf, editDiff, preview, summarize } from "./render.ts";
 import { bold, cyan, dim, green, red, yellow, type Screen } from "./screen.ts";
 
 export type Notice = Parameters<Parameters<Runtime["subscribe"]>[0]>[0];
@@ -23,6 +24,8 @@ export interface TranscriptOptions {
   compactAt?(): number;
   /** 上一轮失败后能否用 /retry 重新请求 */
   canRetry(): boolean;
+  /** 插件为自己的工具注册的显示方式（随会话的插件实例变） */
+  renderer?(tool: string): { plugin: string; renderer: ToolRenderer } | undefined;
 }
 
 export interface Transcript {
@@ -41,6 +44,10 @@ export interface Transcript {
   turnFailed: boolean;
   /** 开始新会话时清空 */
   reset(): void;
+  /** 工具调用括号里的一行摘要：插件的 renderer 优先 */
+  summary(name: string, input: unknown): string;
+  /** 审批时的预览：插件的 renderer 优先 */
+  preview(c: Parameters<typeof preview>[0]): Promise<string>;
 }
 
 /** 工具结果折叠起来的完整内容最多这么多行 */
@@ -141,6 +148,42 @@ export function transcript(opts: TranscriptOptions): Transcript {
   const doneProgress = (id: string) => {
     if (running.delete(id)) screen.progress(id, undefined);
   };
+  /** 有 result renderer 的调用的参数，结果出来时交给它 */
+  const inputs = new Map<string, unknown>();
+
+  /** 出过错的 renderer（插件 + 工具），只提示一次 */
+  const failed = new Set<string>();
+  /** 调用插件的 renderer；没有、出错时返回 undefined（用默认的显示） */
+  async function custom<T>(name: string, use: (r: ToolRenderer) => T | undefined | Promise<T | undefined>): Promise<T | undefined> {
+    const found = opts.renderer?.(name);
+    if (!found) return undefined;
+    try {
+      return await use(found.renderer);
+    } catch (err) {
+      renderFailed(found.plugin, name, err);
+      return undefined;
+    }
+  }
+  /** 同步的版本：摘要和结果在事件通知里同步显示 */
+  function customSync<T>(name: string, use: (r: ToolRenderer) => T | undefined): T | undefined {
+    const found = opts.renderer?.(name);
+    if (!found) return undefined;
+    try {
+      return use(found.renderer);
+    } catch (err) {
+      renderFailed(found.plugin, name, err);
+      return undefined;
+    }
+  }
+  function renderFailed(plugin: string, name: string, err: unknown) {
+    if (failed.has(`${plugin}:${name}`)) return;
+    failed.add(`${plugin}:${name}`);
+    screen.log(yellow(`[warning] plugin ${plugin}: showing ${name} failed, using the default display: ${errorText(err)}`));
+  }
+  const summary = (name: string, input: unknown): string => {
+    const s = customSync(name, (r) => r.summary?.(input));
+    return typeof s === "string" ? clip(s.split("\n")[0]!, 120) : summarize(cwd, name, input);
+  };
 
   const self: Transcript = {
     usage,
@@ -149,6 +192,11 @@ export function transcript(opts: TranscriptOptions): Transcript {
     turnFailed: false,
     onNotice,
     replay,
+    summary,
+    async preview(c) {
+      const p = await custom(c.name, (r) => r.preview?.(c.input));
+      return typeof p === "string" ? p : preview(c, cwd);
+    },
     echo: (text) => screen.log(text.startsWith("/") ? cyan(`› ${text}`) : `\n${bold(`› ${text.replace(/\n/g, "\n  ")}`)}`),
     reset() {
       for (const k of Object.keys(usage) as (keyof Usage)[]) usage[k] = 0;
@@ -161,6 +209,7 @@ export function transcript(opts: TranscriptOptions): Transcript {
       tasks.clear();
       calls.clear();
       diffs.clear();
+      inputs.clear();
       self.lastEnd = undefined;
     },
   };
@@ -227,7 +276,7 @@ export function transcript(opts: TranscriptOptions): Transcript {
     if (p.kind === "task-tool") {
       // 要用户批准的调用在审批时显示
       if (p.decision === "ask") return;
-      const step = `${p.decision === "deny" ? "✗" : "·"} ${p.name}(${summarize(cwd, p.name, p.input)})`;
+      const step = `${p.decision === "deny" ? "✗" : "·"} ${p.name}(${summary(p.name, p.input)})`;
       steps.set(toolUseId, [...(steps.get(toolUseId) ?? []), step]);
       return taskLine(step);
     }
@@ -262,13 +311,14 @@ export function transcript(opts: TranscriptOptions): Transcript {
         const name = toolNames.get(d.toolUseId) ?? "?";
         const full = callDetails(name, d.input);
         if (full) calls.set(d.toolUseId, full);
+        if (opts.renderer?.(name)?.renderer.result) inputs.set(d.toolUseId, d.input);
         if (d.decision === "ask") return;
         // 修改文件的调用：执行前按文件当时的内容算出 diff，结果出来后接在后面（重新显示历史时文件已经变了，不算）
         if (d.decision === "allow" && !replaying) {
           const diff = editDiff(cwd, name, d.input);
           if (diff) diffs.set(d.toolUseId, diff);
         }
-        const head = `${bold(name)}(${summarize(cwd, name, d.input)})`;
+        const head = `${bold(name)}(${summary(name, d.input)})`;
         if (d.decision === "deny") screen.log(red(`✗ ${head}`) + dim(d.reason ? ` — ${clip(d.reason, 200)}` : ""), { id: d.toolUseId, details: full });
         else {
           activity(`Running ${name}`);
@@ -297,8 +347,17 @@ export function transcript(opts: TranscriptOptions): Transcript {
         calls.delete(d.toolUseId);
         const diff = diffs.get(d.toolUseId);
         diffs.delete(d.toolUseId);
+        const input = inputs.get(d.toolUseId);
+        inputs.delete(d.toolUseId);
         if (quiet.delete(d.toolUseId) && !d.isError) return;
         const text = textOf(d.content).trim();
+        const name = toolNames.get(d.toolUseId) ?? "?";
+        const mine = customSync(name, (r) => r.result?.({ input, text, isError: d.isError === true }));
+        if (mine && typeof mine.line === "string") {
+          const details = typeof mine.details === "string" && mine.details ? mine.details.replace(/^/gm, "    ") : undefined;
+          screen.amend(d.toolUseId, (d.isError ? red : dim)("⎿ ") + clip(mine.line.split("\n")[0]!, 200), { details });
+          return;
+        }
         const lines = text.split("\n");
         // 改了文件：结果行后面是增删的行数，展开看完整的 diff
         if (diff && !d.isError) {
@@ -330,6 +389,7 @@ export function transcript(opts: TranscriptOptions): Transcript {
         tasks.delete(d.toolUseId);
         calls.delete(d.toolUseId);
         diffs.delete(d.toolUseId);
+        inputs.delete(d.toolUseId);
         screen.amend(d.toolUseId, yellow("⎿ interrupted before finishing; not retried"));
         return;
       }
@@ -419,7 +479,7 @@ export function transcript(opts: TranscriptOptions): Transcript {
         const d = e.data as EventDataMap["input.received"];
         if (d.kind === "approval") {
           const name = toolNames.get(d.toolUseId) ?? "?";
-          const head = `${bold(name)}(${summarize(cwd, name, asked.get(d.toolUseId))})`;
+          const head = `${bold(name)}(${summary(name, asked.get(d.toolUseId))})`;
           screen.log(d.approved ? green(`✓ ${head}`) : red(`✗ ${head}`) + dim(d.reason ? ` — ${clip(d.reason, 200)}` : ""), {
             id: d.toolUseId,
             details: callDetails(name, asked.get(d.toolUseId)),
