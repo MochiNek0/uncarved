@@ -330,15 +330,20 @@ interface ToolResult {
 renderers: [{
   tool: "deploy",
   summary: (input) => input.env,                                  // ● deploy(staging)
+  details: (input) => input.notes,                                 // 摘要放不下的参数，展开调用时显示在最前面
   preview: async (input) => `will deploy ${await headCommit()} to ${input.env}`,   // 审批时显示，可以多行、带颜色
-  result: ({ input, text, isError }) =>                           // ⎿ 后面的一行，details 点击展开
-    isError ? undefined : { line: `deployed to ${input.env}`, details: text },
+  before: (input) => currentVersion(input.env),                    // 执行前同步调用，返回值交给 result
+  result: ({ input, text, isError, before }) =>                   // ⎿ 后面的一行，details 点击展开
+    isError ? undefined : { line: `${before} → deployed to ${input.env}`, details: text },
 }],
 ```
 
+jade 自己的工具也用这套接口，由提供它们的内置插件带上：例如 `bash` 的 `details` 是多行或很长的命令，`edit_file` 的 `preview` 是审批时的 diff、`before` 记下修改前的文件、`result` 在结果行后面显示增删的行数。所以代替内置插件（`replaces`）时，新插件也可以为它的同名工具提供这些显示。
+
 - **只能为本插件 `tools` 里的工具注册**。jade 自己的、MCP 的、别的插件的工具的显示（尤其是审批时的预览）改不了，否则插件能让一条危险的命令在审批框里看起来无害。为别的工具注册的会被忽略并提示。
-- 三个函数都可以不写。返回 `undefined` 时用默认的显示；出错时也用默认的显示，并在对话里提示一次。
-- `summary` 只显示第一行，`result` 的 `line` 也只显示第一行；`details` 和 `preview` 可以多行。`summary`、`result` 要同步返回（对话按事件同步显示），`preview` 可以是异步的。
+- 这些函数都可以不写。返回 `undefined` 时用默认的显示；出错时也用默认的显示，并在对话里提示一次。
+- `summary` 只显示第一行，`result` 的 `line` 也只显示第一行；`details` 和 `preview` 可以多行。`summary`、`details`、`before`、`result` 要同步返回（对话按事件同步显示），`preview` 可以是异步的。
+- `before` 在工具执行之前调用：用户拒绝的调用不调用；重新显示历史时文件之类已经变了，也不调用，这时 `result` 收到的 `before` 是 `undefined`。
 - `jade -p` 的输出和恢复会话时重新显示的历史也用这些函数。`preview` 也是 [responder](#远程应答responder) 收到的 `preview`（去掉颜色）。
 
 ## Hook

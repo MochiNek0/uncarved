@@ -26,6 +26,7 @@ import { todoTool } from "./tools/todo.ts";
 import { askUserTool, type AskUser } from "./tools/ask.ts";
 import { webTools } from "./tools/web.ts";
 import { screenshotTool } from "./tools/screenshot.ts";
+import { askRenderers, fsRenderers, memoryRenderers, shellRenderers, taskRenderers, todoRenderers, webRenderers } from "./ui/renderers.ts";
 import { PROVIDER_KIND, SETTING_ENV, visionFromEnv, type ProviderSetting } from "./provider.ts";
 
 const READ_ONLY = new Set(["read_file", "list_dir", "glob", "grep"]);
@@ -177,8 +178,8 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
 
   // 文件工具据此判断读取和修改是不是同一次回复里发出的
   const responses = { calls: 0 };
-  if (!off("jade/fs")) add(withCounter({ id: "jade/fs", version: "0.1.0", kernel: "^0.1", tools: fsTools(cwd, { checkpoints, responses, scratch: opts.scratch }) }, responses));
-  if (!off("jade/shell")) add({ id: "jade/shell", version: "0.1.0", kernel: "^0.1", tools: shell.tools });
+  if (!off("jade/fs")) add(withCounter({ id: "jade/fs", version: "0.1.0", kernel: "^0.1", tools: fsTools(cwd, { checkpoints, responses, scratch: opts.scratch }), renderers: fsRenderers(cwd) }, responses));
+  if (!off("jade/shell")) add({ id: "jade/shell", version: "0.1.0", kernel: "^0.1", tools: shell.tools, renderers: shellRenderers });
   let web: Tool[] = [];
   let hasScreenshot = false;
   if (!off("jade/web")) {
@@ -204,6 +205,7 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
       version: "0.2.0",
       kernel: "^0.1",
       tools: shot ? [...web, shot] : web,
+      renderers: webRenderers,
       commands: [searchCommand({ envFile: path.join(opts.home, ".env"), env: opts.env })],
       ...(shot
         ? {
@@ -219,14 +221,14 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
         : {}),
     });
   }
-  if (!off("jade/todo")) add({ id: "jade/todo", version: "0.1.0", kernel: "^0.1", tools: [todoTool()] });
-  if (!off("jade/ask") && opts.askUser) add({ id: "jade/ask", version: "0.1.0", kernel: "^0.1", tools: [askUserTool(opts.askUser)] });
+  if (!off("jade/todo")) add({ id: "jade/todo", version: "0.1.0", kernel: "^0.1", tools: [todoTool()], renderers: todoRenderers });
+  if (!off("jade/ask") && opts.askUser) add({ id: "jade/ask", version: "0.1.0", kernel: "^0.1", tools: [askUserTool(opts.askUser)], renderers: askRenderers });
 
   let memory: Memory | undefined;
   if (!off("jade/memory")) {
     memory = new Memory(opts.home, root);
     const text = await memory.prompt();
-    add(withSystem({ id: "jade/memory", version: "0.1.0", kernel: "^0.1", tools: [memoryTool(memory)], commands: [memoryCommand(memory)] }, text ? [{ text, trust: "trusted" }] : []));
+    add(withSystem({ id: "jade/memory", version: "0.1.0", kernel: "^0.1", tools: [memoryTool(memory)], commands: [memoryCommand(memory)], renderers: memoryRenderers }, text ? [{ text, trust: "trusted" }] : []));
   }
 
   /** 最终加载了的内置插件，子 Agent 据此决定给哪些工具；组装完成后才填上 */
@@ -242,7 +244,7 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
       mcp: kept.has("jade/mcp") ? mcp : [],
       extensions: thirdParty,
     }));
-    add({ id: "jade/task", version: "0.1.0", kernel: "^0.1", tools: [taskTool({ store, provider, plugins: subagentPlugins, approve: opts.approveSubagent })] });
+    add({ id: "jade/task", version: "0.1.0", kernel: "^0.1", tools: [taskTool({ store, provider, plugins: subagentPlugins, approve: opts.approveSubagent })], renderers: taskRenderers });
   }
 
   if (!off("jade/skills")) {
@@ -375,7 +377,7 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
     responders: added.flatMap(({ plugin }) => (plugin.responder ? [{ plugin: plugin.id, responder: plugin.responder }] : [])),
     suggester: suggesters[0],
     keys,
-    renderers: new Map(added.flatMap(({ plugin }) => (plugin.renderers ?? []).map((r) => [r.tool, { plugin: plugin.id, renderer: r }] as const))),
+    renderers: new Map(([...builtin, ...added.map((a) => a.plugin)] as JadePlugin[]).flatMap((plugin) => (plugin.renderers ?? []).map((r) => [r.tool, { plugin: plugin.id, renderer: r }] as const))),
     beforeSend: added.flatMap(({ plugin }) => (plugin.beforeSend ? [{ plugin: plugin.id, fn: plugin.beforeSend.bind(plugin) }] : [])),
     providers: added.flatMap(({ plugin }) => (plugin.providers ?? []).map((def) => ({ plugin: plugin.id, def }))),
     tools: allTools,
@@ -453,9 +455,9 @@ async function createExtensions(sources: LoadedPlugin[], host: HostContext, disa
       // 只认自己的工具：别的工具的显示（尤其是审批时的预览）不能由插件改
       plugin.renderers = list.filter((r) => {
         const tool = r?.tool;
-        const fns = ["summary", "preview", "result"].every((k) => (r as unknown as Record<string, unknown>)[k] === undefined || typeof (r as unknown as Record<string, unknown>)[k] === "function");
+        const fns = ["summary", "details", "preview", "before", "result"].every((k) => (r as unknown as Record<string, unknown>)[k] === undefined || typeof (r as unknown as Record<string, unknown>)[k] === "function");
         let why: string | undefined;
-        if (typeof tool !== "string" || !fns) why = "it needs a tool name, and summary, preview and result must be functions";
+        if (typeof tool !== "string" || !fns) why = "it needs a tool name, and summary, details, preview, before and result must be functions";
         else if (!own.has(tool)) why = "a plugin can only render its own tools";
         else if (seen.has(tool)) why = "the tool already has a renderer";
         if (why) warnings.push(`${where}: renderer for ${JSON.stringify(tool)} is ignored: ${why}`);

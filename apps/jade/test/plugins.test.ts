@@ -786,11 +786,11 @@ describe("tool renderers", () => {
         }) as never,
     };
     const jade = await createJade({ cwd, home, store: new MemoryLogStore(), provider: scripted([]).provider, env: {}, extensions: [loaded] });
-    expect([...jade.renderers].map(([k, v]) => `${k} ${v.plugin}`)).toEqual(["deploy x/deploy"]);
+    expect([...jade.renderers].filter(([, v]) => !v.plugin.startsWith("jade/")).map(([k, v]) => `${k} ${v.plugin}`)).toEqual(["deploy x/deploy"]);
     const warnings = jade.warnings.join("\n");
     expect(warnings).toContain('renderer for "deploy" is ignored: the tool already has a renderer');
     expect(warnings).toContain('renderer for "bash" is ignored: a plugin can only render its own tools');
-    expect(warnings).toContain('renderer for "deploy" is ignored: it needs a tool name, and summary, preview and result must be functions');
+    expect(warnings).toContain('renderer for "deploy" is ignored: it needs a tool name, and summary, details, preview, before and result must be functions');
     jade.shutdown();
   });
 });
