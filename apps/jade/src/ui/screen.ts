@@ -97,6 +97,56 @@ export const italic = paint("3", "23");
 export const underline = paint("4", "24");
 export const strike = paint("9", "29");
 
+// ---------- 过滤控制字符 ----------
+
+/** 转义序列（CSI、OSC、DCS 这类字符串、其余 ESC 开头的）和换行、制表符之外的控制字符（含 C1） */
+const CONTROL = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b[\]P^_X][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[^[\]P^_X]?|[\x00-\x08\x0b-\x1f\x7f-\x9f]/g;
+const SGR = /^\x1b\[[0-9;:]*m$/;
+
+/**
+ * 去掉可能搅乱终端的东西，只留颜色（SGR）、换行和制表符：插件、工具输出和模型的文字里可能有移动光标、清屏、
+ * 改窗口标题、写剪贴板之类的序列。单独的 \r（进度条）按终端的效果处理：每行只留最后一段
+ */
+export function terminalSafe(text: string): string {
+  const lines = text.replaceAll("\r\n", "\n").split("\n");
+  return lines
+    .map((l) => (l.includes("\r") ? (l.split("\r").filter(Boolean).at(-1) ?? "") : l).replace(CONTROL, (m) => (SGR.test(m) ? m : "")))
+    .join("\n");
+}
+
+/** 让显示到屏幕上的每一段文字都经过 terminalSafe */
+export function safeScreen(screen: Screen): Screen {
+  const s = terminalSafe;
+  const opt = (v: string | undefined) => (v === undefined ? undefined : s(v));
+  return {
+    interactive: screen.interactive,
+    log: (text, o) => screen.log(s(text), o && { ...o, details: opt(o.details) }),
+    amend: (id, text, o) => screen.amend(id, s(text), o && { ...o, details: opt(o.details) }),
+    progress: (id, line, o) => screen.progress(id, opt(line), o),
+    stream: (kind, text) => screen.stream(kind, s(text)),
+    endStream: () => screen.endStream(),
+    busy: (label) => screen.busy(opt(label)),
+    status: (info) => {
+      const out: Partial<StatusInfo> = { ...info };
+      for (const k of ["cwd", "branch", "model", "mode", "session"] as const) if (typeof info[k] === "string") out[k] = s(info[k]);
+      if (info.plugins) out.plugins = info.plugins.map((p) => ({ plugin: p.plugin, text: s(p.text) }));
+      screen.status(out);
+    },
+    queued: (items) => screen.queued(items.map(s)),
+    suggest: (text) => screen.suggest(opt(text)),
+    select: (title, choices, o) =>
+      screen.select(
+        s(title),
+        choices.map((c) => ({ ...c, label: s(c.label), hint: opt(c.hint) })),
+        o && { ...o, body: opt(o.body) },
+      ),
+    input: (title, o) => screen.input(s(title), o && { ...o, initial: opt(o.initial), placeholder: opt(o.placeholder) }),
+    draft: screen.draft && { text: () => screen.draft!.text(), insert: (t) => screen.draft!.insert(s(t)), set: (t) => screen.draft!.set(s(t)) },
+    clear: () => screen.clear(),
+    close: () => screen.close(),
+  };
+}
+
 // ---------- 纯文本实现 ----------
 
 const MAX_OUTPUT_LINES = 20;

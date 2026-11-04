@@ -15,7 +15,7 @@ import {
   type InstallRecord,
 } from "./plugins/install.ts";
 import { inspectPlugin, type PluginInfo } from "./plugins/loader.ts";
-import { bold, dim, green, red, yellow } from "./ui/screen.ts";
+import { bold, dim, green, red, terminalSafe, yellow } from "./ui/screen.ts";
 
 export const PLUGIN_HELP = `Usage: jade plugin <command>
 
@@ -49,8 +49,9 @@ export interface PluginCliOptions {
 
 /** 返回退出码 */
 export async function pluginCli(argv: string[], o: PluginCliOptions): Promise<number> {
-  const out = o.out ?? ((t: string) => console.log(t));
-  const err = o.err ?? ((t: string) => console.error(t));
+  // 插件的名字、说明来自插件目录（可能是刚下载的）：只留颜色，去掉能搅乱终端的控制序列
+  const out = (t: string) => (o.out ?? console.log)(terminalSafe(t));
+  const err = (t: string) => (o.err ?? console.error)(terminalSafe(t));
   const [sub, ...rest] = argv;
   const flags = { project: false, link: false, force: false } as { project: boolean; link: boolean; force: boolean; name?: string; path?: string };
   const args: string[] = [];

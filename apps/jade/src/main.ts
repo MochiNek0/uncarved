@@ -42,7 +42,7 @@ import { display } from "./tools/fs.ts";
 import type { ApproveSubagent, SubagentApproval } from "./tools/task.ts";
 import type { Question } from "./tools/ask.ts";
 import type { Check } from "./plugins/checks.ts";
-import { bold, dim, green, plainScreen, red, yellow, type CommandInfo, type Screen } from "./ui/screen.ts";
+import { bold, dim, green, plainScreen, red, safeScreen, yellow, type CommandInfo, type Screen } from "./ui/screen.ts";
 import { configurator } from "./ui/configure.ts";
 import { reviewer } from "./plugins/review.ts";
 import { callDetails, clip, shortPath } from "./ui/render.ts";
@@ -244,7 +244,8 @@ const ALL_COMMANDS: CommandInfo[] = [
   ...[...customs.values()].map((c) => ({ name: c.name, args: c.args, about: `${c.description} (${c.plugin ? `plugin ${c.plugin}` : c.layer})` })),
 ];
 
-const screen: Screen = tuiModule
+// 插件、工具输出和模型的文字都经过这里显示：只留颜色，去掉能搅乱终端的控制序列
+const screen: Screen = safeScreen(tuiModule
   ? (await tuiModule).tuiScreen({
       status: { cwd: shortPath(cwd), branch: await branchFound, model: modelLabel(), mode: opts.mode ?? "ask" },
       version: VERSION,
@@ -264,7 +265,7 @@ const screen: Screen = tuiModule
         key: (spec) => ready && pluginKey(spec),
       },
     })
-  : plainScreen({ interactive: Boolean(process.stdin.isTTY) });
+  : plainScreen({ interactive: Boolean(process.stdin.isTTY) }));
 
 /** 压缩、子 Agent 和主循环共用；/model 改配置后换掉里面的实现 */
 const provider = switchable({
