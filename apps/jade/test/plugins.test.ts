@@ -786,6 +786,54 @@ describe("model services from plugins", () => {
     jade.shutdown();
   }, 20_000);
 
+  test("collecting providers does not change the exported objects; methods keep their this", async () => {
+    class Foo {
+      kind = "foo";
+      settings = [{ env: "FOO_KEY", label: "key" }, { env: "JADE_X", label: "bad" }];
+      prefix = "foo-";
+      model() {
+        return `${this.prefix}1`;
+      }
+      via() {
+        return `${this.prefix}api`;
+      }
+      async listModels() {
+        return [this.model()];
+      }
+      create() {
+        return { id: this.kind, complete: async () => ({ model: this.model(), content: [], stopReason: "end" as const }) };
+      }
+    }
+    const exported = new Foo();
+    const before = structuredClone(exported.settings);
+    const { providers, warnings } = collectProviders([
+      {
+        name: "foo",
+        id: "x/foo",
+        dir: "/plugins/foo",
+        layer: "user",
+        kind: "module",
+        entry: "index.ts",
+        info: { kind: "module", entry: "index.ts", json: {}, bundle: { skills: [], commands: [], unsupported: [] } },
+        providers: [exported],
+        create: async () => {
+          throw new Error("unused");
+        },
+      },
+    ]);
+    expect(warnings.join("\n")).toContain('setting "JADE_X" is ignored');
+    const def = providers[0]!.def;
+    // jade 用的是检查过的副本；插件导出的对象一点没变
+    expect(def).not.toBe(exported);
+    expect(def.settings!.map((s) => s.env)).toEqual(["FOO_KEY"]);
+    expect(exported.settings).toEqual(before);
+    // 类的方法在原型上：副本里的方法仍然以原对象为 this
+    expect(def.model({})).toBe("foo-1");
+    expect(def.via!({})).toBe("foo-api");
+    expect(await def.listModels!({})).toEqual(["foo-1"]);
+    expect((await def.create({})).id).toBe("foo");
+  });
+
   test("a module exports its providers; the plugin instance does not provide them", async () => {
     const { cwd, home } = await dirs();
     const dir = path.join(home, "plugins", "foo");
