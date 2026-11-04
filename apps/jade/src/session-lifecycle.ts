@@ -38,6 +38,11 @@ export class SessionLifecycle<Mode = string> {
   #scope: SessionScope;
   #rt: Runtime | undefined;
   #sessionId = "";
+  /**
+   * 当前会话已经离开（当前的一套已关闭、会话已收尾）。正常时离开后马上换成新的；
+   * 只有 reload 收尾之后两次打开都失败时会停在这里，之后 leave 不再收尾一次，reload、switchTo 可以再试
+   */
+  #left = false;
   /** 后台进行中的 dispose：换会话时不等它（新会话已经能用了），退出前等完（各自限时，见 DISPOSE_TIMEOUT_MS） */
   readonly #disposals = new Set<Promise<void>>();
 
@@ -84,18 +89,20 @@ export class SessionLifecycle<Mode = string> {
    * 会话收尾（session.detached 的 hook）用的还是这套实例，之后才在后台 dispose。返回会话是否保留了下来
    */
   async leave(reason = "the session ended"): Promise<boolean> {
-    const { scope, rt, sessionId } = this.current;
-    scope.close(reason);
-    scope.jade.shutdown();
+    if (this.#left) return true;
+    const { sessionId } = this.current;
+    if (!(await this.#detach(reason))) return true;
     try {
-      await rt.detach();
       return !(await this.#deps.discard(sessionId));
     } catch (err) {
       this.#deps.error(err);
       return true;
-    } finally {
-      this.#disposeInBackground(scope);
     }
+  }
+
+  /** 当前会话是否已经离开（reload 收尾后没能打开会话时）；这时要 switchTo 或 reload 才能继续 */
+  get left(): boolean {
+    return this.#left;
   }
 
   /**
@@ -105,7 +112,7 @@ export class SessionLifecycle<Mode = string> {
   async switchTo(id: string | undefined, mode: Mode | undefined): Promise<{ previous: string; kept: boolean }> {
     // 同一个会话不能同时由两个运行时打开：先打开再收尾旧的，会把 session.detached 写进新运行时正在用的日志
     // （没用过的会话还会被 discard 删掉）。内置的 /resume 已经挡住，这里挡住插件直接调用 session.resume
-    if (id !== undefined && id === this.#sessionId) throw new Error(`${id} is the current session`);
+    if (id !== undefined && id === this.#sessionId && !this.#left) throw new Error(`${id} is the current session`);
     const next = await this.#deps.prepare(mode);
     let rt: Runtime;
     try {
@@ -124,20 +131,13 @@ export class SessionLifecycle<Mode = string> {
 
   /**
    * 用新的插件实例继续当前会话：工具和系统提示词按现在的配置重新生成，对话内容不变。
-   * 同一个会话要先 detach 才能用新的实例恢复，所以先关掉当前的一套；恢复失败时改为开始新会话，返回那个错误
+   * 同一个会话要先 detach 才能用新的实例恢复，所以先关掉当前的一套；恢复失败时改为开始新会话，返回那个错误。
+   * 新会话也开不了时抛出：这时当前会话已经离开（left），可以再 reload、switchTo；leave 不会再收尾一次
    */
   async reload(mode: Mode | undefined): Promise<{ error?: unknown }> {
     const next = await this.#deps.prepare(mode);
-    const { scope, rt, sessionId } = this.current;
-    scope.close("the session was reloaded");
-    scope.jade.shutdown();
-    try {
-      await rt.detach();
-    } catch (err) {
-      this.#deps.error(err);
-    } finally {
-      this.#disposeInBackground(scope);
-    }
+    const { sessionId } = this.current;
+    if (!this.#left) await this.#detach("the session was reloaded");
     let error: unknown;
     let opened: Runtime;
     try {
@@ -165,7 +165,25 @@ export class SessionLifecycle<Mode = string> {
     this.#scope = scope;
     this.#rt = rt;
     this.#sessionId = rt.state.sessionId;
+    this.#left = false;
     scope.activate();
+  }
+
+  /** 离开当前会话：关闭当前的一套，会话收尾，在后台 dispose。返回收尾是否成功（失败时已经报告） */
+  async #detach(reason: string): Promise<boolean> {
+    const { scope, rt } = this.current;
+    this.#left = true;
+    scope.close(reason);
+    scope.jade.shutdown();
+    try {
+      await rt.detach();
+      return true;
+    } catch (err) {
+      this.#deps.error(err);
+      return false;
+    } finally {
+      this.#disposeInBackground(scope);
+    }
   }
 
   #disposeInBackground(scope: SessionScope) {
