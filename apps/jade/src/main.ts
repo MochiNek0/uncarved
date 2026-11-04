@@ -31,6 +31,7 @@ import { loadSkills } from "./skills.ts";
 import { hasProvider, loadEnvFile, parseTokens, updateEnvFile } from "./config.ts";
 import { createJade, type Jade } from "./distro.ts";
 import { SessionScope } from "./session-scope.ts";
+import { SessionLifecycle, type Current } from "./session-lifecycle.ts";
 import { firstAnswer } from "./respond.ts";
 import { describeRule, MODES, POLICY_KEY, type AllowRule, type Mode, type PolicySettings } from "./plugins/policy.ts";
 import { compactThreshold, contextWindowFromEnv, contextWindowInfo, isContextOverflow } from "./context.ts";
@@ -433,14 +434,6 @@ async function prepareScope(mode?: Mode): Promise<SessionScope> {
   return next;
 }
 
-/** 后台进行中的 dispose：换会话时不等它（新会话已经能用了），退出前等完（各自限时，见 DISPOSE_TIMEOUT_MS） */
-const disposals = new Set<Promise<void>>();
-function disposeInBackground(old: SessionScope) {
-  const done = old.dispose().then(warn);
-  disposals.add(done);
-  void done.finally(() => disposals.delete(done));
-}
-
 const warn = (list: string[]) => {
   for (const w of list) screen.log(yellow(`[warning] ${w}`));
 };
@@ -462,9 +455,20 @@ if (!hasProvider()) {
   }
   screen.status({ model: modelLabel() });
 }
-/** 当前会话的插件作用域和它的插件实例；换会话时一起换 */
-let scope = await prepareScope(opts.mode);
-let jade: Jade = scope.jade;
+/** 会话的开始、离开、换会话、重新加载，见 session-lifecycle.ts */
+const sessions = await SessionLifecycle.prepare<Mode>(
+  {
+    prepare: prepareScope,
+    open: (plugins, id) => (id ? Runtime.resume({ store, provider, plugins, sessionId: id }) : Runtime.create({ store, provider, plugins })),
+    discard: (id) => discardIfEmpty(store, id),
+    warn,
+    error: (err) => screen.log(red(`[error] ${errorText(err)}`)),
+  },
+  opts.mode,
+);
+/** 当前会话的插件作用域、插件实例、运行时和 id；换会话之后由 adopt 一起换 */
+let scope = sessions.scope;
+let jade: Jade = sessions.jade;
 warn(jade.warnings);
 
 /** 选的模型服务用不了：终端界面里直接进 /model 换一个服务，不然用户只能手改 .env；不能交互时报错退出 */
@@ -600,11 +604,15 @@ if (opts.cont) {
 }
 
 // /clear 换成新的运行时和会话
-let rt = resumeId
-  ? await Runtime.resume({ store, provider, plugins: jade.plugins, sessionId: resumeId })
-  : await Runtime.create({ store, provider, plugins: jade.plugins });
-let sessionId = rt.state.sessionId;
-scope.activate();
+let rt!: Runtime;
+let sessionId!: string;
+function adopt(c: Current) {
+  scope = c.scope;
+  jade = c.jade;
+  rt = c.rt;
+  sessionId = c.sessionId;
+}
+adopt(await sessions.begin(resumeId));
 
 // 权限设置记在日志里（derived），关卡从那里读，恢复会话后仍然有效
 // 主会话不会是 readonly（只给子 Agent 用；旧会话里记的 readonly 由关卡换成 plan）
@@ -1031,20 +1039,8 @@ function interrupt() {
  * 离开会话但保留它：写入 session.detached，插件的收尾写入完成后再退出（4.2）。
  * 没收到过输入的会话没什么可恢复的，删掉它的日志；返回会话是否保留了下来
  */
-async function leave(): Promise<boolean> {
-  // 先关闭作用域：进行中的快捷键中止，插件的 ctx.signal 中止，之后它们的 ctx 不再生效
-  scope.close("the session ended");
-  jade.shutdown();
-  try {
-    await rt.detach();
-    return !(await discardIfEmpty(store, sessionId));
-  } catch (err) {
-    screen.log(red(`[error] ${errorText(err)}`));
-    return true;
-  } finally {
-    // 会话收尾（session.detached 的 hook）用的还是这套实例，之后才让插件收尾
-    disposeInBackground(scope);
-  }
+function leave(): Promise<boolean> {
+  return sessions.leave();
 }
 
 /** 关掉界面后再提示怎么恢复：终端界面退出备用屏幕后，里面的内容就看不到了 */
@@ -1061,7 +1057,7 @@ async function quit(code = 0) {
   // 中断后等这一轮收尾，再写 session.detached；pump 看到 quitting 就不再取排队的输入
   await work?.catch(() => {});
   await leave();
-  await Promise.all(disposals);
+  await sessions.settled();
   await closePlugins();
   await closeScreen();
   process.exit(code);
@@ -1074,33 +1070,22 @@ async function quit(code = 0) {
  */
 async function switchSession(id?: string) {
   await flushPendingMode();
-  const mode = settings().mode;
-  const next = await prepareScope(mode);
-  let nextRt: Runtime;
+  let switched: { previous: string; kept: boolean };
   try {
-    nextRt = id
-      ? await Runtime.resume({ store, provider, plugins: next.jade.plugins, sessionId: id })
-      : await Runtime.create({ store, provider, plugins: next.jade.plugins });
+    switched = await sessions.switchTo(id, settings().mode);
   } catch (err) {
-    // 回滚：新的一套从没激活过，收掉它就行；当前的一套一直是 active，什么都不用恢复
-    next.jade.shutdown();
-    warn(await next.dispose());
-    return screen.log(red(`[error] could not resume ${id}: ${errorText(err)}`));
+    // 已经回滚：留在当前会话
+    return screen.log(red(`[error] ${id ? `could not resume ${id}` : "could not start a new session"}: ${errorText(err)}`));
   }
-  const kept = await leave();
-  const old = sessionId;
-  scope = next;
-  jade = next.jade;
-  rt = nextRt;
+  const { previous: old, kept } = switched;
+  adopt(sessions.current);
   rt.subscribe(view.onNotice);
-  sessionId = rt.state.sessionId;
   view.reset();
   notes.length = 0;
   announcedMode = undefined;
   pendingRules.length = 0;
   screen.clear();
   screen.status({ session: sessionId, mode: settings().mode, context: undefined, cache: undefined, spent: undefined, speed: undefined });
-  next.activate();
   if (!id) return screen.log(dim(kept ? `Started a new session. The previous one can be resumed with /resume or: jade --resume ${old}` : "Started a new session."));
   if (!(await resumeSession())) {
     screen.log(dim("Starting a new session instead."));
@@ -1114,24 +1099,13 @@ async function switchSession(id?: string) {
  */
 async function reloadSession() {
   await flushPendingMode();
-  const next = await prepareScope(settings().mode);
-  // 同一个会话要先 detach 才能用新的实例 resume，所以先关掉当前的一套
-  scope.close("the session was reloaded");
-  jade.shutdown();
-  await rt.detach();
-  disposeInBackground(scope);
-  scope = next;
-  jade = next.jade;
-  try {
-    rt = await Runtime.resume({ store, provider, plugins: jade.plugins, sessionId });
-  } catch (err) {
-    screen.log(red(`[error] could not reload the session: ${errorText(err)}; starting a new one`));
-    rt = await Runtime.create({ store, provider, plugins: jade.plugins });
-    sessionId = rt.state.sessionId;
+  const { error } = await sessions.reload(settings().mode);
+  adopt(sessions.current);
+  if (error !== undefined) {
+    screen.log(red(`[error] could not reload the session: ${errorText(error)}; starting a new one`));
     view.reset();
     screen.status({ session: sessionId });
   }
-  next.activate();
   rt.subscribe(view.onNotice);
   await guarded(() => rt.recover());
 }
@@ -1547,7 +1521,7 @@ if (tui) {
     if (text) await (name === undefined ? sendTyped(text) : say(text));
   });
   await leave();
-  await Promise.all(disposals);
+  await sessions.settled();
   await closePlugins();
   await closeScreen();
 }
