@@ -23,6 +23,8 @@ await plugin.close();
 
 `spawnPlugin` 返回一个普通的 `Plugin`，另外带 `close()` 和 `exited`（进程退出时 resolve）。进程退出后不会自动重启，是否重新启动由调用方决定。
 
+宿主可以在协议上加自己的东西：`manifest` 是插件对 `initialize` 的完整回复，宿主从中读自己认识的字段；`request(method, params, signal?)` 发宿主自己定义的请求（方法名请带上宿主的前缀，例如 jade 的 `jade/command`），返回插件的回复。内核的方法（`initialize`、`hook`、`shutdown`、`$/` 开头的）不能这样发。
+
 ### 选项
 
 | 选项 | 说明 |

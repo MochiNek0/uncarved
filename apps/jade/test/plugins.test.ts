@@ -375,6 +375,55 @@ describe("out-of-process plugins", () => {
     }
     expect(loaded.process!.exited).toBeDefined();
   }, 20_000);
+
+  test("a process plugin declares slash commands in its initialize reply; jade runs them over jade/command", async () => {
+    const { cwd, home } = await dirs();
+    const dir = path.join(home, "plugins", "greet");
+    await mkdir(dir, { recursive: true });
+    // 最小的进程外插件：一行一条 JSON-RPC
+    await writeFile(
+      path.join(dir, "main.ts"),
+      `import { createInterface } from "node:readline";
+const send = (m) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...m }) + "\\n");
+const manifest = { id: "x/greet", version: "1.0.0", kernel: "^0.1", hooks: [], commands: [
+  { name: "hello", description: "say hello", args: "[name]" },
+  { name: "ask", instant: true },
+  { name: "bad name" },
+] };
+for await (const line of createInterface({ input: process.stdin })) {
+  const msg = JSON.parse(line);
+  if (msg.id === undefined) continue;
+  const p = msg.params;
+  const result =
+    msg.method === "initialize" ? manifest
+    : msg.method === "shutdown" ? {}
+    : msg.method === "jade/command" && p.name === "hello" ? { text: "Hello, " + (p.args || "world") + " from " + p.sessionId }
+    : msg.method === "jade/command" && p.name === "ask" ? { prompt: "explain " + p.args }
+    : undefined;
+  send(result ? { id: msg.id, result } : { id: msg.id, error: { code: -32601, message: "unknown " + msg.method } });
+  if (msg.method === "shutdown") process.exit(0);
+}
+`,
+    );
+    await writeFile(path.join(dir, "plugin.json"), JSON.stringify({ command: process.execPath, args: ["main.ts"] }));
+    const loaded = await loadPlugin({ name: "greet", dir, layer: "user" }, { trust: new MemoryTrustStore(), confirm: async () => true });
+    try {
+      const jade = await createJade({ cwd, home, store: new MemoryLogStore(), provider: scripted([]).provider, env: {}, extensions: [loaded] });
+      expect(jade.warnings.filter((w) => w.includes("greet"))).toEqual([
+        'plugin greet (user): command "bad name" is ignored: it needs a name of letters, digits, - and _, and a run function',
+      ]);
+      const hello = jade.commands.get("hello")!;
+      expect(hello.plugin).toBe("x/greet");
+      expect([hello.command.description, hello.command.args, hello.command.instant]).toEqual(["say hello", "[name]", false]);
+      expect(jade.commands.get("ask")!.command.instant).toBe(true);
+      const ctx = { sessionId: "s1", cwd, signal: new AbortController().signal, derived: {}, ui: { interactive: false, log: () => {}, select: async () => undefined as never, input: async () => undefined }, note: () => {} };
+      expect(await hello.command.run("jade", ctx)).toBe("Hello, jade from s1");
+      expect(await jade.commands.get("ask")!.command.run("this", ctx)).toEqual({ prompt: "explain this" });
+      jade.shutdown();
+    } finally {
+      await loaded.close!();
+    }
+  }, 20_000);
 });
 
 describe("session commands use the public SessionControl", () => {

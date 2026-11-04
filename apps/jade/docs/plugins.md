@@ -652,7 +652,7 @@ definePlugin({
 
 ## 进程外插件（任何语言）
 
-`plugin.json` 里写了 `command` 时，jade 启动这个进程，经 stdin/stdout 用 JSON-RPC 2.0 通信，一行一条消息。插件可以用任何语言编写。进程外插件**只能提供 hook**，不能提供工具和斜杠命令。
+`plugin.json` 里写了 `command` 时，jade 启动这个进程，经 stdin/stdout 用 JSON-RPC 2.0 通信，一行一条消息。插件可以用任何语言编写。进程外插件可以提供 hook 和[斜杠命令](#进程外插件的斜杠命令)，不能提供工具。
 
 ```json
 {
@@ -682,6 +682,7 @@ jade 发给插件的请求：
 |---|---|---|
 | `initialize` | `{ kernel: "0.1.0" }` | 插件清单，见下文 |
 | `hook` | `{ hook, sessionId, payload }` | transform：只含要修改的字段的对象；gate：`{ decision, reason? }`；observe：`{}` |
+| `jade/command` | `{ name, args, sessionId, cwd }` | 见[进程外插件的斜杠命令](#进程外插件的斜杠命令) |
 | `$/cancel`（通知，无需回复） | `{ id }` | — |
 | `shutdown` | `{}` | `{}`，然后退出 |
 
@@ -720,6 +721,25 @@ jade 发给插件的请求：
 - 日志请写到 stderr。stdout 上任何不是 JSON-RPC 的输出（空行除外）都会让 jade 结束插件进程。
 - stdin 关闭时请退出。
 - 进程意外退出后，jade 会提示，`/plugins` 能看到它最后的 stderr 输出。jade 不会自动重启插件，这之后它的 hook 都会出错：gate 出错按 `deny` 处理，transform 出错会让这一轮失败。重启 jade 即可恢复。
+
+### 进程外插件的斜杠命令
+
+在插件清单里加上 `commands`：
+
+```json
+{
+  "id": "example/greet", "version": "1.0.0", "kernel": "^0.1", "hooks": [],
+  "commands": [{ "name": "hello", "description": "say hello", "args": "[name]", "instant": true }]
+}
+```
+
+`name`、`description`、`args`、`instant` 和进程内插件的命令一样。用户输入 `/hello jade` 时，jade 发 `jade/command { name: "hello", args: "jade", sessionId, cwd }`，插件回复：
+
+- `{ "text": "..." }`：显示给用户；
+- `{ "prompt": "..." }`：作为用户消息发给模型（`instant` 的命令不能这样回复）；
+- `{}`：什么都不显示。
+
+回复错误时显示错误信息。用户按 esc 时 jade 发 `$/cancel`。进程外插件的命令拿不到 `ui`（选择、输入）、`note` 和 `session`。
 
 完整设计见 [5.5-out-of-process-hooks.md](../../../docs/design/5.5-out-of-process-hooks.md)，Python 的完整实现见 [`redact-secrets/redact.py`](../examples/plugins/redact-secrets/redact.py)。
 
