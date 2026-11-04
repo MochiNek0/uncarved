@@ -322,7 +322,7 @@ describe("in-process plugins", () => {
     expect(s.requests[0]!.messages[0]!.content[0]).toMatchObject({ kind: "text", text: "the chat so far" });
   });
 
-  test("suggest, beforeSend and ctx.status are collected; only the first suggest is used", async () => {
+  test("ctx.status is collected; responder, suggest and beforeSend are no longer offered and are ignored with a warning", async () => {
     const { cwd, home } = await dirs();
     const statuses: [string, string | undefined][] = [];
     const fake = (name: string, extra: (host: HostContext) => Record<string, unknown>): LoadedPlugin => ({
@@ -335,7 +335,6 @@ describe("in-process plugins", () => {
       info: { kind: "module", entry: "index.ts", json: {}, bundle: { skills: [], commands: [], unsupported: [] } },
       create: async (host) => ({ id: `x/${name}`, version: "1.0.0", kernel: "^0.1", ...extra(host) }) as never,
     });
-    const next = async () => "run the tests";
     const jade = await createJade({
       cwd,
       home,
@@ -344,47 +343,18 @@ describe("in-process plugins", () => {
       env: {},
       onStatus: (p, t) => void statuses.push([p, t]),
       extensions: [
-        fake("ghost", () => ({ suggest: { next } })),
-        fake("ghost2", () => ({ suggest: { next } })),
-        fake("bad", () => ({ suggest: { next: "nope" }, beforeSend: 1 })),
-        fake("upper", (host) => (host.status("upper", "ready"), { beforeSend: (t: string) => t.toUpperCase() })),
+        fake("old", () => ({ suggest: { next: async () => "x" }, beforeSend: (t: string) => t, responder: { approve: async () => ({ approved: true }) } })),
+        fake("upper", (host) => (host.status("upper", "ready"), {})),
       ],
     });
-    expect(jade.suggester?.plugin).toBe("x/ghost");
-    expect(jade.warnings.find((w) => w.includes("x/ghost2"))).toContain("x/ghost already provides it");
-    expect(jade.warnings.filter((w) => w.includes("plugin x/bad")).join("\n")).toContain("suggest is ignored");
-    expect(jade.warnings.filter((w) => w.includes("plugin x/bad")).join("\n")).toContain("beforeSend is ignored");
-    expect(jade.beforeSend.map((b) => b.plugin)).toEqual(["x/upper"]);
-    expect(await jade.beforeSend[0]!.fn("hi", { sessionId: "s", signal: new AbortController().signal })).toBe("HI");
+    expect(jade.warnings.filter((w) => w.includes("plugin x/old"))).toEqual([
+      "plugin x/old (user): responder is ignored: jade does not offer it to plugins",
+      "plugin x/old (user): suggest is ignored: jade does not offer it to plugins",
+      "plugin x/old (user): beforeSend is ignored: jade does not offer it to plugins",
+    ]);
+    // 其余部分照常加载
+    expect(jade.extensions.map((e) => e.plugin.id)).toEqual(["x/old", "x/upper"]);
     expect(statuses).toEqual([["upper", "ready"]]);
-  });
-
-  test("only user plugins can provide a responder", async () => {
-    const { cwd, home } = await dirs();
-    const fake = (name: string, layer: "user" | "project", responder: unknown): LoadedPlugin => ({
-      name,
-      id: `x/${name}`,
-      dir: path.join(home, "plugins", name),
-      layer,
-      kind: "module",
-      entry: "index.ts",
-      info: { kind: "module", entry: "index.ts", json: {}, bundle: { skills: [], commands: [], unsupported: [] } },
-      create: async () => ({ id: `x/${name}`, version: "1.0.0", kernel: "^0.1", responder }) as never,
-    });
-    const approve = async () => ({ approved: true });
-    const jade = await createJade({
-      cwd,
-      home,
-      store: new MemoryLogStore(),
-      provider: scripted([]).provider,
-      env: {},
-      extensions: [fake("phone", "user", { approve }), fake("repo", "project", { approve }), fake("broken", "user", { approve: "yes" })],
-    });
-    expect(jade.responders.map((r) => r.plugin)).toEqual(["x/phone"]);
-    expect(jade.warnings.find((w) => w.includes("plugin x/repo"))).toContain("only user plugins can answer approvals");
-    expect(jade.warnings.find((w) => w.includes("plugin x/broken"))).toContain("must be functions");
-    // 被忽略的插件其余部分照常加载
-    expect(jade.extensions.map((e) => e.plugin.id)).toEqual(["x/phone", "x/repo", "x/broken"]);
   });
 
   test("jade never rewrites a plugin instance: what it keeps is on the extension, what it ignores stays where it was", async () => {
@@ -432,8 +402,6 @@ describe("in-process plugins", () => {
     expect(ext!.commands.map((c) => c.name)).toEqual(["ok"]);
     expect(ext!.keys.map((k) => k.key)).toEqual(["ctrl+g"]);
     expect(ext!.renderers.map((r) => r.tool)).toEqual(["x_tool"]);
-    expect([ext!.responder, ext!.beforeSend, ext!.suggest]).toEqual([undefined, undefined, undefined]);
-    expect(jade.responders).toEqual([]);
     expect(jade.renderers.get("x_tool")?.plugin).toBe("x/repo");
     expect(jade.renderers.get("read_file")?.plugin).not.toBe("x/repo");
     const warned = jade.warnings.filter((w) => w.includes("plugin x/repo")).join("\n");

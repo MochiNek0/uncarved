@@ -19,7 +19,6 @@ import { spawnPlugin, type StdioPlugin } from "@uncarved/plugin-stdio";
 import { definePlugin, loadProjectPluginFactory, type Awaitable, type Message, type Plugin, type TrustStore, type Usage } from "uncarved";
 import { projectDirs } from "../commands.ts";
 import type { RunCommand } from "../tools/shell.ts";
-import type { Question } from "../tools/ask.ts";
 import type { Checkpoint } from "../tools/checkpoint.ts";
 import type { ProviderDef } from "../provider.ts";
 
@@ -62,7 +61,7 @@ export interface JadePluginContext {
   /** 终端界面的输入框（见 InputControl）。只给用户层插件；非交互运行（-p）时没有 */
   input?: InputControl;
   /**
-   * 替用户提交一行，和在输入框里按回车一样：/ 开头的是命令，消息先经过各插件的 beforeSend；模型正忙时排队。
+   * 替用户提交一行，和在输入框里按回车一样：/ 开头的是命令；模型正忙时排队。
    * 对话里会注明是哪个插件发的。只给用户层插件（它能替用户说话）；非交互运行（-p）时没有
    */
   send?(text: string): void;
@@ -248,55 +247,13 @@ export interface PluginCommand {
   run(args: string, ctx: PluginCommandContext): Awaitable<PluginCommandResult>;
 }
 
-/** 宿主请用户批准的一个工具调用 */
-export interface ApprovalRequest {
-  /** 显示给用户的一行，例如 "bash(npm test)"；子 Agent 的调用以 "sub-agent " 开头 */
-  title: string;
-  tool: string;
-  input: unknown;
-  /** 和终端里一样的预览（diff、命令），不带颜色 */
-  preview: string;
-  /** 为什么要问，例如 auto 模式下审查转给用户的理由 */
-  reason?: string;
-}
-
-/**
- * 在终端之外回答用户该回答的问题（例如经聊天机器人发到手机上）。宿主同时等终端和所有 responder，
- * 用最先给出的回答，然后中止其余的（signal）。返回 undefined 表示这次不回答，宿主继续等别的。
- * 只有用户层的插件能提供：它能替用户批准操作
- */
-export interface Responder {
-  /** message：用户拒绝时说的话，会转告模型 */
-  approve?(req: ApprovalRequest, signal: AbortSignal): Promise<{ approved: boolean; message?: string } | undefined>;
-  /** ask_user 的问题：每个问题一个回答 */
-  ask?(questions: Question[], signal: AbortSignal): Promise<string[] | undefined>;
-}
-
-/**
- * 预测用户的下一条消息，在输入框里显示成灰字（→ 或 Tab 接受，Ctrl+→ 接受一个词，Esc 丢弃）。
- * 只在终端界面里、一轮正常结束后调用；出错、中断、子 Agent、jade -p 都不调用。
- * 返回整条文字，或者流式返回片段；只显示第一行。用户提交新输入或按 Esc 时 signal 中止
- */
-export interface Suggester {
-  next(ctx: { sessionId: string; messages: Message[] }, signal: AbortSignal): Promise<string | undefined> | AsyncIterable<string>;
-}
-
 /** jade 的插件：内核的 Plugin，外加 jade 认识的扩展字段 */
 export interface JadePlugin extends Plugin {
   commands?: PluginCommand[];
-  /** 见 Responder；项目层插件的会被忽略 */
-  responder?: Responder;
-  /** 见 Suggester；多个插件都提供时只用第一个 */
-  suggest?: Suggester;
   /** 快捷键，见 PluginKey；和排在前面的插件用了同一个键时忽略 */
   keys?: PluginKey[];
   /** 本插件的工具在对话里怎么显示，见 ToolRenderer */
   renderers?: ToolRenderer[];
-  /**
-   * 用户输入的消息发给模型之前（斜杠命令、宿主自己发的话不经过）：返回新的文字代替原文，返回 undefined 不改，
-   * 返回空字符串不发送。多个插件按加载顺序依次处理；改动会在对话里提示用户
-   */
-  beforeSend?(text: string, ctx: { sessionId: string; signal: AbortSignal }): Awaitable<string | undefined>;
   /**
    * jade 不再用这个实例时调用一次：换会话（/clear、/resume）、重新加载、退出，以及创建了却没用上的实例（例如按 id 停用的）。
    * 在会话的收尾（session.detached 的 hook）之后。停掉定时器、关掉连接和监听；

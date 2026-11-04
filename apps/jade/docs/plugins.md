@@ -7,7 +7,7 @@
 - **斜杠命令**：用户在 jade 里输入的 `/命令`，可以和用户交互（选择、输入）。
 - **内容**：skills、Markdown 写的命令、MCP 服务配置，放在插件目录里随插件一起安装，不用写代码。
 - **代替内置功能**：jade 自己的功能（文件工具、shell、web、提示词、压缩……）也是插件，第三方插件可以代替其中任何一个，只有审批（`jade/policy`）不能代替。见[内置插件](#内置插件)。
-- **和用户的交互**：在输入框里给出下一条消息的建议（[suggest](#预测下一条消息suggest)）、在消息发出前改写它（[beforeSend](#改写用户消息beforesend)）、在状态栏显示一段文字（[ctx.status](#状态栏ctxstatus)）、在终端之外回答审批（[responder](#远程应答responder)）。插件还能用 [ctx.complete](#调用模型ctxcomplete) 调用用户配置的模型。
+- **和用户的交互**：在状态栏显示一段文字（[ctx.status](#状态栏ctxstatus)）、读写输入框和替用户发送（[ctx.input、ctx.send](#输入框和替用户发送ctxinputctxsend)）、快捷键（[keys](#快捷键keys)）。插件还能用 [ctx.complete](#调用模型ctxcomplete) 调用用户配置的模型。
 
 先看看是不是不用写插件：
 
@@ -16,7 +16,7 @@
 
 需要改变 jade 本身的行为（拦截、改写、审计）或者加斜杠命令时，再写插件。
 
-jade 的插件就是 [uncarved](../../../packages/kernel/README.md) 内核的插件，外加 jade 认识的 `commands`、`responder`、`suggest`、`beforeSend` 字段。为 uncarved 写的插件不用改就能在 jade 里用。
+jade 的插件就是 [uncarved](../../../packages/kernel/README.md) 内核的插件，外加 jade 认识的 `commands`、`keys`、`renderers`、`dispose` 字段。为 uncarved 写的插件不用改就能在 jade 里用。
 
 本文的完整示例在 [`examples/plugins`](../examples/plugins)：
 
@@ -118,7 +118,7 @@ jade plugin enable <id|目录名>
 - **有代码的插件必须在 `plugin.json` 里写 `id`**，见下文[插件的身份](#插件的身份pluginjson-的-id)。
 - 插件在 jade 启动时加载，**改了插件要重启 jade 才生效**。
 - 加载或创建失败的插件会被跳过，启动时显示原因，不影响 jade 本身。常见原因有：入口找不到、内核版本不兼容、`needs` 没声明、`id` 或工具名和已有的重复。
-- 子 Agent（`task` 工具）只执行第三方插件的 `tool.gate`、`tool.before`、`tool.after` 这三种 hook（拦截、改写参数、给结果脱敏），不带它们的工具、其他 hook、`suggest` 和 `beforeSend`。所以给工具结果脱敏的插件对子 Agent 读到的内容同样生效，而按轮次触发的 observe hook 不会被子 Agent 触发。
+- 子 Agent（`task` 工具）只执行第三方插件的 `tool.gate`、`tool.before`、`tool.after` 这三种 hook（拦截、改写参数、给结果脱敏），不带它们的工具、其他 hook、命令和快捷键。所以给工具结果脱敏的插件对子 Agent 读到的内容同样生效，而按轮次触发的 observe hook 不会被子 Agent 触发。
 - `plugin.json` 还可以写 `name`、`version`、`description`，`jade plugin list` 和 `/plugins` 显示它们。
 
 ### 插件的身份：`plugin.json` 的 `id`
@@ -149,9 +149,6 @@ interface JadePlugin {
   tools?: Tool[];
   hooks?: HookSpec[];
   commands?: PluginCommand[];   // jade 的扩展：斜杠命令
-  responder?: Responder;        // jade 的扩展：在终端之外回答审批和 ask_user，见下文
-  suggest?: Suggester;          // jade 的扩展：预测下一条消息，输入框里显示成灰字，见下文
-  beforeSend?(text, ctx): string | undefined;  // jade 的扩展：用户消息发出前改写，见下文
   keys?: PluginKey[];           // jade 的扩展：快捷键，见下文
   renderers?: ToolRenderer[];   // jade 的扩展：本插件的工具在对话里怎么显示，见下文
   dispose?(): void | Promise<void>;  // jade 的扩展：不再用这个实例时收尾，见下文
@@ -293,7 +290,7 @@ ctx.input?.set("");            // 换掉全部文字（这里是清空），光�
 ctx.send?.("运行测试并修好失败的");  // 替用户提交
 ```
 
-- `send` 和用户在输入框里按回车一样：`/` 开头的是命令，消息先经过各插件的 [`beforeSend`](#改写用户消息beforesend)；模型正忙时排队。对话里会先显示 `[plugin <id> sent this for you]`。
+- `send` 和用户在输入框里按回车一样：`/` 开头的是命令；模型正忙时排队。对话里会先显示 `[plugin <id> sent this for you]`。
 - **只给用户层插件**：改输入框、发消息等于替用户说话，项目层插件的上下文里没有这两个字段。终端界面之外（`jade -p`、管道）也没有，所以用之前判断一下。
 - 什么时候调用都行（快捷键、定时器、后台连接里）。工厂函数里（会话还没开始）和换会话后旧实例的调用不生效。
 
@@ -395,7 +392,7 @@ jade 自己的工具也用这套接口，由提供它们的内置插件带上：
 - 这些函数都可以不写。返回 `undefined` 时用默认的显示；出错时也用默认的显示，并在对话里提示一次。
 - `summary` 只显示第一行，`result` 的 `line` 也只显示第一行；`details` 和 `preview` 可以多行。`summary`、`details`、`before`、`result` 要同步返回（对话按事件同步显示），`preview` 可以是异步的。
 - `before` 在工具执行之前调用：用户拒绝的调用不调用；重新显示历史时文件之类已经变了，也不调用，这时 `result` 收到的 `before` 是 `undefined`。
-- `jade -p` 的输出和恢复会话时重新显示的历史也用这些函数。`preview` 也是 [responder](#远程应答responder) 收到的 `preview`（去掉颜色）。
+- `jade -p` 的输出和恢复会话时重新显示的历史也用这些函数。
 
 ## Hook
 
@@ -528,71 +525,11 @@ interface SessionControl {
 }
 ```
 
-- jade 自己的 `/clear`、`/resume`、`/retry`（`jade/sessions`）和 `/undo`（`jade/undo`）只用这个接口，见 [`src/plugins/sessions.ts`](../src/plugins/sessions.ts)。用 `replaces: ["jade/sessions"]` 可以换成你自己的实现。
+- jade 自己的 `/clear`、`/resume`、`/retry`（`jade/sessions`）和 `/undo`（`jade/undo`）只用这个接口，见 [`src/plugins/sessions.ts`](../src/plugins/sessions.ts)。在 `plugin.json` 里写 `"replaces": ["jade/sessions"]` 可以换成你自己的实现。
 - `/search`（`jade/web`）改了 `$JADE_HOME/.env` 里的搜索服务密钥后调用 `reload()`，新的工具配置在当前会话里立即生效，见 [`src/plugins/core.ts`](../src/plugins/core.ts)。`reload()` 之后调用它的插件实例被换掉，不要再用它的状态。
 - 只有排队执行的命令有 `session`；`instant` 的命令在模型工作时执行，不能换会话或写日志，`session` 为 `undefined`。
 - `record` 的 key 只能是插件的 id 或以 `"<id>/"` 开头，不能改别的插件（例如权限设置）记下的数据。
 - `clear` / `resume` 之后，`session` 指向新的会话；命令返回 `{ prompt }` 时发给新会话。
-
-## 远程应答（responder）
-
-插件可以在终端之外替用户回答 jade 要问的事，例如把审批发到 Telegram、飞书，在手机上点"允许"：
-
-```ts
-interface Responder {
-  approve?(req: ApprovalRequest, signal: AbortSignal): Promise<{ approved: boolean; message?: string } | undefined>;
-  ask?(questions: { question: string; options: { label: string; description?: string }[] }[], signal: AbortSignal): Promise<string[] | undefined>;
-}
-
-interface ApprovalRequest {
-  title: string;     // 例如 "bash(npm test)"，子 Agent 的以 "sub-agent " 开头
-  tool: string;
-  input: unknown;
-  preview: string;   // 和终端里一样的 diff 或命令，不带颜色
-  reason?: string;   // 为什么要问，例如 auto 模式的审查转给用户的理由
-}
-```
-
-- 需要用户批准工具调用（主 Agent 和子 Agent 的都算）、或者模型调用 `ask_user` 时，jade 同时等终端和所有插件的 responder，用**最先**给出的回答，然后中止其余的：终端的对话框会关掉，插件收到 `signal` 的 abort，应该把发出去的消息改成"已处理"之类。用户按 esc 中断时也会 abort。
-- 返回 `undefined` 表示这次不回答（例如还没配置好），jade 继续等别的；出错时显示警告，也当作不回答。
-- `approve` 拒绝时，`message` 是用户说的话，会转告模型。手机上回答时不能选"总是允许"，只有终端能加规则。
-- `ask` 要给每个问题一个非空的回答，按问题的顺序。
-- 没有终端（`jade -p`、在 tmux 里无人值守）时，只要有 responder，审批照样能做；没有 responder 时照常直接拒绝。
-- **只有用户层插件能提供 responder**，项目层插件的会被忽略并提示：随仓库来的代码不能替你批准它自己要做的事。进程外插件暂不支持。
-- 进度通知不需要 responder：在 `event` 扩展点上挂 observe hook 就能看到每个事件。
-
-## 预测下一条消息（suggest）
-
-插件可以预测用户接下来想说什么，jade 在输入框里把它显示成灰字：
-
-```ts
-suggest: {
-  async *next({ sessionId, messages }, signal) {
-    // 返回整条文字（Promise<string | undefined>），或者像这样流式返回片段
-    yield "run the ";
-    yield "tests";
-  },
-}
-```
-
-- 只在终端界面里、一轮**正常结束**之后调用（还有排队的消息时不调用）；出错、中断、子 Agent、`jade -p` 都不调用。
-- 只显示第一行。用户提交新输入或按 Esc 时 `signal` 中止，插件应该停下正在进行的请求。出错时显示一条警告。
-- 按键由 jade 处理：**→** 或 **Tab** 接受全部，**Ctrl+→**（macOS 上 Option+→）接受一个词，**Esc** 丢弃。用户输入的和建议的开头对得上时只显示剩下的部分；对不上时隐藏，删回对得上时又出现。接受后只是填进输入框，不会直接发送。
-- 多个插件都提供 `suggest` 时只用第一个，其余的启动时提示。
-- 调用模型可以用 [`ctx.complete`](#调用模型ctxcomplete)。
-
-## 改写用户消息（beforeSend）
-
-```ts
-beforeSend(text, { sessionId, signal }) {
-  return text.replace(/\bJIRA-(\d+)\b/g, "https://jira.example.com/browse/JIRA-$1");
-}
-```
-
-- 用户输入的消息发给模型之前调用；斜杠命令、自定义命令、skill 和 jade 自己发的话不经过它。
-- 返回新的文字代替原文，返回 `undefined` 不改，返回空字符串不发送。多个插件按加载顺序依次处理。
-- 改写过的消息在对话里提示 `[plugin <id> changed the message]`，点开能看到改写后的全文；对话里显示的仍是用户输入的原文。
-- 出错、返回的不是字符串或 30 秒内没有返回时，跳过这个插件的改动并显示警告，后面的插件照常处理（拿到的是这个插件之前的文字）。返回空字符串时不发送，后面的插件也不再处理。
 
 ## 模型服务（providers）
 
@@ -839,7 +776,7 @@ jade 发给插件的请求：
 5. **会话结束后，ctx 就过期了**。不要把它保存到会话之外。
 6. **耗时的操作都接收 `signal`**，中止后尽快返回，结果会被丢弃。
 7. **调用 `session.clear/resume/reload` 是这次命令的最后一步**。
-8. **同名、同键按加载顺序先到先得**。项目层插件不能替用户说话、不能回答审批、不能提供模型服务。
+8. **同名、同键按加载顺序先到先得**。项目层插件不能替用户说话、不能提供模型服务；任何插件都不能替用户回答审批。
 
 ### 每个扩展点
 
@@ -858,9 +795,6 @@ jade 发给插件的请求：
 | `commands` | 会话 | 两层 | 宿主命令 > 内置插件的命令 > 自定义命令和 skill > 第三方插件（之间先到先得） | 名字不对：忽略这个命令并警告 |
 | `keys` | 会话（同一个键可以并发） | 两层；项目层的回复不能改输入框 | 先到先得；jade 自己用的键不可用 | 格式不对：忽略并警告；执行出错：警告 |
 | `renderers` | 会话 | 两层 | 只能渲染自己的工具，每个工具一个 | 退回默认显示，警告一次 |
-| `responder` | 会话 | 仅用户层 | 和终端同时等，用最先给出的回答 | 视为不回答，警告 |
-| `suggest` | 会话 | 两层 | 只用第一个 | 不显示建议，警告 |
-| `beforeSend` | 会话（依次） | 两层 | 按加载顺序链式处理 | 跳过这个插件的改动，警告；30 秒超时 |
 | 代替内置插件 | 每个会话按清单的 `replaces` 计算 | 两层 | 可以代替的都代替；被跳过的插件声明的代替不算；`jade/policy` 不可代替 | 代替不存在的内置插件：警告；写在插件对象上：不起作用，警告 |
 | `dispose` | 会话 | 两层（进程外插件没有） | — | 警告；5 秒超时 |
 | `ctx.status` | 会话 | 两层 | 按插件的 `id` 各占一段 | 会话结束后还调用：不起作用，警告一次 |
@@ -869,6 +803,8 @@ jade 发给插件的请求：
 | `ctx.complete`、`ctx.run` | 调用 | 两层 | — | 错误抛给插件 |
 
 不合格的部分只是不生效，jade 不改你的插件对象：返回的对象原样留着，jade 用的是检查过、留下的那部分。
+
+表里没有的字段 jade 不读。早先有过的 `responder`（在终端之外回答审批）、`suggest`（预测下一条消息）、`beforeSend`（发出前改写消息）已经去掉，写了会提示不起作用。
 
 ## 安全
 

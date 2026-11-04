@@ -635,41 +635,6 @@ describe("terminal UI", () => {
     expect(output()).toContain("hi");
   });
 
-  test("a suggestion shows as ghost text: → or tab takes it, ctrl+→ takes a word, typing filters it, esc drops it", async () => {
-    const { screen, type, output, calls, clear } = setup();
-    screen.suggest("run the tests\nsecond line is ignored");
-    await until(output, "run the tests");
-    expect(output()).not.toContain("second line");
-    // 输入对得上时只显示剩下的部分，对不上时不显示
-    await type("run");
-    await until(output, "› run the tests");
-    clear();
-    await type("x");
-    await sleep(50);
-    expect(output()).not.toContain("the tests");
-    await type("\x7f");
-    await until(output, "the tests");
-    // Ctrl+→ 接受一个词，→ 接受剩下的全部
-    await type("\x1b[1;5C");
-    await type("\x1b[C");
-    await type("\r");
-    expect(calls.submit).toEqual(["run the tests"]);
-    // Tab 也能接受；Esc 丢弃
-    screen.suggest("next one");
-    await until(output, "next one");
-    await type("\t");
-    await type("\r");
-    expect(calls.submit.at(-1)).toBe("next one");
-    screen.suggest("dropped");
-    await until(output, "dropped");
-    await type("\x1b");
-    await sleep(50);
-    clear();
-    await type("d");
-    await sleep(50);
-    expect(output()).not.toContain("ropped");
-  });
-
   test("plugins' status bar segments are shown", async () => {
     const { screen, output } = setup();
     screen.status({ plugins: [{ plugin: "ci", text: "CI passing" }] });
