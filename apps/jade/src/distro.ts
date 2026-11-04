@@ -122,7 +122,7 @@ export interface Jade {
   /** 每个内置插件的状态 */
   builtins: BuiltinState[];
   /** 成功加入本会话的第三方插件实例 */
-  extensions: { source: LoadedPlugin; plugin: JadePlugin }[];
+  extensions: Extension[];
   /** 插件（内置的和第三方的）提供的斜杠命令，按小写的名字 */
   commands: Map<string, { plugin: string; command: PluginCommand; builtin: boolean }>;
   /** 用户层第三方插件提供的 responder，宿主问用户时和终端一起等 */
@@ -146,6 +146,17 @@ export interface Jade {
   shutdown(): void;
   /** 启动时要告诉用户的问题，例如找不到 shell */
   warnings: string[];
+}
+
+/**
+ * 加入本会话的一个第三方插件实例。检查过的快捷键和命令放在这里，不写回实例：
+ * 进程外插件的实例是在会话之间共用的进程对象，它的快捷键和命令每套单独生成（LoadedPlugin.adapters）
+ */
+export interface Extension {
+  source: LoadedPlugin;
+  plugin: JadePlugin;
+  commands: PluginCommand[];
+  keys: PluginKey[];
 }
 
 export async function createJade(opts: JadeOptions): Promise<Jade> {
@@ -359,17 +370,20 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
   for (const extra of suggesters.slice(1)) warnings.push(`plugin ${extra.plugin}: suggest is ignored: plugin ${suggesters[0]!.plugin} already provides it`);
   const plugins = [...builtin, ...thirdParty];
   const commands = new Map<string, { plugin: string; command: PluginCommand; builtin: boolean }>();
-  for (const p of [...builtin, ...added.map((a) => a.plugin)] as JadePlugin[]) {
-    const isBuiltin = BUILTIN_IDS.has(p.id) && builtin.includes(p);
-    for (const c of p.commands ?? []) {
+  const owners = [
+    ...(builtin as JadePlugin[]).map((p) => ({ id: p.id, commands: p.commands ?? [], builtin: BUILTIN_IDS.has(p.id) })),
+    ...added.map((a) => ({ id: a.plugin.id, commands: a.commands, builtin: false })),
+  ];
+  for (const p of owners) {
+    for (const c of p.commands) {
       const taken = commands.get(c.name.toLowerCase());
       if (taken) warnings.push(`plugin ${p.id}: command /${c.name} is ignored: plugin ${taken.plugin} already provides it`);
-      else commands.set(c.name.toLowerCase(), { plugin: p.id, command: c, builtin: isBuiltin });
+      else commands.set(c.name.toLowerCase(), { plugin: p.id, command: c, builtin: p.builtin });
     }
   }
   const keys = new Map<string, { plugin: string; key: PluginKey }>();
-  for (const { plugin } of added) {
-    for (const k of plugin.keys ?? []) {
+  for (const { plugin, keys: own } of added) {
+    for (const k of own) {
       const taken = keys.get(k.key);
       if (taken) warnings.push(`plugin ${plugin.id}: key ${k.key} is ignored: plugin ${taken.plugin} already uses it`);
       else keys.set(k.key, { plugin: plugin.id, key: k });
@@ -402,8 +416,8 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
  * 创建第三方插件的实例。有问题的插件跳过并给出警告，而不是让整个 jade 起不来：工厂出错、内核不兼容、命令格式不对。
  * 只带内容（skills、命令、MCP 配置）的插件没有实例，由宿主处理
  */
-async function createExtensions(sources: LoadedPlugin[], host: HostContext, warnings: string[]) {
-  const out: { source: LoadedPlugin; plugin: JadePlugin }[] = [];
+async function createExtensions(sources: LoadedPlugin[], host: HostContext, warnings: string[]): Promise<Extension[]> {
+  const out: Extension[] = [];
   /** 创建了却不用的实例也要收尾 */
   const discard = async (source: LoadedPlugin, plugin: JadePlugin) => {
     const w = await disposeInstance(source, plugin);
@@ -433,13 +447,13 @@ async function createExtensions(sources: LoadedPlugin[], host: HostContext, warn
       await discard(source, plugin);
       continue;
     }
-    const commands = (plugin.commands ?? []).filter((c) => {
-      const ok = c && typeof c.name === "string" && COMMAND_NAME.test(c.name) && typeof c.run === "function";
+    // 进程外插件的快捷键和命令按清单为这一套生成；模块插件的就在实例上
+    const parts = source.adapters ? source.adapters(host) : plugin;
+    const commands = listOf(parts.commands).filter((c): c is PluginCommand => {
+      const ok = Boolean(c) && typeof c.name === "string" && COMMAND_NAME.test(c.name) && typeof c.run === "function";
       if (!ok) warnings.push(`${where}: command ${JSON.stringify(c?.name)} is ignored: it needs a name of letters, digits, - and _, and a run function`);
       return ok;
     });
-    // 原地修改而不是复制：内核只认加载器返回的那个项目层插件对象（宪法 7.1）
-    if (plugin.commands) plugin.commands = commands;
     if (plugin.responder !== undefined) {
       const r = plugin.responder as Partial<Record<string, unknown>> | null;
       const ok = typeof r === "object" && r !== null && ["approve", "ask"].every((k) => r[k] === undefined || typeof r[k] === "function");
@@ -453,16 +467,12 @@ async function createExtensions(sources: LoadedPlugin[], host: HostContext, warn
       warnings.push(`${where}: providers is ignored: export it from the plugin module instead (export const providers = [...])`);
       delete (plugin as { providers?: unknown }).providers;
     }
-    if (plugin.keys !== undefined) {
-      const list = Array.isArray(plugin.keys) ? plugin.keys : [];
-      plugin.keys = list.filter((k) => {
-        const key = typeof k?.key === "string" ? k.key.toLowerCase() : undefined;
-        const ok = key !== undefined && KEY_SPEC.test(key) && !RESERVED_KEYS.has(key) && typeof k.run === "function";
-        if (!ok) warnings.push(`${where}: key ${JSON.stringify(k?.key)} is ignored: it needs a run function and a key like ctrl+<letter> or alt+<letter or digit> that jade does not use itself`);
-        else k.key = key;
-        return ok;
-      });
-    }
+    const keys = listOf(parts.keys).flatMap((k): PluginKey[] => {
+      const key = typeof k?.key === "string" ? k.key.toLowerCase() : undefined;
+      if (key !== undefined && KEY_SPEC.test(key) && !RESERVED_KEYS.has(key) && typeof k.run === "function") return [{ key, description: k.description, run: (ctx) => k.run(ctx) }];
+      warnings.push(`${where}: key ${JSON.stringify(k?.key)} is ignored: it needs a run function and a key like ctrl+<letter> or alt+<letter or digit> that jade does not use itself`);
+      return [];
+    });
     if (plugin.renderers !== undefined) {
       const own = new Set((plugin.tools ?? []).map((t) => t.name));
       const seen = new Set<string>();
@@ -488,9 +498,14 @@ async function createExtensions(sources: LoadedPlugin[], host: HostContext, warn
       warnings.push(`${where}: suggest is ignored: it needs a next function`);
       delete plugin.suggest;
     }
-    out.push({ source, plugin });
+    out.push({ source, plugin, commands, keys });
   }
   return out;
+}
+
+/** 插件给的列表：没给时为空；给的不是数组时当作一个不合格的项，好让上面提示 */
+function listOf<T>(v: T[] | undefined): T[] {
+  return v === undefined ? [] : Array.isArray(v) ? v : [undefined as T];
 }
 
 /**
@@ -515,7 +530,7 @@ async function disposeInstance(source: LoadedPlugin, plugin: JadePlugin): Promis
 }
 
 /** 按顺序检查第三方插件的 id 和工具名不和已有的（留下的内置插件、排在前面的第三方插件）重复 */
-function accept(made: { source: LoadedPlugin; plugin: JadePlugin }[], existing: Plugin[]) {
+function accept(made: Extension[], existing: Plugin[]) {
   const ids = new Set(existing.map((p) => p.id));
   const toolNames = new Set(existing.flatMap((p) => (p.tools ?? []).map((t) => t.name)));
   const accepted: typeof made = [];
