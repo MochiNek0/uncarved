@@ -133,14 +133,17 @@ export interface Jade {
   keys: Map<string, { plugin: string; key: PluginKey }>;
   /** 用户消息发出前依次处理它的插件 */
   beforeSend: { plugin: string; fn: NonNullable<JadePlugin["beforeSend"]> }[];
-  /** 用户层第三方插件提供的模型服务，宿主启动时注册 */
-  providers: { plugin: string; def: PluginProvider }[];
   /** 主会话的工具；宿主用 read_file / list_dir 读取 @ 引用的文件 */
   tools: Tool[];
   /** 宿主退出时调用：杀掉后台 shell */
   shutdown(): void;
   /** 启动时要告诉用户的问题，例如找不到 shell */
   warnings: string[];
+  /**
+   * 按 id 停用而没有加进来的第三方插件（目录名）。创建了实例才知道 id，而它导出的模型服务在那之前已经注册了，
+   * 宿主据此去掉那些服务
+   */
+  disabledById: string[];
 }
 
 export async function createJade(opts: JadeOptions): Promise<Jade> {
@@ -165,7 +168,8 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
   const host: HostContext = { jade: JADE_VERSION, cwd: realPath(cwd), root: realPath(root), home: opts.home, definePlugin, run: shell.run, complete: completer(provider), status: (plugin, text) => opts.onStatus?.(plugin, text), checkpoints, input: opts.input, send: opts.send };
 
   // 第三方插件先创建：要先知道它们代替哪些内置插件
-  const made = await createExtensions(opts.extensions ?? [], host, disabled, warnings);
+  const disabledById: string[] = [];
+  const made = await createExtensions(opts.extensions ?? [], host, disabled, warnings, disabledById);
 
   // ---------- 内置插件（jade/prompts 最后创建：它要知道最终有哪些工具） ----------
   const built = new Map<string, JadePlugin>();
@@ -379,7 +383,7 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
     keys,
     renderers: new Map(([...builtin, ...added.map((a) => a.plugin)] as JadePlugin[]).flatMap((plugin) => (plugin.renderers ?? []).map((r) => [r.tool, { plugin: plugin.id, renderer: r }] as const))),
     beforeSend: added.flatMap(({ plugin }) => (plugin.beforeSend ? [{ plugin: plugin.id, fn: plugin.beforeSend.bind(plugin) }] : [])),
-    providers: added.flatMap(({ plugin }) => (plugin.providers ?? []).map((def) => ({ plugin: plugin.id, def }))),
+    disabledById,
     tools: allTools,
     shutdown: shell.shutdown,
     warnings,
@@ -390,7 +394,7 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
  * 创建第三方插件的实例。有问题的插件跳过并给出警告，而不是让整个 jade 起不来：工厂出错、内核不兼容、命令格式不对。
  * 只带内容（skills、命令、MCP 配置）的插件没有实例，由宿主处理
  */
-async function createExtensions(sources: LoadedPlugin[], host: HostContext, disabled: Set<string>, warnings: string[]) {
+async function createExtensions(sources: LoadedPlugin[], host: HostContext, disabled: Set<string>, warnings: string[], disabledById: string[]) {
   const out: { source: LoadedPlugin; plugin: JadePlugin }[] = [];
   for (const source of sources) {
     if (!source.create) continue;
@@ -403,7 +407,10 @@ async function createExtensions(sources: LoadedPlugin[], host: HostContext, disa
       warnings.push(`${where} is skipped: ${err instanceof Error ? err.message : String(err)}`);
       continue;
     }
-    if (disabled.has(plugin.id)) continue;
+    if (disabled.has(plugin.id)) {
+      disabledById.push(source.name);
+      continue;
+    }
     if (plugin.replaces !== undefined && !(Array.isArray(plugin.replaces) && plugin.replaces.every((x) => typeof x === "string"))) {
       warnings.push(`${where} is skipped: "replaces" must be an array of plugin ids`);
       continue;
@@ -423,20 +430,10 @@ async function createExtensions(sources: LoadedPlugin[], host: HostContext, disa
       else if (!ok) warnings.push(`${where}: responder is ignored: approve and ask must be functions`);
       if (source.layer === "project" || !ok) delete plugin.responder;
     }
-    if (plugin.providers !== undefined) {
-      const list = Array.isArray(plugin.providers) ? plugin.providers : [];
-      // 服务能看到全部对话和 API key：随仓库来的插件不能提供
-      if (source.layer === "project") {
-        warnings.push(`${where}: providers are ignored: only user plugins can provide model services`);
-        delete plugin.providers;
-      } else {
-        plugin.providers = list.filter((d) => {
-          const ok = d && typeof d.kind === "string" && PROVIDER_KIND.test(d.kind) && typeof d.model === "function" && typeof d.create === "function";
-          if (!ok) warnings.push(`${where}: provider ${JSON.stringify(d?.kind)} is ignored: it needs a kind of letters, digits, - and _, and model and create functions`);
-          else if (d.settings !== undefined) d.settings = providerSettings(d.settings, `${where}: provider ${d.kind}`, warnings);
-          return ok;
-        });
-      }
+    // 模型服务不属于某套插件实例：改成在模块里导出（export const providers），加载时就注册
+    if ("providers" in plugin) {
+      warnings.push(`${where}: providers is ignored: export it from the plugin module instead (export const providers = [...])`);
+      delete (plugin as { providers?: unknown }).providers;
     }
     if (plugin.keys !== undefined) {
       const list = Array.isArray(plugin.keys) ? plugin.keys : [];
@@ -479,6 +476,35 @@ async function createExtensions(sources: LoadedPlugin[], host: HostContext, disa
 }
 
 /** 插件服务的配置项：格式不对、用了 jade 自己的变量、重复、第二个 model 的跳过并警告 */
+/**
+ * 插件模块导出的模型服务（LoadedPlugin.providers）：检查后返回要注册的服务和要告诉用户的问题。
+ * 只认用户层插件：服务能看到全部对话和 API key。不用创建插件实例，所以宿主可以先注册服务、配置好模型，再创建插件
+ */
+export function collectProviders(sources: LoadedPlugin[]): { providers: { plugin: string; def: PluginProvider }[]; warnings: string[] } {
+  const warnings: string[] = [];
+  const providers = sources.flatMap((source) => {
+    if (source.providers === undefined) return [];
+    const where = `plugin ${source.name} (${source.layer})`;
+    if (source.layer === "project") {
+      warnings.push(`${where}: providers are ignored: only user plugins can provide model services`);
+      return [];
+    }
+    if (!Array.isArray(source.providers)) {
+      warnings.push(`${where}: providers is ignored: it must be an array`);
+      return [];
+    }
+    return (source.providers as PluginProvider[])
+      .filter((d) => {
+        const ok = d && typeof d.kind === "string" && PROVIDER_KIND.test(d.kind) && typeof d.model === "function" && typeof d.create === "function";
+        if (!ok) warnings.push(`${where}: provider ${JSON.stringify(d?.kind)} is ignored: it needs a kind of letters, digits, - and _, and model and create functions`);
+        else if (d.settings !== undefined) d.settings = providerSettings(d.settings, `${where}: provider ${d.kind}`, warnings);
+        return ok;
+      })
+      .map((def) => ({ plugin: source.name, def }));
+  });
+  return { providers, warnings };
+}
+
 function providerSettings(raw: unknown, where: string, warnings: string[]): ProviderSetting[] {
   if (!Array.isArray(raw)) {
     warnings.push(`${where}: settings are ignored: they must be an array`);

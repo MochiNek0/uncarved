@@ -132,7 +132,6 @@ interface JadePlugin {
   responder?: Responder;        // jade 的扩展：在终端之外回答审批和 ask_user，见下文
   suggest?: Suggester;          // jade 的扩展：预测下一条消息，输入框里显示成灰字，见下文
   beforeSend?(text, ctx): string | undefined;  // jade 的扩展：用户消息发出前改写，见下文
-  providers?: PluginProvider[]; // jade 的扩展：模型服务，用 JADE_PROVIDER 选择，见下文
   keys?: PluginKey[];           // jade 的扩展：快捷键，见下文
   renderers?: ToolRenderer[];   // jade 的扩展：本插件的工具在对话里怎么显示，见下文
 }
@@ -266,7 +265,8 @@ keys: [
 ```
 
 - `key` 写成 `ctrl+<字母>` 或 `alt+<字母或数字>`，不分大小写。jade 自己用的键不能用：`ctrl+a/c/d/e/h/i/j/k/l/m/o/r/u/w` 和 `alt+f`。格式不对或用了保留键的会被忽略并提示；两个插件用了同一个键时，排在前面的生效。
-- 输入框有焦点时按下就调用 `run({ sessionId })`，模型工作时也一样；弹出选择框、输入框时不响应。`run` 不阻塞界面，出错时在对话里显示警告。
+- 输入框有焦点时按下就调用 `run({ key, sessionId, signal })`，模型工作时也一样；弹出选择框、输入框时不响应。`key` 是按下的键，规范成小写（例如 `ctrl+t`）。`run` 不阻塞界面，出错时在对话里显示警告。
+- 上一次的 `run` 还没结束时再按，会再调用一次：切换式的键（按一下开始、再按一下结束）要自己记住状态。换会话（`/clear`、`/resume`）、重新加载和退出时 `signal` 中止，请据此停下要很久的工作（例如录音、请求模型）。
 - `/help` 列出插件的快捷键和 `description`。
 - 项目层插件也能提供快捷键，但它的上下文里没有 `input`、`send`。
 - 进程外插件也能提供，见[进程外插件的快捷键](#进程外插件的快捷键)。
@@ -547,7 +547,7 @@ beforeSend(text, { sessionId, signal }) {
 
 ## 模型服务（providers）
 
-插件可以提供新的模型服务，用户在 `$JADE_HOME/.env` 里写 `JADE_PROVIDER=<kind>` 选它：
+插件可以提供新的模型服务，用户在 `$JADE_HOME/.env` 里写 `JADE_PROVIDER=<kind>` 选它。服务不放在插件对象里，而是从插件模块**导出** `providers`：它不属于哪个会话的插件实例，jade 加载插件时就读到，不用创建实例。
 
 ```ts
 interface PluginProvider {
@@ -570,33 +570,35 @@ interface ProviderSetting {
 ```
 
 ```ts
-definePlugin({
-  id: "me/foo",
-  version: "1.0.0",
-  providers: [{
-    kind: "foo",
-    model: (env) => env.FOO_MODEL ?? "foo-large",
-    settings: [
-      { env: "FOO_API_KEY", label: "Foo API key", secret: true, required: true },
-      { env: "FOO_MODEL", label: "Model", model: true },
-    ],
-    listModels: async (env) => fetchFooModels(env.FOO_API_KEY),
-    create: (env) => {
-      if (!env.FOO_API_KEY) throw new Error("FOO_API_KEY is required for the foo provider");
-      return fooProvider({ apiKey: env.FOO_API_KEY, model: env.FOO_MODEL ?? "foo-large" });
-    },
-  }],
-});
+// index.ts
+export const providers: PluginProvider[] = [{
+  kind: "foo",
+  model: (env) => env.FOO_MODEL ?? "foo-large",
+  settings: [
+    { env: "FOO_API_KEY", label: "Foo API key", secret: true, required: true },
+    { env: "FOO_MODEL", label: "Model", model: true },
+  ],
+  listModels: async (env) => fetchFooModels(env.FOO_API_KEY),
+  create: (env) => {
+    if (!env.FOO_API_KEY) throw new Error("FOO_API_KEY is required for the foo provider");
+    return fooProvider({ apiKey: env.FOO_API_KEY, model: env.FOO_MODEL ?? "foo-large" });
+  },
+}];
+
+// 插件本身照常是默认导出；只提供服务的插件也要有一个
+export default definePlugin({ id: "me/foo", version: "1.0.0" });
 ```
 
 - `env` 是 jade 的环境变量，包括 `$JADE_HOME/.env` 里的。服务自己的配置项（地址、密钥）由插件定名字，用户写进 `.env`。
-- **只认用户层插件**：服务能看到全部对话和 API key，项目层插件提供的 `providers` 被忽略。
-- **只在启动时读一次**：provider 是整个进程共用的（主会话、子 Agent、压缩、auto 模式的审查、`ctx.complete`），换会话不重建，所以 `create` 不要依赖按会话的状态。
+- **只认用户层插件**：服务能看到全部对话和 API key，项目层插件导出的 `providers` 被忽略。
+- **只在启动时读一次**：provider 是整个进程共用的（主会话、子 Agent、压缩、auto 模式的审查、`ctx.complete`），换会话不重建。它定义在模块里、拿不到插件实例，自然也不会依赖按会话的状态。
+- 工厂函数返回的插件对象里写 `providers` 不起作用，jade 会提示改成导出。
+- 停用插件后它的服务也不能用。按目录名停用（`jade plugin disable foo`）时插件根本不加载；按 id 停用（`jade plugin disable me/foo`）时，jade 要创建插件实例才知道 id，那之后才去掉它的服务，所以启动时会先用一下它的 `create`。选的正是这个服务时，终端界面里进 `/model` 换一个，`-p` 报错退出。推荐按目录名停用。
 - jade 在外面包一层重试和限速（`JADE_RPM`），压缩、子 Agent 也都经过它。要让重试正确工作，请求失败时抛 uncarved 的 `ProviderError`：能重试的设 `retryable: true`，限流时带上 `status: 429`。
 - `JADE_EFFORT`、`JADE_MAX_TOKENS` 不检查，插件愿意的话自己从 `env` 里读；`JADE_VISION` 不设时算不能看图片。
 - 选了插件的服务时，jade 等插件加载完才创建 provider，启动会比内置服务慢一点。`JADE_PROVIDER` 写的名字没有插件提供时，启动时报错并列出可选的服务。
 - **`/model`**：声明了 `settings` 的服务出现在 "Add a model… → Another service…" 的列表里，选中后依次询问各项，再选模型；配置写进 `$JADE_HOME/.env`，并和内置服务一样记进 `models.json`，之后可以在 `/model` 里直接切换回来（类型和模型名以外的配置项都相同的算同一个服务）。没有声明模型名（`model: true`）的服务，`/model` 不能换它的模型。
-- 第一次运行、还没配置任何模型时，jade 先加载插件再进入配置流程，所以列表里也有插件提供的服务。配置好模型之后，jade 会把插件实例重新创建一遍，所以工厂函数里也可以调用 `ctx.complete`（用插件提供的模型服务时也一样）。
+- 启动顺序是：加载插件（读到导出的 `providers`）→ 注册服务 → 还没配置模型时进入配置流程（列表里也有插件提供的服务）→ 创建插件实例。所以工厂函数里也可以调用 `ctx.complete`，用插件提供的模型服务时也一样。
 - 进程外插件不能提供 `providers`。
 
 ## 带上 skills、命令和 MCP 服务
@@ -758,7 +760,7 @@ jade 发给插件的请求：
 { "keys": [{ "key": "ctrl+t", "description": "uppercase the input" }] }
 ```
 
-按下时 jade 发 `jade/key { key, sessionId, text }`，`text` 是输入框里还没提交的文字。进程在会话之间共用，换会话后状态不会清空，需要按会话区分时用 `sessionId`。用户层插件可以回复：
+按下时 jade 发 `jade/key { key, sessionId, text }`，`key` 规范成小写（清单里写 `Ctrl+T` 收到的也是 `ctrl+t`），`text` 是输入框里还没提交的文字。上一次还没回复时再按，会再发一个请求；换会话、重新加载和退出时 jade 发 `$/cancel` 取消还没回复的请求。进程在会话之间共用，换会话后状态不会清空，需要按会话区分时用 `sessionId`。用户层插件可以回复：
 
 - `{ "set": "..." }`：换掉输入框里的全部文字；
 - `{ "insert": "..." }`：在光标处插入；

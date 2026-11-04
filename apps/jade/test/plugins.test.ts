@@ -6,7 +6,7 @@ import { existsSync, realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { MemoryLogStore, MemoryTrustStore, readAll, Runtime, type Block, type ModelRequest, type ModelResponse, type Provider } from "uncarved";
-import { clearProviders, createJade, discoverPlugins, listModels, loadPlugin, providerFromEnv, providerInfo, registerProviders, SEARCH_PROVIDERS, visionFromEnv, type FoundPlugin, type LoadedPlugin } from "../src/index.ts";
+import { clearProviders, collectProviders, createJade, discoverPlugins, listModels, loadPlugin, pluginProviders, providerFromEnv, providerInfo, registerProviders, unregisterProviders, SEARCH_PROVIDERS, visionFromEnv, type FoundPlugin, type LoadedPlugin } from "../src/index.ts";
 import type { HostContext, SessionControl } from "../src/plugins/loader.ts";
 
 const MODEL = { by: "model", provider: "scripted", model: "scripted-1" } as const;
@@ -635,7 +635,7 @@ describe("model services from plugins", () => {
   });
 
   test("only user plugins can provide services, and malformed ones are skipped", async () => {
-    const { cwd, home } = await dirs();
+    const { home } = await dirs();
     const fake = (name: string, layer: "user" | "project", providers: unknown): LoadedPlugin => ({
       name,
       dir: path.join(home, "plugins", name),
@@ -643,29 +643,73 @@ describe("model services from plugins", () => {
       kind: "module",
       entry: "index.ts",
       info: { kind: "module", entry: "index.ts", json: {}, bundle: { skills: [], commands: [], unsupported: [] } },
-      create: async () => ({ id: `x/${name}`, version: "1.0.0", kernel: "^0.1", providers }) as never,
+      providers,
+      create: async () => {
+        throw new Error("collecting providers must not create plugin instances");
+      },
     });
-    const jade = await createJade({
-      cwd,
-      home,
-      store: new MemoryLogStore(),
-      provider: scripted([]).provider,
-      env: {},
-      extensions: [
-        fake("good", "user", [
-          { ...def("foo"), settings: [{ env: "FOO_KEY", label: "key" }, { env: "JADE_MAX_TOKENS", label: "x" }, { env: "FOO_KEY", label: "again" }] },
-          { kind: "bad name", model: () => "", create: () => ({}) },
-        ]),
-        fake("repo", "project", [def("bar")]),
-      ],
-    });
-    expect(jade.providers.map((p) => `${p.plugin}:${p.def.kind}`)).toEqual(["x/good:foo"]);
+    const { providers, warnings } = collectProviders([
+      fake("good", "user", [
+        { ...def("foo"), settings: [{ env: "FOO_KEY", label: "key" }, { env: "JADE_MAX_TOKENS", label: "x" }, { env: "FOO_KEY", label: "again" }] },
+        { kind: "bad name", model: () => "", create: () => ({}) },
+      ]),
+      fake("repo", "project", [def("bar")]),
+      fake("odd", "user", def("baz")),
+    ]);
+    expect(providers.map((p) => `${p.plugin}:${p.def.kind}`)).toEqual(["good:foo"]);
     // 不能用 jade 自己的变量，也不能重复
-    expect(jade.providers[0]!.def.settings!.map((x) => x.env)).toEqual(["FOO_KEY"]);
-    expect(jade.warnings.join("\n")).toContain('setting "JADE_MAX_TOKENS" is ignored');
-    expect(jade.warnings.join("\n")).toContain("setting FOO_KEY is ignored: it is listed twice");
-    expect(jade.warnings.join("\n")).toContain('provider "bad name" is ignored');
-    expect(jade.warnings.join("\n")).toContain("plugin repo (project): providers are ignored: only user plugins can provide model services");
+    expect(providers[0]!.def.settings!.map((x) => x.env)).toEqual(["FOO_KEY"]);
+    const text = warnings.join("\n");
+    expect(text).toContain('setting "JADE_MAX_TOKENS" is ignored');
+    expect(text).toContain("setting FOO_KEY is ignored: it is listed twice");
+    expect(text).toContain('provider "bad name" is ignored');
+    expect(text).toContain("plugin repo (project): providers are ignored: only user plugins can provide model services");
+    expect(text).toContain("plugin odd (user): providers is ignored: it must be an array");
+  });
+
+  test("a plugin disabled by its id is reported, so the host can take back the services it exported", async () => {
+    const { cwd, home } = await dirs();
+    const fake = (name: string): LoadedPlugin => ({
+      name,
+      dir: path.join(home, "plugins", name),
+      layer: "user",
+      kind: "module",
+      entry: "index.ts",
+      info: { kind: "module", entry: "index.ts", json: {}, bundle: { skills: [], commands: [], unsupported: [] } },
+      providers: [def(`${name}-svc`)],
+      create: async () => ({ id: `x/${name}`, version: "1.0.0", kernel: "^0.1" }),
+    });
+    clearProviders();
+    try {
+      const sources = [fake("keep"), fake("off")];
+      registerProviders(collectProviders(sources).providers);
+      const jade = await createJade({ cwd, home, store: new MemoryLogStore(), provider: scripted([]).provider, env: {}, extensions: sources, disabled: new Set(["x/off"]) });
+      expect(jade.disabledById).toEqual(["off"]);
+      expect(jade.extensions.map((e) => e.plugin.id)).toEqual(["x/keep"]);
+      expect(unregisterProviders(jade.disabledById)).toEqual(["off-svc"]);
+      expect(pluginProviders().map((p) => p.def.kind)).toEqual(["keep-svc"]);
+      jade.shutdown();
+    } finally {
+      clearProviders();
+    }
+  });
+
+  test("a module exports its providers; the plugin instance does not provide them", async () => {
+    const { cwd, home } = await dirs();
+    const dir = path.join(home, "plugins", "foo");
+    await mkdir(dir, { recursive: true });
+    await writeFile(
+      path.join(dir, "index.ts"),
+      `export const providers = [{ kind: "foo", model: () => "f1", create: () => ({ id: "foo", complete: async () => ({ model: "f1", content: [], stopReason: "end" }) }) }];
+export default () => ({ id: "x/foo", version: "1.0.0", kernel: "^0.1", providers: [{ kind: "late", model: () => "", create: () => ({}) }] });
+`,
+    );
+    const loaded = await loadPlugin({ name: "foo", dir, layer: "user" }, { trust: new MemoryTrustStore(), confirm: async () => false });
+    // 加载就能读到，不用创建插件实例
+    expect(collectProviders([loaded]).providers.map((p) => `${p.plugin}:${p.def.kind}`)).toEqual(["foo:foo"]);
+    const jade = await createJade({ cwd, home, store: new MemoryLogStore(), provider: scripted([]).provider, env: {}, extensions: [loaded] });
+    // 工厂函数返回的 providers 不认，提示改成导出
+    expect(jade.warnings.join("\n")).toContain("providers is ignored: export it from the plugin module instead");
     jade.shutdown();
   });
 });
@@ -746,6 +790,8 @@ for await (const line of createInterface({ input: process.stdin })) {
   const msg = JSON.parse(line);
   if (msg.id === undefined) continue;
   const p = msg.params;
+  // 不回复：jade 中止时发 $/cancel
+  if (msg.method === "jade/key" && p.text === "hang") continue;
   const result =
     msg.method === "initialize" ? { id: "x/" + process.env.NAME, version: "1.0.0", kernel: "^0.1", hooks: [], keys: [{ key: process.env.KEY, description: "shout" }] }
     : msg.method === "shutdown" ? {}
@@ -763,7 +809,7 @@ for await (const line of createInterface({ input: process.stdin })) {
       return dir;
     };
     const opts = { trust: new MemoryTrustStore(), confirm: async () => true };
-    const user = await loadPlugin({ name: "shout", dir: await make(home, "shout", "ctrl+t"), layer: "user" }, opts);
+    const user = await loadPlugin({ name: "shout", dir: await make(home, "shout", "Ctrl+T"), layer: "user" }, opts);
     const repo = await loadPlugin({ name: "repo", dir: await make(path.join(cwd, ".jade"), "repo", "alt+r"), layer: "project" }, opts);
     try {
       let text = "hi";
@@ -779,13 +825,19 @@ for await (const line of createInterface({ input: process.stdin })) {
         send: (p, t) => void sent.push([p, t]),
       });
       expect([...jade.keys].map(([k, v]) => `${k} ${v.plugin} ${v.key.description}`)).toEqual(["ctrl+t x/shout shout", "alt+r x/repo shout"]);
-      await jade.keys.get("ctrl+t")!.key.run({ sessionId: "s1" });
+      await jade.keys.get("ctrl+t")!.key.run({ key: "ctrl+t", sessionId: "s1", signal: new AbortController().signal });
       expect(text).toBe("HI ctrl+t s1!");
       expect(sent).toEqual([["shout", "seen hi"]]);
       // 项目层：拿不到输入框的内容，回复里的 set、insert、send 不起作用
-      await jade.keys.get("alt+r")!.key.run({ sessionId: "s1" });
+      await jade.keys.get("alt+r")!.key.run({ key: "alt+r", sessionId: "s1", signal: new AbortController().signal });
       expect(text).toBe("HI ctrl+t s1!");
       expect(sent).toHaveLength(1);
+      // 插件不回复时，signal 中止就结束，不会一直挂着
+      text = "hang";
+      const ac = new AbortController();
+      const pending = jade.keys.get("ctrl+t")!.key.run({ key: "ctrl+t", sessionId: "s1", signal: ac.signal });
+      ac.abort(new Error("the session ended"));
+      await expect(Promise.resolve(pending)).rejects.toThrow();
       jade.shutdown();
     } finally {
       await Promise.all([user.close!(), repo.close!()]);
@@ -812,11 +864,11 @@ for await (const line of createInterface({ input: process.stdin })) {
     expect(jade.warnings.filter((w) => w.includes("notes"))).toEqual([]);
     expect(statuses).toEqual(["0 notes"]);
     // ctrl+t：输入框里的文字记成一条笔记，清空输入框
-    await jade.keys.get("ctrl+t")!.key.run({ sessionId: "s1" });
+    await jade.keys.get("ctrl+t")!.key.run({ key: "ctrl+t", sessionId: "s1", signal: new AbortController().signal });
     expect(await readFile(path.join(cwd, "NOTES.md"), "utf8")).toBe("- buy milk\n");
     expect(text).toBe("");
     expect(statuses.at(-1)).toBe("1 notes");
-    await jade.keys.get("ctrl+g")!.key.run({ sessionId: "s1" });
+    await jade.keys.get("ctrl+g")!.key.run({ key: "ctrl+g", sessionId: "s1", signal: new AbortController().signal });
     expect(sent).toEqual([["notes", expect.stringContaining("NOTES.md")]]);
     const ui = { interactive: false, log: () => {}, select: async () => undefined as never, input: async () => undefined };
     const ctx = { sessionId: "s", cwd, signal: new AbortController().signal, derived: {}, ui, note: () => {} };
@@ -855,12 +907,12 @@ for await (const line of createInterface({ input: process.stdin })) {
       const ctx = { sessionId: "s", cwd, signal: new AbortController().signal, derived: {}, ui, note: () => {} };
       expect(await jade.commands.get("wc")!.command.run("one two three", ctx)).toBe("3 words, 13 characters");
       expect(await jade.commands.get("explain")!.command.run("closures", ctx)).toEqual({ prompt: expect.stringContaining("closures") });
-      await jade.keys.get("alt+u")!.key.run({ sessionId: "s1" });
+      await jade.keys.get("alt+u")!.key.run({ key: "alt+u", sessionId: "s1", signal: new AbortController().signal });
       expect(text).toBe("HELLO WORLD");
-      await jade.keys.get("alt+d")!.key.run({ sessionId: "s1" });
+      await jade.keys.get("alt+d")!.key.run({ key: "alt+d", sessionId: "s1", signal: new AbortController().signal });
       expect(text).toMatch(/^HELLO WORLD\d{4}-\d\d-\d\d$/);
       text = "what is here?";
-      await jade.keys.get("alt+s")!.key.run({ sessionId: "s1" });
+      await jade.keys.get("alt+s")!.key.run({ key: "alt+s", sessionId: "s1", signal: new AbortController().signal });
       expect(sent).toEqual([["text-keys", "In this directory: what is here?"]]);
       expect(text).toBe("");
       jade.shutdown();

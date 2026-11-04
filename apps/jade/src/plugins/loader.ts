@@ -116,8 +116,12 @@ export interface PluginKey {
   key: string;
   /** /help 里显示 */
   description?: string;
-  /** 出错时在对话里显示警告。要改输入框、发消息用插件上下文的 input、send */
-  run(ctx: { sessionId: string }): Awaitable<void>;
+  /**
+   * 出错时在对话里显示警告。要改输入框、发消息用插件上下文的 input、send。
+   * key 是按下的键，规范成小写（例如 "ctrl+g"）；换会话、退出时 signal 中止。
+   * 上一次还没执行完时再按，会再调用一次（切换式的键要自己记住状态）
+   */
+  run(ctx: { key: string; sessionId: string; signal: AbortSignal }): Awaitable<void>;
 }
 
 /**
@@ -271,11 +275,6 @@ export interface JadePlugin extends Plugin {
   /** 本插件的工具在对话里怎么显示，见 ToolRenderer */
   renderers?: ToolRenderer[];
   /**
-   * 模型服务，用 JADE_PROVIDER=<kind> 选择。只认用户层插件（服务能看到全部对话和 API key）；
-   * 只在启动时读一次，之后的会话共用，所以不要依赖按会话的状态
-   */
-  providers?: PluginProvider[];
-  /**
    * 用户输入的消息发给模型之前（斜杠命令、宿主自己发的话不经过）：返回新的文字代替原文，返回 undefined 不改，
    * 返回空字符串不发送。多个插件按加载顺序依次处理；改动会在对话里提示用户
    */
@@ -355,6 +354,11 @@ export interface LoadedPlugin extends FoundPlugin {
   info: PluginInfo;
   /** 创建一套实例，每个会话调用一次；进程外插件只有一个进程，每次返回同一个对象。只有内容的插件没有 */
   create?(host: HostContext): Promise<JadePlugin>;
+  /**
+   * 用户层插件模块导出的模型服务（export const providers），用 JADE_PROVIDER=<kind> 选择。
+   * 不属于哪套插件实例：加载时就读到，启动时注册一次，所有会话共用。还没检查，见 collectProviders
+   */
+  providers?: unknown;
   /** 进程外插件：结束进程 */
   close?(): Promise<void>;
   /** 进程外插件的状态：退出信息和最近的 stderr */
@@ -414,13 +418,15 @@ export async function loadPlugin(found: FoundPlugin, opts: LoadOptions): Promise
   }
 
   const file = path.resolve(found.dir, entry);
-  const exported = ((await import(pathToFileURL(file).href)) as { default?: unknown }).default;
+  const mod = (await import(pathToFileURL(file).href)) as { default?: unknown; providers?: unknown };
+  const exported = mod.default;
   if (typeof exported !== "function" && !isPlugin(exported)) throw new Error("default export is neither a plugin nor a function returning one");
   return {
     ...found,
     kind: "module",
     entry,
     info,
+    providers: mod.providers,
     async create(host) {
       const made = typeof exported === "function" ? await (exported as JadePluginFactory)(ctx(host)) : exported;
       if (!isPlugin(made)) throw new Error("plugin factory did not return a plugin");
@@ -517,27 +523,25 @@ function processCommands(proc: StdioPlugin): PluginCommand[] {
 }
 
 /**
- * 进程外插件在 initialize 的回复里声明的快捷键。按下时发 jade/key { key, sessionId }，用户层插件还带上输入框的内容 text；
+ * 进程外插件在 initialize 的回复里声明的快捷键。按下时发 jade/key { key, sessionId }（key 是规范成小写的键名，
+ * 换会话、退出时发 $/cancel 取消），用户层插件还带上输入框的内容 text；
  * 用户层插件可以回复 { set } 替换输入框、{ insert } 在光标处插入、{ send } 替用户发送，项目层插件的这些字段不起作用。
  * 键名等字段不对的由 createExtensions 统一提示
  */
 function processKeys(proc: StdioPlugin, ctx: JadePluginContext): PluginKey[] {
   // 不是数组时当作一个没有键名的快捷键，好让 createExtensions 提示
   const list = (Array.isArray(proc.manifest.keys) ? proc.manifest.keys : [{}]) as (Record<string, unknown> | null)[];
-  return list.map((k) => {
-    const key = k && typeof k === "object" ? k.key : undefined;
-    return {
-      key: key as string,
-      description: typeof k?.description === "string" ? k.description : undefined,
-      run: async ({ sessionId }) => {
-        const { input, send } = ctx;
-        const reply = (await proc.request("jade/key", { key, sessionId, ...(input ? { text: input.text() } : {}) })) as Record<string, unknown> | null;
-        if (typeof reply?.set === "string") input?.set(reply.set);
-        if (typeof reply?.insert === "string") input?.insert(reply.insert);
-        if (typeof reply?.send === "string") send?.(reply.send);
-      },
-    };
-  });
+  return list.map((k) => ({
+    key: (k && typeof k === "object" ? k.key : undefined) as string,
+    description: typeof k?.description === "string" ? k.description : undefined,
+    run: async ({ key, sessionId, signal }) => {
+      const { input, send } = ctx;
+      const reply = (await proc.request("jade/key", { key, sessionId, ...(input ? { text: input.text() } : {}) }, signal)) as Record<string, unknown> | null;
+      if (typeof reply?.set === "string") input?.set(reply.set);
+      if (typeof reply?.insert === "string") input?.insert(reply.insert);
+      if (typeof reply?.send === "string") send?.(reply.send);
+    },
+  }));
 }
 
 /**
