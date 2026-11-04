@@ -1,0 +1,5 @@
+{
+  "id": "example/protect-files",
+  "version": "1.0.0",
+  "description": "Keeps the agent from changing .env, lock files and .git"
+}

@@ -18,8 +18,6 @@ const factory: JadePluginFactory = ({ cwd, definePlugin, input, send, status }) 
   status(`${notes().length} notes`);
 
   return definePlugin({
-    id: "example/notes",
-    version: "1.0.0",
     tools: [
       {
         name: "add_note",

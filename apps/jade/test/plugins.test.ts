@@ -6,7 +6,7 @@ import { existsSync, realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { MemoryLogStore, MemoryTrustStore, readAll, Runtime, type Block, type ModelRequest, type ModelResponse, type Provider } from "uncarved";
-import { clearProviders, collectProviders, createJade, DISPOSE_TIMEOUT_MS, discoverPlugins, listModels, loadPlugin, pluginProviders, providerFromEnv, providerInfo, registerProviders, unregisterProviders, SEARCH_PROVIDERS, visionFromEnv, type FoundPlugin, type LoadedPlugin } from "../src/index.ts";
+import { clearProviders, collectProviders, createJade, DISPOSE_TIMEOUT_MS, discoverPlugins, listModels, loadPlugin, providerFromEnv, providerInfo, registerProviders, resolvePlugins, SEARCH_PROVIDERS, visionFromEnv, type FoundPlugin, type LoadedPlugin } from "../src/index.ts";
 import type { HostContext, SessionControl } from "../src/plugins/loader.ts";
 
 const MODEL = { by: "model", provider: "scripted", model: "scripted-1" } as const;
@@ -84,6 +84,45 @@ describe("plugin discovery", () => {
     await expect(loadPlugin(await at("broken", "{"), opts)).rejects.toThrow("plugin.json");
     await expect(loadPlugin(await at("both", JSON.stringify({ entry: "a.ts", command: "x" })), opts)).rejects.toThrow("not both");
     await expect(loadPlugin(await at("args", JSON.stringify({ command: "x", args: "a" })), opts)).rejects.toThrow('"args"');
+    // 有代码的插件要在 plugin.json 里写 id
+    await expect(loadPlugin(await at("no-id", JSON.stringify({ entry: "a.ts" })), opts)).rejects.toThrow('"id" is required');
+    await expect(loadPlugin(await at("no-id-process", JSON.stringify({ command: "x" })), opts)).rejects.toThrow('"id" is required');
+    await expect(loadPlugin(await at("bad-id", JSON.stringify({ id: "a b", entry: "a.ts" })), opts)).rejects.toThrow('"id" must be');
+  });
+
+  test("plugins are told apart by the id in plugin.json before any of their code runs", async () => {
+    const { cwd: root, home } = await dirs();
+    const write = async (dir: string, files: Record<string, string>) => {
+      for (const [name, text] of Object.entries(files)) {
+        await mkdir(path.dirname(path.join(dir, name)), { recursive: true });
+        await writeFile(path.join(dir, name), text);
+      }
+    };
+    // 被执行就会留下记号：停用的、重复的插件都不应该被执行
+    const code = (mark: string) => `globalThis.__jadeRan = [...(globalThis.__jadeRan ?? []), ${JSON.stringify(mark)}];\nexport default (ctx) => ctx.definePlugin({});\n`;
+    const user = (name: string) => path.join(home, "plugins", name);
+    const project = (name: string) => path.join(root, ".jade", "plugins", name);
+    await write(user("keep"), { "plugin.json": JSON.stringify({ id: "me/keep", version: "1.0.0" }), "index.js": code("keep") });
+    await write(user("off"), { "plugin.json": JSON.stringify({ id: "me/off", version: "1.0.0" }), "index.js": code("off") });
+    await write(project("same-id"), { "plugin.json": JSON.stringify({ id: "me/keep", version: "2.0.0" }), "index.js": code("same-id") });
+    await write(project("reserved"), { "plugin.json": JSON.stringify({ id: "jade/web", version: "1.0.0" }), "index.js": code("reserved") });
+    await write(project("broken"), { "plugin.json": "{" });
+    await write(project("docs"), { "skills/x/SKILL.md": "---\nname: x\ndescription: x\n---\n" });
+    const r = await resolvePlugins(await discoverPlugins({ home, root, cwd: root }), new Set(["me/off"]));
+    expect(r.plugins.map((p) => `${p.layer}:${p.name}:${p.id}`)).toEqual(["user:keep:me/keep", "project:docs:docs"]);
+    expect(r.broken.map((b) => b.found.name)).toEqual(["broken"]);
+    expect(r.warnings.join("\n")).toContain(`plugin ${project("same-id")} is skipped: plugin ${user("keep")} already has the id me/keep`);
+    expect(r.warnings.join("\n")).toContain("the id jade/web is reserved");
+    expect((globalThis as { __jadeRan?: string[] }).__jadeRan).toBeUndefined();
+
+    // 加载、创建实例：ctx.definePlugin 补上清单里的 id 和 version
+    const loaded = await loadPlugin(r.plugins[0]!, { trust: new MemoryTrustStore(), confirm: async () => false });
+    expect(loaded.id).toBe("me/keep");
+    const jade = await createJade({ cwd: root, home, store: new MemoryLogStore(), provider: scripted([]).provider, env: {}, extensions: [loaded] });
+    expect(jade.extensions.map((e) => `${e.plugin.id} ${e.plugin.version}`)).toEqual(["me/keep 1.0.0"]);
+    expect((globalThis as { __jadeRan?: string[] }).__jadeRan).toEqual(["keep"]);
+    delete (globalThis as { __jadeRan?: string[] }).__jadeRan;
+    jade.shutdown();
   });
 });
 
@@ -147,8 +186,9 @@ describe("in-process plugins", () => {
 
   test("broken plugins are skipped with a warning instead of stopping jade", async () => {
     const { cwd, home } = await dirs();
-    const fake = (name: string, make: () => unknown): LoadedPlugin => ({
+    const fake = (name: string, make: () => unknown, id = `x/${name}`): LoadedPlugin => ({
       name,
+      id,
       dir: path.join(home, "plugins", name),
       layer: "user",
       kind: "module",
@@ -177,11 +217,12 @@ describe("in-process plugins", () => {
           throw new Error("boom");
         }),
         fake("old", () => ({ id: "x/old", version: "1.0.0", kernel: "^9" })),
-        fake("undeclared", () => ({ id: "x/u", version: "1.0.0", kernel: "^0.1", hooks: [{ kind: "observe", point: "event", fn: () => {} }] })),
-        fake("clash-id", () => ({ id: "jade/policy", version: "1.0.0", kernel: "^0.1" })),
-        fake("bare-jade", () => ({ id: "jade", version: "1.0.0", kernel: "^0.1" })),
-        fake("jade-ns", () => ({ id: "jade/extra", version: "1.0.0", kernel: "^0.1" })),
-        fake("clash-tool", () => ({ id: "x/t", version: "1.0.0", kernel: "^0.1", tools: [tool("read_file")] })),
+        fake("undeclared", () => ({ id: "x/undeclared", version: "1.0.0", kernel: "^0.1", hooks: [{ kind: "observe", point: "event", fn: () => {} }] })),
+        fake("other-id", () => ({ id: "x/something-else", version: "1.0.0", kernel: "^0.1" })),
+        fake("clash-id", () => ({ id: "jade/policy", version: "1.0.0", kernel: "^0.1" }), "jade/policy"),
+        fake("bare-jade", () => ({ id: "jade", version: "1.0.0", kernel: "^0.1" }), "jade"),
+        fake("jade-ns", () => ({ id: "jade/extra", version: "1.0.0", kernel: "^0.1" }), "jade/extra"),
+        fake("clash-tool", () => ({ id: "x/clash-tool", version: "1.0.0", kernel: "^0.1", tools: [tool("read_file")] })),
         fake("good", () => ({
           id: "x/good",
           version: "1.0.0",
@@ -189,20 +230,21 @@ describe("in-process plugins", () => {
           tools: [tool("good_tool")],
           commands: [{ name: "ok", run: () => "fine" }, { name: "bad name", run: () => "" }, { name: "norun" }],
         })),
-        fake("dup-command", () => ({ id: "x/dup", version: "1.0.0", kernel: "^0.1", commands: [{ name: "OK", run: () => "" }] })),
+        fake("dup-command", () => ({ id: "x/dup-command", version: "1.0.0", kernel: "^0.1", commands: [{ name: "OK", run: () => "" }] })),
       ],
     });
     const warned = (name: string) => jade.warnings.find((w) => w.includes(name)) ?? "";
-    expect(warned("plugin throws")).toContain("boom");
-    expect(warned("plugin old")).toContain("requires kernel ^9");
-    expect(warned("plugin undeclared")).toContain("undeclared capabilities");
-    expect(warned("plugin clash-id")).toContain("already has the id jade/policy");
-    expect(warned("plugin bare-jade")).toContain("the id jade is reserved");
-    expect(warned("plugin jade-ns")).toContain("the id jade/extra is reserved");
-    expect(warned("plugin clash-tool")).toContain("tool read_file already exists");
-    expect(jade.warnings.filter((w) => w.includes("plugin good")).length).toBe(2);
-    expect(warned("x/dup")).toContain("x/good already provides it");
-    expect(jade.extensions.map((e) => e.plugin.id)).toEqual(["x/good", "x/dup"]);
+    expect(warned("plugin x/throws")).toContain("boom");
+    expect(warned("plugin x/old")).toContain("requires kernel ^9");
+    expect(warned("plugin x/undeclared")).toContain("undeclared capabilities");
+    expect(warned("plugin x/other-id")).toContain('its id "x/something-else" does not match "id" in plugin.json');
+    expect(warned("plugin jade/policy ")).toContain("already has the id jade/policy");
+    expect(warned("plugin jade ")).toContain("the id jade is reserved");
+    expect(warned("plugin jade/extra ")).toContain("the id jade/extra is reserved");
+    expect(warned("plugin x/clash-tool")).toContain("tool read_file already exists");
+    expect(jade.warnings.filter((w) => w.includes("plugin x/good (")).length).toBe(2);
+    expect(warned("x/dup-command")).toContain("x/good already provides it");
+    expect(jade.extensions.map((e) => e.plugin.id)).toEqual(["x/good", "x/dup-command"]);
     expect([...jade.commands].filter(([, c]) => !c.builtin).map(([k]) => k)).toEqual(["ok"]);
     // 剩下的插件能正常组成运行时
     await Runtime.create({ store: new MemoryLogStore(), provider: s.provider, plugins: jade.plugins });
@@ -229,6 +271,7 @@ describe("in-process plugins", () => {
     };
     const loaded: LoadedPlugin = {
       name: "redact",
+      id: "x/redact",
       dir: path.join(home, "plugins", "redact"),
       layer: "user",
       kind: "module",
@@ -261,6 +304,7 @@ describe("in-process plugins", () => {
     let complete: ((...a: Parameters<HostContext["complete"]>) => ReturnType<HostContext["complete"]>) | undefined;
     const loaded: LoadedPlugin = {
       name: "asker",
+      id: "x/asker",
       dir: path.join(home, "plugins", "asker"),
       layer: "user",
       kind: "module",
@@ -283,6 +327,7 @@ describe("in-process plugins", () => {
     const statuses: [string, string | undefined][] = [];
     const fake = (name: string, extra: (host: HostContext) => Record<string, unknown>): LoadedPlugin => ({
       name,
+      id: `x/${name}`,
       dir: path.join(home, "plugins", name),
       layer: "user",
       kind: "module",
@@ -307,8 +352,8 @@ describe("in-process plugins", () => {
     });
     expect(jade.suggester?.plugin).toBe("x/ghost");
     expect(jade.warnings.find((w) => w.includes("x/ghost2"))).toContain("x/ghost already provides it");
-    expect(jade.warnings.filter((w) => w.includes("plugin bad")).join("\n")).toContain("suggest is ignored");
-    expect(jade.warnings.filter((w) => w.includes("plugin bad")).join("\n")).toContain("beforeSend is ignored");
+    expect(jade.warnings.filter((w) => w.includes("plugin x/bad")).join("\n")).toContain("suggest is ignored");
+    expect(jade.warnings.filter((w) => w.includes("plugin x/bad")).join("\n")).toContain("beforeSend is ignored");
     expect(jade.beforeSend.map((b) => b.plugin)).toEqual(["x/upper"]);
     expect(await jade.beforeSend[0]!.fn("hi", { sessionId: "s", signal: new AbortController().signal })).toBe("HI");
     expect(statuses).toEqual([["upper", "ready"]]);
@@ -318,6 +363,7 @@ describe("in-process plugins", () => {
     const { cwd, home } = await dirs();
     const fake = (name: string, layer: "user" | "project", responder: unknown): LoadedPlugin => ({
       name,
+      id: `x/${name}`,
       dir: path.join(home, "plugins", name),
       layer,
       kind: "module",
@@ -335,8 +381,8 @@ describe("in-process plugins", () => {
       extensions: [fake("phone", "user", { approve }), fake("repo", "project", { approve }), fake("broken", "user", { approve: "yes" })],
     });
     expect(jade.responders.map((r) => r.plugin)).toEqual(["x/phone"]);
-    expect(jade.warnings.find((w) => w.includes("plugin repo"))).toContain("only user plugins can answer approvals");
-    expect(jade.warnings.find((w) => w.includes("plugin broken"))).toContain("must be functions");
+    expect(jade.warnings.find((w) => w.includes("plugin x/repo"))).toContain("only user plugins can answer approvals");
+    expect(jade.warnings.find((w) => w.includes("plugin x/broken"))).toContain("must be functions");
     // 被忽略的插件其余部分照常加载
     expect(jade.extensions.map((e) => e.plugin.id)).toEqual(["x/phone", "x/repo", "x/broken"]);
   });
@@ -409,12 +455,12 @@ for await (const line of createInterface({ input: process.stdin })) {
 }
 `,
     );
-    await writeFile(path.join(dir, "plugin.json"), JSON.stringify({ command: process.execPath, args: ["main.ts"] }));
+    await writeFile(path.join(dir, "plugin.json"), JSON.stringify({ id: "x/greet", command: process.execPath, args: ["main.ts"] }));
     const loaded = await loadPlugin({ name: "greet", dir, layer: "user" }, { trust: new MemoryTrustStore(), confirm: async () => true });
     try {
       const jade = await createJade({ cwd, home, store: new MemoryLogStore(), provider: scripted([]).provider, env: {}, extensions: [loaded] });
       expect(jade.warnings.filter((w) => w.includes("greet"))).toEqual([
-        'plugin greet (user): command "bad name" is ignored: it needs a name of letters, digits, - and _, and a run function',
+        'plugin x/greet (user): command "bad name" is ignored: it needs a name of letters, digits, - and _, and a run function',
       ]);
       const hello = jade.commands.get("hello")!;
       expect(hello.plugin).toBe("x/greet");
@@ -558,6 +604,7 @@ describe("session commands use the public SessionControl", () => {
     await writeFile(file, "old");
     const plugin: LoadedPlugin = {
       name: "stamp",
+      id: "x/stamp",
       dir: path.join(home, "plugins", "stamp"),
       layer: "user",
       kind: "module",
@@ -638,6 +685,7 @@ describe("model services from plugins", () => {
     const { home } = await dirs();
     const fake = (name: string, layer: "user" | "project", providers: unknown): LoadedPlugin => ({
       name,
+      id: `x/${name}`,
       dir: path.join(home, "plugins", name),
       layer,
       kind: "module",
@@ -656,49 +704,23 @@ describe("model services from plugins", () => {
       fake("repo", "project", [def("bar")]),
       fake("odd", "user", def("baz")),
     ]);
-    expect(providers.map((p) => `${p.plugin}:${p.def.kind}`)).toEqual(["good:foo"]);
+    expect(providers.map((p) => `${p.plugin}:${p.def.kind}`)).toEqual(["x/good:foo"]);
     // 不能用 jade 自己的变量，也不能重复
     expect(providers[0]!.def.settings!.map((x) => x.env)).toEqual(["FOO_KEY"]);
     const text = warnings.join("\n");
     expect(text).toContain('setting "JADE_MAX_TOKENS" is ignored');
     expect(text).toContain("setting FOO_KEY is ignored: it is listed twice");
     expect(text).toContain('provider "bad name" is ignored');
-    expect(text).toContain("plugin repo (project): providers are ignored: only user plugins can provide model services");
-    expect(text).toContain("plugin odd (user): providers is ignored: it must be an array");
-  });
-
-  test("a plugin disabled by its id is reported, so the host can take back the services it exported", async () => {
-    const { cwd, home } = await dirs();
-    const fake = (name: string): LoadedPlugin => ({
-      name,
-      dir: path.join(home, "plugins", name),
-      layer: "user",
-      kind: "module",
-      entry: "index.ts",
-      info: { kind: "module", entry: "index.ts", json: {}, bundle: { skills: [], commands: [], unsupported: [] } },
-      providers: [def(`${name}-svc`)],
-      create: async () => ({ id: `x/${name}`, version: "1.0.0", kernel: "^0.1" }),
-    });
-    clearProviders();
-    try {
-      const sources = [fake("keep"), fake("off")];
-      registerProviders(collectProviders(sources).providers);
-      const jade = await createJade({ cwd, home, store: new MemoryLogStore(), provider: scripted([]).provider, env: {}, extensions: sources, disabled: new Set(["x/off"]) });
-      expect(jade.disabledById).toEqual(["off"]);
-      expect(jade.extensions.map((e) => e.plugin.id)).toEqual(["x/keep"]);
-      expect(unregisterProviders(jade.disabledById)).toEqual(["off-svc"]);
-      expect(pluginProviders().map((p) => p.def.kind)).toEqual(["keep-svc"]);
-      jade.shutdown();
-    } finally {
-      clearProviders();
-    }
+    expect(text).toContain("plugin x/repo (project): providers are ignored: only user plugins can provide model services");
+    expect(text).toContain("plugin x/odd (user): providers is ignored: it must be an array");
   });
 
   test("dispose: used instances on jade.dispose (once), unused ones right away; errors and timeouts become warnings", async () => {
     const { cwd, home } = await dirs();
     const disposed: string[] = [];
-    const fake = (name: string, id: string, dispose: unknown): LoadedPlugin => ({
+    const fake = (name: string, id: string, dispose: unknown, sourceId = id): LoadedPlugin => ({
       name,
+      id: sourceId,
       dir: path.join(home, "plugins", name),
       layer: "user",
       kind: "module",
@@ -713,10 +735,9 @@ describe("model services from plugins", () => {
       store: new MemoryLogStore(),
       provider: scripted([]).provider,
       env: {},
-      disabled: new Set(["x/off"]),
       extensions: [
         fake("a", "x/a", record("a")),
-        fake("off", "x/off", record("off")),
+        fake("other-id", "x/b", record("other-id"), "x/other-id"),
         fake("dup", "x/a", record("dup")),
         fake("bad", "x/bad", () => {
           throw new Error("boom");
@@ -725,13 +746,13 @@ describe("model services from plugins", () => {
         fake("odd", "x/odd", "not a function"),
       ],
     });
-    // 按 id 停用的、id 重复被拒绝的：创建时就收尾
-    expect(disposed.sort()).toEqual(["dup", "off"]);
-    expect(jade.warnings.join("\n")).toContain("plugin odd (user): dispose is ignored: it must be a function");
+    // id 和清单不一致的、id 重复被拒绝的：创建时就收尾
+    expect(disposed.sort()).toEqual(["dup", "other-id"]);
+    expect(jade.warnings.join("\n")).toContain("plugin x/odd (user): dispose is ignored: it must be a function");
     const started = Date.now();
     const warnings = await jade.dispose();
-    expect(disposed.sort()).toEqual(["a", "dup", "off"]);
-    expect(warnings).toEqual(["plugin bad (user): dispose failed: boom", `plugin slow (user): dispose did not finish within ${DISPOSE_TIMEOUT_MS / 1000}s`]);
+    expect(disposed.sort()).toEqual(["a", "dup", "other-id"]);
+    expect(warnings).toEqual(["plugin x/bad (user): dispose failed: boom", `plugin x/slow (user): dispose did not finish within ${DISPOSE_TIMEOUT_MS / 1000}s`]);
     // 同时进行：总共只等一个时限
     expect(Date.now() - started).toBeLessThan(DISPOSE_TIMEOUT_MS + 2000);
     // 只执行一次
@@ -744,6 +765,7 @@ describe("model services from plugins", () => {
     const { cwd, home } = await dirs();
     const dir = path.join(home, "plugins", "foo");
     await mkdir(dir, { recursive: true });
+    await writeFile(path.join(dir, "plugin.json"), JSON.stringify({ id: "x/foo", version: "1.0.0" }));
     await writeFile(
       path.join(dir, "index.ts"),
       `export const providers = [{ kind: "foo", model: () => "f1", create: () => ({ id: "foo", complete: async () => ({ model: "f1", content: [], stopReason: "end" }) }) }];
@@ -752,7 +774,7 @@ export default () => ({ id: "x/foo", version: "1.0.0", kernel: "^0.1", providers
     );
     const loaded = await loadPlugin({ name: "foo", dir, layer: "user" }, { trust: new MemoryTrustStore(), confirm: async () => false });
     // 加载就能读到，不用创建插件实例
-    expect(collectProviders([loaded]).providers.map((p) => `${p.plugin}:${p.def.kind}`)).toEqual(["foo:foo"]);
+    expect(collectProviders([loaded]).providers.map((p) => `${p.plugin}:${p.def.kind}`)).toEqual(["x/foo:foo"]);
     const jade = await createJade({ cwd, home, store: new MemoryLogStore(), provider: scripted([]).provider, env: {}, extensions: [loaded] });
     // 工厂函数返回的 providers 不认，提示改成导出
     expect(jade.warnings.join("\n")).toContain("providers is ignored: export it from the plugin module instead");
@@ -765,11 +787,12 @@ describe("input box, keys and send", () => {
   async function plugin(base: string, name: string, keys: string) {
     const dir = path.join(base, "plugins", name);
     await mkdir(dir, { recursive: true });
+    await writeFile(path.join(dir, "plugin.json"), JSON.stringify({ id: `x/${name}`, version: "1.0.0" }));
     await writeFile(
       path.join(dir, "index.js"),
       `export default (ctx) => {
   globalThis.__jadeCtx = { ...globalThis.__jadeCtx, ${JSON.stringify(name)}: ctx };
-  return { id: "x/${name}", version: "1.0.0", kernel: "^0.1", keys: ${keys} };
+  return ctx.definePlugin({ keys: ${keys} });
 };
 `,
     );
@@ -798,7 +821,7 @@ describe("input box, keys and send", () => {
     seen.voice!.input!.insert("hello");
     seen.voice!.send!("go");
     expect(inserted).toEqual(["hello"]);
-    expect(sent).toEqual([["voice", "go"]]);
+    expect(sent).toEqual([["x/voice", "go"]]);
     expect(seen.repo!.input).toBeUndefined();
     expect(seen.repo!.send).toBeUndefined();
     jade.shutdown();
@@ -851,7 +874,7 @@ for await (const line of createInterface({ input: process.stdin })) {
       const dir = path.join(base, "plugins", name);
       await mkdir(dir, { recursive: true });
       await writeFile(path.join(dir, "main.ts"), script);
-      await writeFile(path.join(dir, "plugin.json"), JSON.stringify({ command: process.execPath, args: ["main.ts"], env: { NAME: name, KEY: key } }));
+      await writeFile(path.join(dir, "plugin.json"), JSON.stringify({ id: `x/${name}`, command: process.execPath, args: ["main.ts"], env: { NAME: name, KEY: key } }));
       return dir;
     };
     const opts = { trust: new MemoryTrustStore(), confirm: async () => true };
@@ -873,7 +896,7 @@ for await (const line of createInterface({ input: process.stdin })) {
       expect([...jade.keys].map(([k, v]) => `${k} ${v.plugin} ${v.key.description}`)).toEqual(["ctrl+t x/shout shout", "alt+r x/repo shout"]);
       await jade.keys.get("ctrl+t")!.key.run({ key: "ctrl+t", sessionId: "s1", signal: new AbortController().signal });
       expect(text).toBe("HI ctrl+t s1!");
-      expect(sent).toEqual([["shout", "seen hi"]]);
+      expect(sent).toEqual([["x/shout", "seen hi"]]);
       // 项目层：拿不到输入框的内容，回复里的 set、insert、send 不起作用
       await jade.keys.get("alt+r")!.key.run({ key: "alt+r", sessionId: "s1", signal: new AbortController().signal });
       expect(text).toBe("HI ctrl+t s1!");
@@ -915,7 +938,7 @@ for await (const line of createInterface({ input: process.stdin })) {
     expect(text).toBe("");
     expect(statuses.at(-1)).toBe("1 notes");
     await jade.keys.get("ctrl+g")!.key.run({ key: "ctrl+g", sessionId: "s1", signal: new AbortController().signal });
-    expect(sent).toEqual([["notes", expect.stringContaining("NOTES.md")]]);
+    expect(sent).toEqual([["example/notes", expect.stringContaining("NOTES.md")]]);
     const ui = { interactive: false, log: () => {}, select: async () => undefined as never, input: async () => undefined };
     const ctx = { sessionId: "s", cwd, signal: new AbortController().signal, derived: {}, ui, note: () => {} };
     expect(await jade.commands.get("notes")!.command.run("", ctx)).toBe("- buy milk");
@@ -959,7 +982,7 @@ for await (const line of createInterface({ input: process.stdin })) {
       expect(text).toMatch(/^HELLO WORLD\d{4}-\d\d-\d\d$/);
       text = "what is here?";
       await jade.keys.get("alt+s")!.key.run({ key: "alt+s", sessionId: "s1", signal: new AbortController().signal });
-      expect(sent).toEqual([["text-keys", "In this directory: what is here?"]]);
+      expect(sent).toEqual([["example/text-keys", "In this directory: what is here?"]]);
       expect(text).toBe("");
       jade.shutdown();
     } finally {
@@ -975,6 +998,7 @@ describe("tool renderers", () => {
     const summary = () => "x";
     const loaded: LoadedPlugin = {
       name: "deploy",
+      id: "x/deploy",
       dir: path.join(home, "plugins", "deploy"),
       layer: "user",
       kind: "module",

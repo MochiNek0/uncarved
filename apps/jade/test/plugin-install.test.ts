@@ -25,7 +25,8 @@ async function files(dir: string, entries: Record<string, string>) {
 const git = (cwd: string, ...args: string[]) =>
   execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", ...args], { cwd, stdio: "pipe" }).toString();
 
-const PLUGIN = `export default { id: "x/hello", version: "1.0.0", kernel: "^0.1", commands: [{ name: "hello", run: () => "hi" }] };\n`;
+const PLUGIN = `export default (ctx) => ctx.definePlugin({ commands: [{ name: "hello", run: () => "hi" }] });\n`;
+const PLUGIN_JSON = JSON.stringify({ id: "x/hello", version: "1.0.0" });
 
 describe("plugin sources", () => {
   test("git URLs, GitHub shorthands, npm packages, tarballs and local directories", async () => {
@@ -51,7 +52,7 @@ describe("jade plugin add / update / remove", () => {
     const work = await tmp("jade-inst-");
     const src = await files(path.join(work, "src"), {
       "index.ts": PLUGIN,
-      "plugin.json": JSON.stringify({ name: "Hello Plugin", version: "1.0.0" }),
+      "plugin.json": JSON.stringify({ id: "x/hello", name: "Hello Plugin", version: "1.0.0" }),
       "node_modules/junk/index.js": "",
     });
     const pluginsDir = path.join(work, "home", "plugins");
@@ -85,7 +86,7 @@ describe("jade plugin add / update / remove", () => {
 
   test("git: clones a subdirectory at a ref, update fetches new commits", async () => {
     const work = await tmp("jade-git-");
-    const repo = await files(path.join(work, "repo"), { "plugins/hello/index.ts": PLUGIN, "README.md": "" });
+    const repo = await files(path.join(work, "repo"), { "plugins/hello/index.ts": PLUGIN, "plugins/hello/plugin.json": PLUGIN_JSON, "README.md": "" });
     git(repo, "init", "-q", "-b", "main");
     git(repo, "add", ".");
     git(repo, "commit", "-q", "-m", "one");
@@ -93,7 +94,7 @@ describe("jade plugin add / update / remove", () => {
     const pluginsDir = path.join(work, "plugins");
     const r = await addPlugin(`${url}#main`, { pluginsDir, cwd: work, subdir: "plugins/hello" });
     expect(r.name).toBe("hello");
-    expect(await readdir(r.dir)).toEqual(["index.ts"]);
+    expect((await readdir(r.dir)).sort()).toEqual(["index.ts", "plugin.json"]);
     const first = r.record.commit!;
     expect(first).toMatch(/^[0-9a-f]{40}$/);
 
@@ -110,14 +111,14 @@ describe("jade plugin add / update / remove", () => {
 
   test("npm: a packed tarball installs under the package name without its scope", async () => {
     const work = await tmp("jade-npm-");
-    const pkg = await files(path.join(work, "pkg"), { "package.json": JSON.stringify({ name: "@me/jade-hello", version: "0.4.0" }), "index.ts": PLUGIN });
+    const pkg = await files(path.join(work, "pkg"), { "package.json": JSON.stringify({ name: "@me/jade-hello", version: "0.4.0" }), "index.ts": PLUGIN, "plugin.json": JSON.stringify({ id: "x/hello" }) });
     execFileSync(process.execPath, ["pm", "pack", "--destination", work], { cwd: pkg, stdio: "pipe" });
     const tgz = (await readdir(work)).find((n) => n.endsWith(".tgz"))!;
     const pluginsDir = path.join(work, "plugins");
     const r = await addPlugin(path.join(work, tgz), { pluginsDir, cwd: work });
     expect(r.name).toBe("jade-hello");
     expect(r.record).toMatchObject({ kind: "npm", version: "0.4.0" });
-    expect((await readdir(r.dir)).sort()).toEqual(["index.ts", "package.json"]);
+    expect((await readdir(r.dir)).sort()).toEqual(["index.ts", "package.json", "plugin.json"]);
   }, 60_000);
 
   test("the plugin's dependencies are installed", async () => {
@@ -126,6 +127,7 @@ describe("jade plugin add / update / remove", () => {
     await files(path.join(work, "src"), {
       "package.json": JSON.stringify({ name: "with-deps", version: "1.0.0", dependencies: { "dep-x": `file:${dep.split(path.sep).join("/")}` } }),
       "index.ts": PLUGIN,
+      "plugin.json": PLUGIN_JSON,
     });
     const r = await addPlugin("./src", { pluginsDir: path.join(work, "plugins"), cwd: work });
     expect(await stat(path.join(r.dir, "node_modules", "dep-x", "i.js")).then(() => true)).toBe(true);
@@ -133,32 +135,47 @@ describe("jade plugin add / update / remove", () => {
 });
 
 describe("jade plugin CLI", () => {
-  test("list, disable and enable; jade/policy cannot be disabled", async () => {
+  test("list, disable and enable by id (a directory name is turned into the id); jade/policy cannot be disabled", async () => {
     const work = await tmp("jade-cli-");
     const home = path.join(work, "home");
-    await files(path.join(home, "plugins", "hello"), { "index.ts": PLUGIN });
+    await files(path.join(home, "plugins", "hello"), { "index.ts": PLUGIN, "plugin.json": PLUGIN_JSON });
     const out: string[] = [];
     const o = { home, cwd: work, root: work, trust: new MemoryTrustStore(), out: (t: string) => out.push(t), err: (t: string) => out.push(t) };
+    const plain = () => out.join("\n").replace(/\x1b\[\d+m/g, "");
     expect(await pluginCli(["disable", "jade/web"], o)).toBe(0);
     expect(await pluginCli(["disable", "jade/policy"], o)).toBe(1);
+    // plugins.json 只记 id
     expect(await pluginCli(["disable", "hello"], o)).toBe(0);
-    expect((await readPluginSettings(home)).disabled).toEqual(["hello", "jade/web"]);
-    expect(await pluginCli(["enable", "hello"], o)).toBe(0);
+    expect((await readPluginSettings(home)).disabled).toEqual(["jade/web", "x/hello"]);
+    expect(await pluginCli(["enable", "x/hello"], o)).toBe(0);
     expect((await readPluginSettings(home)).disabled).toEqual(["jade/web"]);
     out.length = 0;
+    expect(await pluginCli(["disable", "nobody/else"], o)).toBe(0);
+    expect(plain()).toContain("no built-in or installed plugin has the id nobody/else");
+    expect(await pluginCli(["enable", "nobody/else"], o)).toBe(0);
+    expect(await pluginCli(["disable", "x/hello"], o)).toBe(0);
+    out.length = 0;
     expect(await pluginCli(["list"], o)).toBe(0);
-    const text = out.join("\n").replace(/\x1b\[\d+m/g, "");
+    const text = plain();
     expect(text).toMatch(/jade\/web .* disabled/);
     expect(text).toMatch(/jade\/policy .* required/);
-    expect(text).toContain("hello");
+    expect(text).toMatch(/x\/hello \(hello\/\) 1\.0\.0 module .* disabled/);
     expect(text).toContain("copied by hand");
+    // 卸载时一起去掉它的停用记录
     expect(await pluginCli(["remove", "hello"], o)).toBe(0);
+    expect((await readPluginSettings(home)).disabled).toEqual(["jade/web"]);
     await expect(pluginCli(["frobnicate"], o)).rejects.toThrow("unknown command");
+  });
+
+  test("a plugin with code but no id in plugin.json is not installed", async () => {
+    const work = await tmp("jade-cli-");
+    await files(path.join(work, "src"), { "index.ts": PLUGIN });
+    await expect(addPlugin("./src", { pluginsDir: path.join(work, "plugins"), cwd: work })).rejects.toThrow('"id" is required');
   });
 
   test("--project installs into the repository and records trust, so jade does not ask again", async () => {
     const work = await tmp("jade-cli-");
-    await files(path.join(work, "src"), { "index.ts": PLUGIN });
+    await files(path.join(work, "src"), { "index.ts": PLUGIN, "plugin.json": PLUGIN_JSON });
     const trust = new MemoryTrustStore();
     const o = { home: path.join(work, "home"), cwd: work, root: work, trust, out: () => {}, err: () => {} };
     expect(await pluginCli(["add", "./src", "--project", "--name", "hello"], o)).toBe(0);
@@ -233,8 +250,9 @@ describe("plugins that carry skills, commands and MCP servers", () => {
 
 describe("built-in plugins", () => {
   const provider: Provider = { id: "none", complete: () => Promise.reject(new Error("unused")) };
-  const fakePlugin = (name: string, plugin: object): LoadedPlugin => ({
+  const fakePlugin = (name: string, plugin: { id: string }): LoadedPlugin => ({
     name,
+    id: plugin.id,
     dir: path.join(os.tmpdir(), name),
     layer: "user",
     kind: "module",

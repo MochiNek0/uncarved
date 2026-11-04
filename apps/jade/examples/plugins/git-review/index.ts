@@ -1,6 +1,6 @@
 // 示例：给模型一个 git_diff 工具，再加两个斜杠命令。
 // 默认导出工厂函数：jade 每个会话调用一次，传入工作目录、执行命令的 run 等上下文。
-// 用 ctx.definePlugin 补上 kernel 和 needs，不用 import uncarved（项目层插件通常 import 不到它）。
+// 用 ctx.definePlugin 补上 kernel、needs，以及 plugin.json 里的 id、version，不用 import uncarved（项目层插件通常 import 不到它）。
 
 import type { JadePluginFactory } from "@uncarved/jade";
 
@@ -14,8 +14,6 @@ const factory: JadePluginFactory = ({ cwd, run, definePlugin }) => {
   }
 
   return definePlugin({
-    id: "example/git-review",
-    version: "1.0.0",
     tools: [
       {
         name: "git_diff",

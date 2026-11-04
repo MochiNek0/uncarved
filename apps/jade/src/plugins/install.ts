@@ -386,7 +386,7 @@ function run(cmd: string, args: string[], cwd: string): Promise<string> {
 
 /** $JADE_HOME/plugins.json：只有用户层能停用插件，仓库不能停用用户的插件或内置插件 */
 export interface PluginSettings {
-  /** 停用的插件：内置插件的 id（jade/web），或者插件的目录名 */
+  /** 停用的插件的 id：内置插件（jade/web）或第三方插件（plugin.json 的 id） */
   disabled: string[];
 }
 

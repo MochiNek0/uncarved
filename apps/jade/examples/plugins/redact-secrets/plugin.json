@@ -1,4 +1,5 @@
 {
+  "id": "example/redact-secrets",
   "command": "python",
   "args": ["redact.py"]
 }
