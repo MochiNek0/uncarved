@@ -98,7 +98,7 @@ export interface CommandUI {
   /** 让用户从几项里选一项；取消时返回 undefined */
   select<T>(title: string, choices: Choice<T>[], opts?: { body?: string }): Promise<T | undefined>;
   /** 让用户输入一行；取消时返回 undefined */
-  input(title: string, opts?: { initial?: string; placeholder?: string }): Promise<string | undefined>;
+  input(title: string, opts?: { initial?: string; placeholder?: string; mask?: boolean }): Promise<string | undefined>;
 }
 
 export interface PluginCommandContext {
@@ -141,6 +141,11 @@ export interface SessionControl {
   resume(id: string): Promise<void>;
   /** 上一次请求在模型回复之前就失败了时重新请求，不用再发消息；没有可重试的返回 false */
   retry(): Promise<boolean>;
+  /**
+   * 用新的插件实例继续当前会话，对话内容不变：工具和系统提示词按现在的配置重新生成（例如改了 $JADE_HOME/.env 之后）。
+   * 调用它的插件实例随之被换掉，之后不要再用它的状态
+   */
+  reload(): Promise<void>;
 }
 
 /** 字符串：显示给用户；{ prompt }：作为用户消息发给模型；不返回：什么也不做 */

@@ -8,7 +8,7 @@ import { checkCompat, definePlugin, subsetPlugin, type LogStore, type ModelReque
 import { budget } from "./plugins/budget.ts";
 import { BUILTINS, BUILTIN_IDS, REQUIRED_IDS } from "./plugins/builtins.ts";
 import { checks as checksPlugin, type ApproveCheck, type Check, type Checks } from "./plugins/checks.ts";
-import { checksCommand, compactCommand, mcpCommand, mcpInstructions, memoryCommand, skillsCommand, withCounter, withSystem } from "./plugins/core.ts";
+import { checksCommand, compactCommand, mcpCommand, mcpInstructions, memoryCommand, searchCommand, skillsCommand, withCounter, withSystem } from "./plugins/core.ts";
 import { Memory, memoryTool } from "./memory.ts";
 import { mcpTools, type McpClient } from "./mcp.ts";
 import { skillTool, skillsPrompt, type Skill } from "./skills.ts";
@@ -196,6 +196,7 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
       version: "0.2.0",
       kernel: "^0.1",
       tools: shot ? [...web, shot] : web,
+      commands: [searchCommand({ envFile: path.join(opts.home, ".env"), env: opts.env })],
       ...(shot
         ? {
             needs: ["transform:context.build"],

@@ -39,7 +39,6 @@ import { repoRoot } from "./plugins/prompts.ts";
 import { isBuiltinKind, isRateLimit, pluginProvider, providerFromEnv, providerInfo, providerKind, RateGate, registerProviders, rpmFromEnv, switchable, withRetry } from "./provider.ts";
 import { ago, discardIfEmpty, matchSession, SessionIndex } from "./sessions.ts";
 import { display } from "./tools/fs.ts";
-import { SEARCH_PROVIDERS } from "./tools/web.ts";
 import type { ApproveSubagent, SubagentApproval } from "./tools/task.ts";
 import type { Question } from "./tools/ask.ts";
 import type { Check } from "./plugins/checks.ts";
@@ -73,13 +72,12 @@ const COMMANDS: CommandInfo[] = [
   { name: "model", args: "[name]", about: "switch between saved models, or add one and configure its provider, API key and output limit" },
   { name: "mode", args: `[${MODES.join("|")}]`, about: "show or change the permission mode" },
   { name: "plugins", about: "built-in and installed plugins: their tools, hooks and commands, and the hook execution order" },
-  { name: "search", about: "set up web search services (TinyFish, AnySearch, Tavily, Exa, Firecrawl, Jina)" },
   { name: "exit", about: "quit (the session stays resumable)" },
 ];
 /** 运行中也立即执行的命令（不碰运行时，或者只读；/mode 运行中先记在 pendingMode） */
 const INSTANT = new Set(["help", "model", "mode", "plugins", "exit"]);
 /** 内置插件提供的命令（/memory 在 jade/memory 里，等等）：名字保留给它们，自定义命令不能占用 */
-const BUILTIN_PLUGIN_COMMANDS = ["memory", "checks", "mcp", "skills", "compact", "clear", "resume", "retry", "undo"];
+const BUILTIN_PLUGIN_COMMANDS = ["memory", "checks", "mcp", "skills", "compact", "clear", "resume", "retry", "undo", "search"];
 
 const KEYS = `Keys: enter send · \\ or alt+enter new line · ↑↓ history · @ reference a file · esc interrupt (twice to also clear queued messages) · shift+tab cycle ask/auto/plan · ctrl+c twice to exit
       mouse wheel or PgUp/PgDn scroll the conversation · ctrl+home/ctrl+end jump to the top/bottom · click ▸ expands an item (ctrl+o the latest one) · click in the input moves the cursor · shift+drag selects text
@@ -900,6 +898,7 @@ function sessionControl(plugin: string): SessionControl {
     },
     list: async () => (await index.list(cwd)).map(({ id, title, at }) => ({ id, title, at })),
     clear: () => track(switchSession()),
+    reload: () => track(reloadSession()),
     resume: (id) => track(switchSession(id)),
     retry: async () => {
       if (!canRetry()) return false;
@@ -1085,7 +1084,7 @@ async function switchSession(id?: string) {
 
 /**
  * 用新的插件实例继续当前会话：工具和系统提示词按现在的配置重新生成（例如 /search 改了搜索服务），对话内容不变。
- * 只在空闲时调用（/search 不是 INSTANT 命令）
+ * 只在空闲时调用：插件命令的 session.reload（instant 命令没有 session）
  */
 async function reloadSession() {
   await flushPendingMode();
@@ -1104,35 +1103,6 @@ async function reloadSession() {
   }
   rt.subscribe(view.onNotice);
   await guarded(() => rt.recover());
-}
-
-/** /search：设置或去掉某个搜索服务的 API key（写进 $JADE_HOME/.env），当前会话立即生效 */
-async function configureSearch() {
-  const on = SEARCH_PROVIDERS.filter((p) => process.env[p.env]);
-  const name = await screen.select(
-    on.length ? `Web search is on (${on.map((p) => p.name).join(", ")}; tried in order, the next one takes over on failure)` : "Web search is off",
-    SEARCH_PROVIDERS.map((p) => ({ label: `${p.name}${process.env[p.env] ? " ✓" : ""}`, value: p.name, hint: p.signup })),
-  );
-  const p = SEARCH_PROVIDERS.find((x) => x.name === name);
-  if (!p) return;
-  if (process.env[p.env]) {
-    const choice = await screen.select(p.name, [
-      { label: "Change the API key…", value: "set" as const },
-      { label: "Remove", value: "off" as const, hint: `removes ${p.env} from ${envFile}` },
-    ]);
-    if (!choice) return;
-    if (choice === "off") {
-      await updateEnvFile(envFile, { [p.env]: undefined });
-      await reloadSession();
-      screen.log(dim(`${p.name} removed.${on.length > 1 ? "" : " Web search is off."}`));
-      return;
-    }
-  }
-  const key = (await screen.input(`${p.name} API key`, { mask: true }))?.trim();
-  if (!key) return;
-  await updateEnvFile(envFile, { [p.env]: key });
-  await reloadSession();
-  screen.log(green(`Web search is on with ${p.name}: web_search uses it, and web_fetch falls back to it when a page cannot be fetched directly.`));
 }
 
 /** 从这个目录最近的会话里选一个（-r 不带 id 时）；取消或没有时返回 undefined */
@@ -1383,9 +1353,6 @@ async function command(input: string): Promise<boolean> {
     }
     case "plugins":
       showPlugins();
-      break;
-    case "search":
-      await configureSearch();
       break;
     case "exit":
       return false;

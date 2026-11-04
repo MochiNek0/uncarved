@@ -15,7 +15,7 @@ export const BUILTINS: readonly BuiltinInfo[] = [
   { id: "jade/prompts", about: "system prompt, environment, AGENTS.md / CLAUDE.md instructions" },
   { id: "jade/fs", about: "read_file, write_file, edit_file, multi_edit, list_dir, glob, grep" },
   { id: "jade/shell", about: "bash, bash_output, kill_shell" },
-  { id: "jade/web", about: "web_fetch, web_search" },
+  { id: "jade/web", about: "web_fetch, web_search, /search" },
   { id: "jade/todo", about: "todo_write" },
   { id: "jade/ask", about: "ask_user (the agent asks you clarifying questions)" },
   { id: "jade/memory", about: "memory tool, memories in the system prompt, /memory" },

@@ -11,6 +11,8 @@ import { MEMORY_SCOPES, type Memory, type MemoryScope } from "../memory.ts";
 import { describeServer, type McpClient } from "../mcp.ts";
 import type { Skill } from "../skills.ts";
 import { display } from "../tools/fs.ts";
+import { SEARCH_PROVIDERS } from "../tools/web.ts";
+import { updateEnvFile } from "../config.ts";
 import { clip } from "../ui/render.ts";
 import { bold, dim, green, red, yellow } from "../ui/screen.ts";
 
@@ -212,6 +214,44 @@ export function compactCommand(compact: Compactor): PluginCommand {
     run() {
       compact.request();
       return dim("History will be compacted before the next request.");
+    },
+  };
+}
+
+// ---------- /search ----------
+
+/** /search：设置或去掉某个搜索服务的 API key（写进 $JADE_HOME/.env），用 session.reload 让当前会话立即用上 */
+export function searchCommand(opts: { envFile: string; env?: Record<string, string | undefined> }): PluginCommand {
+  return {
+    name: "search",
+    description: "set up web search services (TinyFish, AnySearch, Tavily, Exa, Firecrawl, Jina)",
+    async run(_args, { ui, session }) {
+      if (!session) throw new Error("/search needs session control, which this host does not provide here");
+      const env = opts.env ?? process.env;
+      const on = SEARCH_PROVIDERS.filter((p) => env[p.env]);
+      const name = await ui.select(
+        on.length ? `Web search is on (${on.map((p) => p.name).join(", ")}; tried in order, the next one takes over on failure)` : "Web search is off",
+        SEARCH_PROVIDERS.map((p) => ({ label: `${p.name}${env[p.env] ? " ✓" : ""}`, value: p.name, hint: p.signup })),
+      );
+      const p = SEARCH_PROVIDERS.find((x) => x.name === name);
+      if (!p) return;
+      if (env[p.env]) {
+        const choice = await ui.select(p.name, [
+          { label: "Change the API key…", value: "set" as const },
+          { label: "Remove", value: "off" as const, hint: `removes ${p.env} from ${opts.envFile}` },
+        ]);
+        if (!choice) return;
+        if (choice === "off") {
+          await updateEnvFile(opts.envFile, { [p.env]: undefined }, env);
+          await session.reload();
+          return dim(`${p.name} removed.${on.length > 1 ? "" : " Web search is off."}`);
+        }
+      }
+      const key = (await ui.input(`${p.name} API key`, { mask: true }))?.trim();
+      if (!key) return;
+      await updateEnvFile(opts.envFile, { [p.env]: key }, env);
+      await session.reload();
+      return green(`Web search is on with ${p.name}: web_search uses it, and web_fetch falls back to it when a page cannot be fetched directly.`);
     },
   };
 }
