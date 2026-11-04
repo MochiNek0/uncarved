@@ -377,7 +377,7 @@ interface PluginCommandContext {
     interactive: boolean; // jade -p 等非交互运行时为 false，select / input 直接返回 undefined
     log(text: string): void;
     select<T>(title: string, choices: { label: string; value: T; hint?: string }[], opts?: { body?: string }): Promise<T | undefined>;
-    input(title: string, opts?: { initial?: string; placeholder?: string }): Promise<string | undefined>;
+    input(title: string, opts?: { initial?: string; placeholder?: string; mask?: boolean }): Promise<string | undefined>; // mask：遮住输入（密钥）
   };
   note(text: string): void; // 附在用户下一条消息前面告诉模型，例如"用户删掉了某条记忆"
   session?: SessionControl; // 操作会话，见下文；instant 命令没有
@@ -409,10 +409,12 @@ interface SessionControl {
   clear(): Promise<void>;                             // 开始新会话，当前的保留、可以恢复
   resume(id: string): Promise<void>;                  // 换到另一个会话；失败时留在当前会话
   retry(): Promise<boolean>;                          // 上次请求在模型回复前失败时重新请求；没有可重试的返回 false
+  reload(): Promise<void>;                            // 用新的插件实例继续当前会话：工具和提示词按现在的配置重新生成
 }
 ```
 
 - jade 自己的 `/clear`、`/resume`、`/retry`（`jade/sessions`）和 `/undo`（`jade/undo`）只用这个接口，见 [`src/plugins/sessions.ts`](../src/plugins/sessions.ts)。用 `replaces: ["jade/sessions"]` 可以换成你自己的实现。
+- `/search`（`jade/web`）改了 `$JADE_HOME/.env` 里的搜索服务密钥后调用 `reload()`，新的工具配置在当前会话里立即生效，见 [`src/plugins/core.ts`](../src/plugins/core.ts)。`reload()` 之后调用它的插件实例被换掉，不要再用它的状态。
 - 只有排队执行的命令有 `session`；`instant` 的命令在模型工作时执行，不能换会话或写日志，`session` 为 `undefined`。
 - `record` 的 key 只能是插件的 id 或以 `"<id>/"` 开头，不能改别的插件（例如权限设置）记下的数据。
 - `clear` / `resume` 之后，`session` 指向新的会话；命令返回 `{ prompt }` 时发给新会话。
@@ -558,7 +560,7 @@ jade 自己的功能都是插件，和第三方插件用同一套接口（[`src/
 | `jade/prompts` | 系统提示词、环境信息、AGENTS.md / CLAUDE.md |
 | `jade/fs` | read_file、write_file、edit_file、multi_edit、list_dir、glob、grep |
 | `jade/shell` | bash、bash_output、kill_shell |
-| `jade/web` | web_fetch、web_search |
+| `jade/web` | web_fetch、web_search、`/search` |
 | `jade/todo` | todo_write |
 | `jade/memory` | memory 工具、提示词里的记忆、`/memory` |
 | `jade/task` | task 工具（只读子 Agent） |

@@ -286,7 +286,7 @@ describe("built-in plugins", () => {
       "jade/undo",
       "jade/repeats",
     ]);
-    expect([...all.commands.keys()]).toEqual(["memory", "skills", "mcp", "checks", "compact", "clear", "resume", "retry", "undo"]);
+    expect([...all.commands.keys()]).toEqual(["search", "memory", "skills", "mcp", "checks", "compact", "clear", "resume", "retry", "undo"]);
     expect(await system(all.plugins)).toContain("Use the task tool");
     all.shutdown();
 

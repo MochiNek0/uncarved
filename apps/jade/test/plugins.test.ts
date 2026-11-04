@@ -6,7 +6,7 @@ import { existsSync, realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { MemoryLogStore, MemoryTrustStore, readAll, Runtime, type Block, type ModelRequest, type ModelResponse, type Provider } from "uncarved";
-import { clearProviders, createJade, discoverPlugins, listModels, loadPlugin, providerFromEnv, providerInfo, registerProviders, visionFromEnv, type FoundPlugin, type LoadedPlugin } from "../src/index.ts";
+import { clearProviders, createJade, discoverPlugins, listModels, loadPlugin, providerFromEnv, providerInfo, registerProviders, SEARCH_PROVIDERS, visionFromEnv, type FoundPlugin, type LoadedPlugin } from "../src/index.ts";
 import type { HostContext, SessionControl } from "../src/plugins/loader.ts";
 
 const MODEL = { by: "model", provider: "scripted", model: "scripted-1" } as const;
@@ -390,6 +390,7 @@ describe("session commands use the public SessionControl", () => {
         { id: "s-older", title: "before", at: new Date().toISOString() },
       ],
       clear: async () => void calls.push("clear"),
+      reload: async () => void calls.push("reload"),
       resume: async (id) => void calls.push(`resume ${id}`),
       retry: async () => false,
       ...over,
@@ -410,6 +411,41 @@ describe("session commands use the public SessionControl", () => {
     expect(session.calls).toEqual(["clear", "resume s-older"]);
     // 不给 session（instant 命令或别的宿主）时说明原因
     await expect(Promise.resolve(jade.commands.get("clear")!.command.run("", { ...ctx, session: undefined }))).rejects.toThrow(/session control/);
+    jade.shutdown();
+  });
+
+  test("/search comes from jade/web: it writes the key to $JADE_HOME/.env and reloads the session", async () => {
+    const { cwd, home } = await dirs();
+    const env: Record<string, string | undefined> = {};
+    const jade = await createJade({ cwd, home, store: new MemoryLogStore(), provider: scripted([]).provider, env });
+    expect(jade.commands.get("search")?.plugin).toBe("jade/web");
+    const session = control();
+    const picks: unknown[] = [];
+    const inputs: { title: string; mask?: boolean }[] = [];
+    const ctx = {
+      sessionId: "s",
+      cwd,
+      signal: new AbortController().signal,
+      derived: {},
+      note: () => {},
+      session,
+      ui: {
+        interactive: true,
+        log: () => {},
+        select: async (_t: string, choices: { value: unknown }[]) => picks.shift() ?? choices[0]!.value,
+        input: async (title: string, o?: { mask?: boolean }) => (inputs.push({ title, mask: o?.mask }), "key-1"),
+      },
+    };
+    const first = SEARCH_PROVIDERS[0]!;
+    expect(await jade.commands.get("search")!.command.run("", ctx as never)).toContain(`Web search is on with ${first.name}`);
+    expect(inputs).toEqual([{ title: `${first.name} API key`, mask: true }]);
+    expect(env[first.env]).toBe("key-1");
+    expect(await readFile(path.join(home, ".env"), "utf8")).toContain(`${first.env}=key-1`);
+    // 再选同一个服务、选 Remove：从 .env 里删掉
+    picks.push(first.name, "off");
+    expect(await jade.commands.get("search")!.command.run("", ctx as never)).toContain("removed");
+    expect(env[first.env]).toBeUndefined();
+    expect(session.calls).toEqual(["reload", "reload"]);
     jade.shutdown();
   });
 
