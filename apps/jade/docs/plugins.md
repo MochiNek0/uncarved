@@ -588,7 +588,7 @@ definePlugin({
 - `JADE_EFFORT`、`JADE_MAX_TOKENS` 不检查，插件愿意的话自己从 `env` 里读；`JADE_VISION` 不设时算不能看图片。
 - 选了插件的服务时，jade 等插件加载完才创建 provider，启动会比内置服务慢一点。`JADE_PROVIDER` 写的名字没有插件提供时，启动时报错并列出可选的服务。
 - **`/model`**：声明了 `settings` 的服务出现在 "Add a model… → Another service…" 的列表里，选中后依次询问各项，再选模型；配置写进 `$JADE_HOME/.env`，并和内置服务一样记进 `models.json`，之后可以在 `/model` 里直接切换回来（类型和模型名以外的配置项都相同的算同一个服务）。没有声明模型名（`model: true`）的服务，`/model` 不能换它的模型。
-- 第一次运行、还没配置任何模型时，jade 在加载插件之前就进入配置流程，那时的列表里只有内置服务；可以先手动在 `.env` 里写 `JADE_PROVIDER`，或者先配一个内置服务，再用 `/model` 换。
+- 第一次运行、还没配置任何模型时，jade 先加载插件再进入配置流程，所以列表里也有插件提供的服务。这时还没有模型，插件的工厂函数里调用 `ctx.complete` 会失败。
 - 进程外插件不能提供 `providers`。
 
 ## 带上 skills、命令和 MCP 服务
