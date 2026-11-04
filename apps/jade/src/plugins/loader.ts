@@ -56,8 +56,44 @@ export interface JadePluginContext {
   status(text: string | undefined): void;
   /** 文件快照：写文件的工具写之前记下原内容，/undo 据此恢复。见 FileCheckpoints */
   checkpoints: FileCheckpoints;
+  /** 终端界面的输入框（见 InputControl）。只给用户层插件；非交互运行（-p）时没有 */
+  input?: InputControl;
+  /**
+   * 替用户提交一行，和在输入框里按回车一样：/ 开头的是命令，消息先经过各插件的 beforeSend；模型正忙时排队。
+   * 对话里会注明是哪个插件发的。只给用户层插件（它能替用户说话）；非交互运行（-p）时没有
+   */
+  send?(text: string): void;
 }
 
+/** 输入框里用户还没提交的文字 */
+export interface InputControl {
+  /** 现在的文字 */
+  text(): string;
+  /** 在光标处插入，光标移到插入的文字后面 */
+  insert(text: string): void;
+  /** 换掉全部文字，光标放到末尾；空字符串清空 */
+  set(text: string): void;
+}
+
+/** "ctrl+<字母>" 或 "alt+<字母或数字>" */
+export const KEY_SPEC = /^(ctrl\+[a-z]|alt\+[a-z0-9])$/;
+/**
+ * jade 自己用的键，插件不能用：编辑（ctrl+a/e/d/w/u/k，alt+f）、搜索历史（ctrl+r）、重画（ctrl+l）、展开（ctrl+o）、
+ * 中断和退出（ctrl+c），以及终端里等同于退格、Tab、回车的 ctrl+h/i/j/m
+ */
+export const RESERVED_KEYS: ReadonlySet<string> = new Set(
+  [..."acdehijklmoruw"].map((c) => `ctrl+${c}`).concat("alt+f"),
+);
+
+/** 插件的快捷键：输入框有焦点时按下（模型工作时也算）调用 run；弹出对话框时不响应 */
+export interface PluginKey {
+  /** 见 KEY_SPEC；不分大小写，不能是 RESERVED_KEYS 里的 */
+  key: string;
+  /** /help 里显示 */
+  description?: string;
+  /** 出错时在对话里显示警告。要改输入框、发消息用插件上下文的 input、send */
+  run(): Awaitable<void>;
+}
 
 /**
  * 文件快照，按会话存放，不进日志。jade/fs 的写文件工具和 jade/undo 都只用这个接口：
@@ -205,6 +241,8 @@ export interface JadePlugin extends Plugin {
   responder?: Responder;
   /** 见 Suggester；多个插件都提供时只用第一个 */
   suggest?: Suggester;
+  /** 快捷键，见 PluginKey；和排在前面的插件用了同一个键时忽略 */
+  keys?: PluginKey[];
   /**
    * 模型服务，用 JADE_PROVIDER=<kind> 选择。只认用户层插件（服务能看到全部对话和 API key）；
    * 只在启动时读一次，之后的会话共用，所以不要依赖按会话的状态
@@ -227,8 +265,11 @@ export type JadePluginDraft = Omit<JadePlugin, "kernel" | "needs"> & { kernel?: 
 
 export type JadePluginFactory = (ctx: JadePluginContext) => Awaitable<JadePlugin>;
 
-/** 宿主（createJade）提供的那部分上下文；status 由加载器按插件的目录名转给宿主 */
-export type HostContext = Omit<JadePluginContext, "dir" | "layer" | "status"> & { status(plugin: string, text: string | undefined): void };
+/** 宿主（createJade）提供的那部分上下文；status、send 由加载器按插件的目录名转给宿主，input、send 只转给用户层插件 */
+export type HostContext = Omit<JadePluginContext, "dir" | "layer" | "status" | "send"> & {
+  status(plugin: string, text: string | undefined): void;
+  send?(plugin: string, text: string): void;
+};
 
 /** plugin.json，可以没有 */
 export interface PluginJson {
@@ -337,7 +378,13 @@ export async function loadPlugin(found: FoundPlugin, opts: LoadOptions): Promise
   if (info.kind === "content") return { ...found, kind: "content", entry: "", info };
 
   const entry = info.entry!;
-  const ctx = (host: HostContext): JadePluginContext => ({ ...host, dir: found.dir, layer: found.layer, status: (text) => host.status(found.name, text) });
+  const ctx = ({ input, send, ...host }: HostContext): JadePluginContext => ({
+    ...host,
+    ...(found.layer === "user" ? { input, send: send && ((text: string) => send(found.name, text)) } : {}),
+    dir: found.dir,
+    layer: found.layer,
+    status: (text) => host.status(found.name, text),
+  });
 
   if (found.layer === "project") {
     // 内核负责：先哈希整个目录、确认，再 import；检查 import 不越出插件目录

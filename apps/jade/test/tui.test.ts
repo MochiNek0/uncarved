@@ -341,12 +341,14 @@ describe("terminal UI", () => {
       }),
       { isTTY: true, columns: 100, rows: 40 },
     );
-    const calls = { submit: [] as string[], interrupt: 0, exit: 0, cycle: 0 };
+    const calls = { submit: [] as string[], interrupt: 0, exit: 0, cycle: 0, keys: [] as string[] };
     const handlers: TuiHandlers = {
       submit: (t) => void calls.submit.push(t),
       interrupt: () => void calls.interrupt++,
       exit: () => void calls.exit++,
       cycleMode: () => void calls.cycle++,
+      // 只有 ctrl+t、alt+v 有插件处理
+      key: (spec) => (spec === "ctrl+t" || spec === "alt+v") && calls.keys.push(spec) > 0,
       files: async () => [
         "src/",
         "src/main.ts",
@@ -403,6 +405,24 @@ describe("terminal UI", () => {
     await type("你好 jade");
     await type("\r");
     expect(calls.submit).toEqual(["你好 jade"]);
+  });
+
+  test("plugin keys reach the handler, and plugins can read and change the input", async () => {
+    const { screen, calls, type } = setup();
+    await type("ab");
+    await type("\x14"); // ctrl+t
+    await type("\x1bv"); // alt+v
+    await type("\x01"); // ctrl+a：jade 自己的键，不交给插件
+    expect(calls.keys).toEqual(["ctrl+t", "alt+v"]);
+    // 插件的键没有插入文字；ctrl+a 把光标移到了开头
+    expect(screen.draft!.text()).toBe("ab");
+    screen.draft!.insert("说 ");
+    await sleep(80);
+    expect(screen.draft!.text()).toBe("说 ab");
+    screen.draft!.set("hello\r\nworld");
+    await type("\r");
+    expect(calls.submit).toEqual(["hello\nworld"]);
+    expect(screen.draft!.text()).toBe("");
   });
 
   test("applies every key that arrives in the same chunk", async () => {

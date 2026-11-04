@@ -591,3 +591,71 @@ describe("model services from plugins", () => {
     jade.shutdown();
   });
 });
+
+describe("input box, keys and send", () => {
+  /** 写一个进程内插件：工厂把拿到的 input、send 记在 globalThis 上，返回给定的 keys */
+  async function plugin(base: string, name: string, keys: string) {
+    const dir = path.join(base, "plugins", name);
+    await mkdir(dir, { recursive: true });
+    await writeFile(
+      path.join(dir, "index.js"),
+      `export default (ctx) => {
+  globalThis.__jadeCtx = { ...globalThis.__jadeCtx, ${JSON.stringify(name)}: ctx };
+  return { id: "x/${name}", version: "1.0.0", kernel: "^0.1", keys: ${keys} };
+};
+`,
+    );
+    return dir;
+  }
+  type Seen = Record<string, { input?: { insert(t: string): void }; send?(t: string): void }>;
+
+  test("only user plugins get ctx.input and ctx.send; send names the plugin", async () => {
+    const { cwd, home } = await dirs();
+    const user = await plugin(home, "voice", "[]");
+    const repo = await plugin(path.join(cwd, ".jade"), "repo", "[]");
+    const opts = { trust: new MemoryTrustStore(), confirm: async () => true };
+    const inserted: string[] = [];
+    const sent: [string, string][] = [];
+    const jade = await createJade({
+      cwd,
+      home,
+      store: new MemoryLogStore(),
+      provider: scripted([]).provider,
+      env: {},
+      extensions: [await loadPlugin({ name: "voice", dir: user, layer: "user" }, opts), await loadPlugin({ name: "repo", dir: repo, layer: "project" }, opts)],
+      input: { text: () => "", insert: (t) => void inserted.push(t), set: () => {} },
+      send: (p, t) => void sent.push([p, t]),
+    });
+    const seen = (globalThis as { __jadeCtx?: Seen }).__jadeCtx!;
+    seen.voice!.input!.insert("hello");
+    seen.voice!.send!("go");
+    expect(inserted).toEqual(["hello"]);
+    expect(sent).toEqual([["voice", "go"]]);
+    expect(seen.repo!.input).toBeUndefined();
+    expect(seen.repo!.send).toBeUndefined();
+    jade.shutdown();
+  });
+
+  test("keys are normalized; malformed, reserved and taken keys are skipped", async () => {
+    const { cwd, home } = await dirs();
+    const run = "run: () => {}";
+    const a = await plugin(home, "a", `[{ key: "Ctrl+G", description: "talk", ${run} }, { key: "ctrl+r", ${run} }, { key: "f2", ${run} }, { key: "alt+v" }]`);
+    const b = await plugin(home, "b", `[{ key: "ctrl+g", ${run} }, { key: "alt+1", ${run} }]`);
+    const opts = { trust: new MemoryTrustStore(), confirm: async () => true };
+    const jade = await createJade({
+      cwd,
+      home,
+      store: new MemoryLogStore(),
+      provider: scripted([]).provider,
+      env: {},
+      extensions: [await loadPlugin({ name: "a", dir: a, layer: "user" }, opts), await loadPlugin({ name: "b", dir: b, layer: "user" }, opts)],
+    });
+    expect([...jade.keys].map(([k, v]) => `${k} ${v.plugin}`)).toEqual(["ctrl+g x/a", "alt+1 x/b"]);
+    const warnings = jade.warnings.join("\n");
+    expect(warnings).toContain('key "ctrl+r" is ignored');
+    expect(warnings).toContain('key "f2" is ignored');
+    expect(warnings).toContain('key "alt+v" is ignored');
+    expect(warnings).toContain("plugin x/b: key ctrl+g is ignored: plugin x/a already uses it");
+    jade.shutdown();
+  });
+});

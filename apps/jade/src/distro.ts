@@ -13,7 +13,7 @@ import { Memory, memoryTool } from "./memory.ts";
 import { mcpTools, type McpClient } from "./mcp.ts";
 import { skillTool, skillsPrompt, type Skill } from "./skills.ts";
 import { compactor, type Compactor } from "./plugins/compact.ts";
-import { COMMAND_NAME, JADE_VERSION, type HostContext, type JadePlugin, type LoadedPlugin, type PluginCommand, type PluginProvider, type Responder, type Suggester } from "./plugins/loader.ts";
+import { COMMAND_NAME, JADE_VERSION, KEY_SPEC, RESERVED_KEYS, type HostContext, type InputControl, type PluginKey, type JadePlugin, type LoadedPlugin, type PluginCommand, type PluginProvider, type Responder, type Suggester } from "./plugins/loader.ts";
 import { policy, type AllowRule, type Mode, type Policy, type PolicyOptions } from "./plugins/policy.ts";
 import { prompts, realPath, repoRoot } from "./plugins/prompts.ts";
 import { repeats } from "./plugins/repeats.ts";
@@ -89,6 +89,10 @@ export interface JadeOptions {
   skills?: Skill[];
   /** 插件用 ctx.status 设置状态栏上自己的那一段；plugin 是插件的目录名，text 为 undefined 时去掉 */
   onStatus?(plugin: string, text: string | undefined): void;
+  /** 终端界面的输入框，给用户层插件的 ctx.input；-p 时没有 */
+  input?: InputControl;
+  /** 用户层插件的 ctx.send：替用户提交一行；plugin 是插件的目录名。-p 时没有 */
+  send?(plugin: string, text: string): void;
 }
 
 export interface BuiltinState {
@@ -122,6 +126,8 @@ export interface Jade {
   responders: { plugin: string; responder: Responder }[];
   /** 预测下一条消息的插件（只用第一个提供 suggest 的） */
   suggester?: { plugin: string; suggest: Suggester };
+  /** 第三方插件的快捷键，按 KEY_SPEC 的写法（小写） */
+  keys: Map<string, { plugin: string; key: PluginKey }>;
   /** 用户消息发出前依次处理它的插件 */
   beforeSend: { plugin: string; fn: NonNullable<JadePlugin["beforeSend"]> }[];
   /** 用户层第三方插件提供的模型服务，宿主启动时注册 */
@@ -153,7 +159,7 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
   // run 也给插件和编辑后检查用，所以 jade/shell 停用时也创建，只是不把工具交给模型
   const shell = shellTools({ cwd });
   const root = await repoRoot(cwd);
-  const host: HostContext = { jade: JADE_VERSION, cwd: realPath(cwd), root: realPath(root), home: opts.home, definePlugin, run: shell.run, complete: completer(provider), status: (plugin, text) => opts.onStatus?.(plugin, text), checkpoints };
+  const host: HostContext = { jade: JADE_VERSION, cwd: realPath(cwd), root: realPath(root), home: opts.home, definePlugin, run: shell.run, complete: completer(provider), status: (plugin, text) => opts.onStatus?.(plugin, text), checkpoints, input: opts.input, send: opts.send };
 
   // 第三方插件先创建：要先知道它们代替哪些内置插件
   const made = await createExtensions(opts.extensions ?? [], host, disabled, warnings);
@@ -345,6 +351,14 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
       else commands.set(c.name.toLowerCase(), { plugin: p.id, command: c, builtin: isBuiltin });
     }
   }
+  const keys = new Map<string, { plugin: string; key: PluginKey }>();
+  for (const { plugin } of added) {
+    for (const k of plugin.keys ?? []) {
+      const taken = keys.get(k.key);
+      if (taken) warnings.push(`plugin ${plugin.id}: key ${k.key} is ignored: plugin ${taken.plugin} already uses it`);
+      else keys.set(k.key, { plugin: plugin.id, key: k });
+    }
+  }
   if (shell.unavailable && kept.has("jade/shell")) warnings.push(shell.unavailable);
   return {
     plugins,
@@ -358,6 +372,7 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
     commands,
     responders: added.flatMap(({ plugin }) => (plugin.responder ? [{ plugin: plugin.id, responder: plugin.responder }] : [])),
     suggester: suggesters[0],
+    keys,
     beforeSend: added.flatMap(({ plugin }) => (plugin.beforeSend ? [{ plugin: plugin.id, fn: plugin.beforeSend.bind(plugin) }] : [])),
     providers: added.flatMap(({ plugin }) => (plugin.providers ?? []).map((def) => ({ plugin: plugin.id, def }))),
     tools: allTools,
@@ -417,6 +432,16 @@ async function createExtensions(sources: LoadedPlugin[], host: HostContext, disa
           return ok;
         });
       }
+    }
+    if (plugin.keys !== undefined) {
+      const list = Array.isArray(plugin.keys) ? plugin.keys : [];
+      plugin.keys = list.filter((k) => {
+        const key = typeof k?.key === "string" ? k.key.toLowerCase() : undefined;
+        const ok = key !== undefined && KEY_SPEC.test(key) && !RESERVED_KEYS.has(key) && typeof k.run === "function";
+        if (!ok) warnings.push(`${where}: key ${JSON.stringify(k?.key)} is ignored: it needs a run function and a key like ctrl+<letter> or alt+<letter or digit> that jade does not use itself`);
+        else k.key = key;
+        return ok;
+      });
     }
     if (plugin.beforeSend !== undefined && typeof plugin.beforeSend !== "function") {
       warnings.push(`${where}: beforeSend is ignored: it must be a function`);
