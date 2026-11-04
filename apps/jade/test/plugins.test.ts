@@ -6,7 +6,7 @@ import { existsSync, realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { MemoryLogStore, MemoryTrustStore, readAll, Runtime, type Block, type ModelRequest, type ModelResponse, type Provider } from "uncarved";
-import { clearProviders, collectProviders, createJade, discoverPlugins, listModels, loadPlugin, pluginProviders, providerFromEnv, providerInfo, registerProviders, unregisterProviders, SEARCH_PROVIDERS, visionFromEnv, type FoundPlugin, type LoadedPlugin } from "../src/index.ts";
+import { clearProviders, collectProviders, createJade, DISPOSE_TIMEOUT_MS, discoverPlugins, listModels, loadPlugin, pluginProviders, providerFromEnv, providerInfo, registerProviders, unregisterProviders, SEARCH_PROVIDERS, visionFromEnv, type FoundPlugin, type LoadedPlugin } from "../src/index.ts";
 import type { HostContext, SessionControl } from "../src/plugins/loader.ts";
 
 const MODEL = { by: "model", provider: "scripted", model: "scripted-1" } as const;
@@ -693,6 +693,52 @@ describe("model services from plugins", () => {
       clearProviders();
     }
   });
+
+  test("dispose: used instances on jade.dispose (once), unused ones right away; errors and timeouts become warnings", async () => {
+    const { cwd, home } = await dirs();
+    const disposed: string[] = [];
+    const fake = (name: string, id: string, dispose: unknown): LoadedPlugin => ({
+      name,
+      dir: path.join(home, "plugins", name),
+      layer: "user",
+      kind: "module",
+      entry: "index.ts",
+      info: { kind: "module", entry: "index.ts", json: {}, bundle: { skills: [], commands: [], unsupported: [] } },
+      create: async () => ({ id, version: "1.0.0", kernel: "^0.1", dispose }) as never,
+    });
+    const record = (name: string) => async () => void disposed.push(name);
+    const jade = await createJade({
+      cwd,
+      home,
+      store: new MemoryLogStore(),
+      provider: scripted([]).provider,
+      env: {},
+      disabled: new Set(["x/off"]),
+      extensions: [
+        fake("a", "x/a", record("a")),
+        fake("off", "x/off", record("off")),
+        fake("dup", "x/a", record("dup")),
+        fake("bad", "x/bad", () => {
+          throw new Error("boom");
+        }),
+        fake("slow", "x/slow", () => new Promise(() => {})),
+        fake("odd", "x/odd", "not a function"),
+      ],
+    });
+    // 按 id 停用的、id 重复被拒绝的：创建时就收尾
+    expect(disposed.sort()).toEqual(["dup", "off"]);
+    expect(jade.warnings.join("\n")).toContain("plugin odd (user): dispose is ignored: it must be a function");
+    const started = Date.now();
+    const warnings = await jade.dispose();
+    expect(disposed.sort()).toEqual(["a", "dup", "off"]);
+    expect(warnings).toEqual(["plugin bad (user): dispose failed: boom", `plugin slow (user): dispose did not finish within ${DISPOSE_TIMEOUT_MS / 1000}s`]);
+    // 同时进行：总共只等一个时限
+    expect(Date.now() - started).toBeLessThan(DISPOSE_TIMEOUT_MS + 2000);
+    // 只执行一次
+    expect(await jade.dispose()).toEqual(warnings);
+    expect(disposed).toHaveLength(3);
+    jade.shutdown();
+  }, 20_000);
 
   test("a module exports its providers; the plugin instance does not provide them", async () => {
     const { cwd, home } = await dirs();

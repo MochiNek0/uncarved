@@ -134,6 +134,7 @@ interface JadePlugin {
   beforeSend?(text, ctx): string | undefined;  // jade 的扩展：用户消息发出前改写，见下文
   keys?: PluginKey[];           // jade 的扩展：快捷键，见下文
   renderers?: ToolRenderer[];   // jade 的扩展：本插件的工具在对话里怎么显示，见下文
+  dispose?(): void | Promise<void>;  // jade 的扩展：不再用这个实例时收尾，见下文
 }
 ```
 
@@ -186,6 +187,22 @@ export default factory;
 | `send` | `(text) => void`：替用户提交一行，见下文。只给用户层插件，`jade -p` 时没有 |
 
 默认导出对象时，每个会话用的是它的一份浅拷贝，适合没有状态的插件。
+
+### 收尾：`dispose`
+
+实例里开了定时器、连接、文件监听的，在 `dispose` 里关掉，不然换一次会话就多一份在后台跑：
+
+```ts
+const factory: JadePluginFactory = (ctx) => {
+  const timer = setInterval(() => ctx.status(clock()), 1000);
+  return ctx.definePlugin({ id: "me/clock", version: "1.0.0", dispose: () => clearInterval(timer) });
+};
+```
+
+- jade 不再用这个实例时调用一次：换会话（`/clear`、`/resume`）、重新加载、退出，以及创建了却没用上的实例（按 id 停用的、和别的插件 id 或工具名冲突被跳过的、`/resume` 失败时新建的那套）。
+- 在会话收尾（`session.detached` 的 hook）**之后**调用，收尾时实例还能正常用。之后 `ctx.status`、`ctx.input`、`ctx.send` 不再起作用。
+- 可以是异步的。各插件的 `dispose` 同时进行，每个最多等 5 秒，超时或出错时显示警告，不影响换会话和退出。
+- 进程外插件没有 `dispose`：进程在会话之间共用，退出时 jade 发 `shutdown`。
 
 ### 调用模型：`ctx.complete`
 
