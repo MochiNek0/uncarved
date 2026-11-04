@@ -1,6 +1,6 @@
 # 设计：jade 插件的生命周期
 
-> 状态：草案；第 1–3 步（静态 id、PluginHost、SessionScope）已实施 · 2026-11-05
+> 状态：草案；第 1–4 步（静态 id、PluginHost、SessionScope、进程外插件的会话适配器）已实施 · 2026-11-05
 >
 > 对应条款：7.1（项目层确认）、8.2（不满足时拒绝加载，不静默降级）、I-9（一切可中断）、4.6（恢复时插件变化）
 >
@@ -194,6 +194,8 @@ pi 让过期的 ctx 抛错。jade 不能这么做：插件常在定时器回调�
 
 改法：会话级的绑定放在 jade 这边，作为 SessionScope 的一部分。按 `proc.manifest` 为每个 scope 生成 keys 和 commands 的适配器，不再写到 `proc` 上。内核只认 `spawnPlugin` 返回的那个对象（7.1），而 keys 和 commands 是 jade 的扩展，内核不读，所以不需要挂在 `proc` 上。
 
+实施：`LoadedPlugin.create` 原样返回 `proc`；进程外插件另有 `adapters(host)`，每套实例调用一次，按清单生成绑定到这一套 ctx 的 keys 和 commands。`createExtensions` 检查过的 keys 和 commands 放在 `Jade.extensions` 的每一项上，不再写回实例，模块插件也一样，所以不管哪种插件，实例对象在创建之后都不会被 jade 改写快捷键和命令。
+
 ## 7. 规则表
 
 这一节写进 `apps/jade/docs/plugins.md`，作为插件作者的参考；同时也是测试清单，每一行至少有一个测试。
@@ -238,7 +240,7 @@ pi 让过期的 ctx 抛错。jade 不能这么做：插件常在定时器回调�
 1. **静态 id**：`plugin.json` 加 `id`，`ctx.definePlugin` 从清单补全 `id` 和 `version`，实例的 id 和清单不一致时跳过；`disabled` 只认 id，在加载之前筛选。删掉 `disabledById`、`unregisterProviders` 和 owner 检查。
 2. **PluginHost**：把 `main.ts` 里的发现、加载、注册服务和 `closePlugins` 收进 `src/plugins/host.ts`；项目层导出的 `providers` 给出警告。
 3. **SessionScope 和换会话事务**：实现四个状态、`ctx.signal`、过期警告、后台 dispose；删掉 `jadeGeneration`、`/resume` 失败时的手动恢复和 `keyRuns`；`leave`、`switchSession`、`reloadSession` 改为调用同一个流程。
-4. **进程外插件的会话适配器**：不再改写 `proc.keys` 和 `proc.commands`。
+4. **进程外插件的会话适配器**：不再改写 `proc.keys` 和 `proc.commands`。（已实施）
 5. **生命周期矩阵测试**：对启动、`/clear`、`/resume` 成功、`/resume` 失败、reload、退出这几条路径，各自断言工厂调用次数、dispose 的次数和时机、状态栏的内容、过期调用是否被拒绝。
 
 第 1、2 步之后，现有的四项取舍会消失三项：按 id 停用仍运行代码、服务显示目录名、项目层服务被静默忽略。第 3 步之后，最后一项（`/clear` 被 dispose 拖慢）也会消失。

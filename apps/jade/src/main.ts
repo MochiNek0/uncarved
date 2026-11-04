@@ -938,16 +938,17 @@ function showPlugins() {
   }
   const carried = (b: PluginBundle) =>
     [b.skills.length ? "skills" : "", b.commands.length ? "commands" : "", b.mcp ? "MCP servers" : ""].filter(Boolean).join(", ");
-  for (const { source, plugin } of jade.extensions) {
+  for (const { source, plugin, commands, keys } of jade.extensions) {
     const exit = source.process?.exited;
     const state = source.kind === "process" ? (exit ? red(` exited (${exit.signal ?? `code ${exit.code}`})`) : green(" running")) : "";
     lines.push(`${bold(plugin.id)} ${plugin.version} ${dim(`${source.layer} · ${display(cwd, source.dir)} · ${source.kind === "process" ? `runs ${source.entry}` : source.entry}`)}${state}`);
     const tools = (plugin.tools ?? []).map((t) => `${t.name} (${t.effect})`);
     const hooks = [...new Set((plugin.hooks ?? []).map((h) => `${h.kind}:${h.point}`))];
-    const cmds = (plugin.commands ?? []).map((c) => `/${c.name}`);
+    const cmds = commands.map((c) => `/${c.name}`);
     if (tools.length) lines.push(`  tools     ${tools.join(", ")}`);
     if (hooks.length) lines.push(`  hooks     ${hooks.join(", ")}`);
     if (cmds.length) lines.push(`  commands  ${cmds.join(", ")}`);
+    if (keys.length) lines.push(`  keys      ${keys.map((k) => k.key).join(", ")}`);
     if (plugin.replaces?.length) lines.push(`  replaces  ${plugin.replaces.join(", ")}`);
     if (carried(source.info.bundle)) lines.push(`  carries   ${carried(source.info.bundle)}`);
     if (exit && source.process!.stderr.length) lines.push(dim(source.process!.stderr.map((l) => `  │ ${clip(l, 200)}`).join("\n")));

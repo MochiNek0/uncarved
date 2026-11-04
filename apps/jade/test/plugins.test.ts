@@ -907,6 +907,28 @@ for await (const line of createInterface({ input: process.stdin })) {
       const pending = jade.keys.get("ctrl+t")!.key.run({ key: "ctrl+t", sessionId: "s1", signal: ac.signal });
       ac.abort(new Error("the session ended"));
       await expect(Promise.resolve(pending)).rejects.toThrow();
+
+      // 准备下一个会话的一套（进程还是同一个）：当前这套的快捷键还是用当前的输入框，进程对象上不挂会话的东西
+      let other = "next";
+      const next = await createJade({
+        cwd,
+        home,
+        store: new MemoryLogStore(),
+        provider: scripted([]).provider,
+        env: {},
+        extensions: [user, repo],
+        input: { text: () => other, insert: (t) => void (other += t), set: (t) => void (other = t) },
+      });
+      const proc = jade.extensions.find((e) => e.plugin.id === "x/shout")!.plugin;
+      expect(next.extensions.find((e) => e.plugin.id === "x/shout")!.plugin).toBe(proc);
+      expect(next.keys.get("ctrl+t")!.key).not.toBe(jade.keys.get("ctrl+t")!.key);
+      expect("keys" in proc).toBe(false);
+      text = "a";
+      await jade.keys.get("ctrl+t")!.key.run({ key: "ctrl+t", sessionId: "s1", signal: new AbortController().signal });
+      expect([text, other]).toEqual(["A ctrl+t s1!", "next"]);
+      await next.keys.get("ctrl+t")!.key.run({ key: "ctrl+t", sessionId: "s2", signal: new AbortController().signal });
+      expect([text, other]).toEqual(["A ctrl+t s1!", "NEXT ctrl+t s2!"]);
+      next.shutdown();
       jade.shutdown();
     } finally {
       await Promise.all([user.close!(), repo.close!()]);

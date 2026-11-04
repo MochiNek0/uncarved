@@ -399,6 +399,11 @@ export interface LoadedPlugin extends FoundPlugin {
   /** 创建一套实例，每个会话调用一次；进程外插件只有一个进程，每次返回同一个对象。只有内容的插件没有 */
   create?(host: HostContext): Promise<JadePlugin>;
   /**
+   * 进程外插件：这一套实例的快捷键和命令，按 initialize 回复里的清单生成、绑定到这一套的 ctx。
+   * 进程（create 返回的对象）在会话之间共用，所以它们不挂在进程对象上，见 docs/design/jade-plugin-lifecycle.md 第 6 节
+   */
+  adapters?(host: HostContext): Pick<JadePlugin, "keys" | "commands">;
+  /**
    * 插件模块导出的模型服务（export const providers），用 JADE_PROVIDER=<kind> 选择；只认用户层的，项目层的读出来只为提示。
    * 不属于哪套插件实例：加载时就读到，启动时注册一次，所有会话共用。还没检查，见 collectProviders
    */
@@ -575,18 +580,17 @@ async function loadProcess(found: FoundPlugin & { id: string }, info: PluginInfo
     await proc.close().catch(() => {});
     throw new Error(`its id ${JSON.stringify(proc.id)} (from initialize) does not match "id" in plugin.json (${found.id})`);
   }
-  // 原地加上而不是复制：内核只认 spawnPlugin 返回的那个项目层插件对象（宪法 7.1）
-  if (proc.manifest.commands !== undefined) (proc as JadePlugin).commands = processCommands(proc);
   const loaded: LoadedPlugin = {
     ...found,
     kind: "process",
     entry: shown,
     info,
-    create: async (host) => {
-      // 进程在会话之间共用，快捷键要用当前会话的输入框：每次创建时换成新的
-      if (proc.manifest.keys !== undefined) (proc as JadePlugin).keys = processKeys(proc, pluginContext(found, info, host));
-      return proc;
-    },
+    // 原样返回：内核只认 spawnPlugin 返回的那个项目层插件对象（宪法 7.1）；这个对象在会话之间共用，不往上挂会话的东西
+    create: async () => proc,
+    adapters: (host) => ({
+      commands: proc.manifest.commands === undefined ? undefined : processCommands(proc),
+      keys: proc.manifest.keys === undefined ? undefined : processKeys(proc, pluginContext(found, info, host)),
+    }),
     close: () => proc.close(),
     process: status,
   };
