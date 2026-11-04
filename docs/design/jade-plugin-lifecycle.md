@@ -200,6 +200,8 @@ pi 让过期的 ctx 抛错。jade 不能这么做：插件常在定时器回调�
 
 这一节写进 `apps/jade/docs/plugins.md`，作为插件作者的参考；同时也是测试清单，每一行至少有一个测试。
 
+已写进 [`plugins.md` 的规则一览](../../apps/jade/docs/plugins.md#规则一览)（那里的表按实现校对过，以那里为准）。每一行的测试见 7.2。
+
 **加载顺序**：用户层在前，项目层从仓库根目录到工作目录；同一层内按目录名排序。下表的“先到先得”都按这个顺序。
 
 | 扩展点 | 作用域 | 哪一层可用 | 冲突 | 出错 |
@@ -232,6 +234,32 @@ pi 让过期的 ctx 抛错。jade 不能这么做：插件常在定时器回调�
 6. **耗时的操作都接收 `signal`**，中止后尽快返回，结果会被丢弃。
 7. **调用 `session.clear/resume/reload` 是这次命令的最后一步**。
 8. **同名、同键按加载顺序先到先得**。项目层插件不能替用户说话、不能回答审批、不能提供模型服务。
+
+### 7.2 每一行的测试
+
+测试都在 `apps/jade/test/`。
+
+| 扩展点 | 测试 |
+|---|---|
+| 清单 | `plugins.test.ts` resolvePlugins 和 plugin host 的测试；`plugin-install.test.ts` 没有 `id` 的插件不安装 |
+| `providers` | `plugins.test.ts` "only user plugins can provide services, and malformed ones are skipped"、plugin host 的测试 |
+| 进程外插件的进程 | `plugins.test.ts` "a process plugin that exits by itself is reported once…" |
+| 工厂函数 | `plugins.test.ts` "broken plugins are skipped with a warning instead of stopping jade" |
+| `tools` | `plugins.test.ts` 同上（`tool read_file already exists`）；`plugin-install.test.ts` "a plugin replaces a built-in and may reuse its tool names…" |
+| `hooks` | 内核的测试（`packages/kernel/test`） |
+| `commands` | `host-rules.test.ts` "slash command names"；`plugins.test.ts` 进程外插件的斜杠命令 |
+| `keys` | `plugins.test.ts` "keys are normalized; malformed, reserved and taken keys are skipped"、"a process plugin's keys go over jade/key…" |
+| `renderers` | `transcript.test.ts` "a plugin's renderer … failures fall back to the default once warned"；`plugins.test.ts` 只能渲染自己的工具 |
+| `responder` | `plugins.test.ts` "only user plugins can provide a responder"；`respond.test.ts` firstAnswer |
+| `suggest` | `plugins.test.ts` "suggest, beforeSend and ctx.status are collected; only the first suggest is used" |
+| `beforeSend` | `host-rules.test.ts` "beforeSend" |
+| `replaces` | `plugin-install.test.ts` 同上；`host-rules.test.ts` 代替内置插件的命令 |
+| `dispose` | `plugins.test.ts` "dispose: used instances on jade.dispose (once)…"；`session-lifecycle.test.ts` |
+| `ctx.status`、`ctx.input`、`ctx.send`、`ctx.signal` | `session-scope.test.ts`、`session-lifecycle.test.ts` |
+| `ctx.complete`、`ctx.run` | `plugins.test.ts` "a plugin can call the current model with ctx.complete…"；`jade.test.ts` 里 `shellTools().run` 的测试 |
+| 不改写插件实例 | `plugins.test.ts` "jade never rewrites a plugin instance…" |
+
+没有覆盖的：`suggest` 出错时的警告（在 `main.ts` 里，只有一行 `catch`）。
 
 ## 8. 实施步骤
 
