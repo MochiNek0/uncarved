@@ -1,0 +1,4 @@
+{
+  "command": "python",
+  "args": ["text_keys.py"]
+}
