@@ -48,6 +48,9 @@ async function handle(msg: Msg): Promise<unknown> {
       return manifest;
     case "shutdown":
       return stubborn ? new Promise(() => {}) : {};
+    case "host/echo":
+      // 宿主自定义的方法：原样回复参数
+      return msg.params;
     case "hook": {
       const { hook, payload } = msg.params!;
       switch (hook) {

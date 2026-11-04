@@ -112,6 +112,16 @@ test("端到端：进程外 transform 改写系统提示词，进程外关卡拒
   expect(await p.exited).toEqual({ code: 0, signal: null });
 });
 
+test("宿主读清单里自己的字段，发自己定义的请求；内核的方法不能这样发", async () => {
+  const p = await start({ hooks: [], extra: { greeting: "hi" } } as never);
+  expect(p.manifest.extra).toEqual({ greeting: "hi" });
+  expect(await p.request("host/echo", { a: 1 })).toEqual({ a: 1 });
+  const failure = (method: string) => p.request(method, {}).then(() => "no error", (e: Error) => e.message);
+  expect(await failure("host/missing")).toBe("unknown host/missing");
+  expect(await failure("hook")).toBe("hook is a kernel method");
+  expect(await failure("$/cancel")).toBe("$/cancel is a kernel method");
+});
+
 test("超时：插件收到 $/cancel，本轮失败", async () => {
   let stderr = "";
   const p = await start(

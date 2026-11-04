@@ -45,6 +45,13 @@ export interface SpawnOptions {
 }
 
 export interface StdioPlugin extends Plugin {
+  /** 插件对 initialize 的完整回复：宿主可以从中读自己认识的字段（例如 jade 的 commands） */
+  readonly manifest: Readonly<Record<string, unknown>>;
+  /**
+   * 发一个宿主自己定义的请求（方法名请带上宿主的前缀，例如 "jade/command"），返回插件的回复。
+   * 内核的方法（initialize、hook、shutdown、$/ 开头的）不能用
+   */
+  request(method: string, params: Record<string, unknown>, signal?: AbortSignal): Promise<unknown>;
   /** 进程退出时 resolve。内核不自动重启，是否重新启动由发行版决定 */
   readonly exited: Promise<{ code: number | null; signal: string | null }>;
   close(): Promise<void>;
@@ -61,6 +68,7 @@ const SHUTDOWN_GRACE_MS = 2_000;
 /** 进程退出后等 stdout 读完的最长时间：孙进程可能继承了 stdout，管道迟迟不关 */
 const EXIT_DRAIN_MS = 1_000;
 const DEFAULT_MAX_MESSAGE_BYTES = 64 * 1024 * 1024;
+const KERNEL_METHODS = new Set(["initialize", "hook", "shutdown"]);
 
 export async function spawnPlugin(opts: SpawnOptions): Promise<StdioPlugin> {
   const layer = opts.layer ?? "distro";
@@ -86,7 +94,8 @@ export async function spawnPlugin(opts: SpawnOptions): Promise<StdioPlugin> {
   const conn = new Connection(child, opts.maxMessageBytes ?? DEFAULT_MAX_MESSAGE_BYTES, opts.onStderr);
 
   try {
-    const manifest = parseManifest(await conn.request("initialize", { kernel: KERNEL_VERSION }, AbortSignal.timeout(opts.initTimeoutMs ?? 10_000)).result);
+    const reply = await conn.request("initialize", { kernel: KERNEL_VERSION }, AbortSignal.timeout(opts.initTimeoutMs ?? 10_000)).result;
+    const manifest = parseManifest(reply);
 
     const plugin: StdioPlugin = {
       id: manifest.id,
@@ -111,6 +120,11 @@ export async function spawnPlugin(opts: SpawnOptions): Promise<StdioPlugin> {
           },
         }),
       ),
+      manifest: reply as Record<string, unknown>,
+      request: (method, params, signal) => {
+        if (KERNEL_METHODS.has(method) || method.startsWith("$/")) return Promise.reject(new PluginProcessError(`${method} is a kernel method`));
+        return conn.request(method, params, signal).result;
+      },
       exited: conn.exited,
       close: () => conn.close(),
     };

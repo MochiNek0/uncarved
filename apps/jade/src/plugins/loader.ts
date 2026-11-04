@@ -4,7 +4,7 @@
 // 一个目录就是一个插件，两种形式：
 // - 进程内：TypeScript / JavaScript 模块，默认导出插件对象，或者返回插件对象的工厂函数（每个会话调用一次）；
 // - 进程外：plugin.json 里写了 command，jade 启动这个进程，经 stdio 用 JSON-RPC 通信（@uncarved/plugin-stdio），
-//   可以用任何语言编写，只能提供 hook。
+//   可以用任何语言编写，可以提供 hook 和斜杠命令。
 // 两种形式之外（或者没有代码时），插件目录还可以带上内容：skills/、commands/、mcp.json（或 .mcp.json），
 // 和 jade 自己的 skills、自定义命令、MCP 配置格式相同。也认 Claude Code 插件的 .claude-plugin/plugin.json。
 // 项目层插件随仓库分发，首次加载和内容变化后要用户确认（宪法 7.1）；用户层插件是用户自己装的，不再确认。
@@ -451,6 +451,8 @@ async function loadProcess(found: FoundPlugin, info: PluginInfo, opts: LoadOptio
       status.stderr.splice(0, Math.max(0, status.stderr.length - STDERR_LINES));
     },
   });
+  // 原地加上而不是复制：内核只认 spawnPlugin 返回的那个项目层插件对象（宪法 7.1）
+  if (proc.manifest.commands !== undefined) (proc as JadePlugin).commands = processCommands(proc);
   const loaded: LoadedPlugin = {
     ...found,
     kind: "process",
@@ -470,6 +472,32 @@ async function loadProcess(found: FoundPlugin, info: PluginInfo, opts: LoadOptio
     }
   });
   return loaded;
+}
+
+/**
+ * 进程外插件在 initialize 的回复里声明的斜杠命令。执行时发 jade/command { name, args, sessionId, cwd }，
+ * 回复 { text } 显示给用户，{ prompt } 作为用户消息发给模型，{} 什么都不做。
+ * 名字等字段不对的由 createExtensions 统一提示
+ */
+function processCommands(proc: StdioPlugin): PluginCommand[] {
+  // 不是数组时当作一个没有名字的命令，好让 createExtensions 提示
+  const list = (Array.isArray(proc.manifest.commands) ? proc.manifest.commands : [{}]) as (Record<string, unknown> | null)[];
+  const str = (v: unknown) => (typeof v === "string" ? v : undefined);
+  return list.map((c) => {
+    const name = c && typeof c === "object" ? c.name : undefined;
+    return {
+      name: name as string,
+      description: str(c?.description),
+      args: str(c?.args),
+      instant: c?.instant === true,
+      run: async (args, ctx) => {
+        const reply = (await proc.request("jade/command", { name, args, sessionId: ctx.sessionId, cwd: ctx.cwd }, ctx.signal)) as Record<string, unknown> | null;
+        if (typeof reply?.prompt === "string") return { prompt: reply.prompt };
+        if (typeof reply?.text === "string") return reply.text;
+        return undefined;
+      },
+    };
+  });
 }
 
 /**
