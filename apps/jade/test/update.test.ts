@@ -53,10 +53,20 @@ describe("update check", () => {
 
   const npm = { kind: "npm" as const, dir: "/usr/local/lib/node_modules/@uncarved/jade" };
   const node = (code: string) => [process.execPath, "-e", code];
+  // autoUpdate 把安装进程和计时器都 unref 了（jade 退出时不等它）。jade 运行时界面让事件循环一直活着；
+  // 测试里没有别的东西撑着，bun test 会一直等下去，所以等结果期间挂一个计时器
+  const alive = async <T>(p: Promise<T>): Promise<T> => {
+    const keep = setInterval(() => {}, 1000);
+    try {
+      return await p;
+    } finally {
+      clearInterval(keep);
+    }
+  };
 
   test("installs in the background and writes the log", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "jade-update-"));
-    const r = await autoUpdate(home, "0.2.0", { install: npm, command: node("console.log('added 1 package')") });
+    const r = await alive(autoUpdate(home, "0.2.0", { install: npm, command: node("console.log('added 1 package')") }));
     expect(r.status).toBe("installed");
     expect(await readFile(path.join(home, "update.log"), "utf8")).toContain("added 1 package");
     expect(existsSync(path.join(home, "update.lock"))).toBe(false);
@@ -64,12 +74,12 @@ describe("update check", () => {
 
   test("does not retry a failed version right away", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "jade-update-"));
-    const r = await autoUpdate(home, "0.2.0", { install: npm, command: node("console.error('EACCES'); process.exit(1)") });
+    const r = await alive(autoUpdate(home, "0.2.0", { install: npm, command: node("console.error('EACCES'); process.exit(1)") }));
     expect(r).toEqual({ status: "failed", log: path.join(home, "update.log") });
     expect(await readFile(path.join(home, "update.log"), "utf8")).toContain("EACCES");
     expect(await autoUpdate(home, "0.2.0", { install: npm, command: node("") })).toEqual({ status: "skipped", why: "failed-recently" });
     // 更新的版本照常试
-    expect((await autoUpdate(home, "0.2.1", { install: npm, command: node("") })).status).toBe("installed");
+    expect((await alive(autoUpdate(home, "0.2.1", { install: npm, command: node("") }))).status).toBe("installed");
   });
 
   test("one jade updates at a time, and dev installs never update", async () => {

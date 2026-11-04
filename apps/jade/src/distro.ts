@@ -51,6 +51,8 @@ export interface JadeOptions {
   maxSteps?: number;
   /** 当前配置的模型，写进主 Agent 的系统提示词（见 prompts 的 model）；每次请求时取 */
   model?: () => { name: string; via: string } | undefined;
+  /** 会话的临时目录：写进提示词让模型把临时文件放这里；关卡按工作目录对待，修改前不用先读 */
+  scratch?: string;
   /** 测试用 */
   today?: string;
   /** 读取搜索服务配置用，默认 process.env；测试用 */
@@ -157,14 +159,14 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
   const built = new Map<string, JadePlugin>();
   const add = (p: JadePlugin) => built.set(p.id, p);
 
-  const pol = policy({ cwd, mode: opts.mode, pendingMode: opts.pendingMode, review: opts.review, readRoots: off("jade/skills") ? [] : skills.map((x) => x.dir) });
+  const pol = policy({ cwd, mode: opts.mode, pendingMode: opts.pendingMode, review: opts.review, readRoots: off("jade/skills") ? [] : skills.map((x) => x.dir), scratch: opts.scratch });
   add(pol.plugin);
   // 占位，组装完成后换成真正的提示词插件
   if (!off("jade/prompts")) add({ id: "jade/prompts", version: "0.3.0", kernel: "^0.1" });
 
   // 文件工具据此判断读取和修改是不是同一次回复里发出的
   const responses = { calls: 0 };
-  if (!off("jade/fs")) add(withCounter({ id: "jade/fs", version: "0.1.0", kernel: "^0.1", tools: fsTools(cwd, { checkpoints, responses }) }, responses));
+  if (!off("jade/fs")) add(withCounter({ id: "jade/fs", version: "0.1.0", kernel: "^0.1", tools: fsTools(cwd, { checkpoints, responses, scratch: opts.scratch }) }, responses));
   if (!off("jade/shell")) add({ id: "jade/shell", version: "0.1.0", kernel: "^0.1", tools: shell.tools });
   let web: Tool[] = [];
   let hasScreenshot = false;
@@ -311,6 +313,7 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
       web: webNames,
       screenshot: hasScreenshot,
       checks: kept.has("jade/checks") && Boolean(checks),
+      scratch: opts.scratch,
       tools: toolNames,
       model: opts.model,
     });

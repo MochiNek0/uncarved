@@ -226,6 +226,19 @@ describe("fs tools", () => {
     expect(await readFile(file, "utf8")).toBe("someone else's change\n");
   });
 
+  test("files in the scratch directory can be changed without reading them first", async () => {
+    const { cwd } = await workspace();
+    const scratch = await mkdtemp(path.join(os.tmpdir(), "jade-scratch-"));
+    const tools = fsTools(cwd, { scratch });
+    // 模型跑的脚本生成的文件：模型没用 read_file 读过
+    await writeFile(path.join(scratch, "gen.cjs"), "generated\n");
+    expect((await run(tools, "write_file", { path: path.join(scratch, "gen.cjs"), content: "mine\n" })).isError).toBe(false);
+    expect(await readFile(path.join(scratch, "gen.cjs"), "utf8")).toBe("mine\n");
+    // 工作目录里照旧要先读
+    await writeFile(path.join(cwd, "user.txt"), "user\n");
+    expect((await run(tools, "write_file", { path: "user.txt", content: "z" })).isError).toBe(true);
+  });
+
   test("a resumed session can change files it read or wrote before, unless they changed since", async () => {
     const { cwd, home } = await workspace();
     const checkpoints = new Checkpoints(path.join(home, "checkpoints"));
@@ -430,6 +443,16 @@ describe("policy", () => {
     expect(decide("readonly", "bash", { command: "git log -5" })).toBe("allow");
     expect(decide("plan", "write_file", { path: inside, content: "" })).toBe("deny");
     expect(decide("plan", "bash", { command: "bun test" })).toBe("deny");
+  });
+
+  test("the scratch directory counts as inside the working directory", () => {
+    const scratch = path.resolve("/tmp/jade-x");
+    const p = policy({ cwd, scratch });
+    const d = (mode: PolicyMode, name: string, input: unknown) => p.decide(gated(name, input), { mode, rules: [] }).decision;
+    expect(d("ask", "read_file", { path: path.join(scratch, "a.json") })).toBe("allow");
+    expect(d("auto", "write_file", { path: path.join(scratch, "t.mjs"), content: "" })).toBe("allow");
+    expect(d("ask", "bash", { command: `cat ${scratch.replaceAll("\\", "/")}/out.txt` })).toBe("allow");
+    expect(d("auto", "write_file", { path: path.resolve("/tmp/other/t.mjs"), content: "" })).toBe("ask");
     expect(decide("plan", "bash", { command: "git log -5" })).toBe("allow");
     expect(decide("plan", "read_file", { path: inside })).toBe("allow");
     const reason = policy({ cwd }).decide(gated("edit_file", { path: inside, old_string: "a", new_string: "b" }), { mode: "plan", rules: [] });
@@ -719,6 +742,34 @@ describe("policy", () => {
     expect(failed.decision).toBe("ask");
     expect(failed.reason).toContain("HTTP 500");
     expect(parseVerdict('{"decision":"allow"}')).toEqual({ decision: "allow", reason: undefined });
+  });
+
+  test("the reviewer sees the content of a script the agent wrote when a command runs it", async () => {
+    const { cwd } = await workspace();
+    await writeFile(path.join(cwd, "tmp_check.mjs"), "console.log('counting items')\n");
+    await writeFile(path.join(cwd, "other.mjs"), "console.log('not mentioned')\n");
+    const origin = { by: "model", provider: "p", model: "m" } as const;
+    const wrote = (p: string): Message => ({
+      role: "assistant",
+      content: [{ kind: "tool_use", id: p, name: "write_file", input: { path: p, content: "" }, origin, trust: "trusted" }],
+    });
+    const messages: Message[] = [wrote("tmp_check.mjs"), wrote("other.mjs")];
+    let seen = "";
+    const provider: Provider = {
+      id: "reviewer",
+      async complete(req) {
+        seen = req.messages.map((m) => m.content.map((b) => (b.kind === "text" ? b.text : "")).join("")).join("");
+        return { model: "m", content: [{ kind: "text", text: '{"decision":"allow"}', origin, trust: "trusted" }], stopReason: "end" };
+      },
+    };
+    const review = reviewer({ provider, cwd, scratch: "/s", messages: () => messages });
+    await review(gated("bash", { command: "node tmp_check.mjs" }), new AbortController().signal);
+    expect(seen).toContain("<agent-files>");
+    expect(seen).toContain("counting items");
+    expect(seen).not.toContain("not mentioned");
+    expect(seen).toContain("Scratch directory (the agent's temporary files): /s");
+    await review(gated("bash", { command: "bun test" }), new AbortController().signal);
+    expect(seen).not.toContain("<agent-files>");
   });
 
   test("always-allow rules cover their command inside a compound command", () => {
@@ -1064,6 +1115,14 @@ describe("jade session", () => {
     const without = await system(null);
     expect(without).toContain("There is no shell in this session");
     expect(without).not.toContain("with bash");
+  });
+
+  test("the system prompt names the scratch directory", async () => {
+    const { cwd, home } = await workspace();
+    const hook = (await prompts({ cwd, home, scratch: "C:/Temp/jade-x" })).hooks![0]!;
+    if (hook.kind !== "transform" || !("fn" in hook)) throw new Error("expected a local transform");
+    const req = (await hook.fn({ system: [], messages: [], tools: [] } as never, {} as never)) as ModelRequest;
+    expect(req.system.map((s) => s.text).join("\n")).toContain("- Scratch directory: C:/Temp/jade-x. Put temporary files");
   });
 
   test("the system prompt lists the working directory's top-level entries: committed ones in a repository", async () => {

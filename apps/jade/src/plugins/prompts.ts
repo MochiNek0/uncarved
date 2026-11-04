@@ -30,6 +30,8 @@ export interface PromptsOptions {
   screenshot?: boolean;
   /** 编辑后会自动运行项目的检查（见 checks 插件） */
   checks?: boolean;
+  /** 临时文件目录（见 distro 的 scratch）；子 Agent 不用 */
+  scratch?: string;
   /** 本会话实际有的工具；给了时，提示词里不提没有的工具（task、todo_write） */
   tools?: ReadonlySet<string>;
   /**
@@ -199,6 +201,13 @@ async function environment(opts: PromptsOptions): Promise<string> {
   const lines = [
     "# Environment",
     `- Working directory: ${opts.cwd}`,
+    // 不给的话模型把临时脚本写进项目（会被编辑后检查当成项目文件、容易留在仓库里），
+    // 或者写到 /tmp：Windows 上 Git Bash 的 /tmp 和 Python、Node 看到的不是同一个目录
+    ...(opts.scratch && opts.role !== "subagent"
+      ? [
+          `- Scratch directory: ${opts.scratch}. Put temporary files (throwaway scripts, test data, captured output) here, not in the working directory, and write this absolute path instead of /tmp. Files here can be overwritten without reading them first.`,
+        ]
+      : []),
     `- Platform: ${process.platform} (${os.release()})`,
     ...(opts.shell ? [`- Shell for the bash tool: ${opts.shell} (POSIX syntax, also on Windows)`] : []),
     // 模型常用 xdg-open、open 打开文件，Git Bash 里没有；start 是 Git 自带的 /usr/bin/start

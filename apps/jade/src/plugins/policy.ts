@@ -55,6 +55,8 @@ export interface PolicyOptions {
   rules?: () => AllowRule[];
   /** 工作目录之外也可以直接读取的目录（skill 的目录），只影响只读工具 */
   readRoots?: string[];
+  /** 会话的临时目录（放临时脚本、测试数据）：读写都和工作目录里一样对待 */
+  scratch?: string;
   /**
    * 还没记进日志的模式：运行中切换模式时日志正被这一轮占着写不进去，宿主先放在这里让关卡立即按它判断，
    * 这一轮结束后再记进日志。关卡的每个决定都记在 tool.decided 里，所以不影响重建（I-5）
@@ -438,7 +440,7 @@ export function policy(opts: PolicyOptions): Policy {
     // 只有 ".." 这一段才表示上级目录，名为 "..foo" 的目录仍在里面
     return rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
   };
-  const inside = (p: string) => within(opts.cwd, p);
+  const inside = (p: string) => within(opts.cwd, p) || (opts.scratch !== undefined && within(opts.scratch, p));
   /** glob 的 pattern 是绝对路径或含 ".." 段时，匹配范围会超出 path */
   const globEscapes = (pattern: string) => path.isAbsolute(pattern) || pattern.split(/[\\/]/).includes("..");
   /** 以 "." 或 "[" 开头的通配段可能匹配到 ".."（取决于 bash 版本和选项），按越界处理 */

@@ -5,7 +5,7 @@
 // 不读当前目录的 .env（见 config.ts）：模型配置放在 $JADE_HOME/.env。
 // 交互运行时用终端界面（ui/tui.tsx），-p 和非交互运行时逐行输出（ui/screen.ts）。
 
-import { readdir, stat } from "node:fs/promises";
+import { mkdtemp, readdir, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
@@ -380,6 +380,10 @@ function setPluginStatus(plugin: string, text: string | undefined) {
   screen.status({ plugins: [...pluginStatus].map(([p, t]) => ({ plugin: p, text: t })) });
 }
 
+// 模型放临时脚本、测试数据的目录，整个进程共用一个（换会话时提示词不变，不影响缓存）。
+// 写成正斜杠：Windows 上 Git Bash、Python、Node 都认 C:/Users/...，而 /tmp 在它们之间不是同一个地方
+const scratch = realpathSync.native(await mkdtemp(path.join(os.tmpdir(), "jade-"))).replaceAll("\\", "/");
+
 /** 每个会话用一套新的插件实例：插件里有按会话记的状态（例如压缩、重复调用的计数） */
 const makeJade = (mode?: Mode) => {
   const generation = ++jadeGeneration;
@@ -397,13 +401,14 @@ const makeJade = (mode?: Mode) => {
     mcp: mcpClients,
     skills,
     compactTokens: compactAt,
+    scratch,
     approveSubagent,
     // 不能交互时（-p）没有人回答，不提供这个工具
     askUser: screen.interactive ? askUser : undefined,
     sharedRules: (): AllowRule[] => [...settings().rules, ...pendingRules],
     pendingMode: () => pendingMode,
     // auto 模式的审查用当前的模型；rt 换会话时跟着换，所以每次取
-    review: reviewer({ provider, cwd, messages: () => rt.state.messages }),
+    review: reviewer({ provider, cwd, scratch, messages: () => rt.state.messages }),
     approveCheck: process.env.JADE_CHECKS === "off" ? undefined : approveCheck,
     checkConfirmed: (c) => trust.has(checkHash(c)),
     checksUnavailable: process.env.JADE_CHECKS === "off" ? "Edit-time checks are turned off by JADE_CHECKS=off." : undefined,

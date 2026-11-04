@@ -53,6 +53,8 @@ export interface FsOptions {
   responses?: { readonly calls: number };
   /** grep 用的 ripgrep，默认 "rg"；null 表示不用（测试） */
   rg?: string | null;
+  /** 会话的临时目录：里面的文件只有模型自己会写（包括它跑的命令生成的），修改前不用先读 */
+  scratch?: string;
 }
 
 /** 读过或写过的文件当时的样子；只在本进程内有效，恢复的会话靠 checkpoints 里记的 sha256 */
@@ -66,6 +68,11 @@ interface Seen {
 export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
   const at = (p: unknown) => resolveIn(cwd, p as string);
   const seen = new Map<string, Seen>();
+  const inScratch = (full: string) => {
+    if (opts.scratch === undefined) return false;
+    const rel = path.relative(opts.scratch, full);
+    return rel !== "" && rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
+  };
   /** 文件没变时保留更早的 call：之前的回复里读过，这次回复里又读一遍，不影响修改 */
   const remember = async (ctx: { sessionId: string }, full: string, info: Stats, text: string, call: number) => {
     const s = seen.get(full);
@@ -75,6 +82,7 @@ export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
   };
   /** 不能修改已有文件的原因；可以修改时返回 undefined。text 是文件现在的内容 */
   const staleness = async (ctx: { sessionId: string }, full: string, info: Stats, text: string): Promise<string | undefined> => {
+    if (inScratch(full)) return undefined;
     const shown = display(cwd, full);
     const modified = `${shown} has been modified since it was last read (by the user or a command). Read it again before changing it.`;
     const s = seen.get(full);
