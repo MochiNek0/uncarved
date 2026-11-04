@@ -60,6 +60,20 @@ export interface TuiHandlers {
   cycleMode?(): void;
   /** 用户按 Esc 丢弃了输入框里的灰字建议 */
   dismissSuggestion?(): void;
+  /** 输入框有焦点时按下 jade 自己不用的 ctrl+<字母>、alt+<字母或数字>（见 keySpec）；返回 true 表示有插件处理了 */
+  key?(spec: string): boolean;
+}
+
+/** 输入框交给 tuiScreen 的读写入口（Prompt 每次渲染时更新） */
+type DraftBridge = { current?: { get(): string; apply(f: (s: EditState) => EditState): void } };
+
+/** 按键写成 "ctrl+g"、"alt+v"（小写）；别的键返回 undefined */
+function keySpec(input: string, key: Key): string | undefined {
+  if (input.length !== 1) return undefined;
+  const c = input.toLowerCase();
+  if (key.ctrl && !key.meta && /^[a-z]$/.test(c)) return `ctrl+${c}`;
+  if (key.meta && !key.ctrl && /^[a-z0-9]$/.test(c)) return `alt+${c}`;
+  return undefined;
 }
 
 type Dialog =
@@ -402,6 +416,7 @@ function notifier(stdout: NodeJS.WriteStream, env = process.env): (message: stri
 export function tuiScreen(opts: TuiOptions): Screen {
   const stdout = opts.io?.stdout ?? process.stdout;
   const store = new Store(opts.status);
+  const draft: DraftBridge = {};
   const notify = notifier(stdout);
   /** 已经工作了很久（见 NOTIFY_AFTER） */
   const longBusy = () => {
@@ -487,6 +502,7 @@ export function tuiScreen(opts: TuiOptions): Screen {
       commands={opts.commands}
       handlers={opts.handlers}
       history={opts.history ?? []}
+      draft={draft}
     />,
     {
       exitOnCtrlC: false,
@@ -586,6 +602,14 @@ export function tuiScreen(opts: TuiOptions): Screen {
     },
     suggest(text) {
       store.update({ suggestion: text?.split("\n")[0]!.trim() || undefined });
+    },
+    draft: {
+      text: () => draft.current?.get() ?? "",
+      insert: (text) => draft.current?.apply((s) => edit.insert(s, text.replace(/\r\n?/g, "\n"))),
+      set: (text) => {
+        const value = text.replace(/\r\n?/g, "\n");
+        draft.current?.apply(() => ({ value, cursor: value.length }));
+      },
     },
     select: <T,>(title: string, choices: Choice<T>[], o?: { body?: string; signal?: AbortSignal }) => {
       if (longBusy()) notify(title);
@@ -758,6 +782,7 @@ function App({
   commands,
   handlers,
   history,
+  draft,
 }: {
   store: Store;
   /** 把选中的文字放进剪贴板 */
@@ -766,6 +791,7 @@ function App({
   commands: CommandInfo[];
   handlers: TuiHandlers;
   history: string[];
+  draft: DraftBridge;
 }) {
   const state = useSyncExternalStore(store.subscribe, store.get);
   const dialog = state.dialogs[0];
@@ -953,6 +979,7 @@ function App({
             commands={commands}
             handlers={handlers}
             history={history}
+            bridge={draft}
             busy={Boolean(state.busy)}
             active={!dialog}
             onSubmit={() => store.scrollBy(-max, max)}
@@ -1373,6 +1400,7 @@ function Prompt({
   commands,
   handlers,
   history: initial,
+  bridge,
   busy,
   active,
   onSubmit,
@@ -1383,6 +1411,8 @@ function Prompt({
   commands: CommandInfo[];
   handlers: TuiHandlers;
   history: string[];
+  /** 让 tuiScreen 的 draft 读写输入框 */
+  bridge: DraftBridge;
   busy: boolean;
   active: boolean;
   /** 提交后对话区回到底部 */
@@ -1539,6 +1569,7 @@ function Prompt({
       cursor: mention!.start + text.length,
     });
   };
+  bridge.current = { get: () => current().value, apply: (f) => set(f(current())) };
   const recall = (i: number) => {
     browsing.current = i;
     const value =
@@ -1689,6 +1720,8 @@ function Prompt({
         if (browsing.current >= 0) recall(browsing.current - 1);
         return;
       }
+      const spec = keySpec(input, key);
+      if (spec && handlers.key?.(spec)) return;
       const next = editKey(state, input, key);
       if (next) set(next);
     },

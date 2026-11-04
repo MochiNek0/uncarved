@@ -131,6 +131,7 @@ interface JadePlugin {
   suggest?: Suggester;          // jade 的扩展：预测下一条消息，输入框里显示成灰字，见下文
   beforeSend?(text, ctx): string | undefined;  // jade 的扩展：用户消息发出前改写，见下文
   providers?: PluginProvider[]; // jade 的扩展：模型服务，用 JADE_PROVIDER 选择，见下文
+  keys?: PluginKey[];           // jade 的扩展：快捷键，见下文
 }
 ```
 
@@ -179,6 +180,8 @@ export default factory;
 | `complete` | `({ system?, prompt, onText? }, signal) => Promise<{ text, model, usage? }>`：用当前配置的模型发一次请求，见下文 |
 | `status` | `(text \| undefined) => void`：设置状态栏上本插件的那一段，见下文 |
 | `checkpoints` | 文件快照：写文件的工具写之前记下原内容，`/undo` 据此恢复，见下文 |
+| `input` | 输入框：`text()`、`insert(text)`、`set(text)`，见下文。只给用户层插件，`jade -p` 时没有 |
+| `send` | `(text) => void`：替用户提交一行，见下文。只给用户层插件，`jade -p` 时没有 |
 
 默认导出对象时，每个会话用的是它的一份浅拷贝，适合没有状态的插件。
 
@@ -229,6 +232,41 @@ async execute(input, toolCtx) {
 
 - `list(sessionId)`、`unchangedSince(cp)`、`restore(cp)` 是 `/undo`（`jade/undo`）用的另一半，见 [`src/plugins/sessions.ts`](../src/plugins/sessions.ts)；想换一种撤销方式可以 `replaces: ["jade/undo"]`。
 - 快照按会话存在 `$JADE_HOME/checkpoints/` 下，不进日志。
+
+### 输入框和替用户发送：`ctx.input`、`ctx.send`
+
+```ts
+ctx.input?.text();             // 输入框里还没提交的文字
+ctx.input?.insert("你好");      // 在光标处插入，光标移到插入的文字后面
+ctx.input?.set("");            // 换掉全部文字（这里是清空），光标放到末尾
+ctx.send?.("运行测试并修好失败的");  // 替用户提交
+```
+
+- `send` 和用户在输入框里按回车一样：`/` 开头的是命令，消息先经过各插件的 [`beforeSend`](#改写用户消息beforesend)；模型正忙时排队。对话里会先显示 `[plugin <目录名> sent this for you]`。
+- **只给用户层插件**：改输入框、发消息等于替用户说话，项目层插件的上下文里没有这两个字段。终端界面之外（`jade -p`、管道）也没有，所以用之前判断一下。
+- 什么时候调用都行（快捷键、定时器、后台连接里）。换会话后旧实例的调用不生效。
+
+## 快捷键（keys）
+
+```ts
+keys: [
+  {
+    key: "ctrl+t",
+    description: "push to talk",
+    async run() {
+      // 开始或结束录音；识别出的文字放进输入框，让用户看一眼再发
+      const text = await toggleRecording();
+      if (text) ctx.input?.insert(text);
+    },
+  },
+],
+```
+
+- `key` 写成 `ctrl+<字母>` 或 `alt+<字母或数字>`，不分大小写。jade 自己用的键不能用：`ctrl+a/c/d/e/h/i/j/k/l/m/o/r/u/w` 和 `alt+f`。格式不对或用了保留键的会被忽略并提示；两个插件用了同一个键时，排在前面的生效。
+- 输入框有焦点时按下就调用 `run`，模型工作时也一样；弹出选择框、输入框时不响应。`run` 不阻塞界面，出错时在对话里显示警告。
+- `/help` 列出插件的快捷键和 `description`。
+- 项目层插件也能提供快捷键，但它的上下文里没有 `input`、`send`。
+- 有的终端自己占用了部分组合键（例如 `ctrl+s`、`ctrl+q` 的流控制，`ctrl+z` 挂起），这些键可能到不了 jade。
 
 ## 工具
 

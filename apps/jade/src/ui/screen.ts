@@ -70,6 +70,8 @@ export interface Screen {
   select<T>(title: string, choices: Choice<T>[], opts?: { body?: string; signal?: AbortSignal }): Promise<T | undefined>;
   /** 让用户输入一行；取消时返回 undefined。signal 同 select */
   input(title: string, opts?: { initial?: string; mask?: boolean; placeholder?: string; signal?: AbortSignal }): Promise<string | undefined>;
+  /** 输入框里还没提交的文字（插件的 ctx.input 用）；只有终端界面有 */
+  readonly draft?: { text(): string; insert(text: string): void; set(text: string): void };
   /** 清空已经显示的对话（开始新会话时） */
   clear(): void;
   close(): Promise<void>;

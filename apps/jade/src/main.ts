@@ -260,6 +260,7 @@ const screen: Screen = tuiModule
         files: () => mentionCandidates(cwd),
         dismissSuggestion: () => ready && clearSuggestion(),
         cycleMode: () => ready && cycleMode(),
+        key: (spec) => ready && pluginKey(spec),
       },
     })
   : plainScreen({ interactive: Boolean(process.stdin.isTTY) });
@@ -415,6 +416,13 @@ const makeJade = (mode?: Mode) => {
     checkConfirmed: (c) => trust.has(checkHash(c)),
     checksUnavailable: process.env.JADE_CHECKS === "off" ? "Edit-time checks are turned off by JADE_CHECKS=off." : undefined,
     onStatus: (plugin, text) => generation === jadeGeneration && setPluginStatus(plugin, text),
+    // 换会话后旧的插件实例不能再改输入框、发消息
+    input: screen.draft && {
+      text: () => screen.draft!.text(),
+      insert: (text) => void (generation === jadeGeneration && screen.draft!.insert(String(text))),
+      set: (text) => void (generation === jadeGeneration && screen.draft!.set(String(text))),
+    },
+    send: screen.draft && ((plugin, text) => void (generation === jadeGeneration && pluginSend(plugin, text))),
   });
 };
 
@@ -1206,6 +1214,24 @@ async function say(text: string) {
   if (view.lastEnd === "end" && queue.length === 0) void suggestNext();
 }
 
+/** 插件的快捷键：找到了就在后台执行，返回 true */
+function pluginKey(spec: string): boolean {
+  const found = jade.keys.get(spec);
+  if (!found) return false;
+  Promise.resolve()
+    .then(() => found.key.run())
+    .catch((err) => screen.log(yellow(`[warning] plugin ${found.plugin}: ${spec} failed: ${errorText(err)}`)));
+  return true;
+}
+
+/** 插件的 ctx.send：和用户在输入框里提交一样，先注明是哪个插件发的 */
+function pluginSend(plugin: string, text: string) {
+  if (typeof text !== "string" || !text.trim()) return;
+  screen.log(dim(`[plugin ${plugin} sent this for you]`));
+  if (ready) onSubmit(text);
+  else early.push(text);
+}
+
 /** 用户输入的消息：先交给插件的 beforeSend（可能改写或不发），再发出 */
 async function sendTyped(text: string) {
   for (const { plugin, fn } of jade.beforeSend) {
@@ -1332,6 +1358,8 @@ async function command(input: string): Promise<boolean> {
     case "help":
       screen.log(ALL_COMMANDS.map((c) => `${`/${c.name}${c.args ? ` ${c.args}` : ""}`.padEnd(commandWidth())}${dim(c.about)}`).join("\n"));
       screen.log(dim(KEYS));
+      if (jade.keys.size)
+        screen.log(dim(`Plugin keys: ${[...jade.keys].map(([k, { plugin, key }]) => `${k} ${key.description ?? ""} (${plugin})`.replace("  ", " ")).join(" · ")}`));
       break;
     case "model":
       await configure.model(rest[0]);
