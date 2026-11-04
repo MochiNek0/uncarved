@@ -25,6 +25,8 @@ export const BUILTINS: readonly BuiltinInfo[] = [
   { id: "jade/checks", about: "project checks after edits, /checks" },
   { id: "jade/compact", about: "compacts the history near the context limit, /compact" },
   { id: "jade/budget", about: "limits the steps of a turn" },
+  { id: "jade/sessions", about: "/clear, /resume, /retry" },
+  { id: "jade/undo", about: "/undo (restores the files changed in the last turn)" },
   { id: "jade/repeats", about: "rejects calls repeated in one response and re-opening an unchanged file, warns about repeated failures and read-backs" },
 ];
 

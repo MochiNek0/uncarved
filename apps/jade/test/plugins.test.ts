@@ -1,12 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { cp, mkdir, mkdtemp, writeFile } from "node:fs/promises";
-import { realpathSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { cp, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { existsSync, realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { MemoryLogStore, MemoryTrustStore, readAll, Runtime, type Block, type ModelRequest, type ModelResponse, type Provider } from "uncarved";
 import { createJade, discoverPlugins, loadPlugin, type FoundPlugin, type LoadedPlugin } from "../src/index.ts";
-import type { HostContext } from "../src/plugins/loader.ts";
+import type { HostContext, SessionControl } from "../src/plugins/loader.ts";
 
 const MODEL = { by: "model", provider: "scripted", model: "scripted-1" } as const;
 type Step = Omit<ModelResponse, "model">;
@@ -374,4 +375,116 @@ describe("out-of-process plugins", () => {
     }
     expect(loaded.process!.exited).toBeDefined();
   }, 20_000);
+});
+
+describe("session commands use the public SessionControl", () => {
+  const ui = { interactive: true, log: () => {}, select: async () => undefined as never, input: async () => undefined };
+  const control = (over: Partial<SessionControl> = {}): SessionControl & { calls: string[] } => {
+    const calls: string[] = [];
+    return {
+      calls,
+      messages: () => [],
+      record: async (k) => void calls.push(`record ${k}`),
+      list: async () => [
+        { id: "s-current", title: "now", at: new Date().toISOString() },
+        { id: "s-older", title: "before", at: new Date().toISOString() },
+      ],
+      clear: async () => void calls.push("clear"),
+      resume: async (id) => void calls.push(`resume ${id}`),
+      retry: async () => false,
+      ...over,
+    };
+  };
+
+  test("/clear, /resume and /retry come from jade/sessions and go through ctx.session", async () => {
+    const { cwd, home } = await dirs();
+    const jade = await createJade({ cwd, home, store: new MemoryLogStore(), provider: scripted([]).provider, env: {} });
+    expect(["clear", "resume", "retry", "undo"].map((n) => jade.commands.get(n)?.plugin)).toEqual(["jade/sessions", "jade/sessions", "jade/sessions", "jade/undo"]);
+    const session = control();
+    const ctx = { sessionId: "s-current", cwd, signal: new AbortController().signal, derived: {}, ui, note: () => {}, session };
+    await jade.commands.get("clear")!.command.run("", ctx);
+    // 前缀匹配到唯一的会话
+    await jade.commands.get("resume")!.command.run("s-o", ctx);
+    expect(await jade.commands.get("resume")!.command.run("s-current", ctx)).toContain("current session");
+    expect(await jade.commands.get("retry")!.command.run("", ctx)).toContain("Nothing to retry");
+    expect(session.calls).toEqual(["clear", "resume s-older"]);
+    // 不给 session（instant 命令或别的宿主）时说明原因
+    await expect(Promise.resolve(jade.commands.get("clear")!.command.run("", { ...ctx, session: undefined }))).rejects.toThrow(/session control/);
+    jade.shutdown();
+  });
+
+  test("disabling jade/sessions removes its commands", async () => {
+    const { cwd, home } = await dirs();
+    const jade = await createJade({ cwd, home, store: new MemoryLogStore(), provider: scripted([]).provider, env: {}, disabled: ["jade/sessions"] });
+    expect(jade.commands.has("clear")).toBe(false);
+    expect(jade.commands.has("undo")).toBe(true);
+    expect(jade.builtins.find((b) => b.id === "jade/sessions")).toMatchObject({ state: "disabled" });
+    jade.shutdown();
+  });
+
+  test("/undo restores the last turn's files and records it under its own key", async () => {
+    const { cwd, home } = await dirs();
+    const store = new MemoryLogStore();
+    const s = scripted([{ content: [use("w", "write_file", { path: "new.txt", content: "hi\n" })], stopReason: "tool_use" }, reply("done")]);
+    const jade = await createJade({ cwd, home, store, provider: s.provider, env: {}, mode: "yolo" });
+    const rt = await Runtime.create({ store, provider: s.provider, plugins: jade.plugins });
+    await rt.send(msg("write it"));
+    expect(existsSync(path.join(cwd, "new.txt"))).toBe(true);
+    const notes: string[] = [];
+    const session = control({ messages: () => structuredClone(rt.state.messages), record: (k, v) => rt.record(k, v) });
+    const ctx = { sessionId: rt.state.sessionId, cwd, signal: new AbortController().signal, derived: rt.state.derived, ui, note: (t: string) => void notes.push(t), session };
+    expect(await jade.commands.get("undo")!.command.run("", ctx)).toContain("Undid 1 change");
+    expect(existsSync(path.join(cwd, "new.txt"))).toBe(false);
+    expect(rt.state.derived["jade/undo"]).toEqual({ undone: ["w"] });
+    expect(notes[0]).toContain("undid your changes");
+    expect(await jade.commands.get("undo")!.command.run("", { ...ctx, derived: rt.state.derived })).toContain("Nothing to undo");
+    jade.shutdown();
+  });
+
+  test("/undo also restores files that a third-party tool saved through ctx.checkpoints", async () => {
+    const { cwd, home } = await dirs();
+    const file = path.join(cwd, "notes.txt");
+    await writeFile(file, "old");
+    const plugin: LoadedPlugin = {
+      name: "stamp",
+      dir: path.join(home, "plugins", "stamp"),
+      layer: "user",
+      kind: "module",
+      entry: "index.ts",
+      info: { kind: "module", entry: "index.ts", json: {}, bundle: { skills: [], commands: [], unsupported: [] } },
+      create: async (host) =>
+        ({
+          id: "x/stamp",
+          version: "1.0.0",
+          kernel: "^0.1",
+          tools: [
+            {
+              name: "stamp",
+              description: "overwrite notes.txt",
+              inputSchema: { type: "object" },
+              effect: "write",
+              concurrency: "exclusive",
+              async execute(_input: unknown, ctx: { sessionId: string; toolUseId: string }) {
+                const after = "new";
+                await host.checkpoints.save(ctx.sessionId, { toolUseId: ctx.toolUseId, tool: "stamp", path: file, before: await readFile(file, "utf8"), afterHash: createHash("sha256").update(after).digest("hex") });
+                await writeFile(file, after);
+                return { content: "ok" };
+              },
+            },
+          ],
+        }) as never,
+    };
+    const store = new MemoryLogStore();
+    const s = scripted([{ content: [use("t", "stamp", {})], stopReason: "tool_use" }, reply("done")]);
+    const jade = await createJade({ cwd, home, store, provider: s.provider, env: {}, mode: "yolo", extensions: [plugin] });
+    expect(jade.warnings.filter((w) => w.includes("stamp"))).toEqual([]);
+    const rt = await Runtime.create({ store, provider: s.provider, plugins: jade.plugins });
+    await rt.send(msg("stamp it"));
+    expect(await readFile(file, "utf8")).toBe("new");
+    const session = control({ messages: () => structuredClone(rt.state.messages), record: (k, v) => rt.record(k, v) });
+    const ctx = { sessionId: rt.state.sessionId, cwd, signal: new AbortController().signal, derived: rt.state.derived, ui, note: () => {}, session };
+    expect(await jade.commands.get("undo")!.command.run("", ctx)).toContain("Undid 1 change");
+    expect(await readFile(file, "utf8")).toBe("old");
+    jade.shutdown();
+  });
 });

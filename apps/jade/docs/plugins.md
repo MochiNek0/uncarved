@@ -177,6 +177,7 @@ export default factory;
 | `run` | `(command, { cwd?, timeoutMs, signal? }) => Promise<{ code, output, timedOut }>`：用 jade 的 shell 执行命令，超时或中断时连同子进程一起结束。找不到 shell 时没有这个字段 |
 | `complete` | `({ system?, prompt, onText? }, signal) => Promise<{ text, model, usage? }>`：用当前配置的模型发一次请求，见下文 |
 | `status` | `(text \| undefined) => void`：设置状态栏上本插件的那一段，见下文 |
+| `checkpoints` | 文件快照：写文件的工具写之前记下原内容，`/undo` 据此恢复，见下文 |
 
 默认导出对象时，每个会话用的是它的一份浅拷贝，适合没有状态的插件。
 
@@ -204,6 +205,29 @@ ctx.status(undefined);  // 去掉
 
 - 每个插件一段，只显示一行，超过 40 个字符截断。窗口窄时比快捷键提示晚、比缓存比例早被去掉。
 - 什么时候调用都行（工厂函数里、hook 里、定时器里）。换会话时清空，旧会话的实例再调用不会显示。
+
+### 文件快照：`ctx.checkpoints`
+
+插件的工具写文件之前记一份快照，用户的 `/undo` 就会把它和 jade 自己的 `write_file`、`edit_file` 一起撤销：
+
+```ts
+async execute(input, toolCtx) {
+  const before = existsSync(file) ? await readFile(file, "utf8") : null;   // null：文件原本不存在，撤销时删掉
+  const after = render(input);
+  await ctx.checkpoints.save(toolCtx.sessionId, {
+    toolUseId: toolCtx.toolUseId,
+    tool: "my_tool",
+    path: file,                                                     // 绝对路径
+    before,
+    afterHash: createHash("sha256").update(after).digest("hex"),   // 撤销前据此判断文件之后有没有被改过
+  });
+  await writeFile(file, after);
+  return { content: "ok" };
+}
+```
+
+- `list(sessionId)`、`unchangedSince(cp)`、`restore(cp)` 是 `/undo`（`jade/undo`）用的另一半，见 [`src/plugins/sessions.ts`](../src/plugins/sessions.ts)；想换一种撤销方式可以 `replaces: ["jade/undo"]`。
+- 快照按会话存在 `$JADE_HOME/checkpoints/` 下，不进日志。
 
 ## 工具
 
@@ -355,6 +379,7 @@ interface PluginCommandContext {
     input(title: string, opts?: { initial?: string; placeholder?: string }): Promise<string | undefined>;
   };
   note(text: string): void; // 附在用户下一条消息前面告诉模型，例如"用户删掉了某条记忆"
+  session?: SessionControl; // 操作会话，见下文；instant 命令没有
 }
 ```
 
@@ -372,6 +397,24 @@ interface PluginCommandContext {
 - 取消选择或输入时 `select`/`input` 返回 `undefined`，命令应该直接结束。
 - `jade -p "/命令 参数"` 也能用。
 - 内置插件的 `/memory`、`/skills`、`/mcp`、`/checks`、`/compact` 也是这样写的，见 [`src/plugins/core.ts`](../src/plugins/core.ts)。
+
+### 操作会话：`ctx.session`
+
+```ts
+interface SessionControl {
+  messages(): Message[];                              // 当前会话的消息（拷贝）
+  record(key: string, value: unknown): Promise<void>; // 写一项派生数据进日志，恢复会话后仍在
+  list(): Promise<{ id: string; title: string; at: string }[]>; // 这个目录里的会话，最近的在前
+  clear(): Promise<void>;                             // 开始新会话，当前的保留、可以恢复
+  resume(id: string): Promise<void>;                  // 换到另一个会话；失败时留在当前会话
+  retry(): Promise<boolean>;                          // 上次请求在模型回复前失败时重新请求；没有可重试的返回 false
+}
+```
+
+- jade 自己的 `/clear`、`/resume`、`/retry`（`jade/sessions`）和 `/undo`（`jade/undo`）只用这个接口，见 [`src/plugins/sessions.ts`](../src/plugins/sessions.ts)。用 `replaces: ["jade/sessions"]` 可以换成你自己的实现。
+- 只有排队执行的命令有 `session`；`instant` 的命令在模型工作时执行，不能换会话或写日志，`session` 为 `undefined`。
+- `record` 的 key 只能是插件的 id 或以 `"<id>/"` 开头，不能改别的插件（例如权限设置）记下的数据。
+- `clear` / `resume` 之后，`session` 指向新的会话；命令返回 `{ prompt }` 时发给新会话。
 
 ## 远程应答（responder）
 
@@ -469,6 +512,8 @@ jade 自己的功能都是插件，和第三方插件用同一套接口（[`src/
 | `jade/checks` | 编辑后检查、`/checks` |
 | `jade/compact` | 接近上下文上限时压缩历史、`/compact` |
 | `jade/budget` | 每轮的步数上限 |
+| `jade/sessions` | `/clear`、`/resume`、`/retry` |
+| `jade/undo` | `/undo`（恢复上一轮改过的文件） |
 | `jade/repeats` | 拒绝同一次回复里重复的调用，提醒反复失败的调用 |
 
 用户可以用 `jade plugin disable <id>` 停用其中任何一个（`jade/policy` 除外），停用后它的工具、提示词段落和命令都不再出现。

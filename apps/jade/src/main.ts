@@ -23,7 +23,7 @@ import {
 } from "uncarved";
 import { realpathSync } from "node:fs";
 import { expandCommand, loadCommands } from "./commands.ts";
-import { discoverPlugins, inspectPlugin, loadPlugin, type LoadedPlugin, type PluginBundle, type PluginInfo } from "./plugins/loader.ts";
+import { discoverPlugins, inspectPlugin, loadPlugin, type LoadedPlugin, type PluginBundle, type PluginInfo, type SessionControl } from "./plugins/loader.ts";
 import { readPluginSettings } from "./plugins/install.ts";
 import { PLUGIN_HELP, pluginCli, UsageError } from "./plugin-cli.ts";
 import { describeServer, loadMcpConfig, McpClient, mcpTrustHash } from "./mcp.ts";
@@ -37,8 +37,7 @@ import { InputHistory } from "./history.ts";
 import { attachMentions, mentionCandidates } from "./mentions.ts";
 import { repoRoot } from "./plugins/prompts.ts";
 import { isRateLimit, providerFromEnv, providerInfo, RateGate, rpmFromEnv, switchable, withRetry } from "./provider.ts";
-import { discardIfEmpty, SessionIndex } from "./sessions.ts";
-import { lastTurnChanges, UNDO_KEY, type Checkpoint, type UndoState } from "./tools/checkpoint.ts";
+import { ago, discardIfEmpty, matchSession, SessionIndex } from "./sessions.ts";
 import { display } from "./tools/fs.ts";
 import { SEARCH_PROVIDERS } from "./tools/web.ts";
 import type { ApproveSubagent, SubagentApproval } from "./tools/task.ts";
@@ -73,10 +72,6 @@ const COMMANDS: CommandInfo[] = [
   { name: "help", about: "list the commands and keys" },
   { name: "model", args: "[name]", about: "switch between saved models, or add one and configure its provider, API key and output limit" },
   { name: "mode", args: `[${MODES.join("|")}]`, about: "show or change the permission mode" },
-  { name: "clear", about: "start a new session (the current one stays resumable)" },
-  { name: "undo", about: "restore every file the agent changed in its last turn (run again to go further back)" },
-  { name: "retry", about: "request the model again after a failed request, without sending another message" },
-  { name: "resume", args: "[id]", about: "pick a recent session in this directory and switch to it" },
   { name: "plugins", about: "built-in and installed plugins: their tools, hooks and commands, and the hook execution order" },
   { name: "search", about: "set up web search services (TinyFish, AnySearch, Tavily, Exa, Firecrawl, Jina)" },
   { name: "exit", about: "quit (the session stays resumable)" },
@@ -84,7 +79,7 @@ const COMMANDS: CommandInfo[] = [
 /** 运行中也立即执行的命令（不碰运行时，或者只读；/mode 运行中先记在 pendingMode） */
 const INSTANT = new Set(["help", "model", "mode", "plugins", "exit"]);
 /** 内置插件提供的命令（/memory 在 jade/memory 里，等等）：名字保留给它们，自定义命令不能占用 */
-const BUILTIN_PLUGIN_COMMANDS = ["memory", "checks", "mcp", "skills", "compact"];
+const BUILTIN_PLUGIN_COMMANDS = ["memory", "checks", "mcp", "skills", "compact", "clear", "resume", "retry", "undo"];
 
 const KEYS = `Keys: enter send · \\ or alt+enter new line · ↑↓ history · @ reference a file · esc interrupt (twice to also clear queued messages) · shift+tab cycle ask/auto/plan · ctrl+c twice to exit
       mouse wheel or PgUp/PgDn scroll the conversation · ctrl+home/ctrl+end jump to the top/bottom · click ▸ expands an item (ctrl+o the latest one) · click in the input moves the cursor · shift+drag selects text
@@ -564,7 +559,7 @@ if (resumeId === "") {
     fail("--resume without an id needs a terminal to pick from; pass the id");
   }
   resumeId = await pickSession();
-} else if (resumeId) resumeId = await findSession(resumeId);
+} else if (resumeId) resumeId = matchSession(await index.list(cwd), resumeId);
 if (opts.cont) {
   resumeId = (await index.list(cwd))[0]?.id;
   if (!resumeId) {
@@ -815,6 +810,8 @@ function skillMessage(name: string, args: string): string {
 
 /** 正在执行的插件命令；esc 中断它 */
 let commandAbort: AbortController | undefined;
+/** 插件命令经 session 发起的换会话、重试：命令被 esc 中断后也要等它收尾，再处理下一条输入 */
+let sessionWork: Promise<unknown> | undefined;
 
 /** 执行插件的斜杠命令，返回要发给模型的提示词（没有就是 undefined） */
 async function pluginCommand(name: string, args: string): Promise<string | undefined> {
@@ -840,6 +837,8 @@ async function pluginCommand(name: string, args: string): Promise<string | undef
             input: (title, o) => screen.input(title, o),
           },
           note: (text) => void notes.push(text),
+          // instant 的命令在模型工作时执行，不能换会话、写日志
+          session: found.command.instant ? undefined : sessionControl(found.plugin),
         }),
       ),
       ac.signal,
@@ -858,11 +857,34 @@ async function pluginCommand(name: string, args: string): Promise<string | undef
     }
     return undefined;
   } catch (err) {
-    screen.log(red(`[error] /${found.command.name} (plugin ${found.plugin}): ${errorText(err)}`));
+    // 用户按 esc 中断的不算出错
+    if (!ac.signal.aborted) screen.log(red(`[error] /${found.command.name} (plugin ${found.plugin}): ${errorText(err)}`));
     return undefined;
   } finally {
+    await sessionWork?.catch(() => {});
+    sessionWork = undefined;
     if (commandAbort === ac) commandAbort = undefined;
   }
+}
+
+/** 插件命令操作会话的接口；换会话后指向新的会话（rt、sessionId 每次现取） */
+function sessionControl(plugin: string): SessionControl {
+  const track = <T>(p: Promise<T>): Promise<T> => ((sessionWork = p), p);
+  return {
+    messages: () => structuredClone(rt.state.messages),
+    record: async (key, value) => {
+      if (key !== plugin && !key.startsWith(`${plugin}/`)) throw new Error(`plugin ${plugin} can only record keys "${plugin}" or "${plugin}/…", not ${JSON.stringify(key)}`);
+      await rt.record(key, value);
+    },
+    list: async () => (await index.list(cwd)).map(({ id, title, at }) => ({ id, title, at })),
+    clear: () => track(switchSession()),
+    resume: (id) => track(switchSession(id)),
+    retry: async () => {
+      if (!canRetry()) return false;
+      await track(drive({ kind: "retry" }));
+      return true;
+    },
+  };
 }
 
 /** /plugins：内置插件的状态，每个第三方插件的来源、工具、hook、命令和带的内容；跳过的插件在启动时已经提示过 */
@@ -1091,9 +1113,9 @@ async function configureSearch() {
   screen.log(green(`Web search is on with ${p.name}: web_search uses it, and web_fetch falls back to it when a page cannot be fetched directly.`));
 }
 
-/** 从这个目录最近的会话里选一个；取消或没有时返回 undefined */
-async function pickSession(current?: string): Promise<string | undefined> {
-  const all = (await index.list(cwd)).filter((s) => s.id !== current).slice(0, 50);
+/** 从这个目录最近的会话里选一个（-r 不带 id 时）；取消或没有时返回 undefined */
+async function pickSession(): Promise<string | undefined> {
+  const all = (await index.list(cwd)).slice(0, 50);
   if (all.length === 0) {
     screen.log(dim(`No other sessions in ${shortPath(cwd)}.`));
     return undefined;
@@ -1102,23 +1124,6 @@ async function pickSession(current?: string): Promise<string | undefined> {
     "Resume which session?",
     all.map((s) => ({ label: s.title || "(untitled)", value: s.id, hint: `${ago(s.at)} · ${s.id}` })),
   );
-}
-
-/** 这个目录的会话里 id 等于 arg 或以它开头的唯一一个；都不是时原样返回，交给 Runtime.resume 去找 */
-async function findSession(arg: string): Promise<string> {
-  const hits = (await index.list(cwd)).filter((s) => s.id.startsWith(arg));
-  return hits.find((s) => s.id === arg)?.id ?? (hits.length === 1 ? hits[0]!.id : arg);
-}
-
-/** 显示用的相对时间 */
-function ago(iso: string): string {
-  const s = (Date.now() - Date.parse(iso)) / 1000;
-  if (!Number.isFinite(s)) return iso;
-  if (s < 60) return "just now";
-  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
-  if (s < 86400) return `${Math.floor(s / 3600)} h ago`;
-  if (s < 86400 * 7) return `${Math.floor(s / 86400)} d ago`;
-  return iso.slice(0, 10);
 }
 
 process.on("SIGINT", () => (running ? interrupt() : void quit(130)));
@@ -1269,11 +1274,6 @@ async function suggestNext() {
 /** 上一轮在模型回复之前就失败了：最后一条消息还没有回复 */
 const canRetry = () => rt.phase === "idle" && rt.state.messages.at(-1)?.role === "user";
 
-async function retry() {
-  if (!canRetry()) return screen.log(dim("Nothing to retry: the last message already has a reply."));
-  await drive({ kind: "retry" });
-}
-
 async function drive(input: UserInput) {
   // 计时从这次输入开始，不接着上一条排队消息的
   screen.busy(undefined);
@@ -1296,42 +1296,6 @@ async function drive(input: UserInput) {
     await guarded(() => rt.send({ kind: "message", content: [hostNote(CONTINUE_NOTE)] }));
   }
   await savePendingRules().catch((err) => screen.log(red(`[error] ${errorText(err)}`)));
-}
-
-/** 撤销最近一轮里还没撤销的全部文件修改：同一个文件改过几次的，恢复到这一轮改它之前的样子 */
-async function undo() {
-  const undone = new Set((rt.state.derived[UNDO_KEY] as UndoState | undefined)?.undone ?? []);
-  const cps = lastTurnChanges(rt.state.messages, await jade.checkpoints.list(sessionId), undone);
-  if (cps.length === 0) return screen.log(dim("Nothing to undo."));
-  /** 文件 → 这一轮最早的快照（恢复成它的 before）；cps 是最新的在前 */
-  const files = new Map<string, Checkpoint>();
-  for (const cp of cps) files.set(cp.path, cp);
-  // 只有最新一次写入之后的内容能和文件现在的样子比较
-  const latest = new Map<string, Checkpoint>();
-  for (const cp of cps) if (!latest.has(cp.path)) latest.set(cp.path, cp);
-  const changed: string[] = [];
-  for (const cp of latest.values()) if (!(await jade.checkpoints.unchangedSince(cp))) changed.push(display(cwd, cp.path));
-  const list = [...files.values()].map((cp) => `  ${cp.before === null ? "delete " : "restore"} ${display(cwd, cp.path)}`).join("\n");
-  if (files.size > 1 || changed.length > 0) {
-    const ok = await screen.select(
-      changed.length > 0
-        ? `${changed.join(", ")} changed since the agent wrote ${changed.length > 1 ? "them" : "it"}. Undo anyway and discard those changes too?`
-        : `Undo the agent's last turn of changes (${files.size} files)?`,
-      [
-        { label: "No", value: false },
-        { label: changed.length > 0 ? "Yes, undo anyway" : "Yes, undo", value: true },
-      ],
-      { body: list },
-    );
-    if (!ok) return;
-  }
-  for (const cp of cps) await jade.checkpoints.restore(cp);
-  await rt.record(UNDO_KEY, { undone: [...undone, ...cps.map((c) => c.toolUseId)] } satisfies UndoState);
-  const what = [...files.values()].map((cp) =>
-    cp.before === null ? `deleted ${display(cwd, cp.path)} (you had created it)` : `restored ${display(cwd, cp.path)} to its content before your changes`,
-  );
-  notes.push(`The user undid your changes from your last turn: ${what.join("; ")}. Read these files again before changing them.`);
-  screen.log(green(`Undid ${cps.length} change${cps.length > 1 ? "s" : ""} from the last turn:`) + "\n" + dim(list));
 }
 
 /** 恢复的会话里已有的内容：终端界面里重新显示对话，逐行输出时只统计用量 */
@@ -1393,22 +1357,6 @@ async function command(input: string): Promise<boolean> {
       else await setMode(m as Mode);
       screen.log(`mode: ${settings().mode}${pendingMode ? dim(" (from the next tool call)") : ""}`);
       if (settings().rules.length) screen.log(dim(`always allowed in this session:\n${settings().rules.map((r) => `  ${describeRule(r)}`).join("\n")}`));
-      break;
-    }
-    case "undo":
-      await undo();
-      break;
-    case "retry":
-      await retry();
-      break;
-    case "clear":
-      await switchSession();
-      break;
-    case "resume": {
-      const id = rest[0] ? await findSession(rest[0]) : await pickSession(sessionId);
-      if (!id) break;
-      if (id === sessionId) screen.log(dim("That is the current session."));
-      else await switchSession(id);
       break;
     }
     case "plugins":

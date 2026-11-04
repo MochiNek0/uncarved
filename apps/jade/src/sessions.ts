@@ -59,3 +59,20 @@ export async function discardIfEmpty(store: LogStore & { dir: string }, sessionI
   await rm(path.join(store.dir, `${sessionId}.jsonl`), { force: true });
   return true;
 }
+
+/** id 等于 arg 或以它开头的唯一一个会话；都不是时原样返回，交给 Runtime.resume 去找 */
+export function matchSession(entries: { id: string }[], arg: string): string {
+  const hits = entries.filter((s) => s.id.startsWith(arg));
+  return hits.find((s) => s.id === arg)?.id ?? (hits.length === 1 ? hits[0]!.id : arg);
+}
+
+/** 显示用的相对时间 */
+export function ago(iso: string, now = Date.now()): string {
+  const s = (now - Date.parse(iso)) / 1000;
+  if (!Number.isFinite(s)) return iso;
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)} h ago`;
+  if (s < 86400 * 7) return `${Math.floor(s / 86400)} d ago`;
+  return iso.slice(0, 10);
+}

@@ -20,6 +20,7 @@ import { definePlugin, loadProjectPluginFactory, type Awaitable, type Message, t
 import { projectDirs } from "../commands.ts";
 import type { RunCommand } from "../tools/shell.ts";
 import type { Question } from "../tools/ask.ts";
+import type { Checkpoint } from "../tools/checkpoint.ts";
 
 export const JADE_VERSION: string = JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")).version;
 
@@ -49,6 +50,27 @@ export interface JadePluginContext {
   complete(req: CompleteRequest, signal: AbortSignal): Promise<CompleteResult>;
   /** 设置状态栏上本插件的那一段文字（一行，过长时截断，窗口窄时先被去掉）；undefined 去掉 */
   status(text: string | undefined): void;
+  /** 文件快照：写文件的工具写之前记下原内容，/undo 据此恢复。见 FileCheckpoints */
+  checkpoints: FileCheckpoints;
+}
+
+
+/**
+ * 文件快照，按会话存放，不进日志。jade/fs 的写文件工具和 jade/undo 都只用这个接口：
+ * 第三方插件的工具写文件前也调用 save，/undo 就能撤销它的修改
+ */
+export interface FileCheckpoints {
+  /**
+   * 写文件之前调用（用工具调用的 ctx.sessionId、ctx.toolUseId）。path 是绝对路径；before 是原内容，null 表示文件原本不存在；
+   * afterHash 是写入后内容（UTF-8）的 sha256 十六进制，撤销前用它判断文件之后有没有被别人改过
+   */
+  save(sessionId: string, cp: Omit<Checkpoint, "at">): Promise<void>;
+  /** 会话的全部快照，最新的在前 */
+  list(sessionId: string): Promise<Checkpoint[]>;
+  /** 文件现在的内容还是不是这次写入后的样子 */
+  unchangedSince(cp: Checkpoint): Promise<boolean>;
+  /** 把文件恢复成 before（before 为 null 时删掉文件） */
+  restore(cp: Checkpoint): Promise<void>;
 }
 
 export interface CompleteRequest {
@@ -85,6 +107,36 @@ export interface PluginCommandContext {
   ui: CommandUI;
   /** 附在用户下一条消息前面告诉模型的话，例如"用户删掉了某条记忆" */
   note(text: string): void;
+  /** 操作会话（见 SessionControl）；instant 的命令在模型工作时执行，没有这个字段 */
+  session?: SessionControl;
+}
+
+/** 这个目录里的一个会话（会话索引里的一项） */
+export interface SessionSummary {
+  id: string;
+  /** 第一条消息的开头 */
+  title: string;
+  /** 最近一次使用的时间（ISO） */
+  at: string;
+}
+
+/**
+ * 斜杠命令操作会话用的接口，jade 自己的 /clear、/resume、/retry、/undo 也只用它。
+ * 换会话之后它指向新的会话：之后的 messages()、record() 都是新会话的
+ */
+export interface SessionControl {
+  /** 当前会话的消息（拷贝） */
+  messages(): Message[];
+  /** 写一项派生数据进日志（derived.recorded），恢复会话后仍在。key 只能是插件的 id 或以 "<id>/" 开头 */
+  record(key: string, value: unknown): Promise<void>;
+  /** 这个工作目录里的会话，最近用过的在前 */
+  list(): Promise<SessionSummary[]>;
+  /** 开始新会话，当前的保留、可以恢复 */
+  clear(): Promise<void>;
+  /** 换到会话 id；恢复失败时留在当前会话并显示原因 */
+  resume(id: string): Promise<void>;
+  /** 上一次请求在模型回复之前就失败了时重新请求，不用再发消息；没有可重试的返回 false */
+  retry(): Promise<boolean>;
 }
 
 /** 字符串：显示给用户；{ prompt }：作为用户消息发给模型；不返回：什么也不做 */
