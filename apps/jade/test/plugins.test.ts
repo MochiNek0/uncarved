@@ -707,6 +707,61 @@ describe("input box, keys and send", () => {
     expect(warnings).toContain("plugin x/b: key ctrl+g is ignored: plugin x/a already uses it");
     jade.shutdown();
   });
+
+  test("a process plugin's keys go over jade/key; only a user one sees and changes the input box or sends", async () => {
+    const { cwd, home } = await dirs();
+    // 同一个进程外插件分别装在用户层和项目层
+    const script = `import { createInterface } from "node:readline";
+const send = (m) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...m }) + "\\n");
+for await (const line of createInterface({ input: process.stdin })) {
+  const msg = JSON.parse(line);
+  if (msg.id === undefined) continue;
+  const p = msg.params;
+  const result =
+    msg.method === "initialize" ? { id: "x/" + process.env.NAME, version: "1.0.0", kernel: "^0.1", hooks: [], keys: [{ key: process.env.KEY, description: "shout" }] }
+    : msg.method === "shutdown" ? {}
+    : msg.method === "jade/key" ? { set: String(p.text).toUpperCase() + " " + p.key, insert: "!", send: "seen " + p.text }
+    : undefined;
+  send(result ? { id: msg.id, result } : { id: msg.id, error: { code: -32601, message: "unknown " + msg.method } });
+  if (msg.method === "shutdown") process.exit(0);
+}
+`;
+    const make = async (base: string, name: string, key: string) => {
+      const dir = path.join(base, "plugins", name);
+      await mkdir(dir, { recursive: true });
+      await writeFile(path.join(dir, "main.ts"), script);
+      await writeFile(path.join(dir, "plugin.json"), JSON.stringify({ command: process.execPath, args: ["main.ts"], env: { NAME: name, KEY: key } }));
+      return dir;
+    };
+    const opts = { trust: new MemoryTrustStore(), confirm: async () => true };
+    const user = await loadPlugin({ name: "shout", dir: await make(home, "shout", "ctrl+t"), layer: "user" }, opts);
+    const repo = await loadPlugin({ name: "repo", dir: await make(path.join(cwd, ".jade"), "repo", "alt+r"), layer: "project" }, opts);
+    try {
+      let text = "hi";
+      const sent: [string, string][] = [];
+      const jade = await createJade({
+        cwd,
+        home,
+        store: new MemoryLogStore(),
+        provider: scripted([]).provider,
+        env: {},
+        extensions: [user, repo],
+        input: { text: () => text, insert: (t) => void (text += t), set: (t) => void (text = t) },
+        send: (p, t) => void sent.push([p, t]),
+      });
+      expect([...jade.keys].map(([k, v]) => `${k} ${v.plugin} ${v.key.description}`)).toEqual(["ctrl+t x/shout shout", "alt+r x/repo shout"]);
+      await jade.keys.get("ctrl+t")!.key.run();
+      expect(text).toBe("HI ctrl+t!");
+      expect(sent).toEqual([["shout", "seen hi"]]);
+      // 项目层：拿不到输入框的内容，回复里的 set、insert、send 不起作用
+      await jade.keys.get("alt+r")!.key.run();
+      expect(text).toBe("HI ctrl+t!");
+      expect(sent).toHaveLength(1);
+      jade.shutdown();
+    } finally {
+      await Promise.all([user.close!(), repo.close!()]);
+    }
+  }, 20_000);
 });
 
 describe("tool renderers", () => {

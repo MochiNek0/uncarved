@@ -267,6 +267,7 @@ keys: [
 - 输入框有焦点时按下就调用 `run`，模型工作时也一样；弹出选择框、输入框时不响应。`run` 不阻塞界面，出错时在对话里显示警告。
 - `/help` 列出插件的快捷键和 `description`。
 - 项目层插件也能提供快捷键，但它的上下文里没有 `input`、`send`。
+- 进程外插件也能提供，见[进程外插件的快捷键](#进程外插件的快捷键)。
 - 有的终端自己占用了部分组合键（例如 `ctrl+s`、`ctrl+q` 的流控制，`ctrl+z` 挂起），这些键可能到不了 jade。
 
 ## 工具
@@ -652,7 +653,7 @@ definePlugin({
 
 ## 进程外插件（任何语言）
 
-`plugin.json` 里写了 `command` 时，jade 启动这个进程，经 stdin/stdout 用 JSON-RPC 2.0 通信，一行一条消息。插件可以用任何语言编写。进程外插件可以提供 hook 和[斜杠命令](#进程外插件的斜杠命令)，不能提供工具。
+`plugin.json` 里写了 `command` 时，jade 启动这个进程，经 stdin/stdout 用 JSON-RPC 2.0 通信，一行一条消息。插件可以用任何语言编写。进程外插件可以提供 hook、[斜杠命令](#进程外插件的斜杠命令)和[快捷键](#进程外插件的快捷键)，不能提供工具。
 
 ```json
 {
@@ -683,6 +684,7 @@ jade 发给插件的请求：
 | `initialize` | `{ kernel: "0.1.0" }` | 插件清单，见下文 |
 | `hook` | `{ hook, sessionId, payload }` | transform：只含要修改的字段的对象；gate：`{ decision, reason? }`；observe：`{}` |
 | `jade/command` | `{ name, args, sessionId, cwd }` | 见[进程外插件的斜杠命令](#进程外插件的斜杠命令) |
+| `jade/key` | `{ key, text? }` | 见[进程外插件的快捷键](#进程外插件的快捷键) |
 | `$/cancel`（通知，无需回复） | `{ id }` | — |
 | `shutdown` | `{}` | `{}`，然后退出 |
 
@@ -740,6 +742,23 @@ jade 发给插件的请求：
 - `{}`：什么都不显示。
 
 回复错误时显示错误信息。用户按 esc 时 jade 发 `$/cancel`。进程外插件的命令拿不到 `ui`（选择、输入）、`note` 和 `session`。
+
+### 进程外插件的快捷键
+
+在插件清单里加上 `keys`，`key`、`description` 和[进程内插件的快捷键](#快捷键keys)一样：
+
+```json
+{ "keys": [{ "key": "ctrl+t", "description": "uppercase the input" }] }
+```
+
+按下时 jade 发 `jade/key { key, text }`，`text` 是输入框里还没提交的文字。用户层插件可以回复：
+
+- `{ "set": "..." }`：换掉输入框里的全部文字；
+- `{ "insert": "..." }`：在光标处插入；
+- `{ "send": "..." }`：替用户提交，和 [`ctx.send`](#输入框和替用户发送ctxinputctxsend) 一样；
+- `{}`：什么都不做。
+
+几个字段可以一起写，按 `set`、`insert`、`send` 的顺序执行。和进程内插件一样，**只有用户层插件**能读、改输入框和替用户发送：项目层插件收到的请求里没有 `text`，回复里的这些字段不起作用。出错时在对话里显示警告。
 
 完整设计见 [5.5-out-of-process-hooks.md](../../../docs/design/5.5-out-of-process-hooks.md)，Python 的完整实现见 [`redact-secrets/redact.py`](../examples/plugins/redact-secrets/redact.py)。
 

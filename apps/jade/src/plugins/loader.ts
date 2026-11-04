@@ -4,7 +4,7 @@
 // 一个目录就是一个插件，两种形式：
 // - 进程内：TypeScript / JavaScript 模块，默认导出插件对象，或者返回插件对象的工厂函数（每个会话调用一次）；
 // - 进程外：plugin.json 里写了 command，jade 启动这个进程，经 stdio 用 JSON-RPC 通信（@uncarved/plugin-stdio），
-//   可以用任何语言编写，可以提供 hook 和斜杠命令。
+//   可以用任何语言编写，可以提供 hook、斜杠命令和快捷键。
 // 两种形式之外（或者没有代码时），插件目录还可以带上内容：skills/、commands/、mcp.json（或 .mcp.json），
 // 和 jade 自己的 skills、自定义命令、MCP 配置格式相同。也认 Claude Code 插件的 .claude-plugin/plugin.json。
 // 项目层插件随仓库分发，首次加载和内容变化后要用户确认（宪法 7.1）；用户层插件是用户自己装的，不再确认。
@@ -398,13 +398,7 @@ export async function loadPlugin(found: FoundPlugin, opts: LoadOptions): Promise
   if (info.kind === "content") return { ...found, kind: "content", entry: "", info };
 
   const entry = info.entry!;
-  const ctx = ({ input, send, ...host }: HostContext): JadePluginContext => ({
-    ...host,
-    ...(found.layer === "user" ? { input, send: send && ((text: string) => send(found.name, text)) } : {}),
-    dir: found.dir,
-    layer: found.layer,
-    status: (text) => host.status(found.name, text),
-  });
+  const ctx = (host: HostContext) => pluginContext(found, host);
 
   if (found.layer === "project") {
     // 内核负责：先哈希整个目录、确认，再 import；检查 import 不越出插件目录
@@ -425,6 +419,17 @@ export async function loadPlugin(found: FoundPlugin, opts: LoadOptions): Promise
       if (!isPlugin(made)) throw new Error("plugin factory did not return a plugin");
       return { ...made, layer: "user" };
     },
+  };
+}
+
+/** 宿主给的上下文换成某个插件的：输入框和替用户发送只给用户层插件 */
+function pluginContext(found: FoundPlugin, { input, send, ...host }: HostContext): JadePluginContext {
+  return {
+    ...host,
+    ...(found.layer === "user" ? { input, send: send && ((text: string) => send(found.name, text)) } : {}),
+    dir: found.dir,
+    layer: found.layer,
+    status: (text) => host.status(found.name, text),
   };
 }
 
@@ -458,7 +463,11 @@ async function loadProcess(found: FoundPlugin, info: PluginInfo, opts: LoadOptio
     kind: "process",
     entry: shown,
     info,
-    create: async () => proc,
+    create: async (host) => {
+      // 进程在会话之间共用，快捷键要用当前会话的输入框：每次创建时换成新的
+      if (proc.manifest.keys !== undefined) (proc as JadePlugin).keys = processKeys(proc, pluginContext(found, host));
+      return proc;
+    },
     close: () => proc.close(),
     process: status,
   };
@@ -495,6 +504,30 @@ function processCommands(proc: StdioPlugin): PluginCommand[] {
         if (typeof reply?.prompt === "string") return { prompt: reply.prompt };
         if (typeof reply?.text === "string") return reply.text;
         return undefined;
+      },
+    };
+  });
+}
+
+/**
+ * 进程外插件在 initialize 的回复里声明的快捷键。按下时发 jade/key { key }，用户层插件还带上输入框的内容 text；
+ * 用户层插件可以回复 { set } 替换输入框、{ insert } 在光标处插入、{ send } 替用户发送，项目层插件的这些字段不起作用。
+ * 键名等字段不对的由 createExtensions 统一提示
+ */
+function processKeys(proc: StdioPlugin, ctx: JadePluginContext): PluginKey[] {
+  // 不是数组时当作一个没有键名的快捷键，好让 createExtensions 提示
+  const list = (Array.isArray(proc.manifest.keys) ? proc.manifest.keys : [{}]) as (Record<string, unknown> | null)[];
+  return list.map((k) => {
+    const key = k && typeof k === "object" ? k.key : undefined;
+    return {
+      key: key as string,
+      description: typeof k?.description === "string" ? k.description : undefined,
+      run: async () => {
+        const { input, send } = ctx;
+        const reply = (await proc.request("jade/key", { key, ...(input ? { text: input.text() } : {}) })) as Record<string, unknown> | null;
+        if (typeof reply?.set === "string") input?.set(reply.set);
+        if (typeof reply?.insert === "string") input?.insert(reply.insert);
+        if (typeof reply?.send === "string") send?.(reply.send);
       },
     };
   });
