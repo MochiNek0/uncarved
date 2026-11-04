@@ -13,7 +13,7 @@ import { Memory, memoryTool } from "./memory.ts";
 import { mcpTools, type McpClient } from "./mcp.ts";
 import { skillTool, skillsPrompt, type Skill } from "./skills.ts";
 import { compactor, type Compactor } from "./plugins/compact.ts";
-import { COMMAND_NAME, DISPOSE_TIMEOUT_MS, JADE_VERSION, KEY_SPEC, RESERVED_KEYS, type HostContext, type InputControl, type PluginKey, type ToolRenderer, type JadePlugin, type LoadedPlugin, type PluginCommand, type Responder, type Suggester } from "./plugins/loader.ts";
+import { COMMAND_NAME, DISPOSE_TIMEOUT_MS, JADE_VERSION, KEY_SPEC, RESERVED_KEYS, type HostContext, type HostInput, type PluginKey, type ToolRenderer, type JadePlugin, type LoadedPlugin, type PluginCommand, type Responder, type Suggester } from "./plugins/loader.ts";
 import { policy, type AllowRule, type Mode, type Policy, type PolicyOptions } from "./plugins/policy.ts";
 import { prompts, realPath, repoRoot } from "./plugins/prompts.ts";
 import { repeats } from "./plugins/repeats.ts";
@@ -90,10 +90,12 @@ export interface JadeOptions {
   skills?: Skill[];
   /** 插件用 ctx.status 设置状态栏上自己的那一段；plugin 是插件的 id，text 为 undefined 时去掉 */
   onStatus?(plugin: string, text: string | undefined): void;
-  /** 终端界面的输入框，给用户层插件的 ctx.input；-p 时没有 */
-  input?: InputControl;
+  /** 终端界面的输入框，给用户层插件的 ctx.input（多一个参数：调用的插件的 id）；-p 时没有 */
+  input?: HostInput;
   /** 用户层插件的 ctx.send：替用户提交一行；plugin 是插件的 id。-p 时没有 */
   send?(plugin: string, text: string): void;
+  /** 插件的 ctx.signal：这套实例的会话结束时中止（见 SessionScope）；不给时永不中止 */
+  signal?: AbortSignal;
 }
 
 export interface BuiltinState {
@@ -165,7 +167,7 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
   // run 也给插件和编辑后检查用，所以 jade/shell 停用时也创建，只是不把工具交给模型
   const shell = shellTools({ cwd });
   const root = await repoRoot(cwd);
-  const host: HostContext = { jade: JADE_VERSION, cwd: realPath(cwd), root: realPath(root), home: opts.home, definePlugin, run: shell.run, complete: completer(provider), status: (plugin, text) => opts.onStatus?.(plugin, text), checkpoints, input: opts.input, send: opts.send };
+  const host: HostContext = { jade: JADE_VERSION, cwd: realPath(cwd), root: realPath(root), home: opts.home, definePlugin, run: shell.run, complete: completer(provider), status: (plugin, text) => opts.onStatus?.(plugin, text), checkpoints, input: opts.input, send: opts.send, signal: opts.signal ?? new AbortController().signal };
 
   // 第三方插件先创建：要先知道它们代替哪些内置插件
   const made = await createExtensions(opts.extensions ?? [], host, warnings);
