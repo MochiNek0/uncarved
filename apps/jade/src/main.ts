@@ -21,7 +21,8 @@ import {
   type UserInput,
 } from "uncarved";
 import { realpathSync } from "node:fs";
-import { expandCommand, loadCommands } from "./commands.ts";
+import { runBeforeSend, abortable } from "./before-send.ts";
+import { expandCommand, loadCommands, pluginMenu } from "./commands.ts";
 import { type PluginBundle, type SessionControl } from "./plugins/loader.ts";
 import { openPluginHost } from "./plugins/host.ts";
 import { readPluginSettings } from "./plugins/install.ts";
@@ -496,23 +497,11 @@ for (const sk of skills) {
   skillCommands.set(name, sk);
   ALL_COMMANDS.push({ name: sk.name, args: "[task]", about: `${clip(sk.description.replace(/\s+/g, " "), 80)} (skill)` });
 }
-// 内置插件的命令排在宿主命令后面；第三方插件的命令排在最后
-const builtinPluginCommands: CommandInfo[] = [];
-for (const [name, { plugin, command: c, builtin }] of jade.commands) {
-  if (builtin) {
-    builtinPluginCommands.push({ name: c.name, args: c.args, about: c.description ?? "" });
-    continue;
-  }
-  // 内置插件的命令名（/clear、/undo…）在 jade.commands 里内置插件优先：这里还是第三方的，说明那个内置插件被代替或停用了，
-  // 第三方插件可以提供它
-  if (hostNames.has(name) || customs.has(name) || skillCommands.has(name)) {
-    const what = hostNames.has(name) ? "a built-in command" : customs.has(name) ? "a custom command" : "a skill";
-    screen.log(yellow(`[warning] command /${c.name} of plugin ${plugin} is ignored: ${what} has that name`));
-    continue;
-  }
-  ALL_COMMANDS.push({ name: c.name, args: c.args, about: `${c.description ?? ""} (plugin ${plugin})`.trim() });
-}
-ALL_COMMANDS.splice(COMMANDS.length, 0, ...builtinPluginCommands);
+// 内置插件的命令排在宿主命令后面；第三方插件的命令排在最后。同名时谁生效见 pluginMenu
+const menu = pluginMenu(jade.commands, { host: hostNames, custom: customs, skill: skillCommands });
+warn(menu.warnings);
+ALL_COMMANDS.push(...menu.plugins);
+ALL_COMMANDS.splice(COMMANDS.length, 0, ...menu.builtin);
 
 /** 结束进程外插件的进程和 MCP 服务 */
 async function closePlugins() {
@@ -978,14 +967,6 @@ async function savePendingRules() {
   await saveSettings({ ...s, rules: [...s.rules, ...pendingRules.splice(0)] });
 }
 
-function abortable<T>(p: Promise<T>, signal: AbortSignal): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const stop = () => reject(signal.reason);
-    signal.addEventListener("abort", stop, { once: true });
-    p.then(resolve, reject).finally(() => signal.removeEventListener("abort", stop));
-  });
-}
-
 // ---------- 运行 ----------
 
 /** 正在执行一轮对话（或一个需要独占运行时的命令） */
@@ -1236,22 +1217,16 @@ function pluginSend(plugin: string, text: string) {
 }
 
 /** 用户输入的消息：先交给插件的 beforeSend（可能改写或不发），再发出 */
-async function sendTyped(text: string) {
-  for (const { plugin, fn } of jade.beforeSend) {
-    try {
-      // 插件卡住时不能一直不发：30 秒后按原文发出
-      const signal = AbortSignal.timeout(30_000);
-      const next = await abortable(Promise.resolve(fn(text, { sessionId, signal })), signal);
-      if (next === undefined || next === text) continue;
-      if (typeof next !== "string") throw new Error("beforeSend must return a string or undefined");
-      if (!next.trim()) return screen.log(dim(`[plugin ${plugin} did not send the message]`));
-      screen.log(dim(`[plugin ${plugin} changed the message]`), { details: next });
-      text = next;
-    } catch (err) {
-      screen.log(yellow(`[warning] plugin ${plugin}: beforeSend failed, the message is sent as typed: ${errorText(err)}`));
-    }
-  }
-  await say(text);
+async function sendTyped(typed: string) {
+  const text = await runBeforeSend(jade.beforeSend, typed, {
+    sessionId,
+    report: {
+      changed: (plugin, next) => screen.log(dim(`[plugin ${plugin} changed the message]`), { details: next }),
+      dropped: (plugin) => screen.log(dim(`[plugin ${plugin} did not send the message]`)),
+      failed: (plugin, err) => screen.log(yellow(`[warning] plugin ${plugin}: beforeSend failed, so its change is skipped: ${errorText(err)}`)),
+    },
+  });
+  if (text !== undefined) await say(text);
 }
 
 // ---------- 预测下一条消息 ----------

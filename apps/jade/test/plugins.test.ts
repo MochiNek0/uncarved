@@ -386,6 +386,63 @@ describe("in-process plugins", () => {
     // 被忽略的插件其余部分照常加载
     expect(jade.extensions.map((e) => e.plugin.id)).toEqual(["x/phone", "x/repo", "x/broken"]);
   });
+
+  test("jade never rewrites a plugin instance: what it keeps is on the extension, what it ignores stays where it was", async () => {
+    const { cwd, home } = await dirs();
+    const approve = async () => ({ approved: true });
+    const run = () => {};
+    const tool = { name: "x_tool", description: "d", effect: "read" as const, inputSchema: { type: "object" }, execute: async () => ({ content: "ok" }) };
+    // 项目层插件：实例就是内核认的那个对象，jade 只能读
+    const made = {
+      id: "x/repo",
+      version: "1.0.0",
+      kernel: "^0.1",
+      tools: [tool],
+      responder: { approve },
+      providers: [],
+      dispose: "later",
+      beforeSend: 1,
+      suggest: { next: "nope" },
+      renderers: [{ tool: "x_tool", summary: () => "s" }, { tool: "read_file", summary: () => "x" }],
+      commands: [{ name: "ok", run }, { name: "bad name", run }],
+      keys: [{ key: "Ctrl+G", run }, { key: "ctrl+c", run }],
+    };
+    const before = { ...made, renderers: [...made.renderers], commands: [...made.commands], keys: [...made.keys] };
+    const source: LoadedPlugin = {
+      name: "repo",
+      id: "x/repo",
+      dir: path.join(cwd, ".jade", "plugins", "repo"),
+      layer: "project",
+      kind: "module",
+      entry: "index.ts",
+      info: { kind: "module", entry: "index.ts", json: {}, bundle: { skills: [], commands: [], unsupported: [] } },
+      create: async () => made as never,
+    };
+    const jade = await createJade({ cwd, home, store: new MemoryLogStore(), provider: scripted([]).provider, env: {}, extensions: [source] });
+    const [ext] = jade.extensions;
+    expect(ext!.plugin).toBe(made as never);
+    // 实例的每个字段都还是原来的值（同一个对象、同一个数组、同样的内容）
+    expect(Object.keys(made)).toEqual(Object.keys(before));
+    for (const k of Object.keys(before) as (keyof typeof before)[]) {
+      if (Array.isArray(before[k])) expect(made[k]).toEqual(before[k] as never);
+      else expect(made[k]).toBe(before[k] as never);
+    }
+    expect(made.keys[0]!.key).toBe("Ctrl+G");
+    // jade 用的是检查过、留下的
+    expect(ext!.commands.map((c) => c.name)).toEqual(["ok"]);
+    expect(ext!.keys.map((k) => k.key)).toEqual(["ctrl+g"]);
+    expect(ext!.renderers.map((r) => r.tool)).toEqual(["x_tool"]);
+    expect([ext!.responder, ext!.beforeSend, ext!.suggest]).toEqual([undefined, undefined, undefined]);
+    expect(jade.responders).toEqual([]);
+    expect(jade.renderers.get("x_tool")?.plugin).toBe("x/repo");
+    expect(jade.renderers.get("read_file")?.plugin).not.toBe("x/repo");
+    const warned = jade.warnings.filter((w) => w.includes("plugin x/repo")).join("\n");
+    for (const what of ["responder is ignored", "providers is ignored", "dispose is ignored", "beforeSend is ignored", "suggest is ignored", 'renderer for "read_file"', 'command "bad name"', 'key "ctrl+c"'])
+      expect(warned).toContain(what);
+    // dispose 不是函数：不调用，也不出错
+    expect(await jade.dispose()).toEqual([]);
+    jade.shutdown();
+  });
 });
 
 const python = (() => {
@@ -1088,6 +1145,49 @@ for await (const line of createInterface({ input: process.stdin })) {
       await host.close();
       clearProviders();
       delete (globalThis as { __jadeRepoRuns?: number }).__jadeRepoRuns;
+    }
+  }, 20_000);
+
+  test("a process plugin that exits by itself is reported once; its calls fail after that and it is not restarted", async () => {
+    const { cwd: root, home } = await dirs();
+    const dir = path.join(home, "plugins", "dies");
+    await mkdir(dir, { recursive: true });
+    await writeFile(path.join(dir, "plugin.json"), JSON.stringify({ id: "me/dies", command: process.execPath, args: ["main.ts"] }));
+    await writeFile(
+      path.join(dir, "main.ts"),
+      `import { createInterface } from "node:readline";
+const send = (m) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...m }) + "\\n");
+for await (const line of createInterface({ input: process.stdin })) {
+  const msg = JSON.parse(line);
+  if (msg.id === undefined) continue;
+  if (msg.method === "jade/command" && msg.params.name === "die") process.exit(3);
+  send({ id: msg.id, result: msg.method === "initialize" ? { id: "me/dies", version: "1.0.0", kernel: "^0.1", hooks: [], commands: [{ name: "die" }, { name: "ping" }] } : { text: "pong" } });
+  if (msg.method === "shutdown") process.exit(0);
+}
+`,
+    );
+    const reports: string[] = [];
+    const host = await openPluginHost({ home, root, cwd: root, disabled: new Set(), trust: new MemoryTrustStore(), confirm: async () => true, report: (kind, text) => void reports.push(`${kind}: ${text}`) });
+    try {
+      const loaded = await host.load();
+      const jade = await createJade({ cwd: root, home, store: new MemoryLogStore(), provider: scripted([]).provider, env: {}, extensions: loaded });
+      const ctx = { sessionId: "s", cwd: root, signal: new AbortController().signal, derived: {}, ui: {} as never, note: () => {} };
+      expect(await jade.commands.get("ping")!.command.run("", ctx as never)).toBe("pong");
+      await expect(Promise.resolve(jade.commands.get("die")!.command.run("", ctx as never))).rejects.toThrow();
+      const proc = loaded.find((p) => p.id === "me/dies")!;
+      while (!proc.process!.exited) await new Promise((r) => setTimeout(r, 20));
+      expect(proc.process!.exited).toEqual({ code: 3, signal: null });
+      expect(reports).toEqual(["warning: plugin me/dies exited (code 3); its hooks fail until jade restarts. /plugins shows its stderr"]);
+      // 之后的调用按出错处理；再加载也是同一个（已经退出的）进程，不重启
+      await expect(Promise.resolve(jade.commands.get("ping")!.command.run("", ctx as never))).rejects.toThrow();
+      expect(await host.load()).toBe(loaded);
+      const next = await createJade({ cwd: root, home, store: new MemoryLogStore(), provider: scripted([]).provider, env: {}, extensions: loaded });
+      await expect(Promise.resolve(next.commands.get("ping")!.command.run("", ctx as never))).rejects.toThrow();
+      expect(reports).toHaveLength(1);
+      jade.shutdown();
+      next.shutdown();
+    } finally {
+      await host.close();
     }
   }, 20_000);
 });

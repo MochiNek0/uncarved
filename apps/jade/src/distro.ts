@@ -149,14 +149,20 @@ export interface Jade {
 }
 
 /**
- * 加入本会话的一个第三方插件实例。检查过的快捷键和命令放在这里，不写回实例：
- * 进程外插件的实例是在会话之间共用的进程对象，它的快捷键和命令每套单独生成（LoadedPlugin.adapters）
+ * 加入本会话的一个第三方插件实例，和 jade 从它上面检查过、留下的扩展点。jade 只用这里的，不改写实例：
+ * 进程外插件的实例是在会话之间共用的进程对象（它的快捷键和命令每套单独生成，见 LoadedPlugin.adapters），
+ * 项目层插件的实例是内核认的那个对象（宪法 7.1）。不合格的扩展点不在这里，并且已经给出警告
  */
 export interface Extension {
   source: LoadedPlugin;
   plugin: JadePlugin;
   commands: PluginCommand[];
   keys: PluginKey[];
+  renderers: ToolRenderer[];
+  /** 只有用户层插件的 */
+  responder?: Responder;
+  beforeSend?: NonNullable<JadePlugin["beforeSend"]>;
+  suggest?: Suggester;
 }
 
 export async function createJade(opts: JadeOptions): Promise<Jade> {
@@ -366,7 +372,7 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
   });
 
   thirdParty = [...(opts.projectPlugins ?? []), ...added.map((a) => a.plugin)];
-  const suggesters = added.flatMap(({ plugin }) => (plugin.suggest ? [{ plugin: plugin.id, suggest: plugin.suggest }] : []));
+  const suggesters = added.flatMap(({ plugin, suggest }) => (suggest ? [{ plugin: plugin.id, suggest }] : []));
   for (const extra of suggesters.slice(1)) warnings.push(`plugin ${extra.plugin}: suggest is ignored: plugin ${suggesters[0]!.plugin} already provides it`);
   const plugins = [...builtin, ...thirdParty];
   const commands = new Map<string, { plugin: string; command: PluginCommand; builtin: boolean }>();
@@ -400,11 +406,15 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
     builtins,
     extensions: added,
     commands,
-    responders: added.flatMap(({ plugin }) => (plugin.responder ? [{ plugin: plugin.id, responder: plugin.responder }] : [])),
+    responders: added.flatMap(({ plugin, responder }) => (responder ? [{ plugin: plugin.id, responder }] : [])),
     suggester: suggesters[0],
     keys,
-    renderers: new Map(([...builtin, ...added.map((a) => a.plugin)] as JadePlugin[]).flatMap((plugin) => (plugin.renderers ?? []).map((r) => [r.tool, { plugin: plugin.id, renderer: r }] as const))),
-    beforeSend: added.flatMap(({ plugin }) => (plugin.beforeSend ? [{ plugin: plugin.id, fn: plugin.beforeSend.bind(plugin) }] : [])),
+    renderers: new Map(
+      [...(builtin as JadePlugin[]).map((p) => ({ id: p.id, renderers: p.renderers ?? [] })), ...added.map((a) => ({ id: a.plugin.id, renderers: a.renderers }))].flatMap((p) =>
+        p.renderers.map((r) => [r.tool, { plugin: p.id, renderer: r }] as const),
+      ),
+    ),
+    beforeSend: added.flatMap(({ plugin, beforeSend }) => (beforeSend ? [{ plugin: plugin.id, fn: beforeSend }] : [])),
     dispose: () => (disposing ??= Promise.all(added.map(({ source, plugin }) => disposeInstance(source, plugin))).then((ws) => ws.filter((w): w is string => w !== undefined))),
     tools: allTools,
     shutdown: shell.shutdown,
@@ -438,10 +448,8 @@ async function createExtensions(sources: LoadedPlugin[], host: HostContext, warn
       continue;
     }
     const plugin = created;
-    if (plugin.dispose !== undefined && typeof plugin.dispose !== "function") {
-      warnings.push(`${where}: dispose is ignored: it must be a function`);
-      delete plugin.dispose;
-    }
+    // disposeInstance 只调用函数：不合格的不用删
+    if (plugin.dispose !== undefined && typeof plugin.dispose !== "function") warnings.push(`${where}: dispose is ignored: it must be a function`);
     if (plugin.replaces !== undefined && !(Array.isArray(plugin.replaces) && plugin.replaces.every((x) => typeof x === "string"))) {
       warnings.push(`${where} is skipped: "replaces" must be an array of plugin ids`);
       await discard(source, plugin);
@@ -454,51 +462,45 @@ async function createExtensions(sources: LoadedPlugin[], host: HostContext, warn
       if (!ok) warnings.push(`${where}: command ${JSON.stringify(c?.name)} is ignored: it needs a name of letters, digits, - and _, and a run function`);
       return ok;
     });
+    let responder: Responder | undefined;
     if (plugin.responder !== undefined) {
       const r = plugin.responder as Partial<Record<string, unknown>> | null;
       const ok = typeof r === "object" && r !== null && ["approve", "ask"].every((k) => r[k] === undefined || typeof r[k] === "function");
       // 项目层插件随仓库来，不能替用户批准它自己要做的事
       if (source.layer === "project") warnings.push(`${where}: responder is ignored: only user plugins can answer approvals`);
       else if (!ok) warnings.push(`${where}: responder is ignored: approve and ask must be functions`);
-      if (source.layer === "project" || !ok) delete plugin.responder;
+      else responder = plugin.responder;
     }
-    // 模型服务不属于某套插件实例：改成在模块里导出（export const providers），加载时就注册
-    if ("providers" in plugin) {
-      warnings.push(`${where}: providers is ignored: export it from the plugin module instead (export const providers = [...])`);
-      delete (plugin as { providers?: unknown }).providers;
-    }
+    // 模型服务不属于某套插件实例：改成在模块里导出（export const providers），加载时就注册。jade 不读实例上的 providers
+    if ("providers" in plugin) warnings.push(`${where}: providers is ignored: export it from the plugin module instead (export const providers = [...])`);
     const keys = listOf(parts.keys).flatMap((k): PluginKey[] => {
       const key = typeof k?.key === "string" ? k.key.toLowerCase() : undefined;
       if (key !== undefined && KEY_SPEC.test(key) && !RESERVED_KEYS.has(key) && typeof k.run === "function") return [{ key, description: k.description, run: (ctx) => k.run(ctx) }];
       warnings.push(`${where}: key ${JSON.stringify(k?.key)} is ignored: it needs a run function and a key like ctrl+<letter> or alt+<letter or digit> that jade does not use itself`);
       return [];
     });
-    if (plugin.renderers !== undefined) {
-      const own = new Set((plugin.tools ?? []).map((t) => t.name));
-      const seen = new Set<string>();
-      const list = Array.isArray(plugin.renderers) ? plugin.renderers : [];
-      // 只认自己的工具：别的工具的显示（尤其是审批时的预览）不能由插件改
-      plugin.renderers = list.filter((r) => {
-        const tool = r?.tool;
-        const fns = ["summary", "details", "preview", "before", "result"].every((k) => (r as unknown as Record<string, unknown>)[k] === undefined || typeof (r as unknown as Record<string, unknown>)[k] === "function");
-        let why: string | undefined;
-        if (typeof tool !== "string" || !fns) why = "it needs a tool name, and summary, details, preview, before and result must be functions";
-        else if (!own.has(tool)) why = "a plugin can only render its own tools";
-        else if (seen.has(tool)) why = "the tool already has a renderer";
-        if (why) warnings.push(`${where}: renderer for ${JSON.stringify(tool)} is ignored: ${why}`);
-        else seen.add(tool!);
-        return !why;
-      });
-    }
-    if (plugin.beforeSend !== undefined && typeof plugin.beforeSend !== "function") {
-      warnings.push(`${where}: beforeSend is ignored: it must be a function`);
-      delete plugin.beforeSend;
-    }
-    if (plugin.suggest !== undefined && typeof (plugin.suggest as { next?: unknown } | null)?.next !== "function") {
-      warnings.push(`${where}: suggest is ignored: it needs a next function`);
-      delete plugin.suggest;
-    }
-    out.push({ source, plugin, commands, keys });
+    const own = new Set((plugin.tools ?? []).map((t) => t.name));
+    const seen = new Set<string>();
+    // 只认自己的工具：别的工具的显示（尤其是审批时的预览）不能由插件改
+    const renderers = listOf(plugin.renderers).filter((r) => {
+      const tool = r?.tool;
+      const fields = r as unknown as Record<string, unknown> | undefined;
+      const fns = Boolean(fields) && ["summary", "details", "preview", "before", "result"].every((k) => fields![k] === undefined || typeof fields![k] === "function");
+      let why: string | undefined;
+      if (typeof tool !== "string" || !fns) why = "it needs a tool name, and summary, details, preview, before and result must be functions";
+      else if (!own.has(tool)) why = "a plugin can only render its own tools";
+      else if (seen.has(tool)) why = "the tool already has a renderer";
+      if (why) warnings.push(`${where}: renderer for ${JSON.stringify(tool)} is ignored: ${why}`);
+      else seen.add(tool!);
+      return !why;
+    });
+    let beforeSend: Extension["beforeSend"];
+    if (typeof plugin.beforeSend === "function") beforeSend = plugin.beforeSend.bind(plugin);
+    else if (plugin.beforeSend !== undefined) warnings.push(`${where}: beforeSend is ignored: it must be a function`);
+    let suggest: Suggester | undefined;
+    if (typeof (plugin.suggest as { next?: unknown } | null | undefined)?.next === "function") suggest = plugin.suggest;
+    else if (plugin.suggest !== undefined) warnings.push(`${where}: suggest is ignored: it needs a next function`);
+    out.push({ source, plugin, commands, keys, renderers, responder, beforeSend, suggest });
   }
   return out;
 }

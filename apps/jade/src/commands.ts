@@ -13,6 +13,8 @@
 
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
+import type { Jade } from "./distro.ts";
+import type { CommandInfo } from "./ui/screen.ts";
 
 export interface CustomCommand {
   name: string;
@@ -117,4 +119,26 @@ export function projectDirs(root: string, cwd: string): string[] {
   const dirs = [root];
   if (rel) for (const seg of rel.split(path.sep)) dirs.push(path.join(dirs.at(-1)!, seg));
   return dirs;
+}
+
+/**
+ * 斜杠命令同名时谁生效：宿主命令 > 内置插件的命令 > 自定义命令和 skill > 第三方插件（第三方之间先到先得）。
+ * 内置插件和第三方插件之间的先后由 createJade 定（jade.commands 里内置插件优先；内置插件被代替或停用时，第三方插件可以用它的命令名）；
+ * 这里再让第三方插件给宿主命令、自定义命令和 skill 让位。返回菜单里内置插件的和第三方插件的命令，以及被忽略的命令的警告
+ */
+export function pluginMenu(
+  commands: Jade["commands"],
+  taken: { host: Set<string>; custom: { has(name: string): boolean }; skill: { has(name: string): boolean } },
+): { builtin: CommandInfo[]; plugins: CommandInfo[]; warnings: string[] } {
+  const out = { builtin: [] as CommandInfo[], plugins: [] as CommandInfo[], warnings: [] as string[] };
+  for (const [name, { plugin, command: c, builtin }] of commands) {
+    if (builtin) {
+      out.builtin.push({ name: c.name, args: c.args, about: c.description ?? "" });
+      continue;
+    }
+    const what = taken.host.has(name) ? "a built-in command" : taken.custom.has(name) ? "a custom command" : taken.skill.has(name) ? "a skill" : undefined;
+    if (what) out.warnings.push(`command /${c.name} of plugin ${plugin} is ignored: ${what} has that name`);
+    else out.plugins.push({ name: c.name, args: c.args, about: `${c.description ?? ""} (plugin ${plugin})`.trim() });
+  }
+  return out;
 }
