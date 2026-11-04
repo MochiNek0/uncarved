@@ -60,8 +60,8 @@ async function setup() {
     input: { text: () => "", insert: (t) => void ui.typed.push(t), set: (t) => void ui.typed.push(t) },
     warn: (w) => void ui.warnings.push(w),
   };
-  /** 让下一次恢复会话失败（只影响带 id 的 open） */
-  const failing = { resume: false };
+  /** 让恢复会话（带 id 的 open）、开始新会话（不带 id 的 open）失败 */
+  const failing = { resume: false, create: false };
   const deps: LifecycleDeps<string> = {
     prepare: async () => {
       const scope = new SessionScope(host);
@@ -70,6 +70,7 @@ async function setup() {
     },
     open: async (plugins, id) => {
       if (id && failing.resume) throw new Error(`cannot resume ${id}`);
+      if (!id && failing.create) throw new Error("cannot start a session");
       return id ? Runtime.resume({ store, provider, plugins, sessionId: id }) : Runtime.create({ store, provider, plugins });
     },
     discard: async () => false,
@@ -196,10 +197,53 @@ describe("session lifecycle matrix", () => {
     expect(take()).toEqual([]);
     expect(sessions.current.sessionId).toBe(id);
     expect(sessions.scope.state).toBe("active");
+    expect(sessions.left).toBe(false);
     expect(ui.status).toEqual(["me/probe=#1"]);
     await sessions.leave();
     await sessions.settled();
     expect(ui.warnings).toEqual([]);
     expect(ui.errors).toEqual([]);
+  });
+
+  test("reload that cannot open any session: the session is left once, then /clear or reload recovers", async () => {
+    const { ui, deps, failing, take } = await setup();
+    const sessions = await SessionLifecycle.prepare(deps);
+    const id = (await sessions.begin()).sessionId;
+    take();
+
+    // 恢复和新会话都失败：新的一套收掉，抛出；当前会话已经收尾（只一次），left
+    failing.resume = failing.create = true;
+    await expect(sessions.reload(undefined)).rejects.toThrow("cannot start a session");
+    await sessions.settled();
+    expect(take()).toEqual(["create #2", "abort #1: the session was reloaded", "detached #1", "dispose #1", "abort #2: the session ended", "dispose #2"]);
+    expect(sessions.left).toBe(true);
+
+    // 再 reload：不再收尾已经离开的会话（不会 SessionDetached），恢复成功
+    failing.resume = failing.create = false;
+    expect(await sessions.reload(undefined)).toEqual({});
+    expect(take()).toEqual(["create #3"]);
+    expect(sessions.left).toBe(false);
+    expect(sessions.current.sessionId).toBe(id);
+    expect(ui.status).toEqual(["me/probe=#3"]);
+
+    // 再失败一次，这回用 /clear 恢复；离开（退出）也不再收尾一次
+    failing.resume = failing.create = true;
+    await expect(sessions.reload(undefined)).rejects.toThrow();
+    await sessions.settled();
+    take();
+    expect(await sessions.leave()).toBe(true);
+    expect(take()).toEqual([]);
+    failing.resume = failing.create = false;
+    expect(await sessions.switchTo(undefined, undefined)).toEqual({ previous: id, kept: true });
+    expect(take()).toEqual(["create #5"]);
+    expect(sessions.left).toBe(false);
+    expect(sessions.current.sessionId).not.toBe(id);
+    expect(ui.status).toEqual(["me/probe=#5"]);
+
+    await sessions.leave();
+    await sessions.settled();
+    expect(take()).toEqual(["abort #5: the session ended", "detached #5", "dispose #5"]);
+    expect(ui.errors).toEqual([]);
+    expect(ui.warnings).toEqual([]);
   });
 });

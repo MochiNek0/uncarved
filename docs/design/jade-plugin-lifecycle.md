@@ -167,7 +167,7 @@ commit
 | 启动 | ✓ | 只有第 3 步 | 没有旧 scope |
 | `/clear` | ✓ | ✓ | |
 | `/resume` | ✓（`Runtime.resume`） | ✓ | 失败时 rollback，留在当前会话。要换到当前会话本身时直接拒绝，不 prepare：同一个会话不能同时由两个 Runtime 打开 |
-| reload | ✓（resume 当前会话） | ✓ | 需要先 detach 当前 Runtime 才能 resume，所以先做第 1、2 步，再 prepare；prepare 失败时新建会话（和现在一样） |
+| reload | ✓（resume 当前会话） | ✓ | 需要先 detach 当前 Runtime 才能 resume，所以先做第 1、2 步，再 prepare；prepare 失败时新建会话（和现在一样）。新会话也开不了时，当前会话已经离开（`left`）：不再发消息，再 reload、`/clear` 或 `/resume` 时不会再收尾一次 |
 | 退出 | — | 第 1、2 步，然后**等待** dispose | 退出要等 dispose 完成，最多 5 秒 |
 
 这个流程只在一处实现（例如 `SessionScope` 加上 `main.ts` 里的一个 `replaceSession(prepare)`）。`leave`、`switchSession`、`reloadSession` 和 `abortKeys` 都改为调用它。

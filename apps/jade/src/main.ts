@@ -1046,7 +1046,16 @@ async function switchSession(id?: string) {
  */
 async function reloadSession() {
   await flushPendingMode();
-  const { error } = await sessions.reload(settings().mode);
+  let error: unknown;
+  try {
+    ({ error } = await sessions.reload(settings().mode));
+  } catch (err) {
+    // 没换成新的插件实例时（prepare 失败）当前会话照常；已经离开当前会话、新会话也开不了时，只能等用户再试
+    if (!sessions.left) throw err;
+    screen.log(red(`[error] could not reload the session or start a new one: ${errorText(err)}`));
+    screen.log("Use /clear or /resume to continue.");
+    return;
+  }
   adopt(sessions.current);
   if (error !== undefined) {
     screen.log(red(`[error] could not reload the session: ${errorText(error)}; starting a new one`));
@@ -1185,6 +1194,8 @@ function pluginSend(plugin: string, text: string) {
 const canRetry = () => rt.phase === "idle" && rt.state.messages.at(-1)?.role === "user";
 
 async function drive(input: UserInput) {
+  // 重新加载失败后没有可用的会话（见 reloadSession）
+  if (sessions.left) return screen.log(red("[error] there is no open session. Use /clear or /resume to continue."));
   // 计时从这次输入开始，不接着上一条排队消息的
   screen.busy(undefined);
   screen.busy("Working");
