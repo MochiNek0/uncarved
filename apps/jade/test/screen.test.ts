@@ -78,3 +78,12 @@ test("safeScreen keeps escape sequences that are split across stream chunks, and
   s.draft!.insert("x\r\ny");
   expect(seen).toEqual([["set", "line1\nline2"], ["insert", "x\ny"]]);
 });
+
+test("safeScreen puts plain text into the input box: colors are dropped too", () => {
+  const seen: unknown[] = [];
+  const rec = (name: string) => (...args: unknown[]) => void seen.push([name, ...args]);
+  const s = safeScreen({ interactive: true, draft: { text: () => "", insert: rec("insert"), set: rec("set") } } as unknown as Screen);
+  s.draft!.set("\x1b[31mfix\x1b[0m it");
+  s.draft!.insert("a\x1b[2J\x1b[1mb\x1b[22m");
+  expect(seen).toEqual([["set", "fix it"], ["insert", "ab"]]);
+});

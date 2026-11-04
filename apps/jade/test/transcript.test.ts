@@ -196,3 +196,17 @@ test("clipStyled counts only visible characters and resets colors it cuts off", 
   expect(clipStyled(g("abc") + g("def"), 4)).toBe(`${g("abc")}\x1b[32md…\x1b[0m`);
   expect(clipStyled("abcdef", 3)).toBe("abc…");
 });
+
+test("a plugin's colored result line is clipped by visible characters, never inside a color sequence", () => {
+  const amended: string[] = [];
+  const noop = () => {};
+  const screen = { interactive: false, log: noop, amend: (_id: string, text: string) => amended.push(text), progress: noop, stream: noop, endStream: noop, busy: noop, status: noop } as unknown as Screen;
+  const g = (s: string) => `\x1b[32m${s}\x1b[39m`;
+  const renderer: ToolRenderer = { tool: "deploy", result: () => ({ line: "x".repeat(198) + g("hello") }) };
+  const t = transcript({ screen, cwd: "/", store: new MemoryLogStore(), contextWindow: () => 100_000, canRetry: () => false, renderer: (tool) => (tool === "deploy" ? { plugin: "x/deploy", renderer } : undefined) });
+  const event = (type: string, data: unknown) => t.onNotice({ type: "event", event: { type, data, origin: { by: "kernel" } } as unknown as LogEvent });
+  event("model.responded", { content: [{ kind: "tool_use", id: "d1", name: "deploy", input: {} }], usage: {} });
+  event("tool.decided", { toolUseId: "d1", input: {}, decision: "allow", decidedBy: "policy" });
+  event("tool.completed", { toolUseId: "d1", content: [{ kind: "text", text: "ok" }], isError: false });
+  expect(amended.at(-1)).toContain(`${"x".repeat(198)}\x1b[32mhe…\x1b[0m`);
+});

@@ -3,6 +3,7 @@
 // - 纯文本（这里）：-p 和非交互运行时使用，逐行输出，提问用 readline
 
 import { createInterface, type Interface } from "node:readline/promises";
+import { stripVTControlCharacters } from "node:util";
 
 export interface Choice<T> {
   label: string;
@@ -123,6 +124,7 @@ export function safeScreen(screen: Screen): Screen {
   const s = terminalSafe;
   const opt = (v: string | undefined) => (v === undefined ? undefined : s(v));
   const lf = (t: string) => t.replace(/\r\n?/g, "\n");
+  const plain = (t: string) => stripVTControlCharacters(s(t));
   /** 流式文字末尾还没写完的转义序列，等下一段 */
   let held: { kind: "text" | "thinking"; text: string } | undefined;
   return {
@@ -162,8 +164,9 @@ export function safeScreen(screen: Screen): Screen {
         o && { ...o, body: opt(o.body) },
       ),
     input: (title, o) => screen.input(s(title), o && { ...o, initial: opt(o.initial), placeholder: opt(o.placeholder) }),
-    // 输入框里的 \r 是换行（旧 Mac 的换行符），不是进度条：先换成 \n，terminalSafe 才不会只留最后一段
-    draft: screen.draft && { text: () => screen.draft!.text(), insert: (t) => screen.draft!.insert(s(lf(t))), set: (t) => screen.draft!.set(s(lf(t))) },
+    // 输入框里的 \r 是换行（旧 Mac 的换行符），不是进度条：先换成 \n，terminalSafe 才不会只留最后一段。
+    // 输入框里是要发给模型的纯文字，颜色也去掉
+    draft: screen.draft && { text: () => screen.draft!.text(), insert: (t) => screen.draft!.insert(plain(lf(t))), set: (t) => screen.draft!.set(plain(lf(t))) },
     clear: () => screen.clear(),
     close: () => screen.close(),
   };

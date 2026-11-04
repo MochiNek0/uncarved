@@ -364,7 +364,7 @@ export function transcript(opts: TranscriptOptions): Transcript {
         if (mine && typeof mine.line === "string") {
           const own = typeof mine.details === "string" && mine.details ? [mine.details.replace(/^/gm, "    ")] : [];
           const folded = [...(call ? [call] : []), ...own].join("\n") || undefined;
-          screen.amend(d.toolUseId, (d.isError ? red : dim)("⎿ ") + clip(mine.line.split("\n")[0]!, 200), { details: folded });
+          screen.amend(d.toolUseId, (d.isError ? red : dim)("⎿ ") + clipStyled(mine.line.split("\n")[0]!, 200), { details: folded });
           return;
         }
         const lines = text.split("\n");

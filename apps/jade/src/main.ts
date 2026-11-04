@@ -1098,6 +1098,7 @@ async function quit(code = 0) {
 async function switchSession(id?: string) {
   await flushPendingMode();
   const mode = settings().mode;
+  const current = { generation: jadeGeneration, status: [...pluginStatus] };
   const next = await makeJade(mode);
   let nextRt: Runtime;
   try {
@@ -1106,6 +1107,11 @@ async function switchSession(id?: string) {
       : await Runtime.create({ store, provider, plugins: next.plugins });
   } catch (err) {
     next.shutdown();
+    // 留在当前会话：当前的插件实例继续能改输入框、发消息、设状态，状态栏换回它们设置的
+    jadeGeneration = current.generation;
+    pluginStatus.clear();
+    for (const [p, t] of current.status) pluginStatus.set(p, t);
+    screen.status({ plugins: current.status.map(([p, t]) => ({ plugin: p, text: t })) });
     return screen.log(red(`[error] could not resume ${id}: ${errorText(err)}`));
   }
   const kept = await leave();

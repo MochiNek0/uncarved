@@ -202,6 +202,65 @@ describe("model configuration", () => {
     }
   });
 
+  test("/model keeps a saved plugin service whose plugin is not loaded this time", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "jade-models-unloaded-"));
+    const envFile = path.join(dir, ".env");
+    const modelsFile = path.join(dir, "models.json");
+    const keys = ["JADE_PROVIDER", "OPENAI_COMPAT_BASE_URL", "OPENAI_COMPAT_API_KEY", "OPENAI_COMPAT_MODEL", "JADE_MAX_TOKENS", "JADE_EFFORT", "JADE_CONTEXT_WINDOW", "OPENAI_COMPAT_EXTRA_BODY", "FOO_KEY", "FOO_MODEL"];
+    const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+    clearProviders();
+    try {
+      for (const k of keys) delete process.env[k];
+      await updateEnvFile(envFile, { JADE_PROVIDER: "openai-compat", OPENAI_COMPAT_BASE_URL: "http://a/v1", OPENAI_COMPAT_MODEL: "alpha" });
+      registerProviders([
+        {
+          plugin: "x/foo",
+          def: {
+            kind: "foo",
+            model: (env) => env.FOO_MODEL ?? "",
+            create: () => ({ id: "foo", complete: async () => ({ model: "f", content: [], stopReason: "end" }) }),
+            settings: [
+              { env: "FOO_KEY", label: "Foo API key", secret: true, required: true },
+              { env: "FOO_MODEL", label: "Model", model: true },
+            ],
+          },
+        },
+      ]);
+      const answers: unknown[] = [];
+      const inputs: (string | undefined)[] = [];
+      const screen = {
+        log: () => {},
+        select: async (_t: string, choices: { label: string; value: unknown }[]) => {
+          const want = answers.shift();
+          return typeof want === "function" ? (want as (c: typeof choices) => unknown)(choices) : want;
+        },
+        input: async () => inputs.shift(),
+      } as unknown as Screen;
+      const pickLabel = (label: string) => (c: { label: string; value: unknown }[]) => c.find((x) => x.label === label)!.value;
+      const configure = configurator({ screen, envFile, modelsFile, apply: async () => {}, contextWindow: () => 1, onApplied: () => {} });
+      answers.push(pickLabel("Add a model…"), pickLabel("Another service…"), pickLabel("foo"));
+      inputs.push("sekret", "f1");
+      await configure.model(undefined);
+      await configure.model("alpha");
+      // 插件这次没加载：打开 /model（会把当前的模型记下来）、换模型都不能删掉它的服务和密钥
+      clearProviders();
+      await configure.model(undefined);
+      await configure.model("beta");
+      const services = (JSON.parse(await readFile(modelsFile, "utf8")) as { services: { env: Record<string, string> }[] }).services;
+      expect(services.find((s) => s.env.JADE_PROVIDER === "foo")?.env.FOO_KEY).toBe("sekret");
+      // 插件回来以后能直接切回去
+      registerProviders([{ plugin: "x/foo", def: { kind: "foo", model: (env) => env.FOO_MODEL ?? "", create: () => ({ id: "foo", complete: async () => ({ model: "f", content: [], stopReason: "end" }) }), settings: [{ env: "FOO_KEY", label: "Foo API key", secret: true }, { env: "FOO_MODEL", label: "Model", model: true }] } }]);
+      await configure.model("f1");
+      expect([process.env.JADE_PROVIDER, process.env.FOO_KEY, process.env.FOO_MODEL]).toEqual(["foo", "sekret", "f1"]);
+    } finally {
+      clearProviders();
+      for (const k of keys) {
+        if (saved[k] === undefined) delete process.env[k];
+        else process.env[k] = saved[k];
+      }
+    }
+  });
+
   test("/model groups models by service, keeps each model's own settings and switches back", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "jade-models-"));
     const envFile = path.join(dir, ".env");
