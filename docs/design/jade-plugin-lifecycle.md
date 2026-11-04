@@ -166,7 +166,7 @@ commit
 |---|---|---|---|
 | 启动 | ✓ | 只有第 3 步 | 没有旧 scope |
 | `/clear` | ✓ | ✓ | |
-| `/resume` | ✓（`Runtime.resume`） | ✓ | 失败时 rollback，留在当前会话 |
+| `/resume` | ✓（`Runtime.resume`） | ✓ | 失败时 rollback，留在当前会话。要换到当前会话本身时直接拒绝，不 prepare：同一个会话不能同时由两个 Runtime 打开 |
 | reload | ✓（resume 当前会话） | ✓ | 需要先 detach 当前 Runtime 才能 resume，所以先做第 1、2 步，再 prepare；prepare 失败时新建会话（和现在一样） |
 | 退出 | — | 第 1、2 步，然后**等待** dispose | 退出要等 dispose 完成，最多 5 秒 |
 

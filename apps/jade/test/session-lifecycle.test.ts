@@ -185,4 +185,21 @@ describe("session lifecycle matrix", () => {
     expect(take()).toEqual(["create #1", "abort #1: the session ended", "dispose #1"]);
     expect(() => sessions.current).toThrow("the session has not begun");
   });
+
+  test("switching to the current session is refused before any plugin is created", async () => {
+    const { ui, deps, take } = await setup();
+    const sessions = await SessionLifecycle.prepare(deps);
+    const id = (await sessions.begin()).sessionId;
+    take();
+    // 插件经 session.resume 直接要当前会话：不创建新的一套，当前会话不受影响（没中止、没收尾）
+    await expect(sessions.switchTo(id, undefined)).rejects.toThrow(`${id} is the current session`);
+    expect(take()).toEqual([]);
+    expect(sessions.current.sessionId).toBe(id);
+    expect(sessions.scope.state).toBe("active");
+    expect(ui.status).toEqual(["me/probe=#1"]);
+    await sessions.leave();
+    await sessions.settled();
+    expect(ui.warnings).toEqual([]);
+    expect(ui.errors).toEqual([]);
+  });
 });
