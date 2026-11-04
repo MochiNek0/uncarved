@@ -106,14 +106,23 @@ export function collectProviders(sources: readonly LoadedPlugin[]): { providers:
       warnings.push(`${where}: providers is ignored: it must be an array`);
       return [];
     }
-    return (source.providers as PluginProvider[])
-      .filter((d) => {
-        const ok = d && typeof d.kind === "string" && PROVIDER_KIND.test(d.kind) && typeof d.model === "function" && typeof d.create === "function";
-        if (!ok) warnings.push(`${where}: provider ${JSON.stringify(d?.kind)} is ignored: it needs a kind of letters, digits, - and _, and model and create functions`);
-        else if (d.settings !== undefined) d.settings = providerSettings(d.settings, `${where}: provider ${d.kind}`, warnings);
-        return ok;
-      })
-      .map((def) => ({ plugin: source.id, def }));
+    return (source.providers as PluginProvider[]).flatMap((d) => {
+      const ok = d && typeof d.kind === "string" && PROVIDER_KIND.test(d.kind) && typeof d.model === "function" && typeof d.create === "function";
+      if (!ok) {
+        warnings.push(`${where}: provider ${JSON.stringify(d?.kind)} is ignored: it needs a kind of letters, digits, - and _, and model and create functions`);
+        return [];
+      }
+      // 不改插件导出的对象：用检查过的字段另做一个，方法绑定到原对象（插件的方法里可能用 this）
+      const def: PluginProvider = {
+        kind: d.kind,
+        model: d.model.bind(d),
+        create: d.create.bind(d),
+        ...(typeof d.via === "function" ? { via: d.via.bind(d) } : {}),
+        ...(typeof d.listModels === "function" ? { listModels: d.listModels.bind(d) } : {}),
+        ...(d.settings !== undefined ? { settings: providerSettings(d.settings, `${where}: provider ${d.kind}`, warnings) } : {}),
+      };
+      return [{ plugin: source.id, def }];
+    });
   });
   return { providers, warnings };
 }
