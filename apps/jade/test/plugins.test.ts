@@ -6,7 +6,7 @@ import { existsSync, realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { MemoryLogStore, MemoryTrustStore, readAll, Runtime, type Block, type ModelRequest, type ModelResponse, type Provider } from "uncarved";
-import { clearProviders, collectProviders, createJade, DISPOSE_TIMEOUT_MS, discoverPlugins, listModels, loadPlugin, providerFromEnv, providerInfo, registerProviders, resolvePlugins, SEARCH_PROVIDERS, visionFromEnv, type FoundPlugin, type LoadedPlugin } from "../src/index.ts";
+import { clearProviders, collectProviders, createJade, DISPOSE_TIMEOUT_MS, discoverPlugins, listModels, loadPlugin, openPluginHost, pluginProviders, providerFromEnv, providerInfo, registerProviders, resolvePlugins, SEARCH_PROVIDERS, visionFromEnv, type FoundPlugin, type LoadedPlugin } from "../src/index.ts";
 import type { HostContext, SessionControl } from "../src/plugins/loader.ts";
 
 const MODEL = { by: "model", provider: "scripted", model: "scripted-1" } as const;
@@ -987,6 +987,85 @@ for await (const line of createInterface({ input: process.stdin })) {
       jade.shutdown();
     } finally {
       await loaded.close!();
+    }
+  }, 20_000);
+});
+
+describe("plugin host (process scope)", () => {
+  test("reads manifests before loading, loads once, registers user providers, reports project ones, and closes processes quietly", async () => {
+    const { cwd: root, home } = await dirs();
+    const write = async (dir: string, files: Record<string, string>) => {
+      for (const [name, text] of Object.entries(files)) {
+        await mkdir(path.dirname(path.join(dir, name)), { recursive: true });
+        await writeFile(path.join(dir, name), text);
+      }
+      return dir;
+    };
+    const svc = (kind: string) => `{ kind: "${kind}", model: () => "m", create: () => ({ id: "${kind}", complete: async () => ({ model: "m", content: [], stopReason: "end" }) }) }`;
+    await write(path.join(home, "plugins", "svc"), {
+      "plugin.json": JSON.stringify({ id: "me/svc", version: "1.0.0" }),
+      "index.js": `export const providers = [${svc("host-svc")}];\nexport default (ctx) => ctx.definePlugin({});\n`,
+    });
+    // 项目层插件导出的服务不认，但要提示；为了读出它，模块不能被执行第二次
+    await write(path.join(root, ".jade", "plugins", "repo-svc"), {
+      "plugin.json": JSON.stringify({ id: "repo/svc", version: "1.0.0" }),
+      "index.js": `globalThis.__jadeRepoRuns = (globalThis.__jadeRepoRuns ?? 0) + 1;\nexport const providers = [${svc("repo-svc")}];\nexport default (ctx) => ctx.definePlugin({});\n`,
+    });
+    await write(path.join(home, "plugins", "proc"), {
+      "plugin.json": JSON.stringify({ id: "me/proc", command: process.execPath, args: ["main.ts"] }),
+      "main.ts": `import { createInterface } from "node:readline";
+const send = (m) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...m }) + "\\n");
+for await (const line of createInterface({ input: process.stdin })) {
+  const msg = JSON.parse(line);
+  if (msg.id === undefined) continue;
+  send({ id: msg.id, result: msg.method === "initialize" ? { id: "me/proc", version: "1.0.0", kernel: "^0.1", hooks: [] } : {} });
+  if (msg.method === "shutdown") process.exit(0);
+}
+`,
+    });
+    await write(path.join(home, "plugins", "kit"), { "skills/deploy/SKILL.md": "---\nname: deploy\ndescription: d\n---\n" });
+    await write(path.join(home, "plugins", "broken"), { "index.js": "export default {};" });
+    await write(path.join(home, "plugins", "off"), { "plugin.json": JSON.stringify({ id: "me/off", version: "1.0.0" }), "index.js": "throw new Error('disabled plugins must not run');" });
+
+    const reports: string[] = [];
+    clearProviders();
+    const host = await openPluginHost({
+      home,
+      root,
+      cwd: root,
+      disabled: new Set(["me/off"]),
+      trust: new MemoryTrustStore(),
+      confirm: async () => true,
+      report: (kind, text) => void reports.push(`${kind}: ${text}`),
+    });
+    try {
+      // 清单读完就知道带了什么内容，不用等加载
+      expect(host.plugins.map((p) => p.id)).toEqual(["kit", "me/proc", "me/svc", "repo/svc"]);
+      expect(host.bundled((b) => b.skills).map((b) => b.plugin)).toEqual(["kit"]);
+      expect(host.loaded).toEqual([]);
+      expect(reports).toEqual([]);
+
+      const loaded = await host.load();
+      expect(await host.load()).toBe(loaded);
+      expect(loaded.map((p) => p.id)).toEqual(["kit", "me/proc", "me/svc", "repo/svc"]);
+      expect(host.loaded).toEqual(loaded);
+      expect(pluginProviders().map((p) => `${p.plugin}:${p.def.kind}`)).toEqual(["me/svc:host-svc"]);
+      expect((globalThis as { __jadeRepoRuns?: number }).__jadeRepoRuns).toBe(1);
+      expect(reports).toEqual([
+        expect.stringMatching(/^skipped: plugin .*broken: plugin\.json: "id" is required/),
+        "warning: plugin repo/svc (project): providers are ignored: only user plugins can provide model services",
+      ]);
+
+      const proc = loaded.find((p) => p.id === "me/proc")!;
+      await host.close();
+      await host.close();
+      expect(proc.process!.exited).toBeDefined();
+      // 关闭时进程退出是预期的，不报告
+      expect(reports).toHaveLength(2);
+    } finally {
+      await host.close();
+      clearProviders();
+      delete (globalThis as { __jadeRepoRuns?: number }).__jadeRepoRuns;
     }
   }, 20_000);
 });

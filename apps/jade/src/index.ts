@@ -27,3 +27,4 @@ export * from "./plugins/install.ts";
 export * from "./plugins/builtins.ts";
 export * from "./mcp.ts";
 export * from "./skills.ts";
+export * from "./plugins/host.ts";

@@ -15,7 +15,6 @@ import {
   readAll,
   Runtime,
   RuntimeBusy,
-  UntrustedPlugin,
   type Block,
   type Plugin,
   type Provider,
@@ -23,20 +22,21 @@ import {
 } from "uncarved";
 import { realpathSync } from "node:fs";
 import { expandCommand, loadCommands } from "./commands.ts";
-import { discoverPlugins, loadPlugin, resolvePlugins, type LoadedPlugin, type PluginBundle, type SessionControl } from "./plugins/loader.ts";
+import { type PluginBundle, type SessionControl } from "./plugins/loader.ts";
+import { openPluginHost } from "./plugins/host.ts";
 import { readPluginSettings } from "./plugins/install.ts";
 import { PLUGIN_HELP, pluginCli, UsageError } from "./plugin-cli.ts";
 import { describeServer, loadMcpConfig, McpClient, mcpTrustHash } from "./mcp.ts";
 import { loadSkills } from "./skills.ts";
 import { hasProvider, loadEnvFile, parseTokens, updateEnvFile } from "./config.ts";
-import { collectProviders, createJade, type Jade } from "./distro.ts";
+import { createJade, type Jade } from "./distro.ts";
 import { firstAnswer } from "./respond.ts";
 import { describeRule, MODES, POLICY_KEY, type AllowRule, type Mode, type PolicySettings } from "./plugins/policy.ts";
 import { compactThreshold, contextWindowFromEnv, contextWindowInfo, isContextOverflow } from "./context.ts";
 import { InputHistory } from "./history.ts";
 import { attachMentions, mentionCandidates } from "./mentions.ts";
 import { repoRoot } from "./plugins/prompts.ts";
-import { isBuiltinKind, isRateLimit, pluginProvider, providerFromEnv, providerInfo, providerKind, RateGate, registerProviders, rpmFromEnv, switchable, withRetry } from "./provider.ts";
+import { isBuiltinKind, isRateLimit, pluginProvider, providerFromEnv, providerInfo, providerKind, RateGate, rpmFromEnv, switchable, withRetry } from "./provider.ts";
 import { ago, discardIfEmpty, matchSession, SessionIndex } from "./sessions.ts";
 import { display } from "./tools/fs.ts";
 import type { ApproveSubagent, SubagentApproval } from "./tools/task.ts";
@@ -221,13 +221,33 @@ const inputs = new InputHistory(path.join(home, "history.jsonl"), cwd);
 /** $JADE_HOME/plugins.json 里停用的插件和内置插件（id） */
 const disabledPlugins = new Set((await readPluginSettings(home)).disabled);
 const repo = realPath(await repoRoot(cwd));
+const trust = new JsonlTrustStore(path.join(home, "trust.jsonl"));
 /**
- * 第三方插件：先只读清单，不执行代码。按 id 停用的、id 重复的在这里就去掉，不加载，也不读它们带的内容；
- * 清单读不了的在 loadPlugins 里报告
+ * 第三方插件（进程级，见 plugins/host.ts）：这里只读清单，不执行代码，停用的不加载，也不读它们带的内容。
+ * 加载（项目层的要确认）在界面起来之后
  */
-const resolved = await resolvePlugins(await discoverPlugins({ home, root: repo, cwd: realPath(cwd) }), disabledPlugins);
-const foundPlugins = resolved.plugins;
-const bundled = (pick: (b: PluginBundle) => string[]) => foundPlugins.flatMap((f) => pick(f.info.bundle).map((dir) => ({ plugin: f.id, dir, layer: f.layer })));
+const plugins = await openPluginHost({
+  home,
+  root: repo,
+  cwd: realPath(cwd),
+  disabled: disabledPlugins,
+  trust,
+  confirm: async ({ path: p, hash, files, command }) =>
+    (await screen.select(
+      `Project plugin ${display(cwd, p)} is new or changed. Load and run it?`,
+      [
+        { label: "No", value: false },
+        { label: "Yes, load it", value: true },
+      ],
+      {
+        body: dim(`${command ? `runs: ${command}\n` : ""}sha256 ${hash.slice(0, 12)}, ${files.length} files:\n${files.map((f) => `  ${f}`).join("\n")}`),
+      },
+    )) ?? false,
+  report: (kind, text) => screen.log(kind === "note" ? dim(`[note] ${text}`) : yellow(`[${kind}] ${text}`)),
+  display: (dir) => display(cwd, dir),
+  untrustedHint: tui ? undefined : "(run jade interactively in this directory once to confirm it)",
+});
+const bundled = plugins.bundled;
 
 /** 自定义命令（$JADE_HOME/commands、.jade/commands、插件带的 commands/）；和内置命令同名的不生效 */
 const builtinNames = new Set([...COMMANDS.map((c) => c.name), ...BUILTIN_PLUGIN_COMMANDS]);
@@ -329,13 +349,13 @@ function retrying(inner: Provider) {
 const seconds = (ms: number) => (ms >= 60_000 ? `${Math.floor(ms / 60_000)}m${Math.round((ms % 60_000) / 1000) ? `${Math.round((ms % 60_000) / 1000)}s` : ""}` : `${Math.max(1, Math.round(ms / 1000))}s`);
 
 const store = new JsonlLogStore(path.join(home, "sessions"));
-const trust = new JsonlTrustStore(path.join(home, "trust.jsonl"));
 const index = new SessionIndex(path.join(home, "index.jsonl"));
 
-/** 正在结束进程外插件：这时它们退出是预期的，不提示 */
+/** 正在退出：这时 MCP 服务断开是预期的，不提示 */
 let pluginsClosing = false;
-// 插件、skill、MCP 服务同时加载：MCP 服务启动可能要好几秒。确认对话框一个接一个：MCP 的排在插件的后面
-const pluginsLoading = loadPlugins();
+// 插件、skill、MCP 服务同时加载：MCP 服务启动可能要好几秒。确认对话框一个接一个：MCP 的排在插件的后面。
+// 插件加载完就注册了它们导出的模型服务（不用创建插件实例），所以下面先配置好模型，再创建插件，工厂函数里也能用 ctx.complete
+const pluginsLoading = plugins.load();
 const mcpConnecting = connectMcp(pluginsLoading);
 const skillsLoading = loadSkills({ home, root: repo, cwd: realPath(cwd), plugins: bundled((b) => b.skills) });
 const pluginSources = await pluginsLoading;
@@ -423,10 +443,6 @@ const makeJade = (mode?: Mode) => {
 const warn = (list: string[]) => {
   for (const w of list) screen.log(yellow(`[warning] ${w}`));
 };
-// 插件提供的模型服务是插件模块导出的，加载时就读到了，不用创建插件实例：先注册、配置好模型，再创建插件，
-// 插件的工厂函数里也能用 ctx.complete。只注册一次，之后的会话共用（provider 是整个进程的）
-const collected = collectProviders(pluginSources);
-warn([...collected.warnings, ...registerProviders(collected.providers)]);
 if (!hasProvider()) {
   // 第一次运行：插件已经加载，/model 的服务列表里也有插件提供的
   screen.log(bold("Welcome to jade.") + " No model is configured yet; let's set one up.");
@@ -491,51 +507,10 @@ for (const [name, { plugin, command: c, builtin }] of jade.commands) {
 }
 ALL_COMMANDS.splice(COMMANDS.length, 0, ...builtinPluginCommands);
 
-/**
- * 第三方插件：$JADE_HOME/plugins/<name>/（用户层）和 .jade/plugins/<name>/（项目层）。
- * 项目层的首次加载及内容变化后要用户确认（7.1）。加载失败的跳过并提示，不影响启动
- */
-async function loadPlugins(): Promise<LoadedPlugin[]> {
-  for (const { found, error } of resolved.broken) screen.log(yellow(`[skipped] plugin ${display(cwd, found.dir)}: ${errorText(error)}`));
-  for (const w of resolved.warnings) screen.log(yellow(`[skipped] ${w}`));
-  const out: LoadedPlugin[] = [];
-  for (const f of foundPlugins) {
-    try {
-      const unsupported = f.info.bundle.unsupported;
-      if (unsupported.length) screen.log(dim(`[note] plugin ${f.id}: jade does not support its ${unsupported.join(" and ")} yet; they are ignored`));
-      out.push(
-        await loadPlugin(f, {
-          trust,
-          confirm: async ({ path: p, hash, files, command }) =>
-            (await screen.select(
-              `Project plugin ${display(cwd, p)} is new or changed. Load and run it?`,
-              [
-                { label: "No", value: false },
-                { label: "Yes, load it", value: true },
-              ],
-              {
-                body: dim(
-                  `${command ? `runs: ${command}\n` : ""}sha256 ${hash.slice(0, 12)}, ${files.length} files:\n${files.map((f) => `  ${f}`).join("\n")}`,
-                ),
-              },
-            )) ?? false,
-          onExit: (p, { code, signal }) => {
-            if (!pluginsClosing) screen.log(yellow(`[warning] plugin ${p.id} exited (${signal ?? `code ${code}`}); its hooks fail until jade restarts. /plugins shows its stderr`));
-          },
-        }),
-      );
-    } catch (err) {
-      const hint = f.layer === "project" && !tui && err instanceof UntrustedPlugin ? " (run jade interactively in this directory once to confirm it)" : "";
-      screen.log(yellow(`[skipped] plugin ${display(cwd, f.dir)}: ${errorText(err)}${hint}`));
-    }
-  }
-  return out;
-}
-
-/** 结束进程外插件的进程 */
+/** 结束进程外插件的进程和 MCP 服务 */
 async function closePlugins() {
   pluginsClosing = true;
-  await Promise.all([...pluginSources.map((p) => p.close?.().catch(() => {})), ...mcpClients.map((c) => c.close().catch(() => {}))]);
+  await Promise.all([plugins.close(), ...mcpClients.map((c) => c.close().catch(() => {}))]);
 }
 
 /**
@@ -546,11 +521,11 @@ async function closePlugins() {
  * dialogsAfter：在它完成之后才弹确认框，不和插件的确认框同时出现
  */
 async function connectMcp(dialogsAfter: Promise<unknown>): Promise<McpClient[]> {
-  const plugins = foundPlugins.flatMap((f) => {
+  const carried = plugins.plugins.flatMap((f) => {
     const mcp = f.info.bundle.mcp;
     return mcp ? [{ plugin: f.id, dir: f.dir, layer: f.layer, file: mcp.file, servers: mcp.servers }] : [];
   });
-  const { servers, warnings } = await loadMcpConfig({ home, root: repo, cwd: realPath(cwd), plugins });
+  const { servers, warnings } = await loadMcpConfig({ home, root: repo, cwd: realPath(cwd), plugins: carried });
   for (const w of warnings) screen.log(yellow(`[warning] ${w}`));
   const clients: McpClient[] = [];
   const connecting: Promise<unknown>[] = [];
