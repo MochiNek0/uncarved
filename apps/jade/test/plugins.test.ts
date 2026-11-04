@@ -659,3 +659,34 @@ describe("input box, keys and send", () => {
     jade.shutdown();
   });
 });
+
+describe("tool renderers", () => {
+  test("a plugin can only render its own tools, once each", async () => {
+    const { cwd, home } = await dirs();
+    const tool = { name: "deploy", description: "", inputSchema: { type: "object" }, effect: "read", concurrency: "safe", idempotent: true, execute: async () => ({ content: "" }) };
+    const summary = () => "x";
+    const loaded: LoadedPlugin = {
+      name: "deploy",
+      dir: path.join(home, "plugins", "deploy"),
+      layer: "user",
+      kind: "module",
+      entry: "index.ts",
+      info: { kind: "module", entry: "index.ts", json: {}, bundle: { skills: [], commands: [], unsupported: [] } },
+      create: async () =>
+        ({
+          id: "x/deploy",
+          version: "1.0.0",
+          kernel: "^0.1",
+          tools: [tool],
+          renderers: [{ tool: "deploy", summary }, { tool: "deploy", summary }, { tool: "bash", summary }, { tool: "deploy", result: "nope" }],
+        }) as never,
+    };
+    const jade = await createJade({ cwd, home, store: new MemoryLogStore(), provider: scripted([]).provider, env: {}, extensions: [loaded] });
+    expect([...jade.renderers].map(([k, v]) => `${k} ${v.plugin}`)).toEqual(["deploy x/deploy"]);
+    const warnings = jade.warnings.join("\n");
+    expect(warnings).toContain('renderer for "deploy" is ignored: the tool already has a renderer');
+    expect(warnings).toContain('renderer for "bash" is ignored: a plugin can only render its own tools');
+    expect(warnings).toContain('renderer for "deploy" is ignored: it needs a tool name, and summary, preview and result must be functions');
+    jade.shutdown();
+  });
+});

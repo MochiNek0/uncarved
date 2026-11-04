@@ -13,7 +13,7 @@ import { Memory, memoryTool } from "./memory.ts";
 import { mcpTools, type McpClient } from "./mcp.ts";
 import { skillTool, skillsPrompt, type Skill } from "./skills.ts";
 import { compactor, type Compactor } from "./plugins/compact.ts";
-import { COMMAND_NAME, JADE_VERSION, KEY_SPEC, RESERVED_KEYS, type HostContext, type InputControl, type PluginKey, type JadePlugin, type LoadedPlugin, type PluginCommand, type PluginProvider, type Responder, type Suggester } from "./plugins/loader.ts";
+import { COMMAND_NAME, JADE_VERSION, KEY_SPEC, RESERVED_KEYS, type HostContext, type InputControl, type PluginKey, type ToolRenderer, type JadePlugin, type LoadedPlugin, type PluginCommand, type PluginProvider, type Responder, type Suggester } from "./plugins/loader.ts";
 import { policy, type AllowRule, type Mode, type Policy, type PolicyOptions } from "./plugins/policy.ts";
 import { prompts, realPath, repoRoot } from "./plugins/prompts.ts";
 import { repeats } from "./plugins/repeats.ts";
@@ -126,6 +126,8 @@ export interface Jade {
   responders: { plugin: string; responder: Responder }[];
   /** 预测下一条消息的插件（只用第一个提供 suggest 的） */
   suggester?: { plugin: string; suggest: Suggester };
+  /** 第三方插件为自己的工具注册的显示方式，按工具名 */
+  renderers: Map<string, { plugin: string; renderer: ToolRenderer }>;
   /** 第三方插件的快捷键，按 KEY_SPEC 的写法（小写） */
   keys: Map<string, { plugin: string; key: PluginKey }>;
   /** 用户消息发出前依次处理它的插件 */
@@ -373,6 +375,7 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
     responders: added.flatMap(({ plugin }) => (plugin.responder ? [{ plugin: plugin.id, responder: plugin.responder }] : [])),
     suggester: suggesters[0],
     keys,
+    renderers: new Map(added.flatMap(({ plugin }) => (plugin.renderers ?? []).map((r) => [r.tool, { plugin: plugin.id, renderer: r }] as const))),
     beforeSend: added.flatMap(({ plugin }) => (plugin.beforeSend ? [{ plugin: plugin.id, fn: plugin.beforeSend.bind(plugin) }] : [])),
     providers: added.flatMap(({ plugin }) => (plugin.providers ?? []).map((def) => ({ plugin: plugin.id, def }))),
     tools: allTools,
@@ -441,6 +444,23 @@ async function createExtensions(sources: LoadedPlugin[], host: HostContext, disa
         if (!ok) warnings.push(`${where}: key ${JSON.stringify(k?.key)} is ignored: it needs a run function and a key like ctrl+<letter> or alt+<letter or digit> that jade does not use itself`);
         else k.key = key;
         return ok;
+      });
+    }
+    if (plugin.renderers !== undefined) {
+      const own = new Set((plugin.tools ?? []).map((t) => t.name));
+      const seen = new Set<string>();
+      const list = Array.isArray(plugin.renderers) ? plugin.renderers : [];
+      // 只认自己的工具：别的工具的显示（尤其是审批时的预览）不能由插件改
+      plugin.renderers = list.filter((r) => {
+        const tool = r?.tool;
+        const fns = ["summary", "preview", "result"].every((k) => (r as unknown as Record<string, unknown>)[k] === undefined || typeof (r as unknown as Record<string, unknown>)[k] === "function");
+        let why: string | undefined;
+        if (typeof tool !== "string" || !fns) why = "it needs a tool name, and summary, preview and result must be functions";
+        else if (!own.has(tool)) why = "a plugin can only render its own tools";
+        else if (seen.has(tool)) why = "the tool already has a renderer";
+        if (why) warnings.push(`${where}: renderer for ${JSON.stringify(tool)} is ignored: ${why}`);
+        else seen.add(tool!);
+        return !why;
       });
     }
     if (plugin.beforeSend !== undefined && typeof plugin.beforeSend !== "function") {

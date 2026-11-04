@@ -75,6 +75,24 @@ export interface InputControl {
   set(text: string): void;
 }
 
+/**
+ * 一个工具在对话里怎么显示，不影响发给模型的内容。只能为本插件 tools 里的工具注册：
+ * 别的工具（jade 自己的、MCP 的、别的插件的）的显示，特别是审批时的预览，插件改不了。
+ * 每个函数都可以不写；返回 undefined 或出错时用 jade 默认的显示（出错时提示一次）
+ */
+export interface ToolRenderer {
+  tool: string;
+  /** 调用行 "● 工具名(…)" 括号里的摘要，只显示第一行；默认是 path 参数或参数的 JSON */
+  summary?(input: unknown): string | undefined;
+  /** 请用户批准时显示的预览，可以多行、带 ANSI 颜色；默认是参数的 JSON */
+  preview?(input: unknown): Awaitable<string | undefined>;
+  /**
+   * 结果：line 接在调用行的 "⎿ " 后面（一行），details 是点击展开后的内容（可以多行）；
+   * 默认显示结果文字的第一行，多出的行折叠起来
+   */
+  result?(r: { input: unknown; text: string; isError: boolean }): { line: string; details?: string } | undefined;
+}
+
 /** "ctrl+<字母>" 或 "alt+<字母或数字>" */
 export const KEY_SPEC = /^(ctrl\+[a-z]|alt\+[a-z0-9])$/;
 /**
@@ -243,6 +261,8 @@ export interface JadePlugin extends Plugin {
   suggest?: Suggester;
   /** 快捷键，见 PluginKey；和排在前面的插件用了同一个键时忽略 */
   keys?: PluginKey[];
+  /** 本插件的工具在对话里怎么显示，见 ToolRenderer */
+  renderers?: ToolRenderer[];
   /**
    * 模型服务，用 JADE_PROVIDER=<kind> 选择。只认用户层插件（服务能看到全部对话和 API key）；
    * 只在启动时读一次，之后的会话共用，所以不要依赖按会话的状态
