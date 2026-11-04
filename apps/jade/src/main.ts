@@ -29,14 +29,14 @@ import { PLUGIN_HELP, pluginCli, UsageError } from "./plugin-cli.ts";
 import { describeServer, loadMcpConfig, McpClient, mcpTrustHash } from "./mcp.ts";
 import { loadSkills } from "./skills.ts";
 import { hasProvider, loadEnvFile, parseTokens, updateEnvFile } from "./config.ts";
-import { createJade, type Jade } from "./distro.ts";
+import { collectProviders, createJade, type Jade } from "./distro.ts";
 import { firstAnswer } from "./respond.ts";
 import { describeRule, MODES, POLICY_KEY, type AllowRule, type Mode, type PolicySettings } from "./plugins/policy.ts";
 import { compactThreshold, contextWindowFromEnv, contextWindowInfo, isContextOverflow } from "./context.ts";
 import { InputHistory } from "./history.ts";
 import { attachMentions, mentionCandidates } from "./mentions.ts";
 import { repoRoot } from "./plugins/prompts.ts";
-import { isBuiltinKind, isRateLimit, pluginProvider, providerFromEnv, providerInfo, providerKind, RateGate, registerProviders, rpmFromEnv, switchable, withRetry } from "./provider.ts";
+import { isBuiltinKind, isRateLimit, pluginProvider, providerFromEnv, providerInfo, providerKind, RateGate, registerProviders, rpmFromEnv, switchable, unregisterProviders, withRetry } from "./provider.ts";
 import { ago, discardIfEmpty, matchSession, SessionIndex } from "./sessions.ts";
 import { display } from "./tools/fs.ts";
 import type { ApproveSubagent, SubagentApproval } from "./tools/task.ts";
@@ -428,13 +428,10 @@ const makeJade = (mode?: Mode) => {
 const warn = (list: string[]) => {
   for (const w of list) screen.log(yellow(`[warning] ${w}`));
 };
-let jade: Jade = await makeJade(opts.mode);
-// 还没有模型时（第一次运行、模型服务由插件提供）创建的插件实例，工厂函数里调用 ctx.complete 会失败：
-// 有了模型之后重新创建一遍，插件的警告只显示那一遍的
-const rebuild = !hasProvider() || pluginProviderPending;
-if (!rebuild) warn(jade.warnings);
-// 插件提供的模型服务：只在启动时注册一次，之后的会话共用（provider 是整个进程的）
-warn(registerProviders(jade.providers));
+// 插件提供的模型服务是插件模块导出的，加载时就读到了，不用创建插件实例：先注册、配置好模型，再创建插件，
+// 插件的工厂函数里也能用 ctx.complete。只注册一次，之后的会话共用（provider 是整个进程的）
+const collected = collectProviders(pluginSources);
+warn([...collected.warnings, ...registerProviders(collected.providers)]);
 if (!hasProvider()) {
   // 第一次运行：插件已经加载，/model 的服务列表里也有插件提供的
   screen.log(bold("Welcome to jade.") + " No model is configured yet; let's set one up.");
@@ -448,30 +445,33 @@ if (!hasProvider()) {
     provider.set(retrying(await providerFromEnv()));
     contextWindow = contextWindowFromEnv();
   } catch (err) {
-    // 例如提供这个服务的插件被删掉、停用或者没加载成功：原因在插件的警告里。
-    // 终端界面里直接进 /model 换一个服务，不然用户只能手改 .env
-    // 插件的警告在下面重新创建插件之后显示
-    if (tui) {
-      screen.log(red(`[error] ${errorText(err)}`));
-      screen.log("Choose another model with /model.");
-      if (!(await configure.provider())) {
-        await closePlugins();
-        await screen.close();
-        process.exit(2);
-      }
-    } else {
-      await closePlugins();
-      await screen.close();
-      // 终端界面已经关了，警告写进错误信息
-      fail([errorText(err), ...jade.warnings.map((w) => `[warning] ${w}`)].join("\n"));
-    }
+    // 例如提供这个服务的插件被删掉、停用或者没加载成功：原因在上面插件的警告里
+    await providerUnavailable(errorText(err));
   }
   screen.status({ model: modelLabel() });
 }
-if (rebuild) {
-  jade.shutdown();
-  jade = await makeJade(opts.mode);
-  warn(jade.warnings);
+let jade: Jade = await makeJade(opts.mode);
+warn(jade.warnings);
+// 按 id 停用的插件：创建了实例才知道 id，它导出的模型服务在那之前已经注册了，这里去掉。停用了就不该再运行它的代码
+const owner = hasProvider() ? pluginProvider(providerKind())?.plugin : undefined;
+if (unregisterProviders(jade.disabledById).length && owner !== undefined && jade.disabledById.includes(owner)) {
+  await providerUnavailable(`JADE_PROVIDER=${providerKind()} is provided by plugin ${owner}, which is disabled`);
+  screen.status({ model: modelLabel() });
+}
+
+/** 选的模型服务用不了：终端界面里直接进 /model 换一个服务，不然用户只能手改 .env；不能交互时报错退出 */
+async function providerUnavailable(message: string): Promise<void> {
+  if (tui) {
+    screen.log(red(`[error] ${message}`));
+    screen.log("Choose another model with /model.");
+    if (await configure.provider()) return;
+    await closePlugins();
+    await screen.close();
+    process.exit(2);
+  }
+  await closePlugins();
+  await screen.close();
+  fail(message);
 }
 if (badSavedMode) screen.log(yellow(`[warning] JADE_MODE=${badSavedMode} is not a mode (${MODES.join(", ")}); starting in ${opts.mode ?? "ask"}`));
 for (const c of shadowed) screen.log(yellow(`[warning] custom command ${display(cwd, c.file)} is ignored: /${c.name} is a built-in command`));
@@ -1061,6 +1061,7 @@ function interrupt() {
  * 没收到过输入的会话没什么可恢复的，删掉它的日志；返回会话是否保留了下来
  */
 async function leave(): Promise<boolean> {
+  abortKeys("the session ended");
   jade.shutdown();
   try {
     await rt.detach();
@@ -1140,6 +1141,7 @@ async function switchSession(id?: string) {
 async function reloadSession() {
   await flushPendingMode();
   const next = await makeJade(settings().mode);
+  abortKeys("the session was reloaded");
   jade.shutdown();
   await rt.detach();
   jade = next;
@@ -1257,14 +1259,31 @@ async function say(text: string) {
   if (view.lastEnd === "end" && queue.length === 0) void suggestNext();
 }
 
+/**
+ * 正在执行的插件快捷键。同一个键可以同时执行几次（例如按一下开始录音、再按一下结束，第一次的 run 一直等到结束）；
+ * 换会话时全部中止，卡住的插件积压的请求也就到此为止
+ */
+const keyRuns = new Set<AbortController>();
+
 /** 插件的快捷键：找到了就在后台执行，返回 true */
 function pluginKey(spec: string): boolean {
   const found = jade.keys.get(spec);
   if (!found) return false;
+  const ac = new AbortController();
+  keyRuns.add(ac);
   Promise.resolve()
-    .then(() => found.key.run({ sessionId }))
-    .catch((err) => screen.log(yellow(`[warning] plugin ${found.plugin}: ${spec} failed: ${errorText(err)}`)));
+    .then(() => found.key.run({ key: spec, sessionId, signal: ac.signal }))
+    .catch((err) => {
+      if (!ac.signal.aborted) screen.log(yellow(`[warning] plugin ${found.plugin}: ${spec} failed: ${errorText(err)}`));
+    })
+    .finally(() => keyRuns.delete(ac));
   return true;
+}
+
+/** 中止正在执行的快捷键：它们属于的会话（输入框里的那份草稿、那套插件实例）不在了 */
+function abortKeys(reason: string) {
+  for (const ac of keyRuns) ac.abort(new Error(reason));
+  keyRuns.clear();
 }
 
 /** 插件的 ctx.send：和用户在输入框里提交一样，先注明是哪个插件发的 */

@@ -236,6 +236,13 @@ export function registerProviders(list: { plugin: string; def: ProviderDef }[]):
   return warnings;
 }
 
+/** 去掉这些插件（目录名）提供的服务，返回去掉的服务的 kind */
+export function unregisterProviders(plugins: string[]): string[] {
+  const gone = [...plugged].filter(([, p]) => plugins.includes(p.plugin)).map(([kind]) => kind);
+  for (const kind of gone) plugged.delete(kind);
+  return gone;
+}
+
 /** JADE_PROVIDER 选的服务由哪个插件提供；内置的或没有插件提供时 undefined */
 export function pluginProvider(kind: string): { plugin: string; def: ProviderDef } | undefined {
   return plugged.get(kind);
