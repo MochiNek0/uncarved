@@ -66,6 +66,18 @@ export interface JadePluginContext {
    * 对话里会注明是哪个插件发的。只给用户层插件（它能替用户说话）；非交互运行（-p）时没有
    */
   send?(text: string): void;
+  /**
+   * 这套实例的会话结束（换会话、重新加载、退出）时中止，在 dispose 之前。
+   * 工厂函数里开的定时器、监听可以挂在它上面关掉：ctx.signal.addEventListener("abort", () => clearInterval(timer))
+   */
+  signal: AbortSignal;
+}
+
+/** 宿主这边的输入框：多了一个参数，是调用的插件的 id（宿主据此提示过期的调用） */
+export interface HostInput {
+  text(plugin?: string): string;
+  insert(text: string, plugin?: string): void;
+  set(text: string, plugin?: string): void;
 }
 
 /** 输入框里用户还没提交的文字 */
@@ -307,10 +319,11 @@ export type ContextPluginDraft = Omit<JadePluginDraft, "id" | "version"> & { id?
 export type JadePluginFactory = (ctx: JadePluginContext) => Awaitable<JadePlugin>;
 
 /** 宿主（createJade）提供的那部分上下文；status、send 由加载器按插件的 id 转给宿主，input、send 只转给用户层插件 */
-export type HostContext = Omit<JadePluginContext, "dir" | "layer" | "status" | "send" | "definePlugin"> & {
+export type HostContext = Omit<JadePluginContext, "dir" | "layer" | "status" | "send" | "definePlugin" | "input"> & {
   definePlugin: <T extends JadePluginDraft>(draft: T) => T & JadePlugin;
   status(plugin: string, text: string | undefined): void;
   send?(plugin: string, text: string): void;
+  input?: HostInput;
 };
 
 /** plugin.json；只带内容的插件可以没有 */
@@ -518,7 +531,12 @@ export async function loadPlugin(found: FoundPlugin & { info?: PluginInfo }, opt
 function pluginContext(found: FoundPlugin & { id: string }, info: PluginInfo, { input, send, definePlugin, ...host }: HostContext): JadePluginContext {
   return {
     ...host,
-    ...(found.layer === "user" ? { input, send: send && ((text: string) => send(found.id, text)) } : {}),
+    ...(found.layer === "user"
+      ? {
+          input: input && { text: () => input.text(found.id), insert: (text: string) => input.insert(text, found.id), set: (text: string) => input.set(text, found.id) },
+          send: send && ((text: string) => send(found.id, text)),
+        }
+      : {}),
     definePlugin: <T extends ContextPluginDraft>(draft: T) => {
       const version = draft.version ?? info.version;
       if (version === undefined) throw new Error('the plugin has no version: add "version" to plugin.json');

@@ -1,6 +1,6 @@
 # 设计：jade 插件的生命周期
 
-> 状态：草案；第 1 步（静态 id）、第 2 步（PluginHost）已实施 · 2026-11-05
+> 状态：草案；第 1–3 步（静态 id、PluginHost、SessionScope）已实施 · 2026-11-05
 >
 > 对应条款：7.1（项目层确认）、8.2（不满足时拒绝加载，不静默降级）、I-9（一切可中断）、4.6（恢复时插件变化）
 >
@@ -90,7 +90,8 @@ preparing ──commit──▶ active ──close──▶ closing ──▶ cl
 |---|---|---|---|
 | preparing | 先存起来，commit 时显示 | 无效，开发时警告一次 | 未中止 |
 | active | 生效 | 生效 | 未中止 |
-| closing / closed | 无效，警告一次 | 无效，警告一次 | **已中止** |
+| closing | 无效（插件还没轮到 dispose，不警告） | 无效，不警告 | **已中止** |
+| closed（dispose 完成） | 无效，警告一次；`status(undefined)` 不警告 | 无效，警告一次 | **已中止** |
 
 用状态代替现在的 `jadeGeneration` 计数器。区别在于：现在 `makeJade` 一开始就把计数加一，于是新实例还没有确定要用，旧实例就已经失效；`/resume` 失败时只能手动把计数、状态栏恢复回去。有了 `preparing` 状态，旧 scope 在 commit 之前一直是 active，回滚不需要任何恢复操作。
 
@@ -180,10 +181,12 @@ commit
 pi 让过期的 ctx 抛错。jade 不能这么做：插件常在定时器回调里调用 `ctx.status`，抛错会变成未捕获的异常，让 jade 崩溃。现在的做法是静默忽略，这又会把泄漏藏起来。折中的办法是：调用无效，并且每个插件只警告一次：
 
 ```
-[warning] plugin me/clock used ctx.status after its session ended; stop timers in dispose (or on ctx.signal)
+[warning] plugin me/clock used ctx.status after its session ended, so it was ignored; stop timers and listeners in dispose, or when ctx.signal aborts
 ```
 
 这样，忘了写 `dispose` 的插件从“看不见的泄漏”变成了“看得见的警告”，符合 8.2 的精神。
+
+实施时的修正：只在 dispose **完成之后**（closed）才警告。closing 到 dispose 之间要等会话收尾，按规矩在 `dispose` 里停定时器的插件，定时器这时再触发一次是正常的，警告它就是误报。`dispose` 里调用 `ctx.status(undefined)` 去掉自己的段落也不警告。
 
 ## 6. 进程外插件
 

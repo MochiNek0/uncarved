@@ -205,24 +205,36 @@ export default factory;
 | `checkpoints` | 文件快照：写文件的工具写之前记下原内容，`/undo` 据此恢复，见下文 |
 | `input` | 输入框：`text()`、`insert(text)`、`set(text)`，见下文。只给用户层插件，`jade -p` 时没有 |
 | `send` | `(text) => void`：替用户提交一行，见下文。只给用户层插件，`jade -p` 时没有 |
+| `signal` | `AbortSignal`：这套实例的会话结束（换会话、重新加载、退出）时中止，见下文 |
 
 默认导出对象时，每个会话用的是它的一份浅拷贝，适合没有状态的插件。
 
-### 收尾：`dispose`
+### 一套实例的一生：`ctx.signal` 和 `dispose`
 
-实例里开了定时器、连接、文件监听的，在 `dispose` 里关掉，不然换一次会话就多一份在后台跑：
+实例里开了定时器、连接、文件监听的，要在会话结束时关掉，不然换一次会话就多一份在后台跑。简单的挂在 `ctx.signal` 上，要等它关完的（例如关连接）写在 `dispose` 里：
 
 ```ts
 const factory: JadePluginFactory = (ctx) => {
   const timer = setInterval(() => ctx.status(clock()), 1000);
-  return ctx.definePlugin({ dispose: () => clearInterval(timer) });
+  ctx.signal.addEventListener("abort", () => clearInterval(timer));   // 或者写在 dispose 里
+  return ctx.definePlugin({ dispose: async () => await connection.close() });
 };
 ```
 
-- jade 不再用这个实例时调用一次：换会话（`/clear`、`/resume`）、重新加载、退出，以及创建了却没用上的实例（`id` 和 `plugin.json` 不一致的、和别的插件 id 或工具名冲突被跳过的、`/resume` 失败时新建的那套）。
-- 在会话收尾（`session.detached` 的 hook）**之后**调用，收尾时实例还能正常用。之后 `ctx.status`、`ctx.input`、`ctx.send` 不再起作用。
-- 可以是异步的。各插件的 `dispose` 同时进行，每个最多等 5 秒，超时或出错时显示警告，不影响换会话和退出。
-- 进程外插件没有 `dispose`：进程在会话之间共用，退出时 jade 发 `shutdown`。
+换会话（`/clear`、`/resume`）、重新加载、退出时，按这个顺序：
+
+1. jade 先创建新会话的一套实例（工厂函数这时运行）。这期间新实例调用 `ctx.status` 的内容先存着，新会话开始时才显示；`ctx.input`、`ctx.send` 不起作用。
+2. 新的一套创建成功后，旧的一套的 `ctx.signal` 中止，进行中的快捷键随之中止；之后旧实例的 `ctx.status`、`ctx.input`、`ctx.send` 不再起作用。创建失败（例如 `/resume` 一个读不了的会话）时，只收掉新的一套，旧的一套照常工作。
+3. 旧会话收尾（`session.detached` 的 hook），这时实例还能正常用。
+4. 调用旧实例的 `dispose`。换会话、重新加载时不等它，新会话立刻能用；退出时等它完成。
+
+其他要点：
+
+- `dispose` 只调用一次。创建了却没用上的实例也会调用（`id` 和 `plugin.json` 不一致的、和别的插件 id 或工具名冲突被跳过的、`/resume` 失败时新建的那套）。
+- 可以是异步的。各插件的 `dispose` 同时进行，每个最多等 5 秒，超时或出错时显示警告。
+- `dispose` 完成后还在调用 `ctx.status`、`ctx.input`、`ctx.send` 的（通常是忘了停掉的定时器），jade 提示一次。在 `dispose` 里调用 `ctx.status(undefined)` 去掉自己的段落不算。
+- 同一时间可能有两套实例（新的一套已经创建、旧的一套还没收尾），不要假设只有一个。
+- 进程外插件没有 `ctx.signal` 和 `dispose`：进程在会话之间共用，退出时 jade 发 `shutdown`。
 
 ### 调用模型：`ctx.complete`
 
@@ -247,7 +259,7 @@ ctx.status(undefined);  // 去掉
 ```
 
 - 每个插件一段，只显示一行，超过 40 个字符截断。窗口窄时比快捷键提示晚、比缓存比例早被去掉。
-- 什么时候调用都行（工厂函数里、hook 里、定时器里）。换会话时清空，旧会话的实例再调用不会显示。
+- 什么时候调用都行（工厂函数里、hook 里、定时器里）。工厂函数里设置的在会话开始时显示；换会话时换成新实例设置的，旧实例再调用不会显示。
 
 ### 文件快照：`ctx.checkpoints`
 
@@ -283,7 +295,7 @@ ctx.send?.("运行测试并修好失败的");  // 替用户提交
 
 - `send` 和用户在输入框里按回车一样：`/` 开头的是命令，消息先经过各插件的 [`beforeSend`](#改写用户消息beforesend)；模型正忙时排队。对话里会先显示 `[plugin <id> sent this for you]`。
 - **只给用户层插件**：改输入框、发消息等于替用户说话，项目层插件的上下文里没有这两个字段。终端界面之外（`jade -p`、管道）也没有，所以用之前判断一下。
-- 什么时候调用都行（快捷键、定时器、后台连接里）。换会话后旧实例的调用不生效。
+- 什么时候调用都行（快捷键、定时器、后台连接里）。工厂函数里（会话还没开始）和换会话后旧实例的调用不生效。
 
 ## 快捷键（keys）
 
