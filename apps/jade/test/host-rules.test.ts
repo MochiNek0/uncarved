@@ -1,75 +1,13 @@
-// 规则表（docs/plugins.md）里由宿主决定的几行：beforeSend 的链式处理和出错、超时，斜杠命令同名时谁生效。
+// 规则表（docs/plugins.md）里由宿主决定的一行：斜杠命令同名时谁生效。
 import { describe, expect, test } from "bun:test";
 import { realpathSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { MemoryLogStore, type Provider } from "uncarved";
-import { runBeforeSend } from "../src/before-send.ts";
 import { pluginMenu } from "../src/commands.ts";
 import { createJade, type Jade, type LoadedPlugin } from "../src/index.ts";
 
-function recorder() {
-  const log: string[] = [];
-  return {
-    log,
-    report: {
-      changed: (p: string, t: string) => void log.push(`${p} changed: ${t}`),
-      dropped: (p: string) => void log.push(`${p} dropped`),
-      failed: (p: string, err: unknown) => void log.push(`${p} failed: ${err instanceof Error ? err.message : String(err)}`),
-    },
-  };
-}
-const step = (plugin: string, fn: (t: string, ctx: { signal: AbortSignal }) => unknown) => ({ plugin, fn: fn as Jade["beforeSend"][number]["fn"] });
-
-describe("beforeSend", () => {
-  test("runs in load order, each plugin getting the text the one before it returned", async () => {
-    const r = recorder();
-    const seen: string[] = [];
-    const text = await runBeforeSend(
-      [step("a/upper", (t) => t.toUpperCase()), step("b/same", (t) => (seen.push(t), undefined)), step("c/bang", (t) => `${t}!`)],
-      "hi",
-      { sessionId: "s", report: r.report },
-    );
-    expect(text).toBe("HI!");
-    expect(seen).toEqual(["HI"]);
-    expect(r.log).toEqual(["a/upper changed: HI", "c/bang changed: HI!"]);
-  });
-
-  test("a plugin that throws, returns a non-string or hangs is skipped with a warning; the others still run", async () => {
-    const r = recorder();
-    let aborted = false;
-    const text = await runBeforeSend(
-      [
-        step("a/upper", (t) => t.toUpperCase()),
-        step("b/throws", () => {
-          throw new Error("boom");
-        }),
-        step("c/number", () => 42),
-        step("d/hangs", (_t, { signal }) => new Promise(() => signal.addEventListener("abort", () => (aborted = true)))),
-        step("e/bang", (t) => `${t}!`),
-      ],
-      "hi",
-      { sessionId: "s", report: r.report, timeoutMs: 50 },
-    );
-    expect(text).toBe("HI!");
-    expect(aborted).toBe(true);
-    expect(r.log[0]).toBe("a/upper changed: HI");
-    expect(r.log[1]).toBe("b/throws failed: boom");
-    expect(r.log[2]).toBe("c/number failed: beforeSend must return a string or undefined");
-    expect(r.log[3]).toStartWith("d/hangs failed:");
-    expect(r.log[4]).toBe("e/bang changed: HI!");
-  });
-
-  test("an empty string means do not send; the plugins after it are not asked", async () => {
-    const r = recorder();
-    let later = false;
-    const text = await runBeforeSend([step("a/drop", () => "  "), step("b/later", () => void (later = true))], "hi", { sessionId: "s", report: r.report });
-    expect(text).toBeUndefined();
-    expect(later).toBe(false);
-    expect(r.log).toEqual(["a/drop dropped"]);
-  });
-});
 
 describe("slash command names", () => {
   test("host commands, then custom commands and skills, win over third-party plugin commands", () => {

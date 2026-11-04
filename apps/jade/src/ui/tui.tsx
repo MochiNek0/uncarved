@@ -58,8 +58,6 @@ export interface TuiHandlers {
   files?(): Promise<string[]>;
   /** Shift+Tab：切换到下一个权限模式 */
   cycleMode?(): void;
-  /** 用户按 Esc 丢弃了输入框里的灰字建议 */
-  dismissSuggestion?(): void;
   /** 输入框有焦点时按下 jade 自己不用的 ctrl+<字母>、alt+<字母或数字>（见 keySpec）；返回 true 表示有插件处理了 */
   key?(spec: string): boolean;
 }
@@ -106,8 +104,6 @@ interface UiState {
   queued: string[];
   dialogs: Dialog[];
   status: StatusInfo;
-  /** 插件预测的下一条消息，输入框里显示成灰字（见 ghostOf） */
-  suggestion?: string;
 }
 
 /** 对话最多保留这么多行（折行前），超出时丢掉最早的一段 */
@@ -600,9 +596,6 @@ export function tuiScreen(opts: TuiOptions): Screen {
     queued(items) {
       store.update({ queued: [...items] });
     },
-    suggest(text) {
-      store.update({ suggestion: text?.split("\n")[0]!.trim() || undefined });
-    },
     draft: {
       text: () => draft.current?.get() ?? "",
       insert: (text) => draft.current?.apply((s) => edit.insert(s, text.replace(/\r\n?/g, "\n"))),
@@ -668,14 +661,6 @@ function mouseEvent(input: string): { button: number; press: boolean; x: number;
   return { button: Number(m[1]) & ~0b11100, press: m[4] === "M", x: Number(m[2]) - 1, y: Number(m[3]) - 1 };
 }
 const WHEEL_LINES = 3;
-/**
- * 输入框里要显示的灰字：已经输入的是建议的开头、光标在末尾、没有打开补全菜单时，显示建议剩下的部分。
- * 输入的和建议对不上时不显示，删回去对得上时又出现
- */
-function ghostOf(suggestion: string | undefined, state: EditState, menu: boolean): string | undefined {
-  if (!suggestion || menu || state.cursor !== state.value.length || !suggestion.startsWith(state.value)) return undefined;
-  return suggestion.slice(state.value.length) || undefined;
-}
 
 /** 按住左键拖动时的按钮号（左键 0 加上移动位 32） */
 const DRAG = 32;
@@ -984,11 +969,6 @@ function App({
             active={!dialog}
             onSubmit={() => store.scrollBy(-max, max)}
             flash={copied}
-            suggestion={state.suggestion}
-            onDismiss={() => {
-              store.update({ suggestion: undefined });
-              handlers.dismissSuggestion?.();
-            }}
           />
           <StatusBar status={state.status} width={Math.max(10, columns - 2)} />
         </Box>
@@ -1297,12 +1277,9 @@ function EditableText({
   active,
   maxRows = Infinity,
   place,
-  ghost,
 }: {
   /** 每次渲染时写入文字的位置，点击换算光标用 */
   place?: { current: Placement };
-  /** 接在文字后面的灰字（光标在末尾时） */
-  ghost?: string;
   state: EditState;
   width: number;
   prefix: string;
@@ -1351,10 +1328,10 @@ function EditableText({
   return (
     <Box ref={ref} flexDirection="column">
       {active ? <CursorAt position={position} /> : null}
-      {state.value === "" && (ghost || placeholder) ? (
+      {state.value === "" && placeholder ? (
         <Text wrap="truncate-end">
           <Text color="cyan">{prefix}</Text>
-          <Text dimColor>{ghost || placeholder}</Text>
+          <Text dimColor>{placeholder}</Text>
         </Text>
       ) : (
         rows.map((r, i) => (
@@ -1367,7 +1344,6 @@ function EditableText({
                   : " ".repeat(prefix.length)}
             </Text>
             {r}
-            {ghost && first + i === all.rows.length - 1 ? <Text dimColor>{ghost}</Text> : null}
           </Text>
         ))
       )}
@@ -1405,8 +1381,6 @@ function Prompt({
   active,
   onSubmit,
   flash,
-  suggestion,
-  onDismiss,
 }: {
   commands: CommandInfo[];
   handlers: TuiHandlers;
@@ -1419,10 +1393,6 @@ function Prompt({
   onSubmit(): void;
   /** 临时显示在输入框右上角的提示（例如"已复制"） */
   flash?: string;
-  /** 插件预测的下一条消息 */
-  suggestion?: string;
-  /** 按 Esc 丢弃建议 */
-  onDismiss(): void;
 }) {
   const selection = useContext(SelectionContext);
   const [current, setState] = useLive<EditState>(empty);
@@ -1634,14 +1604,6 @@ function Prompt({
         return history.current.length
           ? setSearch({ query: "", index: 0 })
           : undefined;
-      // 灰字建议：→ 或 Tab 接受全部，Ctrl+→（macOS 上 Option+→）接受一个词，Esc 丢弃
-      const ghost = ghostOf(suggestion, state, derive().menu > 0);
-      if (ghost) {
-        const take = (part: string) => set({ value: state.value + part, cursor: state.value.length + part.length });
-        if (key.escape) return onDismiss();
-        if ((key.rightArrow || key.tab) && !key.ctrl && !key.meta && !key.shift) return take(ghost);
-        if ((key.rightArrow && (key.ctrl || key.meta)) || (key.meta && input === "f")) return take(/^\s*\S+/.exec(ghost)![0]);
-      }
       if (key.ctrl && input === "c") {
         if (busy) return handlers.interrupt();
         if (state.value) return discard();
@@ -1752,7 +1714,6 @@ function Prompt({
         ) : (
           <EditableText
             state={state}
-            ghost={ghostOf(suggestion, state, derive().menu > 0)}
             width={Math.max(10, columns - 5)}
             prefix="› "
             placeholder={

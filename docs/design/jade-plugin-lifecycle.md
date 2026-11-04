@@ -1,6 +1,6 @@
 # 设计：jade 插件的生命周期
 
-> 状态：第 1–5 步（静态 id、PluginHost、SessionScope、进程外插件的会话适配器、生命周期矩阵测试）已实施；第 9 节的问题待定 · 2026-11-05
+> 状态：第 1–5 步（静态 id、PluginHost、SessionScope、进程外插件的会话适配器、生命周期矩阵测试）已实施；第 9 节的问题都已决定 · 2026-11-05
 >
 > 对应条款：7.1（项目层确认）、8.2（不满足时拒绝加载，不静默降级）、I-9（一切可中断）、4.6（恢复时插件变化）
 >
@@ -215,9 +215,6 @@ pi 让过期的 ctx 抛错。jade 不能这么做：插件常在定时器回调�
 | `commands` | 会话 | 两层 | 宿主命令 > 内置插件 > 自定义命令和 skill > 第三方先到先得 | 警告 |
 | `keys` | 会话（调用可以并发） | 两层；项目层的回复不能改输入框 | 先到先得；保留键不可用 | 警告 |
 | `renderers` | 会话 | 两层 | 只能渲染自己的工具 | 退回默认显示，警告一次 |
-| `responder` | 会话 | 仅用户层 | 全部同时等，用最先给出的回答 | 视为不回答，警告 |
-| `suggest` | 会话 | 两层 | 只用第一个 | 不显示建议，警告 |
-| `beforeSend` | 会话（串行） | 两层 | 按顺序链式处理 | 按原文继续，警告；30 秒超时 |
 | `replaces` | 会话 | 两层 | 不动点计算（见 `distro.ts`）；`jade/policy` 不可代替 | 警告 |
 | `dispose` | 会话 | 两层（进程外插件没有） | — | 警告；5 秒超时 |
 | `ctx.status` | 会话 | 两层 | 按 id 分段 | 过期调用：无效并警告一次 |
@@ -233,7 +230,7 @@ pi 让过期的 ctx 抛错。jade 不能这么做：插件常在定时器回调�
 5. **会话结束后，ctx 就过期了**。不要把它保存到会话之外。
 6. **耗时的操作都接收 `signal`**，中止后尽快返回，结果会被丢弃。
 7. **调用 `session.clear/resume/reload` 是这次命令的最后一步**。
-8. **同名、同键按加载顺序先到先得**。项目层插件不能替用户说话、不能回答审批、不能提供模型服务。
+8. **同名、同键按加载顺序先到先得**。项目层插件不能替用户说话、不能提供模型服务；任何插件都不能替用户回答审批。
 
 ### 7.2 每一行的测试
 
@@ -250,16 +247,12 @@ pi 让过期的 ctx 抛错。jade 不能这么做：插件常在定时器回调�
 | `commands` | `host-rules.test.ts` "slash command names"；`plugins.test.ts` 进程外插件的斜杠命令 |
 | `keys` | `plugins.test.ts` "keys are normalized; malformed, reserved and taken keys are skipped"、"a process plugin's keys go over jade/key…" |
 | `renderers` | `transcript.test.ts` "a plugin's renderer … failures fall back to the default once warned"；`plugins.test.ts` 只能渲染自己的工具 |
-| `responder` | `plugins.test.ts` "only user plugins can provide a responder"；`respond.test.ts` firstAnswer |
-| `suggest` | `plugins.test.ts` "suggest, beforeSend and ctx.status are collected; only the first suggest is used" |
-| `beforeSend` | `host-rules.test.ts` "beforeSend" |
+| 去掉了的 `responder`、`suggest`、`beforeSend` | `plugins.test.ts` "ctx.status is collected; responder, suggest and beforeSend are no longer offered…" |
 | `replaces` | `plugin-install.test.ts` 同上；`host-rules.test.ts` 代替内置插件的命令 |
 | `dispose` | `plugins.test.ts` "dispose: used instances on jade.dispose (once)…"；`session-lifecycle.test.ts` |
 | `ctx.status`、`ctx.input`、`ctx.send`、`ctx.signal` | `session-scope.test.ts`、`session-lifecycle.test.ts` |
 | `ctx.complete`、`ctx.run` | `plugins.test.ts` "a plugin can call the current model with ctx.complete…"；`jade.test.ts` 里 `shellTools().run` 的测试 |
 | 不改写插件实例 | `plugins.test.ts` "jade never rewrites a plugin instance…" |
-
-没有覆盖的：`suggest` 出错时的警告（在 `main.ts` 里，只有一行 `catch`）。
 
 ## 8. 实施步骤
 
@@ -277,9 +270,9 @@ pi 让过期的 ctx 抛错。jade 不能这么做：插件常在定时器回调�
 
 1. ~~**`id` 一定要写在 `plugin.json` 里吗？**~~ **已决定：写在 `plugin.json` 里。** `export const id` 要先 import 才能读到，而 import 就是执行代码。
 2. ~~**`replaces` 要不要也放进清单？**~~ **已决定并实施：放进 `plugin.json`。** 插件对象上的不再起作用（警告）。 放进去后，`/plugins` 和 `jade plugin list` 不执行代码就能显示代替关系，内置插件也能在创建实例之前确定。但不动点计算仍然需要，因为工具名冲突要等实例创建之后才知道。
-3. **过期 ctx 的处理**：本文选择“无效并警告一次”；另一种做法是像 pi 一样抛错。
-4. **要不要收缩扩展点？** 目前没有真实的使用者，所以接口可以随时改，不需要兼容。`responder`、`suggest`、`beforeSend`、`keys`、`renderers`、`providers` 要不要先不公开，还没有决定。
-5. **事件里要不要带 `reason`**（`"startup" | "new" | "resume" | "reload"`）？pi 有，插件可以据此决定要不要恢复状态。jade 可以放在工厂的 ctx 里。没有具体需求的话先不加。
+3. ~~**过期 ctx 的处理**~~ **已决定：保持“无效并警告一次”**，不像 pi 一样抛错。
+4. ~~**要不要收缩扩展点？**~~ **已决定并实施：去掉 `responder`、`suggest`、`beforeSend`**（没有内置插件和示例用到，`responder` 还能替用户回答审批），插件写了会提示不起作用；输入框的灰字建议、终端和 responder 同时等回答的逻辑一起去掉。`keys`（连同 `ctx.input`、`ctx.send`）、`renderers`、`providers` 保留。
+5. ~~**事件里要不要带 `reason`**~~ **已决定：先不加**（`"startup" | "new" | "resume" | "reload"`）。pi 有，插件可以据此决定要不要恢复状态；有具体需求时再放进工厂的 ctx。
 
 ## 10. 不在本次范围
 

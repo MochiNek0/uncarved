@@ -65,8 +65,6 @@ export interface Screen {
   status(info: Partial<StatusInfo>): void;
   /** 排队等待发送的输入 */
   queued(items: string[]): void;
-  /** 插件预测的下一条消息，终端界面在输入框里显示成灰字；undefined 去掉。纯文本输出不显示 */
-  suggest(text: string | undefined): void;
   /** 让用户从几项里选一项；取消时返回 undefined。signal 中止时关掉对话框，也返回 undefined */
   select<T>(title: string, choices: Choice<T>[], opts?: { body?: string; signal?: AbortSignal }): Promise<T | undefined>;
   /** 让用户输入一行；取消时返回 undefined。signal 同 select */
@@ -156,7 +154,6 @@ export function safeScreen(screen: Screen): Screen {
       screen.status(out);
     },
     queued: (items) => screen.queued(items.map(s)),
-    suggest: (text) => screen.suggest(opt(text)),
     select: (title, choices, o) =>
       screen.select(
         s(title),
@@ -243,7 +240,6 @@ export function plainScreen(opts: { interactive: boolean }): Screen {
     busy: () => {},
     status: () => {},
     queued: () => {},
-    suggest: () => {},
     async select(title, choices, o) {
       if (!opts.interactive) return undefined;
       line(yellow(title));

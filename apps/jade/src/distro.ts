@@ -13,7 +13,7 @@ import { Memory, memoryTool } from "./memory.ts";
 import { mcpTools, type McpClient } from "./mcp.ts";
 import { skillTool, skillsPrompt, type Skill } from "./skills.ts";
 import { compactor, type Compactor } from "./plugins/compact.ts";
-import { COMMAND_NAME, DISPOSE_TIMEOUT_MS, JADE_VERSION, KEY_SPEC, RESERVED_KEYS, type HostContext, type HostInput, type PluginKey, type ToolRenderer, type JadePlugin, type LoadedPlugin, type PluginCommand, type Responder, type Suggester } from "./plugins/loader.ts";
+import { COMMAND_NAME, DISPOSE_TIMEOUT_MS, JADE_VERSION, KEY_SPEC, RESERVED_KEYS, type HostContext, type HostInput, type PluginKey, type ToolRenderer, type JadePlugin, type LoadedPlugin, type PluginCommand } from "./plugins/loader.ts";
 import { policy, type AllowRule, type Mode, type Policy, type PolicyOptions } from "./plugins/policy.ts";
 import { prompts, realPath, repoRoot } from "./plugins/prompts.ts";
 import { repeats } from "./plugins/repeats.ts";
@@ -125,16 +125,10 @@ export interface Jade {
   extensions: Extension[];
   /** 插件（内置的和第三方的）提供的斜杠命令，按小写的名字 */
   commands: Map<string, { plugin: string; command: PluginCommand; builtin: boolean }>;
-  /** 用户层第三方插件提供的 responder，宿主问用户时和终端一起等 */
-  responders: { plugin: string; responder: Responder }[];
-  /** 预测下一条消息的插件（只用第一个提供 suggest 的） */
-  suggester?: { plugin: string; suggest: Suggester };
   /** 第三方插件为自己的工具注册的显示方式，按工具名 */
   renderers: Map<string, { plugin: string; renderer: ToolRenderer }>;
   /** 第三方插件的快捷键，按 KEY_SPEC 的写法（小写） */
   keys: Map<string, { plugin: string; key: PluginKey }>;
-  /** 用户消息发出前依次处理它的插件 */
-  beforeSend: { plugin: string; fn: NonNullable<JadePlugin["beforeSend"]> }[];
   /** 主会话的工具；宿主用 read_file / list_dir 读取 @ 引用的文件 */
   tools: Tool[];
   /**
@@ -159,10 +153,6 @@ export interface Extension {
   commands: PluginCommand[];
   keys: PluginKey[];
   renderers: ToolRenderer[];
-  /** 只有用户层插件的 */
-  responder?: Responder;
-  beforeSend?: NonNullable<JadePlugin["beforeSend"]>;
-  suggest?: Suggester;
 }
 
 export async function createJade(opts: JadeOptions): Promise<Jade> {
@@ -373,8 +363,6 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
   });
 
   thirdParty = [...(opts.projectPlugins ?? []), ...added.map((a) => a.plugin)];
-  const suggesters = added.flatMap(({ plugin, suggest }) => (suggest ? [{ plugin: plugin.id, suggest }] : []));
-  for (const extra of suggesters.slice(1)) warnings.push(`plugin ${extra.plugin}: suggest is ignored: plugin ${suggesters[0]!.plugin} already provides it`);
   const plugins = [...builtin, ...thirdParty];
   const commands = new Map<string, { plugin: string; command: PluginCommand; builtin: boolean }>();
   const owners = [
@@ -407,15 +395,12 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
     builtins,
     extensions: added,
     commands,
-    responders: added.flatMap(({ plugin, responder }) => (responder ? [{ plugin: plugin.id, responder }] : [])),
-    suggester: suggesters[0],
     keys,
     renderers: new Map(
       [...(builtin as JadePlugin[]).map((p) => ({ id: p.id, renderers: p.renderers ?? [] })), ...added.map((a) => ({ id: a.plugin.id, renderers: a.renderers }))].flatMap((p) =>
         p.renderers.map((r) => [r.tool, { plugin: p.id, renderer: r }] as const),
       ),
     ),
-    beforeSend: added.flatMap(({ plugin, beforeSend }) => (beforeSend ? [{ plugin: plugin.id, fn: beforeSend }] : [])),
     dispose: () => (disposing ??= Promise.all(added.map(({ source, plugin }) => disposeInstance(source, plugin))).then((ws) => ws.filter((w): w is string => w !== undefined))),
     tools: allTools,
     shutdown: shell.shutdown,
@@ -459,15 +444,6 @@ async function createExtensions(sources: LoadedPlugin[], host: HostContext, warn
       if (!ok) warnings.push(`${where}: command ${JSON.stringify(c?.name)} is ignored: it needs a name of letters, digits, - and _, and a run function`);
       return ok;
     });
-    let responder: Responder | undefined;
-    if (plugin.responder !== undefined) {
-      const r = plugin.responder as Partial<Record<string, unknown>> | null;
-      const ok = typeof r === "object" && r !== null && ["approve", "ask"].every((k) => r[k] === undefined || typeof r[k] === "function");
-      // 项目层插件随仓库来，不能替用户批准它自己要做的事
-      if (source.layer === "project") warnings.push(`${where}: responder is ignored: only user plugins can answer approvals`);
-      else if (!ok) warnings.push(`${where}: responder is ignored: approve and ask must be functions`);
-      else responder = plugin.responder;
-    }
     // 模型服务不属于某套插件实例：改成在模块里导出（export const providers），加载时就注册。jade 不读实例上的 providers
     if ("providers" in plugin) warnings.push(`${where}: providers is ignored: export it from the plugin module instead (export const providers = [...])`);
     const keys = listOf(parts.keys).flatMap((k): PluginKey[] => {
@@ -491,16 +467,15 @@ async function createExtensions(sources: LoadedPlugin[], host: HostContext, warn
       else seen.add(tool!);
       return !why;
     });
-    let beforeSend: Extension["beforeSend"];
-    if (typeof plugin.beforeSend === "function") beforeSend = plugin.beforeSend.bind(plugin);
-    else if (plugin.beforeSend !== undefined) warnings.push(`${where}: beforeSend is ignored: it must be a function`);
-    let suggest: Suggester | undefined;
-    if (typeof (plugin.suggest as { next?: unknown } | null | undefined)?.next === "function") suggest = plugin.suggest;
-    else if (plugin.suggest !== undefined) warnings.push(`${where}: suggest is ignored: it needs a next function`);
-    out.push({ source, plugin, commands, keys, renderers, responder, beforeSend, suggest });
+    // jade 不再提供的扩展点：写了也不起作用，提示一次
+    for (const gone of REMOVED) if (gone in plugin) warnings.push(`${where}: ${gone} is ignored: jade does not offer it to plugins`);
+    out.push({ source, plugin, commands, keys, renderers });
   }
   return out;
 }
+
+/** 去掉了的扩展点（见 docs/design/jade-plugin-lifecycle.md 第 9 节） */
+const REMOVED = ["responder", "suggest", "beforeSend"] as const;
 
 /** 插件给的列表：没给时为空；给的不是数组时当作一个不合格的项，好让上面提示 */
 function listOf<T>(v: T[] | undefined): T[] {

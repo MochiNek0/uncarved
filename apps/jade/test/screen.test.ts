@@ -29,7 +29,6 @@ test("safeScreen filters every piece of text before it reaches the screen", asyn
     busy: rec("busy"),
     status: rec("status"),
     queued: rec("queued"),
-    suggest: rec("suggest"),
     select: async (...a: unknown[]) => (rec("select")(...a), "picked"),
     input: async (...a: unknown[]) => (rec("input")(...a), "typed"),
     draft: { text: () => "draft", insert: rec("insert"), set: rec("set") },
@@ -45,7 +44,6 @@ test("safeScreen filters every piece of text before it reaches the screen", asyn
   s.stream("text", bad);
   s.status({ plugins: [{ plugin: "p", text: bad }], branch: bad });
   s.queued([bad]);
-  s.suggest(bad);
   expect(await s.select<unknown>(bad, [{ label: bad, value: 1, hint: bad }], { body: bad })).toBe("picked");
   expect(await s.input(bad, { initial: bad })).toBe("typed");
   s.draft!.insert(bad);
