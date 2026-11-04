@@ -5,6 +5,7 @@ import path from "node:path";
 import { MemoryLogStore, type LogEvent } from "uncarved";
 import type { ToolRenderer } from "../src/plugins/loader.ts";
 import type { Screen, StatusInfo } from "../src/ui/screen.ts";
+import { fsRenderers, shellRenderers, taskRenderers } from "../src/ui/renderers.ts";
 import { transcript, type TranscriptOptions } from "../src/ui/transcript.ts";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -89,7 +90,9 @@ function recording(cwd = "/", renderer?: TranscriptOptions["renderer"]) {
     busy: noop,
     status: noop,
   } as unknown as Screen;
-  const t = transcript({ screen, cwd, store: new MemoryLogStore(), contextWindow: () => 100_000, canRetry: () => false, renderer });
+  // 和 jade 里一样带上内置工具的 renderer；传进来的（插件的）优先
+  const own = new Map([...fsRenderers(cwd), ...shellRenderers, ...taskRenderers].map((r) => [r.tool, { plugin: "jade/builtin", renderer: r }]));
+  const t = transcript({ screen, cwd, store: new MemoryLogStore(), contextWindow: () => 100_000, canRetry: () => false, renderer: (tool) => renderer?.(tool) ?? own.get(tool) });
   const event = (type: string, data: unknown) => t.onNotice({ type: "event", event: { type, data, origin: { by: "kernel" } } as unknown as LogEvent });
   const use = (id: string, name: string, input: unknown) => {
     event("model.responded", { content: [{ kind: "tool_use", id, name, input }], usage: {} });

@@ -45,7 +45,7 @@ import type { Check } from "./plugins/checks.ts";
 import { bold, dim, green, plainScreen, red, safeScreen, yellow, type CommandInfo, type Screen } from "./ui/screen.ts";
 import { configurator } from "./ui/configure.ts";
 import { reviewer } from "./plugins/review.ts";
-import { callDetails, clip, shortPath } from "./ui/render.ts";
+import { clip, shortPath } from "./ui/render.ts";
 import { transcript } from "./ui/transcript.ts";
 import { run, VERSION } from "./sys.ts";
 import { autoUpdate, autoUpdateEnabled, detectInstall, newerVersion, updateCli } from "./update.ts";
@@ -712,7 +712,7 @@ async function ask(c: Call, who: string, remember: (rule: AllowRule) => Promise<
   // 主 Agent 的调用的结果之后接在这一行后面
   screen.log((approved ? green(`✓ ${who}${head}`) : red(`✗ ${who}${head}`)) + via + dim(reason ? ` — ${clip(reason, 200)}` : ""), {
     id: c.toolUseId,
-    details: callDetails(c.name, c.input),
+    details: view.details(c.name, c.input),
   });
   return { approved, reason };
 }

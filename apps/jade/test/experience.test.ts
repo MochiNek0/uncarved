@@ -5,7 +5,7 @@ import path from "node:path";
 import type { Block, Message } from "uncarved";
 import { expandCommand, lastTurnChanges, loadCommands, parseCommand, type Checkpoint } from "../src/index.ts";
 import { diffLines, diffStats, hunks, renderDiff } from "../src/ui/diff.ts";
-import { preview } from "../src/ui/render.ts";
+import { fsRenderers } from "../src/ui/renderers.ts";
 
 const plain = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
 
@@ -44,14 +44,14 @@ describe("approval preview", () => {
   test("edit_file shows a numbered diff of the real file; a failing edit says so", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "jade-preview-"));
     await writeFile(path.join(dir, "a.ts"), "one\ntwo\nthree\n");
-    const call = (input: unknown) => ({ toolUseId: "t", name: "edit_file", input, decision: "ask" as const });
-    const ok = plain(await preview(call({ path: "a.ts", old_string: "two", new_string: "TWO" }) as never, dir));
+    const preview = async (tool: string, input: unknown) => (await fsRenderers(dir).find((r) => r.tool === tool)!.preview!(input))!;
+    const ok = plain(await preview("edit_file", { path: "a.ts", old_string: "two", new_string: "TWO" }));
     expect(ok).toContain("2 - two");
     expect(ok).toContain("2 + TWO");
     expect(ok).toContain("1   one");
-    const bad = plain(await preview(call({ path: "a.ts", old_string: "four", new_string: "4" }) as never, dir));
+    const bad = plain(await preview("edit_file", { path: "a.ts", old_string: "four", new_string: "4" }));
     expect(bad).toContain("this edit will fail");
-    const overwrite = plain(await preview({ toolUseId: "t", name: "write_file", input: { path: "a.ts", content: "one\n" }, decision: "ask" } as never, dir));
+    const overwrite = plain(await preview("write_file", { path: "a.ts", content: "one\n" }));
     expect(overwrite).toContain("overwrites");
     expect(overwrite).toContain("+0 -2");
   });

@@ -1,13 +1,10 @@
-// 宿主显示用的纯函数：工具调用的一行摘要、审批时的预览、折叠的工具结果。不依赖运行时和界面状态。
+// 宿主显示用的纯函数：工具调用的默认摘要和预览、折叠的工具结果。不依赖运行时和界面状态。
+// 各个工具自己的显示见 renderers.ts（jade 的工具）和插件的 renderers。
 
-import { readFileSync } from "node:fs";
-import { readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { PendingCall } from "uncarved";
-import { applyEditsToText, display, type Edit } from "../tools/fs.ts";
-import { diffLines, diffStats, renderDiff } from "./diff.ts";
-import { dim, green, red, yellow } from "./screen.ts";
+import { display } from "../tools/fs.ts";
+import { dim } from "./screen.ts";
 
 export const clip = (s: string, n: number) => (s.length > n ? s.slice(0, n) + "…" : s);
 
@@ -18,96 +15,17 @@ export function shortPath(p: string): string {
   return shown.split(path.sep).join("/");
 }
 
-/** 工具调用的一行摘要，显示在工具名后面的括号里 */
-export function summarize(cwd: string, name: string, input: unknown): string {
+/** 工具调用默认的一行摘要，显示在工具名后面的括号里：path 参数，没有时是参数的 JSON */
+export function summarize(cwd: string, input: unknown): string {
   const i = (input ?? {}) as Record<string, unknown>;
-  if (name === "bash") return clip(String(i.command ?? "").split("\n")[0]!, 120);
-  if (name === "task") return String(i.description ?? "");
-  if (name === "bash_output" || name === "kill_shell") return String(i.id ?? "");
-  if (name === "todo_write") return `${Array.isArray(i.todos) ? i.todos.length : 0} items`;
-  if (name === "ask_user") return Array.isArray(i.questions) && i.questions.length === 1 ? clip(String(i.questions[0]?.question ?? ""), 120) : `${Array.isArray(i.questions) ? i.questions.length : 0} questions`;
-  if (name === "web_fetch") return clip(String(i.url ?? ""), 120);
-  if (name === "web_search") return clip(String(i.query ?? ""), 120);
-  if (name === "memory") return `${i.action} ${i.scope}: ${clip(String(i.text ?? ""), 120)}`;
   const where = typeof i.path === "string" ? display(cwd, i.path) : "";
-  if (name === "multi_edit") return `${where}, ${Array.isArray(i.edits) ? i.edits.length : 0} edits`;
-  if (name === "grep" || name === "glob") return `${i.pattern}${where && where !== "." ? ` in ${where}` : ""}`;
   return where || clip(JSON.stringify(input), 120);
 }
 
-/** summarize 省略了内容时（目前只有多行或很长的 bash 命令），调用行展开后先显示完整的参数 */
-export function callDetails(name: string, input: unknown): string | undefined {
-  if (name !== "bash") return undefined;
-  const command = String(((input ?? {}) as Record<string, unknown>).command ?? "");
-  const lines = command.split("\n");
-  if (lines.length === 1 && lines[0]!.length <= 120) return undefined;
-  return detailsOf(lines.map((l, i) => `${i === 0 ? "$" : " "} ${l}`), dim, 200);
+/** 审批时默认的预览：参数的 JSON */
+export function preview(input: unknown): string {
+  return dim(clip(JSON.stringify(input, null, 2), 2000));
 }
-
-/**
- * 审批时显示的内容：修改显示成带行号和上下文的 diff（读出文件、按工具的规则算出修改后的内容），
- * 命令显示命令本身。文件读不了、替换不成立时退回到只显示参数里的新旧文本
- */
-export async function preview(c: PendingCall, cwd: string): Promise<string> {
-  const i = (c.input ?? {}) as Record<string, unknown>;
-  const lines = (s: string, mark: string, color: (s: string) => string, max = 30) => {
-    const all = s.split("\n");
-    const shown = all.slice(0, max).map((l) => color(`${mark} ${l}`));
-    if (all.length > max) shown.push(dim(`  … ${all.length - max} more lines`));
-    return shown.join("\n");
-  };
-  const raw = (e: Record<string, unknown>) => `${lines(String(e.old_string ?? ""), "-", red)}\n${lines(String(e.new_string ?? ""), "+", green)}`;
-  const file = typeof i.path === "string" ? path.resolve(cwd, i.path) : undefined;
-  const current = file ? await readFile(file, "utf8").catch(() => undefined) : undefined;
-  if (c.name === "edit_file" || (c.name === "multi_edit" && Array.isArray(i.edits))) {
-    const edits = (c.name === "edit_file" ? [i] : i.edits) as unknown as Edit[];
-    const fallback = () => edits.map((e) => raw(e as unknown as Record<string, unknown>)).join(dim("\n  ⋯\n"));
-    if (current === undefined) return fallback();
-    const r = applyEditsToText(current, edits, display(cwd, file!));
-    if (typeof r === "string") return `${fallback()}\n${yellow(`  (this edit will fail: ${clip(r, 200)})`)}`;
-    return renderDiff(current, r.text);
-  }
-  if (c.name === "write_file") {
-    const content = String(i.content ?? "");
-    if (current !== undefined) return `${dim("  overwrites the existing file:")}\n${renderDiff(current, content)}`;
-    return lines(content, "+", green, 20);
-  }
-  if (c.name === "bash") return lines(String(i.command ?? ""), "$", (s) => s);
-  if (c.name === "memory") return `${i.action === "remove" ? red("- ") : green("+ ")}${String(i.text ?? "")}`;
-  return dim(clip(JSON.stringify(c.input, null, 2), 2000));
-}
-
-/**
- * 修改文件的调用（edit_file、multi_edit、write_file）执行前后的差异，对话里显示在结果后面。
- * 要在工具执行之前调用（读的是修改前的文件），同步读文件：执行前的事件通知是同步的，等异步读完文件可能已经改了。
- * 不是修改文件的调用、替换不成立时返回 undefined
- */
-export function editDiff(cwd: string, name: string, input: unknown): { added: number; removed: number; text: string } | undefined {
-  if (name !== "edit_file" && name !== "multi_edit" && name !== "write_file") return undefined;
-  const i = (input ?? {}) as Record<string, unknown>;
-  if (typeof i.path !== "string") return undefined;
-  const file = path.resolve(cwd, i.path);
-  let before: string | undefined;
-  try {
-    before = readFileSync(file, "utf8");
-  } catch {}
-  let after: string;
-  if (name === "write_file") {
-    after = String(i.content ?? "");
-  } else {
-    if (before === undefined) return undefined;
-    const edits = (name === "edit_file" ? [i] : Array.isArray(i.edits) ? i.edits : []) as unknown as Edit[];
-    const r = applyEditsToText(before, edits, display(cwd, file));
-    if (typeof r === "string") return undefined;
-    after = r.text;
-  }
-  const lines = diffLines(before ?? "", after);
-  const { added, removed } = diffStats(lines);
-  return { added, removed, text: renderDiff(before ?? "", after, MAX_DIFF_LINES, lines) };
-}
-
-/** 对话里折叠的 diff 最多显示这么多行 */
-const MAX_DIFF_LINES = 400;
 
 /** 工具结果展开后的内容：缩进的全部行，超过 max 行时截断 */
 export function detailsOf(lines: string[], color: (s: string) => string, max: number): string {

@@ -84,13 +84,20 @@ export interface ToolRenderer {
   tool: string;
   /** 调用行 "● 工具名(…)" 括号里的摘要，只显示第一行；默认是 path 参数或参数的 JSON */
   summary?(input: unknown): string | undefined;
+  /** 摘要省略了的参数（例如很长的命令），点击调用行展开后显示在最前面，可以多行；默认没有 */
+  details?(input: unknown): string | undefined;
   /** 请用户批准时显示的预览，可以多行、带 ANSI 颜色；默认是参数的 JSON */
   preview?(input: unknown): Awaitable<string | undefined>;
+  /**
+   * 工具执行之前同步调用（例如记下修改前的文件，好在结果里显示 diff），返回值交给 result 的 before。
+   * 用户拒绝的调用、重新显示的历史不调用
+   */
+  before?(input: unknown): unknown;
   /**
    * 结果：line 接在调用行的 "⎿ " 后面（一行），details 是点击展开后的内容（可以多行）；
    * 默认显示结果文字的第一行，多出的行折叠起来
    */
-  result?(r: { input: unknown; text: string; isError: boolean }): { line: string; details?: string } | undefined;
+  result?(r: { input: unknown; text: string; isError: boolean; before?: unknown }): { line: string; details?: string } | undefined;
 }
 
 /** "ctrl+<字母>" 或 "alt+<字母或数字>" */

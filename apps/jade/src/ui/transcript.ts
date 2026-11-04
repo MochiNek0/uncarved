@@ -8,7 +8,8 @@ import type { ShellProgress } from "../tools/shell.ts";
 import type { TaskProgress } from "../tools/task.ts";
 import { renderTodos, type Todo } from "../tools/todo.ts";
 import type { ToolRenderer } from "../plugins/loader.ts";
-import { callDetails, clip, detailsOf, editDiff, preview, summarize } from "./render.ts";
+import type { PendingCall } from "uncarved";
+import { clip, detailsOf, preview, summarize } from "./render.ts";
 import { bold, cyan, dim, green, red, yellow, type Screen } from "./screen.ts";
 
 export type Notice = Parameters<Parameters<Runtime["subscribe"]>[0]>[0];
@@ -46,8 +47,10 @@ export interface Transcript {
   reset(): void;
   /** 工具调用括号里的一行摘要：插件的 renderer 优先 */
   summary(name: string, input: unknown): string;
-  /** 审批时的预览：插件的 renderer 优先 */
-  preview(c: Parameters<typeof preview>[0]): Promise<string>;
+  /** 摘要省略了的参数，调用行展开后显示在最前面（已经缩进）；没有时是 undefined */
+  details(name: string, input: unknown): string | undefined;
+  /** 审批时的预览：工具的 renderer 给的，没有时是参数的 JSON */
+  preview(c: PendingCall): Promise<string>;
 }
 
 /** 工具结果折叠起来的完整内容最多这么多行 */
@@ -139,8 +142,8 @@ export function transcript(opts: TranscriptOptions): Transcript {
   const tasks = new Map<string, string>();
   /** 调用行省略了的参数（例如很长的命令），结果出来后放在折叠内容的最前面 */
   const calls = new Map<string, string>();
-  /** 修改文件的调用执行前算好的 diff */
-  const diffs = new Map<string, NonNullable<ReturnType<typeof editDiff>>>();
+  /** renderer 的 before 在执行前记下的东西，结果出来时交给它的 result */
+  const befores = new Map<string, unknown>();
   const progress =(id: string, line: string, o?: { output?: boolean }) => {
     running.add(id);
     screen.progress(id, line, o);
@@ -182,7 +185,11 @@ export function transcript(opts: TranscriptOptions): Transcript {
   }
   const summary = (name: string, input: unknown): string => {
     const s = customSync(name, (r) => r.summary?.(input));
-    return typeof s === "string" ? clip(s.split("\n")[0]!, 120) : summarize(cwd, name, input);
+    return typeof s === "string" ? clip(s.split("\n")[0]!, 120) : summarize(cwd, input);
+  };
+  const details = (name: string, input: unknown): string | undefined => {
+    const d = customSync(name, (r) => r.details?.(input));
+    return typeof d === "string" && d ? d.replace(/^/gm, "    ") : undefined;
   };
 
   const self: Transcript = {
@@ -193,9 +200,10 @@ export function transcript(opts: TranscriptOptions): Transcript {
     onNotice,
     replay,
     summary,
+    details,
     async preview(c) {
       const p = await custom(c.name, (r) => r.preview?.(c.input));
-      return typeof p === "string" ? p : preview(c, cwd);
+      return typeof p === "string" ? p : preview(c.input);
     },
     echo: (text) => screen.log(text.startsWith("/") ? cyan(`› ${text}`) : `\n${bold(`› ${text.replace(/\n/g, "\n  ")}`)}`),
     reset() {
@@ -208,7 +216,7 @@ export function transcript(opts: TranscriptOptions): Transcript {
       steps.clear();
       tasks.clear();
       calls.clear();
-      diffs.clear();
+      befores.clear();
       inputs.clear();
       self.lastEnd = undefined;
     },
@@ -309,14 +317,14 @@ export function transcript(opts: TranscriptOptions): Transcript {
       case "tool.decided": {
         const d = e.data as EventDataMap["tool.decided"];
         const name = toolNames.get(d.toolUseId) ?? "?";
-        const full = callDetails(name, d.input);
+        const full = details(name, d.input);
         if (full) calls.set(d.toolUseId, full);
         if (opts.renderer?.(name)?.renderer.result) inputs.set(d.toolUseId, d.input);
         if (d.decision === "ask") return;
-        // 修改文件的调用：执行前按文件当时的内容算出 diff，结果出来后接在后面（重新显示历史时文件已经变了，不算）
+        // 执行前交给 renderer 的 before（例如按文件当时的内容算 diff）；重新显示历史时文件已经变了，不调用
         if (d.decision === "allow" && !replaying) {
-          const diff = editDiff(cwd, name, d.input);
-          if (diff) diffs.set(d.toolUseId, diff);
+          const before = customSync(name, (r) => r.before?.(d.input));
+          if (before !== undefined) befores.set(d.toolUseId, before);
         }
         const head = `${bold(name)}(${summary(name, d.input)})`;
         if (d.decision === "deny") screen.log(red(`✗ ${head}`) + dim(d.reason ? ` — ${clip(d.reason, 200)}` : ""), { id: d.toolUseId, details: full });
@@ -345,28 +353,21 @@ export function transcript(opts: TranscriptOptions): Transcript {
         tasks.delete(d.toolUseId);
         const call = calls.get(d.toolUseId);
         calls.delete(d.toolUseId);
-        const diff = diffs.get(d.toolUseId);
-        diffs.delete(d.toolUseId);
+        const before = befores.get(d.toolUseId);
+        befores.delete(d.toolUseId);
         const input = inputs.get(d.toolUseId);
         inputs.delete(d.toolUseId);
         if (quiet.delete(d.toolUseId) && !d.isError) return;
         const text = textOf(d.content).trim();
         const name = toolNames.get(d.toolUseId) ?? "?";
-        const mine = customSync(name, (r) => r.result?.({ input, text, isError: d.isError === true }));
+        const mine = customSync(name, (r) => r.result?.({ input, text, isError: d.isError === true, before }));
         if (mine && typeof mine.line === "string") {
-          const details = typeof mine.details === "string" && mine.details ? mine.details.replace(/^/gm, "    ") : undefined;
-          screen.amend(d.toolUseId, (d.isError ? red : dim)("⎿ ") + clip(mine.line.split("\n")[0]!, 200), { details });
+          const own = typeof mine.details === "string" && mine.details ? [mine.details.replace(/^/gm, "    ")] : [];
+          const folded = [...(call ? [call] : []), ...own].join("\n") || undefined;
+          screen.amend(d.toolUseId, (d.isError ? red : dim)("⎿ ") + clip(mine.line.split("\n")[0]!, 200), { details: folded });
           return;
         }
         const lines = text.split("\n");
-        // 改了文件：结果行后面是增删的行数，展开看完整的 diff
-        if (diff && !d.isError) {
-          const extra = lines.length > 1 ? [detailsOf(lines.slice(1), (s) => s, MAX_DETAIL_LINES)] : [];
-          screen.amend(d.toolUseId, dim(`⎿ ${clip(lines[0] ?? "", 160)} `) + `${green(`+${diff.added}`)} ${red(`-${diff.removed}`)}`, {
-            details: [...extra, diff.text.replace(/^/gm, "    ")].join("\n"),
-          });
-          return;
-        }
         // 结果接在调用的那一行后面；摘要省略了内容时，把完整结果（和子 Agent 调用过的工具）折叠起来，点击展开
         const shown = d.isError ? 4 : 1;
         const width = d.isError ? 200 : 160;
@@ -388,7 +389,7 @@ export function transcript(opts: TranscriptOptions): Transcript {
         doneProgress(d.toolUseId);
         tasks.delete(d.toolUseId);
         calls.delete(d.toolUseId);
-        diffs.delete(d.toolUseId);
+        befores.delete(d.toolUseId);
         inputs.delete(d.toolUseId);
         screen.amend(d.toolUseId, yellow("⎿ interrupted before finishing; not retried"));
         return;
@@ -482,7 +483,7 @@ export function transcript(opts: TranscriptOptions): Transcript {
           const head = `${bold(name)}(${summary(name, asked.get(d.toolUseId))})`;
           screen.log(d.approved ? green(`✓ ${head}`) : red(`✗ ${head}`) + dim(d.reason ? ` — ${clip(d.reason, 200)}` : ""), {
             id: d.toolUseId,
-            details: callDetails(name, asked.get(d.toolUseId)),
+            details: details(name, asked.get(d.toolUseId)),
           });
           continue;
         }
