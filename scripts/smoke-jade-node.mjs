@@ -82,13 +82,15 @@ try {
   const pluginSrc = path.join(tmp, "plugin");
   await mkdir(pluginSrc);
   await writeFile(path.join(pluginSrc, "package.json"), JSON.stringify({ name: "jade-smoke-plugin", version: "1.0.0", type: "module", main: "index.js" }));
+  // 有代码的插件要在 plugin.json 里写 id
+  await writeFile(path.join(pluginSrc, "plugin.json"), JSON.stringify({ id: "smoke/hello", version: "1.0.0" }));
   await writeFile(path.join(pluginSrc, "index.js"), `export default { id: "smoke/hello", version: "1.0.0", kernel: "^0.1", commands: [{ name: "hello", run: () => "hi" }] };\n`);
   execSync("npm pack --silent", { cwd: pluginSrc, stdio: "pipe" });
   const tgz = (await readdir(pluginSrc)).find((f) => f.endsWith(".tgz"));
   const add = await jade(["plugin", "add", path.join(pluginSrc, tgz)]);
   assert.equal(add.code, 0, add.stderr + add.stdout);
   const list = await jade(["plugin", "list"]);
-  assert.match(list.stdout, /jade-smoke-plugin/);
+  assert.match(list.stdout, /smoke\/hello/);
 
   // 4. web_fetch 的网页转文本在 Node 下也能用（以前用的 Bun 的 HTMLRewriter，Node 里没有）
   const { htmlToMarkdown } = await import(pathToFileURL(path.join(path.dirname(bin), "..", "dist", "tools", "web.js")).href);
