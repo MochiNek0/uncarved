@@ -187,7 +187,8 @@ if (!hasProvider() && !tui) {
       `Run jade in a terminal and use /model, or put one of these in ${envFile} (or set them in the shell):\n` +
       `  OPENAI_COMPAT_BASE_URL=…  OPENAI_COMPAT_API_KEY=…  OPENAI_COMPAT_MODEL=…   (any /chat/completions service)\n` +
       `  OPENAI_API_KEY=…  [OPENAI_BASE_URL=…  OPENAI_MODEL=…]                     (OpenAI Responses API)\n` +
-      `  ANTHROPIC_API_KEY=…  [ANTHROPIC_MODEL=…]                                  (Claude)`,
+      `  ANTHROPIC_API_KEY=…  [ANTHROPIC_MODEL=…]                                  (Claude)\n` +
+      `  JADE_PROVIDER=<kind>  plus the settings that plugin documents             (a model service from a plugin)`,
   );
   process.exit(2);
 }
@@ -284,13 +285,8 @@ const configure = configurator({
   onApplied: () => screen.status({ model: modelLabel() }),
 });
 
-if (!hasProvider()) {
-  screen.log(bold("Welcome to jade.") + " No model is configured yet; let's set one up.");
-  if (!(await configure.provider())) {
-    await screen.close();
-    process.exit(2);
-  }
-} else if (providerEarly) {
+// 还没配置模型时，等插件加载完再问（见下面 registerProviders 之后）：插件提供的服务也要列出来
+if (providerEarly) {
   try {
     provider.set(retrying(await providerEarly));
   } catch (err) {
@@ -430,7 +426,15 @@ let jade: Jade = await makeJade(opts.mode);
 for (const w of jade.warnings) screen.log(yellow(`[warning] ${w}`));
 // 插件提供的模型服务：只在启动时注册一次，之后的会话共用（provider 是整个进程的）
 for (const w of registerProviders(jade.providers)) screen.log(yellow(`[warning] ${w}`));
-if (pluginProviderPending) {
+if (!hasProvider()) {
+  // 第一次运行：插件已经加载，/model 的服务列表里也有插件提供的
+  screen.log(bold("Welcome to jade.") + " No model is configured yet; let's set one up.");
+  if (!(await configure.provider())) {
+    await closePlugins();
+    await screen.close();
+    process.exit(2);
+  }
+} else if (pluginProviderPending) {
   try {
     provider.set(retrying(await providerFromEnv()));
     contextWindow = contextWindowFromEnv();
