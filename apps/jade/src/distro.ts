@@ -17,6 +17,7 @@ import { COMMAND_NAME, JADE_VERSION, type HostContext, type JadePlugin, type Loa
 import { policy, type AllowRule, type Mode, type Policy, type PolicyOptions } from "./plugins/policy.ts";
 import { prompts, realPath, repoRoot } from "./plugins/prompts.ts";
 import { repeats } from "./plugins/repeats.ts";
+import { sessionsPlugin, undoPlugin } from "./plugins/sessions.ts";
 import { fsTools } from "./tools/fs.ts";
 import { Checkpoints } from "./tools/checkpoint.ts";
 import { shellTools } from "./tools/shell.ts";
@@ -150,7 +151,7 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
   // run 也给插件和编辑后检查用，所以 jade/shell 停用时也创建，只是不把工具交给模型
   const shell = shellTools({ cwd });
   const root = await repoRoot(cwd);
-  const host: HostContext = { jade: JADE_VERSION, cwd: realPath(cwd), root: realPath(root), home: opts.home, definePlugin, run: shell.run, complete: completer(provider), status: (plugin, text) => opts.onStatus?.(plugin, text) };
+  const host: HostContext = { jade: JADE_VERSION, cwd: realPath(cwd), root: realPath(root), home: opts.home, definePlugin, run: shell.run, complete: completer(provider), status: (plugin, text) => opts.onStatus?.(plugin, text), checkpoints };
 
   // 第三方插件先创建：要先知道它们代替哪些内置插件
   const made = await createExtensions(opts.extensions ?? [], host, disabled, warnings);
@@ -269,6 +270,8 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
     add({ ...compact.plugin, commands: [compactCommand(compact)] });
   }
   if (!off("jade/budget")) add(budget({ maxSteps: opts.maxSteps }));
+  if (!off("jade/sessions")) add(sessionsPlugin());
+  if (!off("jade/undo")) add(undoPlugin(host));
   if (!off("jade/repeats")) {
     // 自己数回复次数：不依赖 jade/fs 是否加载
     const own = { calls: 0 };
