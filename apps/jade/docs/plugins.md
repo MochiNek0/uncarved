@@ -130,6 +130,7 @@ interface JadePlugin {
   responder?: Responder;        // jade 的扩展：在终端之外回答审批和 ask_user，见下文
   suggest?: Suggester;          // jade 的扩展：预测下一条消息，输入框里显示成灰字，见下文
   beforeSend?(text, ctx): string | undefined;  // jade 的扩展：用户消息发出前改写，见下文
+  providers?: PluginProvider[]; // jade 的扩展：模型服务，用 JADE_PROVIDER 选择，见下文
 }
 ```
 
@@ -475,6 +476,60 @@ beforeSend(text, { sessionId, signal }) {
 - 返回新的文字代替原文，返回 `undefined` 不改，返回空字符串不发送。多个插件按加载顺序依次处理。
 - 改写过的消息在对话里提示 `[plugin <id> changed the message]`，点开能看到改写后的全文；对话里显示的仍是用户输入的原文。
 - 出错或 30 秒内没有返回时，按原文发出并显示警告。
+
+## 模型服务（providers）
+
+插件可以提供新的模型服务，用户在 `$JADE_HOME/.env` 里写 `JADE_PROVIDER=<kind>` 选它：
+
+```ts
+interface PluginProvider {
+  kind: string;                                   // JADE_PROVIDER 的值；字母、数字、-、_，不能是 openai-compat、openai、anthropic
+  model(env): string;                             // 当前的模型名：状态栏、/model 显示，上下文窗口按它推断
+  via?(env): string;                              // 系统提示词里"经什么服务运行"，例如 "the Foo API at api.foo.com"
+  create(env): Provider | Promise<Provider>;      // uncarved 的 Provider；缺配置时抛错，信息直接显示给用户
+  listModels?(env): Promise<string[]>;            // /model 里列出可选的模型
+  settings?: ProviderSetting[];                   // /model 添加这个服务时依次询问的配置项
+}
+
+interface ProviderSetting {
+  env: string;            // 环境变量名，例如 "FOO_API_KEY"；大写字母、数字、_，不能以 JADE_ 开头
+  label: string;          // /model 里显示的名字
+  secret?: boolean;       // 输入时遮住；留空沿用已有的值
+  model?: boolean;        // 这一项是模型名：从 listModels 里选，/model 换模型时只改它；最多一项
+  required?: boolean;     // 不能为空
+  placeholder?: string;
+}
+```
+
+```ts
+definePlugin({
+  id: "me/foo",
+  version: "1.0.0",
+  providers: [{
+    kind: "foo",
+    model: (env) => env.FOO_MODEL ?? "foo-large",
+    settings: [
+      { env: "FOO_API_KEY", label: "Foo API key", secret: true, required: true },
+      { env: "FOO_MODEL", label: "Model", model: true },
+    ],
+    listModels: async (env) => fetchFooModels(env.FOO_API_KEY),
+    create: (env) => {
+      if (!env.FOO_API_KEY) throw new Error("FOO_API_KEY is required for the foo provider");
+      return fooProvider({ apiKey: env.FOO_API_KEY, model: env.FOO_MODEL ?? "foo-large" });
+    },
+  }],
+});
+```
+
+- `env` 是 jade 的环境变量，包括 `$JADE_HOME/.env` 里的。服务自己的配置项（地址、密钥）由插件定名字，用户写进 `.env`。
+- **只认用户层插件**：服务能看到全部对话和 API key，项目层插件提供的 `providers` 被忽略。
+- **只在启动时读一次**：provider 是整个进程共用的（主会话、子 Agent、压缩、auto 模式的审查、`ctx.complete`），换会话不重建，所以 `create` 不要依赖按会话的状态。
+- jade 在外面包一层重试和限速（`JADE_RPM`），压缩、子 Agent 也都经过它。要让重试正确工作，请求失败时抛 uncarved 的 `ProviderError`：能重试的设 `retryable: true`，限流时带上 `status: 429`。
+- `JADE_EFFORT`、`JADE_MAX_TOKENS` 不检查，插件愿意的话自己从 `env` 里读；`JADE_VISION` 不设时算不能看图片。
+- 选了插件的服务时，jade 等插件加载完才创建 provider，启动会比内置服务慢一点。`JADE_PROVIDER` 写的名字没有插件提供时，启动时报错并列出可选的服务。
+- **`/model`**：声明了 `settings` 的服务出现在 "Add a model… → Another service…" 的列表里，选中后依次询问各项，再选模型；配置写进 `$JADE_HOME/.env`，并和内置服务一样记进 `models.json`，之后可以在 `/model` 里直接切换回来（类型和模型名以外的配置项都相同的算同一个服务）。没有声明模型名（`model: true`）的服务，`/model` 不能换它的模型。
+- 第一次运行、还没配置任何模型时，jade 在加载插件之前就进入配置流程，那时的列表里只有内置服务；可以先手动在 `.env` 里写 `JADE_PROVIDER`，或者先配一个内置服务，再用 `/model` 换。
+- 进程外插件不能提供 `providers`。
 
 ## 带上 skills、命令和 MCP 服务
 

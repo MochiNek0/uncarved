@@ -3,7 +3,7 @@
 // 每个模型带自己的设置。/model 可以直接切回去，换了服务或地址之前的也不会丢。
 
 import { hasProvider, parseTokens, readSavedServices, updateEnvFile, writeSavedServices, type SavedModel, type SavedService } from "../config.ts";
-import { EFFORTS, listModels, providerInfo, providerKind, rpmFromEnv, visionFromEnv, type ProviderKind } from "../provider.ts";
+import { EFFORTS, isBuiltinKind, listModels, pluginProvider, pluginProviders, providerInfo, providerKind, rpmFromEnv, visionFromEnv, type ProviderKind } from "../provider.ts";
 import { shortPath } from "./render.ts";
 import { dim, green, red, type Screen } from "./screen.ts";
 
@@ -50,18 +50,22 @@ function visionSetting(): boolean | undefined {
   }
 }
 
-function visionHint(kind: ProviderKind): string {
+function visionHint(kind: string): string {
   const v = visionSetting();
-  return v === undefined ? `${kind === "openai-compat" ? "no" : "yes"} (default)` : v ? "yes" : "no";
+  return v === undefined ? `${isBuiltinKind(kind) && kind !== "openai-compat" ? "yes" : "no"} (default)` : v ? "yes" : "no";
 }
 
-/** 一个服务包含的变量 */
-const serviceKeys = (kind: ProviderKind) => [
-  "JADE_PROVIDER",
-  URL_KEY[kind],
-  KEY_KEY[kind],
-  ...(kind === "openai-compat" ? ["OPENAI_COMPAT_EXTRA_BODY"] : []),
-];
+/** 插件服务声明的配置项（见 ProviderDef.settings） */
+const settingsOf = (kind: string) => pluginProvider(kind)?.def.settings ?? [];
+
+/** 一个服务包含的变量（不含模型名）；插件服务是它声明的配置项 */
+const serviceKeys = (kind: string) =>
+  isBuiltinKind(kind)
+    ? ["JADE_PROVIDER", URL_KEY[kind], KEY_KEY[kind], ...(kind === "openai-compat" ? ["OPENAI_COMPAT_EXTRA_BODY"] : [])]
+    : ["JADE_PROVIDER", ...settingsOf(kind).filter((x) => !x.model).map((x) => x.env)];
+
+/** 保存模型名的变量；插件服务没有声明模型名时 undefined */
+const modelKey = (kind: string): string | undefined => (isBuiltinKind(kind) ? MODEL_KEY[kind] : settingsOf(kind).find((x) => x.model)?.env);
 
 type Env = Record<string, string | undefined>;
 
@@ -71,10 +75,14 @@ const pick = (env: Env, keys: string[]) => {
   return out;
 };
 
-/** 服务的类型、地址和密钥都相同的算同一个；配置无效时返回 undefined */
+/**
+ * 服务的类型、地址和密钥都相同的算同一个；插件服务是类型和它声明的配置项（模型名除外）都相同。
+ * 配置无效、插件服务的插件没有加载时返回 undefined
+ */
 function serviceId(env: Env): string | undefined {
   try {
     const i = providerInfo(env);
+    if (!isBuiltinKind(i.kind)) return pluginProvider(i.kind) ? [i.kind, ...serviceKeys(i.kind).slice(1).map((k) => env[k] ?? "")].join("|") : undefined;
     return `${i.kind}|${i.baseURL ?? ""}|${env[KEY_KEY[i.kind]] ?? ""}`;
   } catch {
     return undefined;
@@ -110,9 +118,9 @@ function modelNames(models: SavedModel[]): string {
 }
 
 /** 主菜单里设置那一项的简要说明，例如 "64K out · 1M ctx · images" */
-function settingsSummary(kind: ProviderKind, contextWindow: number): string {
+function settingsSummary(kind: string, contextWindow: number): string {
   const env = process.env;
-  const images = visionSetting() ?? kind !== "openai-compat";
+  const images = visionSetting() ?? (isBuiltinKind(kind) && kind !== "openai-compat");
   return [
     env.JADE_MAX_TOKENS && `${env.JADE_MAX_TOKENS} out`,
     env.JADE_EFFORT && `${env.JADE_EFFORT} effort`,
@@ -175,7 +183,8 @@ export function configurator(opts: ConfigureOptions): Configure {
     for (const k of serviceKeys(kind)) updates[k] = s.env[k];
     for (const k of MODEL_SETTINGS) updates[k] = m.settings[k];
     updates.JADE_PROVIDER = kind;
-    updates[MODEL_KEY[kind]] = m.name;
+    const mk = modelKey(kind);
+    if (mk) updates[mk] = m.name;
     return applyConfig(updates);
   }
 
@@ -188,7 +197,13 @@ export function configurator(opts: ConfigureOptions): Configure {
     const service = (await savedServices()).find((s) => serviceId(s.env) === id);
     const saved = service?.models.find((m) => m.name === model);
     if (service && saved) return useSaved(service, saved);
-    return applyConfig({ [MODEL_KEY[providerKind()]]: model, JADE_CONTEXT_WINDOW: undefined });
+    const kind = providerKind();
+    const mk = modelKey(kind);
+    if (!mk) {
+      screen.log(red(`${kind} is provided by plugin ${pluginProvider(kind)?.plugin ?? "(not loaded)"}, which does not declare a model setting; set the model in ${shortPath(envFile)}.`));
+      return false;
+    }
+    return applyConfig({ [mk]: model, JADE_CONTEXT_WINDOW: undefined });
   }
 
   /** 选模型：服务能列出模型时从列表里选，否则手动输入 */
@@ -211,11 +226,12 @@ export function configurator(opts: ConfigureOptions): Configure {
   async function configureProvider(): Promise<boolean> {
     const current = hasProvider() ? providerInfo() : undefined;
     const currentId = hasProvider() ? serviceId(process.env) : undefined;
-    const kind = await screen.select(
-      "Which service should jade use?",
-      PROVIDERS.map((p) => ({ label: p.label, value: p.kind, hint: p.kind === current?.kind ? `${p.hint} · current` : p.hint })),
-    );
+    const kind = await screen.select<string>("Which service should jade use?", [
+      ...PROVIDERS.map((p) => ({ label: p.label, value: p.kind, hint: p.kind === current?.kind ? `${p.hint} · current` : p.hint })),
+      ...pluginProviders().map((p) => ({ label: p.def.kind, value: p.def.kind, hint: `plugin ${p.plugin}${p.def.kind === current?.kind ? " · current" : ""}` })),
+    ]);
     if (!kind) return false;
+    if (!isBuiltinKind(kind)) return configurePlugin(kind);
     const same = kind === current?.kind;
 
     let baseURL: string | undefined = process.env[URL_KEY[kind]];
@@ -270,6 +286,45 @@ export function configurator(opts: ConfigureOptions): Configure {
     // 同一个地址只换了密钥：原来的服务下的模型归到新的密钥下
     const rekeyed = same && currentId !== undefined && sameAddress(process.env) && key !== process.env[KEY_KEY[kind]];
     return applyConfig(updates, rekeyed ? currentId : undefined);
+  }
+
+  /** 插件提供的服务：依次询问它声明的配置项，再选模型（声明了模型名时） */
+  async function configurePlugin(kind: string): Promise<boolean> {
+    const settings = settingsOf(kind);
+    const same = providerKind() === kind && hasProvider();
+    const services = await savedServices();
+    /** 已知的值：当前用的就是这个服务时取当前的，否则取最近保存过的这个服务的 */
+    const known = (k: string) => (same ? process.env[k] : services.find((s) => providerKind(s.env) === kind)?.env[k]);
+    const env: Env = { JADE_PROVIDER: kind };
+    for (const x of settings.filter((s) => !s.model)) {
+      const old = known(x.env);
+      const answer = await screen.input(x.label, {
+        mask: x.secret,
+        initial: x.secret ? undefined : old,
+        placeholder: x.secret && old ? "leave empty to keep the saved value" : x.placeholder,
+      });
+      if (answer === undefined) return false;
+      // 密钥留空表示沿用，其他的留空表示不设
+      const value = answer.trim() || (x.secret ? old : undefined);
+      if (x.required && !value) {
+        screen.log(red(`${x.label} is required.`));
+        return false;
+      }
+      env[x.env] = value;
+    }
+    const updates: Record<string, string | undefined> = { ...env, JADE_CONTEXT_WINDOW: undefined };
+    // 思考力度的取值每种服务不同
+    if (!same) updates.JADE_EFFORT = undefined;
+    const mk = modelKey(kind);
+    if (mk) {
+      const target = services.find((s) => serviceId(s.env) === serviceId(env));
+      const model = await chooseModel({ ...process.env, ...env }, same ? process.env[mk] : undefined, target?.models.map((m) => m.name));
+      if (!model) return false;
+      const saved = target?.models.find((m) => m.name === model);
+      if (target && saved) return useSaved({ ...target, env: { ...target.env, ...pick(env, serviceKeys(kind)) } }, saved);
+      updates[mk] = model;
+    }
+    return applyConfig(updates);
   }
 
   async function configureModel(arg: string | undefined) {
@@ -329,7 +384,7 @@ export function configurator(opts: ConfigureOptions): Configure {
   /** 当前模型自己的设置（切换模型时跟着换）：输出上限、思考力度、上下文窗口、限速、能不能看图 */
   async function configureSettings() {
     const info = providerInfo();
-    const efforts = EFFORTS[info.kind];
+    const efforts = isBuiltinKind(info.kind) ? EFFORTS[info.kind] : undefined;
     const action = await screen.select<string>(`Settings for ${info.model}`, [
       { label: "Output limit per reply", value: "max", hint: process.env.JADE_MAX_TOKENS ? `${process.env.JADE_MAX_TOKENS} tokens` : "service default" },
       ...(efforts

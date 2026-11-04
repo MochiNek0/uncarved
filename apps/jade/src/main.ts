@@ -36,7 +36,7 @@ import { compactThreshold, contextWindowFromEnv, contextWindowInfo, isContextOve
 import { InputHistory } from "./history.ts";
 import { attachMentions, mentionCandidates } from "./mentions.ts";
 import { repoRoot } from "./plugins/prompts.ts";
-import { isRateLimit, providerFromEnv, providerInfo, RateGate, rpmFromEnv, switchable, withRetry } from "./provider.ts";
+import { isBuiltinKind, isRateLimit, pluginProvider, providerFromEnv, providerInfo, providerKind, RateGate, registerProviders, rpmFromEnv, switchable, withRetry } from "./provider.ts";
 import { ago, discardIfEmpty, matchSession, SessionIndex } from "./sessions.ts";
 import { display } from "./tools/fs.ts";
 import { SEARCH_PROVIDERS } from "./tools/web.ts";
@@ -178,8 +178,10 @@ const tui = Boolean(process.stdin.isTTY && process.stdout.isTTY) && opts.print =
 // 终端界面依赖 ink 和 react，加载要几百毫秒，只在真的用到时才导入；现在就开始加载，和下面读配置、跑 git 同时进行
 const tuiModule = tui ? import("./ui/tui.tsx") : undefined;
 const branchFound = tui ? gitBranch(cwd) : undefined;
-// provider 要动态导入 SDK（一百多毫秒），和终端界面一起加载；出错时在下面创建界面之后再报
-const providerEarly = hasProvider() ? providerFromEnv() : undefined;
+// provider 要动态导入 SDK（一百多毫秒），和终端界面一起加载；出错时在下面创建界面之后再报。
+// JADE_PROVIDER 选的是插件提供的服务时，等插件加载完再创建（pluginProviderPending）
+const pluginProviderPending = hasProvider() && !isBuiltinKind(providerKind());
+const providerEarly = hasProvider() && !pluginProviderPending ? providerFromEnv() : undefined;
 providerEarly?.catch(() => {});
 if (!hasProvider() && !tui) {
   console.error(
@@ -289,9 +291,9 @@ if (!hasProvider()) {
     await screen.close();
     process.exit(2);
   }
-} else {
+} else if (providerEarly) {
   try {
-    provider.set(retrying(await providerEarly!));
+    provider.set(retrying(await providerEarly));
   } catch (err) {
     await screen.close();
     fail(errorText(err));
@@ -361,6 +363,13 @@ function currentModel(): { name: string; via: string } | undefined {
   try {
     host = info.baseURL ? new URL(info.baseURL).host : undefined;
   } catch {}
+  if (!isBuiltinKind(info.kind)) {
+    let via = `the ${info.kind} provider`;
+    try {
+      via = pluginProvider(info.kind)?.def.via?.(process.env) || via;
+    } catch {}
+    return { name: info.model, via };
+  }
   const api = { anthropic: "the Anthropic API", openai: "the OpenAI Responses API", "openai-compat": "an OpenAI-compatible API" }[info.kind];
   return { name: info.model, via: host ? `${api} at ${host}` : api };
 }
@@ -413,6 +422,19 @@ const makeJade = (mode?: Mode) => {
 
 let jade: Jade = await makeJade(opts.mode);
 for (const w of jade.warnings) screen.log(yellow(`[warning] ${w}`));
+// 插件提供的模型服务：只在启动时注册一次，之后的会话共用（provider 是整个进程的）
+for (const w of registerProviders(jade.providers)) screen.log(yellow(`[warning] ${w}`));
+if (pluginProviderPending) {
+  try {
+    provider.set(retrying(await providerFromEnv()));
+    contextWindow = contextWindowFromEnv();
+  } catch (err) {
+    await closePlugins();
+    await screen.close();
+    fail(errorText(err));
+  }
+  screen.status({ model: modelLabel() });
+}
 if (badSavedMode) screen.log(yellow(`[warning] JADE_MODE=${badSavedMode} is not a mode (${MODES.join(", ")}); starting in ${opts.mode ?? "ask"}`));
 for (const c of shadowed) screen.log(yellow(`[warning] custom command ${display(cwd, c.file)} is ignored: /${c.name} is a built-in command`));
 // 插件的命令加进菜单（名字在各个会话的实例之间不变）。内置命令和 .jade/commands 里的同名命令优先

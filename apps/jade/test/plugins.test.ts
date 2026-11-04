@@ -6,7 +6,7 @@ import { existsSync, realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { MemoryLogStore, MemoryTrustStore, readAll, Runtime, type Block, type ModelRequest, type ModelResponse, type Provider } from "uncarved";
-import { createJade, discoverPlugins, loadPlugin, type FoundPlugin, type LoadedPlugin } from "../src/index.ts";
+import { clearProviders, createJade, discoverPlugins, listModels, loadPlugin, providerFromEnv, providerInfo, registerProviders, visionFromEnv, type FoundPlugin, type LoadedPlugin } from "../src/index.ts";
 import type { HostContext, SessionControl } from "../src/plugins/loader.ts";
 
 const MODEL = { by: "model", provider: "scripted", model: "scripted-1" } as const;
@@ -485,6 +485,73 @@ describe("session commands use the public SessionControl", () => {
     const ctx = { sessionId: rt.state.sessionId, cwd, signal: new AbortController().signal, derived: rt.state.derived, ui, note: () => {}, session };
     expect(await jade.commands.get("undo")!.command.run("", ctx)).toContain("Undid 1 change");
     expect(await readFile(file, "utf8")).toBe("old");
+    jade.shutdown();
+  });
+});
+
+describe("model services from plugins", () => {
+  const def = (kind: string, made: Provider = { id: kind, complete: async () => ({ model: "m", content: [], stopReason: "end" }) }) => ({
+    kind,
+    model: (env: Record<string, string | undefined>) => env.FOO_MODEL ?? "foo-1",
+    via: () => "the Foo API",
+    create: async () => made,
+    listModels: async () => ["foo-1", "foo-2"],
+  });
+
+  test("JADE_PROVIDER picks a registered plugin service; unknown names still fail", async () => {
+    clearProviders();
+    try {
+      expect(registerProviders([{ plugin: "x/foo", def: def("foo") }])).toEqual([]);
+      expect(registerProviders([{ plugin: "x/again", def: def("foo") }, { plugin: "x/bad", def: def("openai") }])).toEqual([
+        "plugin x/again: provider foo is ignored: plugin x/foo already provides it",
+        "plugin x/bad: provider openai is ignored: it is a built-in provider",
+      ]);
+      const env = { JADE_PROVIDER: "foo", FOO_MODEL: "foo-2", JADE_EFFORT: "whatever" };
+      expect(providerInfo(env)).toEqual({ kind: "foo", model: "foo-2" });
+      expect((await providerFromEnv(env)).id).toBe("foo");
+      expect(await listModels(env)).toEqual(["foo-1", "foo-2"]);
+      // 插件的服务默认不算能看图片
+      expect(visionFromEnv(env)).toBe(false);
+      await expect(providerFromEnv({ JADE_PROVIDER: "nope" })).rejects.toThrow(/openai-compat, openai, anthropic, foo.*no plugin provides it/);
+      // 没注册时 providerInfo 不报错（插件可能还没加载），只是没有模型名
+      expect(providerInfo({ JADE_PROVIDER: "nope" })).toEqual({ kind: "nope", model: "" });
+    } finally {
+      clearProviders();
+    }
+  });
+
+  test("only user plugins can provide services, and malformed ones are skipped", async () => {
+    const { cwd, home } = await dirs();
+    const fake = (name: string, layer: "user" | "project", providers: unknown): LoadedPlugin => ({
+      name,
+      dir: path.join(home, "plugins", name),
+      layer,
+      kind: "module",
+      entry: "index.ts",
+      info: { kind: "module", entry: "index.ts", json: {}, bundle: { skills: [], commands: [], unsupported: [] } },
+      create: async () => ({ id: `x/${name}`, version: "1.0.0", kernel: "^0.1", providers }) as never,
+    });
+    const jade = await createJade({
+      cwd,
+      home,
+      store: new MemoryLogStore(),
+      provider: scripted([]).provider,
+      env: {},
+      extensions: [
+        fake("good", "user", [
+          { ...def("foo"), settings: [{ env: "FOO_KEY", label: "key" }, { env: "JADE_MAX_TOKENS", label: "x" }, { env: "FOO_KEY", label: "again" }] },
+          { kind: "bad name", model: () => "", create: () => ({}) },
+        ]),
+        fake("repo", "project", [def("bar")]),
+      ],
+    });
+    expect(jade.providers.map((p) => `${p.plugin}:${p.def.kind}`)).toEqual(["x/good:foo"]);
+    // 不能用 jade 自己的变量，也不能重复
+    expect(jade.providers[0]!.def.settings!.map((x) => x.env)).toEqual(["FOO_KEY"]);
+    expect(jade.warnings.join("\n")).toContain('setting "JADE_MAX_TOKENS" is ignored');
+    expect(jade.warnings.join("\n")).toContain("setting FOO_KEY is ignored: it is listed twice");
+    expect(jade.warnings.join("\n")).toContain('provider "bad name" is ignored');
+    expect(jade.warnings.join("\n")).toContain("plugin repo (project): providers are ignored: only user plugins can provide model services");
     jade.shutdown();
   });
 });

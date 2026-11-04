@@ -5,7 +5,9 @@ import path from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { InputHistory } from "../src/history.ts";
 import {
+  clearProviders,
   parseEnv,
+  registerProviders,
   parseTokens,
   providerFromEnv,
   providerInfo,
@@ -129,12 +131,75 @@ describe("model configuration", () => {
       model: "m",
       baseURL: "http://x",
     });
-    expect(() => providerKind({ JADE_PROVIDER: "gemini" })).toThrow(
+    // 没有插件提供的名字在创建 provider 时才报错（插件可能还没加载）
+    await expect(providerFromEnv({ JADE_PROVIDER: "gemini" })).rejects.toThrow(
       "JADE_PROVIDER",
     );
     await expect(
       providerFromEnv({ ...env, JADE_MAX_TOKENS: "lots" }),
     ).rejects.toThrow("JADE_MAX_TOKENS");
+  });
+
+  test("/model configures a plugin service from its declared settings and saves it", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "jade-models-plugin-"));
+    const envFile = path.join(dir, ".env");
+    const modelsFile = path.join(dir, "models.json");
+    const keys = ["JADE_PROVIDER", "OPENAI_COMPAT_BASE_URL", "OPENAI_COMPAT_API_KEY", "OPENAI_COMPAT_MODEL", "JADE_MAX_TOKENS", "JADE_EFFORT", "JADE_CONTEXT_WINDOW", "OPENAI_COMPAT_EXTRA_BODY", "FOO_URL", "FOO_KEY", "FOO_MODEL"];
+    const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+    clearProviders();
+    try {
+      for (const k of keys) delete process.env[k];
+      await updateEnvFile(envFile, { JADE_PROVIDER: "openai-compat", OPENAI_COMPAT_BASE_URL: "http://a/v1", OPENAI_COMPAT_MODEL: "alpha" });
+      registerProviders([
+        {
+          plugin: "x/foo",
+          def: {
+            kind: "foo",
+            model: (env) => env.FOO_MODEL ?? "",
+            create: () => ({ id: "foo", complete: async () => ({ model: "f", content: [], stopReason: "end" }) }),
+            listModels: async (env) => (env.FOO_KEY === "sekret" ? ["f1", "f2"] : []),
+            settings: [
+              { env: "FOO_URL", label: "Foo base URL" },
+              { env: "FOO_KEY", label: "Foo API key", secret: true, required: true },
+              { env: "FOO_MODEL", label: "Model", model: true },
+            ],
+          },
+        },
+      ]);
+      const answers: unknown[] = [];
+      const inputs: (string | undefined)[] = [];
+      const asked: string[] = [];
+      const screen = {
+        log: () => {},
+        select: async (_t: string, choices: { label: string; value: unknown }[]) => {
+          const want = answers.shift();
+          return typeof want === "function" ? (want as (c: typeof choices) => unknown)(choices) : want;
+        },
+        input: async (title: string) => (asked.push(title), inputs.shift()),
+      } as unknown as Screen;
+      const pickLabel = (label: string) => (c: { label: string; value: unknown }[]) => c.find((x) => x.label === label)!.value;
+      const configure = configurator({ screen, envFile, modelsFile, apply: async () => {}, contextWindow: () => 1, onApplied: () => {} });
+      // 服务列表里有插件的服务；问它声明的配置项，模型从它的 listModels 里选
+      answers.push(pickLabel("Add a model…"), pickLabel("Another service…"), pickLabel("foo"), "f2");
+      inputs.push("http://foo", "sekret");
+      await configure.model(undefined);
+      expect(asked).toEqual(["Foo base URL", "Foo API key"]);
+      expect([process.env.JADE_PROVIDER, process.env.FOO_URL, process.env.FOO_KEY, process.env.FOO_MODEL]).toEqual(["foo", "http://foo", "sekret", "f2"]);
+      // 换模型只改声明为模型名的那一项
+      await configure.model("f1");
+      expect(process.env.FOO_MODEL).toBe("f1");
+      // 切回内置服务，再按名字切回插件服务：配置项一起换回来
+      await configure.model("alpha");
+      expect(process.env.JADE_PROVIDER).toBe("openai-compat");
+      await configure.model("f2");
+      expect([process.env.JADE_PROVIDER, process.env.FOO_KEY, process.env.FOO_MODEL]).toEqual(["foo", "sekret", "f2"]);
+    } finally {
+      clearProviders();
+      for (const k of keys) {
+        if (saved[k] === undefined) delete process.env[k];
+        else process.env[k] = saved[k];
+      }
+    }
   });
 
   test("/model groups models by service, keeps each model's own settings and switches back", async () => {
