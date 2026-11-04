@@ -1069,6 +1069,9 @@ async function leave(): Promise<boolean> {
   } catch (err) {
     screen.log(red(`[error] ${errorText(err)}`));
     return true;
+  } finally {
+    // 会话收尾（session.detached 的 hook）用的还是这套实例，之后才让插件收尾
+    warn(await jade.dispose());
   }
 }
 
@@ -1108,6 +1111,7 @@ async function switchSession(id?: string) {
       : await Runtime.create({ store, provider, plugins: next.plugins });
   } catch (err) {
     next.shutdown();
+    warn(await next.dispose());
     // 留在当前会话：当前的插件实例继续能改输入框、发消息、设状态，状态栏换回它们设置的
     jadeGeneration = current.generation;
     pluginStatus.clear();
@@ -1144,6 +1148,7 @@ async function reloadSession() {
   abortKeys("the session was reloaded");
   jade.shutdown();
   await rt.detach();
+  warn(await jade.dispose());
   jade = next;
   try {
     rt = await Runtime.resume({ store, provider, plugins: jade.plugins, sessionId });

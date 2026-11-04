@@ -13,7 +13,7 @@ import { Memory, memoryTool } from "./memory.ts";
 import { mcpTools, type McpClient } from "./mcp.ts";
 import { skillTool, skillsPrompt, type Skill } from "./skills.ts";
 import { compactor, type Compactor } from "./plugins/compact.ts";
-import { COMMAND_NAME, JADE_VERSION, KEY_SPEC, RESERVED_KEYS, type HostContext, type InputControl, type PluginKey, type ToolRenderer, type JadePlugin, type LoadedPlugin, type PluginCommand, type PluginProvider, type Responder, type Suggester } from "./plugins/loader.ts";
+import { COMMAND_NAME, DISPOSE_TIMEOUT_MS, JADE_VERSION, KEY_SPEC, RESERVED_KEYS, type HostContext, type InputControl, type PluginKey, type ToolRenderer, type JadePlugin, type LoadedPlugin, type PluginCommand, type PluginProvider, type Responder, type Suggester } from "./plugins/loader.ts";
 import { policy, type AllowRule, type Mode, type Policy, type PolicyOptions } from "./plugins/policy.ts";
 import { prompts, realPath, repoRoot } from "./plugins/prompts.ts";
 import { repeats } from "./plugins/repeats.ts";
@@ -135,6 +135,11 @@ export interface Jade {
   beforeSend: { plugin: string; fn: NonNullable<JadePlugin["beforeSend"]> }[];
   /** 主会话的工具；宿主用 read_file / list_dir 读取 @ 引用的文件 */
   tools: Tool[];
+  /**
+   * 不再用这套实例时调用（在 shutdown 和会话收尾之后）：调用第三方插件的 dispose，同时进行、各自限时。
+   * 只执行一次；返回要告诉用户的问题
+   */
+  dispose(): Promise<string[]>;
   /** 宿主退出时调用：杀掉后台 shell */
   shutdown(): void;
   /** 启动时要告诉用户的问题，例如找不到 shell */
@@ -314,6 +319,13 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
   }
   warnings.push(...result.rejected);
   const added = result.accepted;
+  // 被拒绝的实例不会再用：现在就收尾
+  for (const m of made) {
+    if (added.includes(m)) continue;
+    const w = await disposeInstance(m.source, m.plugin);
+    if (w) warnings.push(w);
+  }
+  let disposing: Promise<string[]> | undefined;
   const builtin = [...built.values()].filter((p) => !replaced.has(p.id));
   for (const p of builtin) kept.add(p.id);
 
@@ -384,6 +396,7 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
     renderers: new Map(([...builtin, ...added.map((a) => a.plugin)] as JadePlugin[]).flatMap((plugin) => (plugin.renderers ?? []).map((r) => [r.tool, { plugin: plugin.id, renderer: r }] as const))),
     beforeSend: added.flatMap(({ plugin }) => (plugin.beforeSend ? [{ plugin: plugin.id, fn: plugin.beforeSend.bind(plugin) }] : [])),
     disabledById,
+    dispose: () => (disposing ??= Promise.all(added.map(({ source, plugin }) => disposeInstance(source, plugin))).then((ws) => ws.filter((w): w is string => w !== undefined))),
     tools: allTools,
     shutdown: shell.shutdown,
     warnings,
@@ -396,23 +409,36 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
  */
 async function createExtensions(sources: LoadedPlugin[], host: HostContext, disabled: Set<string>, warnings: string[], disabledById: string[]) {
   const out: { source: LoadedPlugin; plugin: JadePlugin }[] = [];
+  /** 创建了却不用的实例也要收尾 */
+  const discard = async (source: LoadedPlugin, plugin: JadePlugin) => {
+    const w = await disposeInstance(source, plugin);
+    if (w) warnings.push(w);
+  };
   for (const source of sources) {
     if (!source.create) continue;
     const where = `plugin ${source.name} (${source.layer})`;
-    let plugin: JadePlugin;
+    let created: JadePlugin | undefined;
     try {
-      plugin = await source.create(host);
-      checkCompat(plugin);
+      created = await source.create(host);
+      checkCompat(created);
     } catch (err) {
       warnings.push(`${where} is skipped: ${err instanceof Error ? err.message : String(err)}`);
+      if (created) await discard(source, created);
       continue;
+    }
+    const plugin = created;
+    if (plugin.dispose !== undefined && typeof plugin.dispose !== "function") {
+      warnings.push(`${where}: dispose is ignored: it must be a function`);
+      delete plugin.dispose;
     }
     if (disabled.has(plugin.id)) {
       disabledById.push(source.name);
+      await discard(source, plugin);
       continue;
     }
     if (plugin.replaces !== undefined && !(Array.isArray(plugin.replaces) && plugin.replaces.every((x) => typeof x === "string"))) {
       warnings.push(`${where} is skipped: "replaces" must be an array of plugin ids`);
+      await discard(source, plugin);
       continue;
     }
     const commands = (plugin.commands ?? []).filter((c) => {
@@ -476,6 +502,27 @@ async function createExtensions(sources: LoadedPlugin[], host: HostContext, disa
 }
 
 /** 插件服务的配置项：格式不对、用了 jade 自己的变量、重复、第二个 model 的跳过并警告 */
+/**
+ * 调用第三方插件实例的 dispose，限时 DISPOSE_TIMEOUT_MS；返回要告诉用户的问题，没有时 undefined。
+ * 进程外插件的进程在会话之间共用，不在这里结束（见 LoadedPlugin.close）
+ */
+async function disposeInstance(source: LoadedPlugin, plugin: JadePlugin): Promise<string | undefined> {
+  if (source.kind === "process" || typeof plugin.dispose !== "function") return undefined;
+  const where = `plugin ${source.name} (${source.layer})`;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), DISPOSE_TIMEOUT_MS);
+  });
+  try {
+    const result = await Promise.race([Promise.resolve().then(() => plugin.dispose!()), timeout]);
+    return result === "timeout" ? `${where}: dispose did not finish within ${DISPOSE_TIMEOUT_MS / 1000}s` : undefined;
+  } catch (err) {
+    return `${where}: dispose failed: ${err instanceof Error ? err.message : String(err)}`;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * 插件模块导出的模型服务（LoadedPlugin.providers）：检查后返回要注册的服务和要告诉用户的问题。
  * 只认用户层插件：服务能看到全部对话和 API key。不用创建插件实例，所以宿主可以先注册服务、配置好模型，再创建插件

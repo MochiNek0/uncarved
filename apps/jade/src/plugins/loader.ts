@@ -100,6 +100,9 @@ export interface ToolRenderer {
   result?(r: { input: unknown; text: string; isError: boolean; before?: unknown }): { line: string; details?: string } | undefined;
 }
 
+/** 插件 dispose 的时限：超过了不再等，显示警告 */
+export const DISPOSE_TIMEOUT_MS = 5000;
+
 /** "ctrl+<字母>" 或 "alt+<字母或数字>" */
 export const KEY_SPEC = /^(ctrl\+[a-z]|alt\+[a-z0-9])$/;
 /**
@@ -279,6 +282,12 @@ export interface JadePlugin extends Plugin {
    * 返回空字符串不发送。多个插件按加载顺序依次处理；改动会在对话里提示用户
    */
   beforeSend?(text: string, ctx: { sessionId: string; signal: AbortSignal }): Awaitable<string | undefined>;
+  /**
+   * jade 不再用这个实例时调用一次：换会话（/clear、/resume）、重新加载、退出，以及创建了却没用上的实例（例如按 id 停用的）。
+   * 在会话的收尾（session.detached 的 hook）之后。停掉定时器、关掉连接和监听；
+   * 之后 ctx.status、ctx.input、ctx.send 不再起作用。限时 DISPOSE_TIMEOUT_MS，出错或超时只显示警告
+   */
+  dispose?(): Awaitable<void>;
   /**
    * 代替的内置插件的 id（例如 "jade/web"）：被代替的内置插件不再加载，它的工具名可以由本插件提供。
    * jade/policy 不能代替
