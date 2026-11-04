@@ -150,14 +150,18 @@ export function configurator(opts: ConfigureOptions): Configure {
     const model = providerInfo().model;
     if (!id || !model) return;
     const kind = providerKind();
-    const services = await savedServices();
-    const old = services.filter((s) => serviceId(s.env) === id || (replacing !== undefined && serviceId(s.env) === replacing));
-    const models = old.flatMap((s) => s.models).filter((m, i, all) => m.name !== model && all.findIndex((x) => x.name === m.name) === i);
+    // 写回时保留现在认不出的服务（例如提供它的插件这次没加载），不然它和它的密钥就丢了
+    const all = await readSavedServices(modelsFile);
+    const old = all.filter((s) => {
+      const sid = serviceId(s.env);
+      return sid !== undefined && (sid === id || (replacing !== undefined && sid === replacing));
+    });
+    const models = old.flatMap((s) => s.models).filter((m, i, list) => m.name !== model && list.findIndex((x) => x.name === m.name) === i);
     const service: SavedService = {
       env: { ...pick(process.env, serviceKeys(kind)), JADE_PROVIDER: kind },
       models: [{ name: model, settings: pick(process.env, MODEL_SETTINGS) }, ...models],
     };
-    await writeSavedServices(modelsFile, [service, ...services.filter((s) => !old.includes(s))]);
+    await writeSavedServices(modelsFile, [service, ...all.filter((s) => !old.includes(s))]);
   }
 
   /** 保存配置并换上新的 provider；失败时报告原因，旧的 provider 继续用 */
@@ -372,8 +376,8 @@ export function configurator(opts: ConfigureOptions): Configure {
       const gone = await pickSaved(owners, "Remove a model from which service?", (s, m) => !(serviceId(s.env) === currentId && m.name === info.model));
       if (!gone) return;
       const id = serviceId(gone.service.env);
-      // 服务下没有模型了就连服务（和它的密钥）一起删掉
-      const rest = (await savedServices())
+      // 服务下没有模型了就连服务（和它的密钥）一起删掉；认不出的服务原样保留
+      const rest = (await readSavedServices(modelsFile))
         .map((s) => (serviceId(s.env) === id ? { ...s, models: s.models.filter((m) => m.name !== gone.model.name) } : s))
         .filter((s) => s.models.length > 0);
       await writeSavedServices(modelsFile, rest);
@@ -419,7 +423,11 @@ export function configurator(opts: ConfigureOptions): Configure {
       const choice = await screen.select("Can this model see images (screenshots, image files)?", [
         { label: "Yes", value: "on", hint: current === true ? "current" : "the screenshot tool becomes available" },
         { label: "No", value: "off", hint: current === false ? "current" : "images are replaced with a note" },
-        { label: "Default", value: DEFAULT, hint: info.kind === "openai-compat" ? "no for compatible services" : "yes" },
+        {
+          label: "Default",
+          value: DEFAULT,
+          hint: info.kind === "openai-compat" ? "no for compatible services" : isBuiltinKind(info.kind) ? "yes" : "no for plugin services",
+        },
       ]);
       if (choice === undefined) return;
       // 换了 provider 立即生效：图片发不发、截图工具给不给模型都在每次请求时按它判断，不用重启
