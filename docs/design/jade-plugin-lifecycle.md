@@ -1,6 +1,6 @@
 # 设计：jade 插件的生命周期
 
-> 状态：草案；第 1–4 步（静态 id、PluginHost、SessionScope、进程外插件的会话适配器）已实施 · 2026-11-05
+> 状态：第 1–5 步（静态 id、PluginHost、SessionScope、进程外插件的会话适配器、生命周期矩阵测试）已实施；第 9 节的问题待定 · 2026-11-05
 >
 > 对应条款：7.1（项目层确认）、8.2（不满足时拒绝加载，不静默降级）、I-9（一切可中断）、4.6（恢复时插件变化）
 >
@@ -241,7 +241,7 @@ pi 让过期的 ctx 抛错。jade 不能这么做：插件常在定时器回调�
 2. **PluginHost**：把 `main.ts` 里的发现、加载、注册服务和 `closePlugins` 收进 `src/plugins/host.ts`；项目层导出的 `providers` 给出警告。
 3. **SessionScope 和换会话事务**：实现四个状态、`ctx.signal`、过期警告、后台 dispose；删掉 `jadeGeneration`、`/resume` 失败时的手动恢复和 `keyRuns`；`leave`、`switchSession`、`reloadSession` 改为调用同一个流程。
 4. **进程外插件的会话适配器**：不再改写 `proc.keys` 和 `proc.commands`。（已实施）
-5. **生命周期矩阵测试**：对启动、`/clear`、`/resume` 成功、`/resume` 失败、reload、退出这几条路径，各自断言工厂调用次数、dispose 的次数和时机、状态栏的内容、过期调用是否被拒绝。
+5. **生命周期矩阵测试**：对启动、`/clear`、`/resume` 成功、`/resume` 失败、reload、退出这几条路径，各自断言工厂调用次数、dispose 的次数和时机、状态栏的内容、过期调用是否被拒绝。（已实施：换会话的流程从 `main.ts` 移到 `src/session-lifecycle.ts`，`test/session-lifecycle.test.ts` 用真的 `createJade`、`Runtime` 和插件测它；界面上的清屏、提示仍在 `main.ts`）
 
 第 1、2 步之后，现有的四项取舍会消失三项：按 id 停用仍运行代码、服务显示目录名、项目层服务被静默忽略。第 3 步之后，最后一项（`/clear` 被 dispose 拖慢）也会消失。
 
