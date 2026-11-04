@@ -519,7 +519,7 @@ interface SessionControl {
   record(key: string, value: unknown): Promise<void>; // 写一项派生数据进日志，恢复会话后仍在
   list(): Promise<{ id: string; title: string; at: string }[]>; // 这个目录里的会话，最近的在前
   clear(): Promise<void>;                             // 开始新会话，当前的保留、可以恢复
-  resume(id: string): Promise<void>;                  // 换到另一个会话；失败时留在当前会话
+  resume(id: string): Promise<void>;                  // 换到另一个会话；失败时留在当前会话。id 是当前会话时拒绝
   retry(): Promise<boolean>;                          // 上次请求在模型回复前失败时重新请求；没有可重试的返回 false
   reload(): Promise<void>;                            // 用新的插件实例继续当前会话：工具和提示词按现在的配置重新生成
 }

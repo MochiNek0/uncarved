@@ -103,6 +103,9 @@ export class SessionLifecycle<Mode = string> {
    * 打开失败时回滚并抛出，当前会话不受影响；成功时返回旧会话的 id 和它是否保留了下来
    */
   async switchTo(id: string | undefined, mode: Mode | undefined): Promise<{ previous: string; kept: boolean }> {
+    // 同一个会话不能同时由两个运行时打开：先打开再收尾旧的，会把 session.detached 写进新运行时正在用的日志
+    // （没用过的会话还会被 discard 删掉）。内置的 /resume 已经挡住，这里挡住插件直接调用 session.resume
+    if (id !== undefined && id === this.#sessionId) throw new Error(`${id} is the current session`);
     const next = await this.#deps.prepare(mode);
     let rt: Runtime;
     try {
