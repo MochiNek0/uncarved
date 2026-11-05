@@ -4,7 +4,7 @@
   "api": "^1",
   "entry": "./index.ts",
   "provides": ["approval@1"],
-  "optional": ["ui@1"],
+  "optional": ["ui@1", "renderers@1"],
   "config": {
     "mode": {
       "default": "ask",

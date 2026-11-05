@@ -4,11 +4,13 @@ import path from "node:path";
 import { JsonlLogStore } from "@uncarved/store-jsonl";
 import {
   checkCompat,
+  readAll,
   definePlugin as kernelPlugin,
   Runtime,
   type GateResult,
   type Layer,
   type LocalHookSpec,
+  type LogEvent,
   type LogStore,
   type Plugin,
   type Provider,
@@ -74,9 +76,16 @@ class LiveSession implements Session {
   #pump: Promise<void> | undefined;
   #report: (m: string) => void;
 
-  constructor(id: string, report: (m: string) => void) {
+  readonly #store: LogStore;
+
+  constructor(id: string, store: LogStore, report: (m: string) => void) {
     this.id = id;
+    this.#store = store;
     this.#report = report;
+  }
+
+  history(): Promise<LogEvent[]> {
+    return readAll(this.#store, this.id);
   }
 
   get state(): State {
@@ -188,7 +197,7 @@ export class Sessions implements SessionManager {
     if (!provider) throw new ServiceUnavailable("provider@1", "(none): no active plugin provides a model");
     const store = host.service<LogStore>("store@1", host.core) ?? (this.#store ??= new JsonlLogStore(path.join(host.home, "sessions")));
 
-    const s = new LiveSession(opts.resume ?? crypto.randomUUID(), host.report);
+    const s = new LiveSession(opts.resume ?? crypto.randomUUID(), store, host.report);
     try {
       for (const p of host.active()) if (p.module.session) await this.#join(s, p);
       const plugins = [this.#corePlugin(s), ...s.parts.map((p) => p.kernel)];

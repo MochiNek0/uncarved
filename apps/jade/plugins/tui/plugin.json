@@ -1,0 +1,10 @@
+{
+  "id": "jade/tui",
+  "version": "0.1.0",
+  "api": "^1",
+  "entry": "./index.ts",
+  "provides": ["frontend@1", "ui@1"],
+  "requires": ["commands@1", "keys@1", "renderers@1"],
+  "optional": ["modes@1", "models@1"],
+  "frontend": { "name": "tui", "default": true }
+}

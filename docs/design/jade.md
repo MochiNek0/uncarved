@@ -1,6 +1,6 @@
 # 设计：jade
 
-> 状态：草案；第 11 节第 1–5 步（核心插件系统、会话、最小发行版、项目层插件的确认、进程外插件）已实现，见 `apps/jade` · 2026-11-05
+> 状态：草案；第 11 节第 1–6 步（核心插件系统、会话、最小发行版、项目层插件的确认、进程外插件、TUI 和注册表插件）已实现，见 `apps/jade` · 2026-11-05
 >
 > 范围：从零重写 jade 层（`apps/jade`）。旧 jade（0.1.3）已归档到 `.archive/jade`，下文的"旧 jade"和旧文件路径都指那里。uncarved 内核原则上不动；实现过程中发现内核缺的东西，记在第 10 节，逐项决定进不进内核。
 >
@@ -91,6 +91,7 @@
   2. 否则层级高的胜（project > user > bundled），**但项目层不能代替用户层或 bundled 的提供者**（第 7 节）；
   3. 同层冲突：两个都不激活，报错，要求用户停用其中一个。不按发现顺序悄悄选一个。
 - **依赖是静态的。** `requires` 缺任何一项，插件不激活；`optional` 缺了照样激活，`ctx.service(name)` 返回 `undefined`。
+- **激活顺序**：提供者先于依赖它的插件。`optional` 的依赖是软的：只由 `requires` 组成的环才算成环（环上的插件都不激活）；经过 `optional` 的环在那里断开，那个插件先激活，它在 `process()` 里取那项可选服务得到 `undefined`，`session()` 里和之后的调用里能拿到。例如 `jade/approval` 可选用 `ui@1`，`jade/tui` 可选用 `modes@1`，`jade/modes` 必需 `approval@1`：approval 先激活。所以可选服务要在用到的时候取，不要在 `process()` 里取了存起来。
 - **不做运行期热替换。** 和 cordis 不同，服务出现、消失不会重新激活依赖它的插件。提供者故障被隔离时，它的服务变成"已失效"：调用会抛 `ServiceUnavailable`，调用方自己决定怎么办。依赖它的插件不会被连带停掉。这样一个插件坏掉不会顺着依赖图把一串插件拖进不确定状态。
 - **服务的形状由提供它的那一方定义**，类型发布在提供者的包里（或者 jade 的公共类型包里，见 3.5）。核心不检查方法签名，只负责名字、版本、提供者和膜。
 - **提供者知道调用方是谁。** `ctx.provide(name, (caller) => impl)` 为每个调用方作用域创建一个实例。`caller` 带调用方的 id、signal 和 `onDispose`。注册表在 `onDispose` 里撤销调用方注册的东西，因此调用方关闭、激活失败或被隔离时，它在别的插件里的注册会自动撤销，调用方自己什么都不用记。撤销由提供者负责，因为调用方不知道注册表返回的东西哪个是撤销函数。所有调用方共用一个实例的服务，直接传对象。
@@ -110,7 +111,8 @@
 `frontend@1` 和 `ui@1` 的形状由 jade 定义（`api.ts` 的 `Frontend`、`UI`），因为每个前端都要提供它们、很多插件都要用 `ui@1`：
 
 - `Frontend.run({ argv, sessions, signal })` 返回退出码。`argv` 是核心去掉自己的参数（`plugins`、`--safe`）之后的命令行，`sessions` 是核心的会话管理器（`SessionManager`：`open`、`close`、`current`）。
-- `UI`：`interactive`、`notify(message, level)`、`select({ title, detail, options }, signal)`。不能提问的前端（`jade/print`）`interactive` 为 false，`select` 总是返回 `undefined`。
+- `UI`：`interactive`、`notify(message, level)`、`select({ title, detail, options }, signal)`、`input({ title, initial, placeholder, mask }, signal)`。不能提问的前端（`jade/print`）`interactive` 为 false，`select`、`input` 总是返回 `undefined`。
+- `Session.history()` 返回会话日志里的全部事件：前端恢复会话时用它重新显示对话（日志存储归核心，前端拿不到）。
 
 命令行入口（`src/main.ts`）只做：处理 `jade plugins …`、`--safe`、`--version`；把以 `-` 开头的参数作为选前端的开关；项目层插件存在且在终端里运行时提供确认方式（记录在 `$JADE_HOME/state/trust.json`）；前端起来之前的消息打到 stderr，之后交给 `ui@1`；连续两次 Ctrl+C 直接退出。
 
@@ -277,15 +279,15 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 
 | 插件 | 提供 | 依赖 | 来自旧 jade |
 |---|---|---|---|
-| `jade/tui` | `frontend@1`、`ui@1`、`tui@1`（local） | `commands@1`、`keys@1`、`renderers@1` | `ui/*`、`main.ts` 的界面部分 |
-| `jade/print` | `frontend@1`（`-p`）、`ui@1` | — | `-p` 模式。`jade/tui` 出现之前它也是默认前端 |
-| `jade/commands` | `commands@1` | — | `commands.ts` |
-| `jade/keys` | `keys@1` | — | 快捷键 |
-| `jade/renderers` | `renderers@1` | — | `ToolRenderer`、`EventRenderer` |
+| `jade/tui` | `frontend@1`（默认）、`ui@1` | `commands@1`、`keys@1`、`renderers@1`；可选 `modes@1`、`models@1` | `ui/*`、`main.ts` 的界面部分（`frontend.ts`）。`tui@1`（local）等第一个要扩展界面的插件出现时再做 |
+| `jade/print` | `frontend@1`（`-p`）、`ui@1` | — | `-p` 模式 |
+| `jade/commands` | `commands@1`：`register`、`get`、`list`。只登记不执行，前端带着 `{ signal, ui, sessions, print }` 调用 `run` | — | 插件命令（`PluginCommand`）。自定义命令（Markdown 文件）以后由单独的插件注册进来 |
+| `jade/keys` | `keys@1`：`register`、`get`、`list`；`shift+tab` 也可以注册 | — | 快捷键 |
+| `jade/renderers` | `renderers@1`：`tool`、`event`、`forTool`、`forEvent` | — | `ToolRenderer`、`EventRenderer`。`jade/fs`、`jade/shell` 为自己的工具登记，`jade/approval` 用工具的 `preview` 作审批对话框的内容 |
 | `jade/models` | `provider@1`、`models@1`（`current`、`complete`、`list`） | `ui@1`（可选） | `provider.ts`、`ui/configure.ts` |
 | `jade/approval` | `approval@1`（`mode`、`setMode`）、gate | `ui@1`（可选：没有或不能提问时，要问的调用一律拒绝） | `plugins/policy.ts` 的审批部分 |
-| `jade/modes` | `modes@1` | `approval@1`、`keys@1` | 计划模式、Shift+Tab、`/mode` |
-| `jade/sessions` | 命令 `/clear` `/resume` `/retry` | `commands@1` | `plugins/sessions.ts`、`session-lifecycle.ts` |
+| `jade/modes` | `modes@1`（`current`、`set`、`cycle`、`subscribe`），Shift+Tab、`/mode` | `approval@1`；可选 `keys@1`、`commands@1` | Shift+Tab、`/mode`。计划模式的"批准计划后开始改"还没移植 |
+| `jade/sessions` | 命令 `/clear` `/resume` `/retry`；会话索引 `$JADE_HOME/state/sessions.jsonl` | `commands@1` | `plugins/sessions.ts`、`session-lifecycle.ts` |
 | `jade/prompts` | `prompts@1`（其他插件往系统提示词里加段落，项目层插件加的标为不可信） | `models@1`（可选，写上当前模型） | `plugins/prompts.ts` |
 | `jade/fs`、`jade/shell`、`jade/web`、`jade/todo`、`jade/ask` | 工具 | `ui@1`（`ask` 需要）、`renderers@1`（可选） | `tools/*` |
 | `jade/task` | 工具 | `models@1` | `tools/task.ts` |
@@ -332,6 +334,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 5. **进程外插件**：协议和桥。
    验证：Python 写的插件提供一个服务，并注册一条命令。已完成：`test/remote.test.ts` 用 Python 插件提供服务、向进程内插件的注册表注册命令（命令执行中再调用宿主的 `ui@1`）、调用进程内插件给的回调、注册工具和 gate；进程退出时插件被隔离、命令被撤销。也在 Node 下用 `jade -p` 跑通了 Python 插件的工具。
 6. **TUI 和注册表插件**：`jade/tui`、`jade/commands`、`jade/keys`、`jade/renderers`、`jade/modes`、`jade/sessions`。
+   已完成：`test/tui-frontend.test.ts` 用假终端和假模型跑真实的 bundled 插件：输入消息、在审批对话框里批准（预览是 `jade/fs` 的 diff）、看到回复、`/mode`、`/help`、`/exit`。`test/registries.test.ts` 覆盖注册、撤销、保留键、`/clear`、`/resume`。暂缺：`/model`（模型配置界面）、`/plugins`、`@` 引用文件的补全、`--continue`、插件在状态栏显示自己的段落、`ctx.input`（改输入框）。
 7. **其余功能插件**逐个移植。每移植一个，都检查它没有用到第三方拿不到的东西。
 8. ~~功能对齐后改名为 jade~~：已提前完成（2026-11-05）。旧 jade 归档到 `.archive/jade`，新实现直接占用 `apps/jade` 和 `jade` 命令；功能对齐前，jade 只是开发中的版本。
 

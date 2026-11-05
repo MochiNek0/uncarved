@@ -5,6 +5,7 @@
 
 import type { GatedToolCall } from "uncarved";
 import { definePlugin, type UI } from "../../src/api.ts";
+import type { Renderers } from "../renderers/index.ts";
 import { describeRule, MODES, policy, type AllowRule, type Mode } from "./policy.ts";
 
 /** approval@1 */
@@ -18,16 +19,18 @@ const RULES_KEY = "jade/approval/rules";
 /** 等用户回答的时限：内核要求 hook 有有限的超时，超时按拒绝处理 */
 const ASK_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const MAX_DETAIL_CHARS = 2000;
+/** 等工具的审批预览的时限，过了就用默认的 detail */
+const PREVIEW_TIMEOUT_MS = 5000;
 
 let mode: Mode = "ask";
+/** 配置里写错的模式：第一个会话打开时告诉用户（process 里可能还拿不到 ui@1：它的提供者可能排在后面激活） */
+let badMode: string | undefined;
 
 export default definePlugin({
   process(ctx) {
     const configured = ctx.config.mode;
     if (typeof configured === "string" && (MODES as readonly string[]).includes(configured)) mode = configured as Mode;
-    else if (configured !== undefined) {
-      ctx.service<UI>("ui@1")?.notify(`jade/approval: mode must be one of ${MODES.join(", ")}, got ${JSON.stringify(configured)}; using ask`, "warning");
-    }
+    else if (configured !== undefined) badMode = JSON.stringify(configured);
     ctx.provide("approval@1", {
       mode: () => mode,
       setMode(next: Mode) {
@@ -40,6 +43,11 @@ export default definePlugin({
   session(ctx) {
     const rules = policy({ cwd: ctx.cwd });
     const ui = ctx.service<UI>("ui@1");
+    if (badMode !== undefined) {
+      ui?.notify(`jade/approval: mode must be one of ${MODES.join(", ")}, got ${badMode}; using ask`, "warning");
+      badMode = undefined;
+    }
+    const renderers = ctx.service<Renderers>("renderers@1");
     let warned = false;
     /** 本进程里刚选的"总是允许"：并发的关卡拿到的 derived 是各自开始时的快照，可能还没有它 */
     const added: AllowRule[] = [];
@@ -80,7 +88,7 @@ export default definePlugin({
           const answer = await ui.select(
             {
               title: `Allow ${call.name}?`,
-              detail: detail(call),
+              detail: (await preview(renderers, call)) ?? detail(call),
               options: [
                 { label: "Allow once", value: "once" },
                 { label: `Always allow ${describeRule(rule)} in this session`, value: "always" },
@@ -103,6 +111,26 @@ export default definePlugin({
     });
   },
 });
+
+/**
+ * 工具自己登记的审批预览（例如文件修改的 diff）。没有登记、返回的不是文字、或者出错时返回 undefined，
+ * 用下面的 detail：预览是别的插件的代码，它坏了不能让审批卡住或失败
+ */
+async function preview(renderers: Renderers | undefined, call: GatedToolCall): Promise<string | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    // 预览可能读文件、算 diff；一直不返回时也要能问用户
+    const late = new Promise<undefined>((resolve) => {
+      timer = setTimeout(() => resolve(undefined), PREVIEW_TIMEOUT_MS);
+    });
+    const text = await Promise.race([Promise.resolve(renderers?.forTool(call.name)?.renderer.preview?.(call.input)), late]);
+    return typeof text === "string" ? text : undefined;
+  } catch {
+    return undefined;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 /** 给用户看的调用内容：命令、路径和要写的内容，太长的截断 */
 function detail(call: GatedToolCall): string {

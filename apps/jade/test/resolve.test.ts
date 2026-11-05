@@ -41,6 +41,16 @@ describe("dependencies", () => {
     expect(state(p, "a")[1]).toContain("dependency cycle");
     expect(order(p)).toEqual(["c"]);
   });
+
+  test("a cycle through an optional dependency is broken there instead of skipping its members", () => {
+    // approval 可选用 ui，ui 可选用 modes，modes 必需 approval：approval 先激活，那时还拿不到 ui
+    const p = plan([
+      src("bundled", { id: "approval", provides: ["approval@1"], optional: ["ui@1"] }),
+      src("bundled", { id: "modes", provides: ["modes@1"], requires: ["approval@1"] }),
+      src("bundled", { id: "tui", provides: ["ui@1"], optional: ["modes@1"] }),
+    ]);
+    expect(order(p)).toEqual(["approval", "modes", "tui"]);
+  });
 });
 
 describe("service conflicts", () => {

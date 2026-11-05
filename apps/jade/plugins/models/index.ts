@@ -3,6 +3,7 @@
 
 import path from "node:path";
 import type { Delta, ModelRequest, ModelResponse, Provider } from "uncarved";
+import { contextWindow } from "./context.ts";
 import { definePlugin, type UI } from "../../src/api.ts";
 import { envWithFile, hasProvider } from "./config.ts";
 import { listModels, providerFromEnv, providerInfo, RateGate, rpmFromEnv, withRetry } from "./provider.ts";
@@ -10,7 +11,7 @@ import { listModels, providerFromEnv, providerInfo, RateGate, rpmFromEnv, withRe
 /** models@1 */
 export interface Models {
   /** 当前配置的服务和模型；没有配置时 undefined。via 是给人看的服务说明，例如 "the Anthropic API" */
-  current(): { kind: string; model: string; via: string } | undefined;
+  current(): { kind: string; model: string; via: string; /** 上下文窗口（token） */ contextWindow: number } | undefined;
   /** 用当前配置的模型完成一次请求（带重试和限速，和会话共用） */
   complete(request: ModelRequest, options: { signal: AbortSignal; onDelta?: (delta: Delta) => void }): Promise<ModelResponse>;
   /** 服务提供的模型列表；不支持或出错时为空 */
@@ -59,7 +60,7 @@ export default definePlugin({
       current() {
         if (!configured) return undefined;
         const info = providerInfo(env);
-        return { kind: info.kind, model: info.model, via: via(info.kind, info.baseURL) };
+        return { kind: info.kind, model: info.model, via: via(info.kind, info.baseURL), contextWindow: contextWindow(info.model, env) };
       },
       complete,
       list: () => listModels(env),

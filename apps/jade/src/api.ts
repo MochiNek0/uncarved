@@ -1,8 +1,8 @@
 // jade 插件 API：插件能看到的全部类型。设计见 docs/design/jade.md。
 // 插件只从这里 import 类型和 definePlugin，运行时用到的一切都从 ctx 拿（3.5）。
 
-import type { LocalHookSpec, RemoteHookSpec, RuntimeNotice, State, Tool, UserInput } from "uncarved";
-export type { LocalHookSpec, RemoteHookSpec, RuntimeNotice, State, Tool, UserInput } from "uncarved";
+import type { LocalHookSpec, LogEvent, RemoteHookSpec, RuntimeNotice, State, Tool, UserInput } from "uncarved";
+export type { LocalHookSpec, LogEvent, RemoteHookSpec, RuntimeNotice, State, Tool, UserInput } from "uncarved";
 
 /** 插件 API 的版本，插件在 plugin.json 的 api 字段里用 ^ 范围声明 */
 export const API_VERSION = "1.0.0";
@@ -131,6 +131,8 @@ export interface Session {
   recover(): Promise<void>;
   abort(reason?: unknown): void;
   subscribe(fn: (n: RuntimeNotice) => void): () => void;
+  /** 日志里的全部事件（恢复会话时前端用它重新显示对话） */
+  history(): Promise<LogEvent[]>;
 }
 
 export interface OpenOptions {
@@ -160,13 +162,23 @@ export interface UI {
   notify(message: string, level?: "info" | "warning" | "error"): void;
   /** 请用户从选项里选一个，返回选中项的 value；不能提问、用户取消或 signal 中止时返回 undefined */
   select<T extends string>(request: SelectRequest<T>, signal?: AbortSignal): Promise<T | undefined>;
+  /** 请用户输入一行；不能提问、用户取消或 signal 中止时返回 undefined */
+  input(request: InputRequest, signal?: AbortSignal): Promise<string | undefined>;
+}
+
+export interface InputRequest {
+  title: string;
+  initial?: string;
+  placeholder?: string;
+  /** 输入的内容不显示（密钥） */
+  mask?: boolean;
 }
 
 export interface SelectRequest<T extends string> {
   title: string;
   /** 选项上方的详细内容，例如要执行的命令、要改的文件 */
   detail?: string;
-  options: { label: string; value: T }[];
+  options: { label: string; value: T; /** 选项后面的灰色说明 */ hint?: string }[];
 }
 
 export interface PluginModule {

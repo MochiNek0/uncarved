@@ -144,28 +144,41 @@ export function resolve(sources: readonly PluginSource[], opts: ResolveOptions):
   }
 }
 
-/** Kahn 算法，同等条件下保持发现顺序 */
+/**
+ * Kahn 算法，同等条件下保持发现顺序。
+ * optional 的依赖是软的：排不下去时，挡住它的只剩 optional 依赖的插件先激活（按发现顺序取第一个），
+ * 它在 process() 里取那些服务时得到 undefined，session() 和之后的调用里能拿到。只有 requires 组成的环才算成环
+ */
 function topo(nodes: PlanEntry[], providers: Map<string, PlanEntry>): { sorted: PlanEntry[]; cycle: PlanEntry[] } {
-  const deps = new Map<PlanEntry, Set<PlanEntry>>();
-  for (const e of nodes) {
-    const m = e.source.manifest;
+  const edges = (e: PlanEntry, list: readonly string[] | undefined) => {
     const ds = new Set<PlanEntry>();
-    for (const s of [...(m.requires ?? []), ...(m.optional ?? [])]) {
+    for (const s of list ?? []) {
       const p = providers.get(s);
       if (p && p !== e) ds.add(p);
     }
-    deps.set(e, ds);
-  }
+    return ds;
+  };
+  const hard = new Map(nodes.map((e) => [e, edges(e, e.source.manifest.requires)]));
+  const soft = new Map(nodes.map((e) => [e, edges(e, e.source.manifest.optional)]));
   const sorted: PlanEntry[] = [];
   const left = new Set(nodes);
-  for (let progress = true; progress; ) {
-    progress = false;
+  const waiting = (e: PlanEntry, map: Map<PlanEntry, Set<PlanEntry>>) => [...map.get(e)!].some((d) => left.has(d));
+  const take = (e: PlanEntry) => {
+    sorted.push(e);
+    left.delete(e);
+  };
+  while (left.size > 0) {
+    let progress = false;
     for (const e of nodes) {
-      if (!left.has(e) || [...deps.get(e)!].some((d) => left.has(d))) continue;
-      sorted.push(e);
-      left.delete(e);
+      if (!left.has(e) || waiting(e, hard) || waiting(e, soft)) continue;
+      take(e);
       progress = true;
     }
+    if (progress) continue;
+    const relaxed = nodes.find((e) => left.has(e) && !waiting(e, hard));
+    if (!relaxed) break;
+    take(relaxed);
   }
+  // 剩下的插件里，只有自己在 requires 环上或依赖环上插件的才算；这里一并跳过
   return { sorted, cycle: [...left] };
 }

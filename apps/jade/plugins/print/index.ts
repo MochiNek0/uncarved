@@ -16,6 +16,7 @@ const ui: UI = {
     process.stderr.write(`${level === "info" ? "" : `[${level}] `}${message}\n`);
   },
   select: async () => undefined,
+  input: async () => undefined,
 };
 
 const frontend: Frontend = {

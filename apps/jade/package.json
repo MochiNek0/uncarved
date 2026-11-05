@@ -23,13 +23,18 @@
     "@uncarved/provider-openai-compat": "workspace:*",
     "@uncarved/provider-openai-responses": "workspace:*",
     "@uncarved/store-jsonl": "workspace:*",
+    "ink": "7.1.1",
     "picomatch": "^4.0.3",
-    "uncarved": "workspace:*"
+    "react": "^19.2.0",
+    "string-width": "^8.2.0",
+    "uncarved": "workspace:*",
+    "wrap-ansi": "^10.0.2"
   },
   "bin": {
     "jade": "./bin/jade.js"
   },
   "devDependencies": {
-    "@types/picomatch": "^4.0.2"
+    "@types/picomatch": "^4.0.2",
+    "@types/react": "^19.2.0"
   }
 }

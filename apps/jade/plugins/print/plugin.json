@@ -4,5 +4,5 @@
   "api": "^1",
   "entry": "./index.ts",
   "provides": ["frontend@1", "ui@1"],
-  "frontend": { "name": "print", "flag": "-p", "default": true }
+  "frontend": { "name": "print", "flag": "-p" }
 }

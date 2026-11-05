@@ -2,9 +2,17 @@
 
 import { definePlugin, type UI } from "../../src/api.ts";
 import type { Prompts } from "../prompts/index.ts";
+import type { Renderers } from "../renderers/index.ts";
+import { shellRenderers } from "./renderers.ts";
 import { shellTools } from "./shell.ts";
 
 export default definePlugin({
+  process(ctx) {
+    // 显示方式和会话无关，登记一次留到进程结束；没有 renderers@1（例如 print）时用前端的默认显示
+    const renderers = ctx.service<Renderers>("renderers@1");
+    if (renderers) for (const r of shellRenderers) renderers.tool(r);
+  },
+
   async session(ctx) {
     const shell = typeof ctx.config.shell === "string" ? ctx.config.shell : undefined;
     const { tools, executable, unavailable, shutdown } = shellTools({ cwd: ctx.cwd, ...(shell ? { shell } : {}) });
