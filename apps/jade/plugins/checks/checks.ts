@@ -18,7 +18,7 @@ import { existsSync, realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { Block, HookContext, LocalHookSpec, Message } from "uncarved";
-import { which as findExecutable, type RunCommand } from "./run.ts";
+import type { RunCommand } from "../shell/shell.ts";
 
 /** 老版本把整个 ChecksState 记在这一个 key 下、每次检查整份重记；恢复老会话时还要读它 */
 export const CHECKS_KEY = "jade/checks";
@@ -73,7 +73,7 @@ export interface ChecksOptions {
   approve: ApproveCheck;
   /** 运行 tsc 的 JavaScript 运行时，默认当前进程（bun 或 node） */
   runtime?: string;
-  /** 默认在 PATH 里找；测试用 */
+  /** 默认在 PATH 里找（由调用方给，见 index.ts 的 shell@1）；测试用 */
   which?: (bin: string) => string | null;
   id?: string;
 }
@@ -163,7 +163,7 @@ export function parseProblems(output: string, cwd: string): Problem[] {
 
 export function checks(opts: ChecksOptions): Checks {
   const id = opts.id ?? "jade/checks";
-  const which = opts.which ?? ((bin: string) => findExecutable(bin) ?? null);
+  const which = opts.which ?? (() => null);
   const runtime = opts.runtime ?? process.execPath;
   /** 本会话里不再运行的检查：用户拒绝了，或者输出认不出来 */
   const disabled = new Set<string>();

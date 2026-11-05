@@ -2,11 +2,12 @@
 
 import { describe, expect, test } from "bun:test";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { MemoryLogStore, readAll, Runtime, type Block, type ModelRequest, type Plugin, type Provider } from "uncarved";
 import { checks, CHECKS_KEY, parseProblems, type Check, type Checks } from "../plugins/checks/checks.ts";
 import { checksRenderers } from "../plugins/checks/index.ts";
-import { commandRunner, type RunCommand } from "../plugins/checks/run.ts";
+import { shellTools, type RunCommand } from "../plugins/shell/shell.ts";
 import type { CommandContext, Commands } from "../plugins/commands/index.ts";
 import { fsTools } from "../plugins/fs/fs.ts";
 import type { SessionManager, UI } from "../src/index.ts";
@@ -165,7 +166,7 @@ describe("edit-time checks", () => {
   });
 });
 
-const hasShell = !("unavailable" in commandRunner());
+const hasShell = shellTools({ cwd: os.tmpdir() }).executable !== undefined;
 const ui: UI = { interactive: false, notify: () => {}, select: async () => undefined, input: async () => undefined };
 const ctxFor = (sessions: SessionManager): CommandContext => ({ signal: new AbortController().signal, ui, sessions, print: () => {} });
 

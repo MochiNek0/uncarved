@@ -12,7 +12,7 @@ import { PluginHost } from "../src/index.ts";
 
 const BUNDLED = path.resolve(import.meta.dir, "../plugins");
 /** 这些测试要用的 bundled 插件；其余的停用 */
-const KEEP = new Set(["approval", "commands", "renderers", "prompts", "fs", "mcp", "skills", "checks"]);
+const KEEP = new Set(["approval", "commands", "renderers", "prompts", "fs", "mcp", "skills", "checks", "shell"]);
 
 export const MODEL = { by: "model", provider: "scripted", model: "s1" } as const;
 export type Step = Omit<ModelResponse, "model">;

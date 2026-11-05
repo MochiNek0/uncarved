@@ -1,9 +1,10 @@
-// jade/shell：bash 工具，以及后台命令的 bash_output、kill_shell。
+// jade/shell：bash 工具，以及后台命令的 bash_output、kill_shell；shell@1 给其他插件执行命令。
 
 import { definePlugin, type UI } from "../../src/api.ts";
 import type { Prompts } from "../prompts/index.ts";
 import type { Renderers } from "../renderers/index.ts";
 import { shellRenderers } from "./renderers.ts";
+import { shellService } from "./service.ts";
 import { shellTools } from "./shell.ts";
 
 export default definePlugin({
@@ -11,6 +12,8 @@ export default definePlugin({
     // 显示方式和会话无关，登记一次留到进程结束；没有 renderers@1（例如 print）时用前端的默认显示
     const renderers = ctx.service<Renderers>("renderers@1");
     if (renderers) for (const r of shellRenderers) renderers.tool(r);
+    // shell@1：找 shell 和杀进程树只有一份（见 service.ts）
+    ctx.provide("shell@1", shellService(typeof ctx.config.shell === "string" ? { shell: ctx.config.shell } : {}));
   },
 
   async session(ctx) {

@@ -214,25 +214,7 @@ export function shellTools(opts: ShellOptions): ShellTools {
     },
   };
 
-  const run: RunCommand = async (command, { cwd, timeoutMs, signal }) => {
-    signal?.throwIfAborted();
-    const proc = await spawn(command, cwd);
-    let timedOut = false;
-    const kill = () => killTree(executable, env, proc.pid);
-    const timer = setTimeout(() => {
-      timedOut = true;
-      kill();
-    }, timeoutMs);
-    signal?.addEventListener("abort", kill, { once: true });
-    try {
-      const [stdout, stderr, code] = await Promise.all([collect(proc.stdout, () => {}), collect(proc.stderr, () => {}), proc.exited]);
-      signal?.throwIfAborted();
-      return { code: timedOut ? null : code, output: [stdout, stderr].filter(Boolean).join("\n"), timedOut };
-    } finally {
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", kill);
-    }
-  };
+  const run: RunCommand = (command, opts) => capture(executable, env, command, opts);
 
   return {
     tools: [bash, bashOutput, killShell],
@@ -242,6 +224,35 @@ export function shellTools(opts: ShellOptions): ShellTools {
       for (const bg of background.values()) if (bg.exitCode === undefined) killTree(executable, env, bg.proc.pid);
     },
   };
+}
+
+/**
+ * 执行一条命令并把输出收下来（不经过模型、不推进度）；超时或中止时连同子进程一起杀掉。
+ * 后台命令和别的插件（`shell@1`，例如 jade/checks）都用它
+ */
+export async function capture(executable: string, env: NodeJS.ProcessEnv | undefined, command: string, opts: { cwd?: string; timeoutMs: number; signal?: AbortSignal }): Promise<RunResult> {
+  opts.signal?.throwIfAborted();
+  const proc = await spawnProc([executable, "-c", command], {
+    cwd: opts.cwd,
+    env,
+    // 自成进程组，超时/中断时能连同子进程一起杀掉
+    detached: process.platform !== "win32",
+  });
+  let timedOut = false;
+  const kill = () => killTree(executable, env, proc.pid);
+  const timer = setTimeout(() => {
+    timedOut = true;
+    kill();
+  }, opts.timeoutMs);
+  opts.signal?.addEventListener("abort", kill, { once: true });
+  try {
+    const [stdout, stderr, code] = await Promise.all([collect(proc.stdout, () => {}), collect(proc.stderr, () => {}), proc.exited]);
+    opts.signal?.throwIfAborted();
+    return { code: timedOut ? null : code, output: [stdout, stderr].filter(Boolean).join("\n"), timedOut };
+  } finally {
+    clearTimeout(timer);
+    opts.signal?.removeEventListener("abort", kill);
+  }
 }
 
 /** ctx.progress 推送的内容 */

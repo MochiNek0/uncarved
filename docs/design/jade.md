@@ -295,7 +295,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 | `jade/plugins` | `/plugins [id]`：每个插件的状态和原因、每个服务的提供者（来自核心的 `jade@1`） | `commands@1`、`jade@1` | — |
 | `jade/sessions` | 命令 `/clear` `/resume` `/retry`；会话索引 `$JADE_HOME/state/sessions.jsonl` | `commands@1` | `plugins/sessions.ts`、`session-lifecycle.ts` |
 | `jade/prompts` | `prompts@1`（其他插件往系统提示词里加段落；项目层插件加的、或标了 `untrusted` 的段落为不可信） | `models@1`（可选，写上当前模型） | `plugins/prompts.ts` |
-| `jade/fs`、`jade/shell` | 工具 | `renderers@1`、`prompts@1`（可选）；fs 可选 `task@1`（把只读工具另建一套给子 Agent） | `tools/*` |
+| `jade/fs`、`jade/shell` | 工具；shell 还提供 `shell@1`（`executable`、`unavailable`、`run(command, { cwd, timeoutMs, signal })`、`which`）：其他插件执行命令的入口，找 shell、补 Git Bash 的 PATH、连子进程一起杀只有这一份 | `renderers@1`、`prompts@1`（可选）；fs 可选 `task@1`（把只读工具另建一套给子 Agent） | `tools/*` |
 | `jade/web` | `web_fetch`、`web_search`、`/search`；只读工具另建一套经 `task@1` 给子 Agent（`web_search` 只在配置了搜索服务时给） | 可选 `ui@1`、`prompts@1`、`commands@1`、`renderers@1`、`task@1` | `tools/web.ts` |
 | `jade/screenshot` | `screenshot` 工具：用本机的 Chrome / Edge / Chromium 无头模式渲染本地文件或网页，把截图交给模型看（`JADE_BROWSER` 可以指定浏览器；没有浏览器时不注册；模型不能看图片时说明原因） | 可选 `renderers@1`、`prompts@1`、`models@1` | `tools/screenshot.ts`（`test/screenshot.test.ts`） |
 | `jade/todo`、`jade/ask` | 工具 | `ask` 需要 `ui@1`，不能提问时不注册工具 | `tools/todo.ts`、`tools/ask.ts` |
@@ -303,7 +303,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 | `jade/compact` | `context.project` 里清理旧输出、总结；`/compact`；上下文溢出后压缩并经 `afterTurn` 重试 | `models@1` | `plugins/compact.ts` |
 | `jade/mcp` | MCP 服务的工具、`/mcp`；项目层服务启动前确认（`$JADE_HOME/trust.jsonl`） | 可选 `ui@1`、`commands@1`、`prompts@1`、`task@1` | `mcp.ts`。插件自带的 MCP 配置（旧的 PluginBundle）没有了 |
 | `jade/skills` | `skill` 工具、`/skills`、`/<skill 名>`；skill 目录经 `approval@1.allowRead` 可直接读 | 可选 | `skills.ts` |
-| `jade/checks` | 改文件后在 `context.project` 里跑项目检查、`/checks`；命令第一次运行前确认 | 可选 `ui@1`、`approval@1` | `plugins/checks.ts` |
+| `jade/checks` | 改文件后在 `context.project` 里跑项目检查、`/checks`；命令第一次运行前确认 | `shell@1`（运行检查）；可选 `ui@1`、`approval@1`、`renderers@1`、`commands@1` | `plugins/checks.ts` |
 | `jade/memory`、`jade/undo` | `memory` 工具和 `/memory`；`/undo`（`tool.before`/`tool.after` 记快照） | 可选 | `memory.ts`、`tools/checkpoint.ts` |
 | `jade/mentions` | 在 `context.project` 里把 `@` 引用的文件附到那条用户消息上 | — | `mentions.ts`。附上的内容不算 `read_file` 读过 |
 | `jade/continue`、`jade/repeats`、`jade/budget` | 截断后续写（`afterTurn`）；重复调用；每轮步数上限 | — | `plugins/turns.ts`、`repeats.ts`、`budget.ts` |
@@ -351,7 +351,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 7. **其余功能插件**逐个移植。每移植一个，都检查它没有用到第三方拿不到的东西。
    大部分已完成：web、todo、ask、task、compact、mcp、skills、checks、memory、undo、mentions、continue、repeats、budget，各有测试（`test/<插件>.test.ts`）。期间核心改了两处：会话队列的竞争（上一条 `send` 刚 resolve 就再 `send`，新输入没人处理），兜底关卡只认 `approval@1` 的提供者（见第 7 节）。
    暂缺：插件的安装和更新（旧 `plugins/install.ts`、`update.ts`）。
-   移植中发现的缺口，以后再定：命令拿不到会话日志，也没有"给模型留一句说明"的接口（memory、undo 各自在 `context.project` 里附说明，`/undo` 的已撤销记录存在 `$JADE_HOME/checkpoints`）；子 Agent 的日志不能关联到父会话；`jade/checks` 复制了 jade/shell 找 shell、杀进程树的代码（可以由 jade/shell 提供 `shell@1`）。
+   移植中发现的缺口，以后再定：命令拿不到会话日志，也没有"给模型留一句说明"的接口（memory、undo 各自在 `context.project` 里附说明，`/undo` 的已撤销记录存在 `$JADE_HOME/checkpoints`）；子 Agent 的日志不能关联到父会话。已经补上的：`jade/checks` 不再复制 jade/shell 找 shell、杀进程树的代码，改由 `shell@1` 提供。
 8. ~~功能对齐后改名为 jade~~：已提前完成（2026-11-05）。旧 jade 归档到 `.archive/jade`，新实现直接占用 `apps/jade` 和 `jade` 命令；功能对齐前，jade 只是开发中的版本。
 
 ## 附录 A：参考调研摘要

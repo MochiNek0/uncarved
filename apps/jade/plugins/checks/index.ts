@@ -16,7 +16,7 @@ import type { Commands } from "../commands/index.ts";
 import type { EventRenderer, Renderers } from "../renderers/index.ts";
 import { changedFiles, checks, type Check, type Checks } from "./checks.ts";
 import { bold, dim, display, realPath, repoRoot, TrustFile, yellow } from "./project.ts";
-import { commandRunner } from "./run.ts";
+import type { Shell } from "../shell/service.ts";
 
 /** 确认记录：同一个目录里的同一条命令只问一次。和旧 jade 的算法相同 */
 const checkHash = (c: Check) => createHash("sha256").update(`jade-check\0${c.cwd}\0${c.command}`).digest("hex");
@@ -105,10 +105,10 @@ export default definePlugin({
     let asking: Promise<unknown> = Promise.resolve();
     sessionSetup = async (s) => {
       if (off) return;
-      const shell = typeof s.config.shell === "string" ? s.config.shell : undefined;
-      const runner = commandRunner(shell);
-      if ("unavailable" in runner) {
-        unavailable = runner.unavailable;
+      // 找 shell、杀进程树都在 jade/shell 里（shell@1），这里不再复制一份
+      const shell = s.require<Shell>("shell@1");
+      if (!shell.executable) {
+        unavailable = `edit-time checks are off: ${shell.unavailable ?? "no shell was found"}`;
         return;
       }
       const ui = s.service<UI>("ui@1");
@@ -142,7 +142,7 @@ export default definePlugin({
         return turn;
       };
       const cwd = realPath(s.cwd);
-      const c = checks({ cwd, root: realPath(repoRoot(cwd)), home: s.home, run: runner.run, approve });
+      const c = checks({ cwd, root: realPath(repoRoot(cwd)), home: s.home, run: shell.run, which: (bin) => shell.which(bin) ?? null, approve });
       const id = s.session.id;
       bySession.set(id, c);
       await s.effect(() => () => {

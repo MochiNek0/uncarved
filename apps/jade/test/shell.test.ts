@@ -5,6 +5,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { ToolContext } from "uncarved";
+import { shellService } from "../plugins/shell/service.ts";
 import { shellTool, shellTools } from "../plugins/shell/shell.ts";
 
 let tmp: string[] = [];
@@ -110,4 +111,42 @@ describe("bash", () => {
       shell.shutdown();
     }
   }, 20_000);
+});
+
+// shell@1：其他插件执行命令的入口（jade/checks 用它跑项目的检查）
+describe("shell@1", () => {
+  test("runs a command and collects its output", async () => {
+    const cwd = await workspace();
+    const service = shellService();
+    if (!service.executable) return; // 这台机器上没有 shell：下面只测"没有 shell"的情形
+    const r = await service.run("echo one; echo two >&2; exit 4", { cwd, timeoutMs: 20_000 });
+    expect(r.code).toBe(4);
+    expect(r.timedOut).toBe(false);
+    expect(r.output).toContain("one");
+    expect(r.output).toContain("two");
+  }, 20_000);
+
+  test("kills the command on abort and on timeout", async () => {
+    const cwd = await workspace();
+    const service = shellService();
+    if (!service.executable) return;
+    const t0 = Date.now();
+    const timed = await service.run("sleep 10; echo done", { cwd, timeoutMs: 500 });
+    expect(timed.timedOut).toBe(true);
+    expect(timed.code).toBeNull();
+    expect(Date.now() - t0).toBeLessThan(5000);
+
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(new Error("stop")), 300);
+    await expect(service.run("sleep 10", { cwd, timeoutMs: 20_000, signal: ac.signal })).rejects.toThrow();
+  }, 20_000);
+
+  test("without a shell the service says so instead of failing at call time", async () => {
+    const service = shellService({ shell: "no-such-shell-for-jade" });
+    expect(service.executable).toBeUndefined();
+    expect(service.unavailable).toContain("no-such-shell-for-jade");
+    await expect(service.run("echo hi", { timeoutMs: 1000 })).rejects.toThrow("no-such-shell-for-jade");
+    // which 不依赖 shell 在不在
+    expect(typeof service.which("no-such-program-for-jade")).toBe("undefined");
+  });
 });
