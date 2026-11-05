@@ -24,5 +24,5 @@ export type {
 } from "./hooks.ts";
 export { RemoteHookError } from "./remote.ts";
 export type { ExtensionPoint, RemoteHookSpec } from "./remote.ts";
-export { asProjectPlugin, hashDir, loadProjectPlugin, loadProjectPluginFactory, MemoryTrustStore, requireTrust, subsetPlugin, UntrustedPlugin } from "./trust.ts";
-export type { ConfirmTrust, TrustGrant, TrustOptions, TrustRecord, TrustStore } from "./trust.ts";
+export { asProjectPlugin, hashDir, importProjectModule, loadProjectPlugin, loadProjectPluginFactory, MemoryTrustStore, requireTrust, subsetPlugin, UntrustedPlugin } from "./trust.ts";
+export type { ConfirmTrust, ProjectModule, TrustGrant, TrustOptions, TrustRecord, TrustStore } from "./trust.ts";

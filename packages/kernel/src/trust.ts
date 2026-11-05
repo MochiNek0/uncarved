@@ -124,6 +124,36 @@ export async function loadProjectPluginFactory(
   dir: string,
   opts: TrustOptions & { entry?: string },
 ): Promise<(context?: unknown) => Promise<Plugin>> {
+  const { module, mark } = await importProjectModule(dir, opts);
+  const exported = (module as { default?: unknown }).default;
+  if (typeof exported !== "function" && !isPluginLike(exported)) {
+    throw new UntrustedPlugin(path.resolve(dir), "default export is neither a plugin nor a function returning one");
+  }
+  return async (context?: unknown) => {
+    const made = typeof exported === "function" ? await (exported as (c: unknown) => unknown)(context) : exported;
+    if (!isPluginLike(made)) throw new UntrustedPlugin(path.resolve(dir), "plugin factory did not return a plugin");
+    return mark(made);
+  };
+}
+
+/** importProjectModule 的结果 */
+export interface ProjectModule {
+  /** 入口模块的命名空间对象 */
+  module: unknown;
+  /**
+   * 把由这份代码创建的插件标记为已确认的项目层插件（layer 固定为 "project"），返回标记后的浅拷贝。
+   * 可以多次调用，例如宿主每个会话用这份代码创建一个插件。只能交给 Runtime 由这个模块创建的插件
+   */
+  mark(plugin: Plugin): Plugin;
+}
+
+/**
+ * 确认并导入一个项目层插件目录的入口模块，模块的形状由宿主决定（7.1）。
+ * 依次：对整个目录计算哈希、检查入口在目录内、检查 import 不出目录、未确认过的内容请求确认、
+ * 确认后再核对一次哈希、导入。任何一步不通过都抛 UntrustedPlugin，且不执行插件的任何代码。
+ * 只想加载默认导出内核插件的模块时，用 loadProjectPlugin / loadProjectPluginFactory
+ */
+export async function importProjectModule(dir: string, opts: TrustOptions & { entry?: string }): Promise<ProjectModule> {
   const root = path.resolve(dir);
   const { hash, files } = await hashDir(root);
   // 入口必须是哈希过的文件，否则 "../x.js" 这样的入口会导入从未确认过的代码
@@ -138,19 +168,16 @@ export async function loadProjectPluginFactory(
   if (prev !== undefined && prev !== hash) throw new UntrustedPlugin(root, "changed since it was imported; restart to load it");
   imported.set(root, hash);
 
-  const mod = (await import(pathToFileURL(path.join(root, entry)).href)) as { default?: unknown };
-  const exported = mod.default;
-  if (typeof exported !== "function" && !isPluginLike(exported)) {
-    throw new UntrustedPlugin(root, "default export is neither a plugin nor a function returning one");
-  }
-  // 凭据当场用掉：之后由工厂直接标记它创建的实例，它们的代码就是刚才确认并导入的代码
+  const module: unknown = await import(pathToFileURL(path.join(root, entry)).href);
+  // 凭据当场用掉：之后由 mark 直接标记这份代码创建的插件，它们的代码就是刚才确认并导入的代码
   if (!grants.delete(grant)) throw new UntrustedPlugin(root, "trust grant is not valid or already used");
-  return async (context?: unknown) => {
-    const made = typeof exported === "function" ? await (exported as (c: unknown) => unknown)(context) : exported;
-    if (!isPluginLike(made)) throw new UntrustedPlugin(root, "plugin factory did not return a plugin");
-    const p: Plugin = { ...made, layer: "project" };
-    confirmed.add(p);
-    return p;
+  return {
+    module,
+    mark(plugin: Plugin): Plugin {
+      const p: Plugin = { ...plugin, layer: "project" };
+      confirmed.add(p);
+      return p;
+    },
   };
 }
 
