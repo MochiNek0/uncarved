@@ -1,0 +1,7 @@
+{
+  "id": "jade/screenshot",
+  "version": "0.1.0",
+  "api": "^1",
+  "entry": "./index.ts",
+  "optional": ["renderers@1", "prompts@1", "models@1"]
+}

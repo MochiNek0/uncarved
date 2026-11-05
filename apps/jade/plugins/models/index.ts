@@ -11,12 +11,20 @@ import type { Commands } from "../commands/index.ts";
 import { contextWindow } from "./context.ts";
 import { envWithFile, hasProvider } from "./config.ts";
 import { configurator } from "./configure.ts";
-import { listModels, providerFromEnv, providerInfo, RateGate, rpmFromEnv, withRetry } from "./provider.ts";
+import { listModels, providerFromEnv, providerInfo, RateGate, rpmFromEnv, visionFromEnv, withRetry } from "./provider.ts";
 
 /** models@1 */
 export interface Models {
   /** 当前配置的服务和模型；没有配置时 undefined。via 是给人看的服务说明，例如 "the Anthropic API" */
-  current(): { kind: string; model: string; via: string; /** 上下文窗口（token） */ contextWindow: number } | undefined;
+  current(): {
+    kind: string;
+    model: string;
+    via: string;
+    /** 上下文窗口（token） */
+    contextWindow: number;
+    /** 模型能不能看图片（JADE_VISION；不设时按服务推断） */
+    vision: boolean;
+  } | undefined;
   /** 用当前配置的模型完成一次请求（带重试和限速，和会话共用） */
   complete(request: ModelRequest, options: { signal: AbortSignal; onDelta?: (delta: import("uncarved").Delta) => void }): Promise<ModelResponse>;
   /** 服务提供的模型列表；不支持或出错时为空 */
@@ -87,7 +95,14 @@ export default definePlugin({
       current() {
         if (!hasProvider(env)) return undefined;
         const info = providerInfo(env);
-        return { kind: info.kind, model: info.model, via: via(info.kind, info.baseURL), contextWindow: contextWindow(info.model, env) };
+        let vision = true;
+        try {
+          vision = visionFromEnv(env);
+        } catch {
+          // 写错的 JADE_VISION 在创建 provider 时报错，这里当作不能看
+          vision = false;
+        }
+        return { kind: info.kind, model: info.model, via: via(info.kind, info.baseURL), contextWindow: contextWindow(info.model, env), vision };
       },
       complete,
       list: () => listModels(env),
