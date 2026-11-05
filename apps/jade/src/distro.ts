@@ -13,7 +13,7 @@ import { Memory, memoryTool } from "./memory.ts";
 import { mcpTools, type McpClient } from "./mcp.ts";
 import { skillTool, skillsPrompt, type Skill } from "./skills.ts";
 import { compactor, type Compactor } from "./plugins/compact.ts";
-import { COMMAND_NAME, DISPOSE_TIMEOUT_MS, JADE_VERSION, KEY_SPEC, RESERVED_KEYS, type HostContext, type HostInput, type PluginKey, type ToolRenderer, type JadePlugin, type LoadedPlugin, type PluginCommand } from "./plugins/loader.ts";
+import { COMMAND_NAME, DISPOSE_TIMEOUT_MS, JADE_VERSION, KEY_SPEC, RESERVED_KEYS, type HostContext, type HostInput, type PluginKey, type ToolRenderer, type EventRenderer, type JadePlugin, type LoadedPlugin, type PluginCommand, type ServiceModel } from "./plugins/loader.ts";
 import { policy, type AllowRule, type Mode, type Policy, type PolicyOptions } from "./plugins/policy.ts";
 import { prompts, realPath, repoRoot } from "./plugins/prompts.ts";
 import { repeats } from "./plugins/repeats.ts";
@@ -26,8 +26,9 @@ import { todoTool } from "./tools/todo.ts";
 import { askUserTool, type AskUser } from "./tools/ask.ts";
 import { webTools } from "./tools/web.ts";
 import { screenshotTool } from "./tools/screenshot.ts";
-import { askRenderers, fsRenderers, memoryRenderers, shellRenderers, taskRenderers, todoRenderers, webRenderers } from "./ui/renderers.ts";
-import { visionFromEnv } from "./provider.ts";
+import { askRenderers, checksRenderers, compactRenderers, fsRenderers, memoryRenderers, shellRenderers, taskRenderers, todoRenderers, webRenderers } from "./ui/renderers.ts";
+import { listModels, serviceEnv, visionFromEnv } from "./provider.ts";
+import { continueTurns, mentionTurns, overflowTurns, planTurns, turns, type TurnParticipant, type Turns, type TurnUI } from "./plugins/turns.ts";
 
 const READ_ONLY = new Set(["read_file", "list_dir", "glob", "grep"]);
 /** 子 Agent 也执行的第三方插件 hook */
@@ -41,6 +42,11 @@ export interface JadeOptions {
   home: string;
   store: LogStore;
   provider: Provider;
+  /**
+   * 插件用 ctx.complete({ model }) 指定的模型：名字是保存过的模型（$JADE_HOME/models.json），对象是插件自己给出的服务。
+   * 创建它的 provider；找不到或格式不对时抛错，信息交给插件。不给时插件不能指定模型
+   */
+  modelFor?: (model: string | ServiceModel) => Promise<Provider>;
   mode?: Mode;
   /** 已经通过 loadProjectPlugin 确认过的项目层插件，原样加入 */
   projectPlugins?: Plugin[];
@@ -96,6 +102,8 @@ export interface JadeOptions {
   send?(plugin: string, text: string): void;
   /** 插件的 ctx.signal：这套实例的会话结束时中止（见 SessionScope）；不给时永不中止 */
   signal?: AbortSignal;
+  /** 参与轮次的内置插件（计划模式、续写、溢出重试、@ 附件）显示和提问用；不给时不显示、不提问 */
+  turnUi?: TurnUI;
 }
 
 export interface BuiltinState {
@@ -125,8 +133,12 @@ export interface Jade {
   extensions: Extension[];
   /** 插件（内置的和第三方的）提供的斜杠命令，按小写的名字 */
   commands: Map<string, { plugin: string; command: PluginCommand; builtin: boolean }>;
-  /** 第三方插件为自己的工具注册的显示方式，按工具名 */
+  /** 插件（内置的和第三方的）为自己的工具注册的显示方式，按工具名 */
   renderers: Map<string, { plugin: string; renderer: ToolRenderer }>;
+  /** 内置插件参与宿主的轮次：用户消息发出前附加内容，一轮结束后决定接下来做什么 */
+  turns: Turns;
+  /** 插件为自己的事件注册的显示方式，按完整的事件类型（"<插件 id>/<类型>"） */
+  eventRenderers: Map<string, { plugin: string; renderer: EventRenderer }>;
   /** 第三方插件的快捷键，按 KEY_SPEC 的写法（小写） */
   keys: Map<string, { plugin: string; key: PluginKey }>;
   /** 主会话的工具；宿主用 read_file / list_dir 读取 @ 引用的文件 */
@@ -152,7 +164,7 @@ export interface Extension {
   plugin: JadePlugin;
   commands: PluginCommand[];
   keys: PluginKey[];
-  renderers: ToolRenderer[];
+  renderers: (ToolRenderer | EventRenderer)[];
 }
 
 export async function createJade(opts: JadeOptions): Promise<Jade> {
@@ -174,7 +186,7 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
   // run 也给插件和编辑后检查用，所以 jade/shell 停用时也创建，只是不把工具交给模型
   const shell = shellTools({ cwd });
   const root = await repoRoot(cwd);
-  const host: HostContext = { jade: JADE_VERSION, cwd: realPath(cwd), root: realPath(root), home: opts.home, definePlugin, run: shell.run, complete: completer(provider), status: (plugin, text) => opts.onStatus?.(plugin, text), checkpoints, input: opts.input, send: opts.send, signal: opts.signal ?? new AbortController().signal };
+  const host: HostContext = { jade: JADE_VERSION, cwd: realPath(cwd), root: realPath(root), home: opts.home, definePlugin, run: shell.run, complete: completer(provider, opts.modelFor), listModels: async (service) => listModels(serviceEnv(service)), status: (plugin, text) => opts.onStatus?.(plugin, text), checkpoints, input: opts.input, send: opts.send, signal: opts.signal ?? new AbortController().signal };
 
   // 第三方插件先创建：要先知道它们代替哪些内置插件
   const made = await createExtensions(opts.extensions ?? [], host, warnings);
@@ -183,8 +195,13 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
   const built = new Map<string, JadePlugin>();
   const add = (p: JadePlugin) => built.set(p.id, p);
 
+  const turnUi: TurnUI = opts.turnUi ?? { interactive: false, log: () => {}, select: async () => undefined };
+  /** 参与轮次的内置插件，按内置插件的 id；被代替、停用的组装完成后去掉 */
+  const turnParts = new Map<string, TurnParticipant>();
+
   const pol = policy({ cwd, mode: opts.mode, pendingMode: opts.pendingMode, review: opts.review, readRoots: off("jade/skills") ? [] : skills.map((x) => x.dir), scratch: opts.scratch });
   add(pol.plugin);
+  turnParts.set("jade/policy", planTurns(pol, turnUi));
   // 占位，组装完成后换成真正的提示词插件
   if (!off("jade/prompts")) add({ id: "jade/prompts", version: "0.3.0", kernel: "^0.1" });
 
@@ -256,7 +273,7 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
       mcp: kept.has("jade/mcp") ? mcp : [],
       extensions: thirdParty,
     }));
-    add({ id: "jade/task", version: "0.1.0", kernel: "^0.1", tools: [taskTool({ store, provider, plugins: subagentPlugins, approve: opts.approveSubagent })], renderers: taskRenderers });
+    add({ id: "jade/task", version: "0.1.0", kernel: "^0.1", tools: [taskTool({ store, provider, plugins: subagentPlugins, approve: opts.approveSubagent })], renderers: taskRenderers() });
   }
 
   if (!off("jade/skills")) {
@@ -287,16 +304,26 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
       confirmed: opts.checkConfirmed,
       unavailable: opts.checksUnavailable ?? (shell.run ? "Edit-time checks are turned off." : "Edit-time checks need a shell; see the warning at startup."),
     });
-    add(checks ? { ...checks.plugin, commands: [command] } : { id: "jade/checks", version: "0.1.0", kernel: "^0.1", commands: [command] });
+    add(checks ? { ...checks.plugin, commands: [command], renderers: checksRenderers } : { id: "jade/checks", version: "0.1.0", kernel: "^0.1", commands: [command] });
   }
   let compact: Compactor | undefined;
   if (!off("jade/compact")) {
     compact = compactor({ provider, thresholdTokens: opts.compactTokens });
-    add({ ...compact.plugin, commands: [compactCommand(compact)] });
+    add({ ...compact.plugin, commands: [compactCommand(compact)], renderers: compactRenderers });
+    turnParts.set("jade/compact", overflowTurns(compact, turnUi));
   }
   if (!off("jade/budget")) add(budget({ maxSteps: opts.maxSteps }));
   if (!off("jade/sessions")) add(sessionsPlugin());
   if (!off("jade/undo")) add(undoPlugin(host));
+  if (!off("jade/continue")) {
+    add({ id: "jade/continue", version: "0.1.0", kernel: "^0.1" });
+    turnParts.set("jade/continue", continueTurns(turnUi));
+  }
+  if (!off("jade/mentions")) {
+    add({ id: "jade/mentions", version: "0.1.0", kernel: "^0.1" });
+    // 用最终的工具（read_file、list_dir）读引用的文件：代替了 jade/fs 的插件的同名工具也行
+    turnParts.set("jade/mentions", mentionTurns({ cwd, tools: () => allTools, ui: turnUi }));
+  }
   if (!off("jade/repeats")) {
     // 自己数回复次数：不依赖 jade/fs 是否加载
     const own = { calls: 0 };
@@ -385,8 +412,18 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
     }
   }
   if (shell.unavailable && kept.has("jade/shell")) warnings.push(shell.unavailable);
+  // 内置插件的显示和第三方的同一个格式（内置的在前）；第三方的已经在 createExtensions 里检查过
+  const turnFlow = turns(
+    [...turnParts].filter(([id]) => kept.has(id)).map(([id, part]) => ({ id, part })),
+    (text) => turnUi.log(text),
+  );
+  const everyRenderer = [
+    ...(builtin as JadePlugin[]).map((p) => ({ id: p.id, renderers: p.renderers ?? [] })),
+    ...added.map((a) => ({ id: a.plugin.id, renderers: a.renderers })),
+  ].flatMap((p) => p.renderers.map((renderer) => ({ id: p.id, renderer })));
   return {
     plugins,
+    turns: turnFlow,
     policy: pol,
     compact: kept.has("jade/compact") ? compact : undefined,
     checkpoints,
@@ -397,9 +434,10 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
     commands,
     keys,
     renderers: new Map(
-      [...(builtin as JadePlugin[]).map((p) => ({ id: p.id, renderers: p.renderers ?? [] })), ...added.map((a) => ({ id: a.plugin.id, renderers: a.renderers }))].flatMap((p) =>
-        p.renderers.map((r) => [r.tool, { plugin: p.id, renderer: r }] as const),
-      ),
+      everyRenderer.flatMap(({ id, renderer: r }) => ("tool" in r ? [[r.tool, { plugin: id, renderer: r }] as const] : [])),
+    ),
+    eventRenderers: new Map(
+      everyRenderer.flatMap(({ id, renderer: r }) => ("event" in r ? [[`${id}/${r.event}`, { plugin: id, renderer: r }] as const] : [])),
     ),
     dispose: () => (disposing ??= Promise.all(added.map(({ source, plugin }) => disposeInstance(source, plugin))).then((ws) => ws.filter((w): w is string => w !== undefined))),
     tools: allTools,
@@ -407,6 +445,9 @@ export async function createJade(opts: JadeOptions): Promise<Jade> {
     warnings,
   };
 }
+
+/** ToolRenderer 里的函数 */
+const TOOL_RENDERER_FNS = ["summary", "details", "call", "progress", "preview", "before", "result"];
 
 /**
  * 创建第三方插件的实例。有问题的插件跳过并给出警告，而不是让整个 jade 起不来：工厂出错、内核不兼容、命令格式不对。
@@ -454,17 +495,27 @@ async function createExtensions(sources: LoadedPlugin[], host: HostContext, warn
     });
     const own = new Set((plugin.tools ?? []).map((t) => t.name));
     const seen = new Set<string>();
-    // 只认自己的工具：别的工具的显示（尤其是审批时的预览）不能由插件改
+    const seenEvents = new Set<string>();
+    // 只认自己的工具和事件：别的工具的显示（尤其是审批时的预览）不能由插件改
     const renderers = listOf(plugin.renderers).filter((r) => {
-      const tool = r?.tool;
       const fields = r as unknown as Record<string, unknown> | undefined;
-      const fns = Boolean(fields) && ["summary", "details", "preview", "before", "result"].every((k) => fields![k] === undefined || typeof fields![k] === "function");
+      if (fields && "event" in fields) {
+        const event = fields.event;
+        let why: string | undefined;
+        if (typeof event !== "string" || !event || typeof fields.render !== "function") why = "it needs an event type and a render function";
+        else if (seenEvents.has(event)) why = "the event already has a renderer";
+        if (why) warnings.push(`${where}: renderer for event ${JSON.stringify(event)} is ignored: ${why}`);
+        else seenEvents.add(event as string);
+        return !why;
+      }
+      const tool = fields?.tool;
+      const fns = Boolean(fields) && TOOL_RENDERER_FNS.every((k) => fields![k] === undefined || typeof fields![k] === "function");
       let why: string | undefined;
-      if (typeof tool !== "string" || !fns) why = "it needs a tool name, and summary, details, preview, before and result must be functions";
+      if (typeof tool !== "string" || !fns) why = `it needs a tool name, and ${TOOL_RENDERER_FNS.slice(0, -1).join(", ")} and ${TOOL_RENDERER_FNS.at(-1)} must be functions`;
       else if (!own.has(tool)) why = "a plugin can only render its own tools";
       else if (seen.has(tool)) why = "the tool already has a renderer";
       if (why) warnings.push(`${where}: renderer for ${JSON.stringify(tool)} is ignored: ${why}`);
-      else seen.add(tool!);
+      else seen.add(tool as string);
       return !why;
     });
     // jade 不再提供的扩展点：写了也不起作用，提示一次
@@ -560,11 +611,16 @@ function subagent(
   };
 }
 
-/** 插件上下文的 complete：用会话的 provider 发一次不带工具的请求 */
-function completer(provider: Provider): HostContext["complete"] {
+/** 插件上下文的 complete：用会话的 provider（或者 req.model 指定的模型）发一次不带工具的请求 */
+function completer(provider: Provider, modelFor?: (model: string | ServiceModel) => Promise<Provider>): HostContext["complete"] {
   const origin = { by: "plugin", id: "jade/extension" } as const;
   return async (req, signal) => {
-    const res = await provider.complete(
+    const model = req.model;
+    if (model !== undefined && !(typeof model === "string" ? model : typeof model === "object" && model !== null && typeof model.model === "string" && model.model))
+      throw new Error("complete: model must be the name of a saved model or a service { kind, baseURL?, apiKey?, model }");
+    if (model !== undefined && !modelFor) throw new Error("complete: this jade cannot use other models; leave out model to use the current one");
+    const use = model !== undefined ? await modelFor!(model) : provider;
+    const res = await use.complete(
       {
         system: req.system ? [{ text: req.system, stability: "stable", origin, trust: "trusted" }] : [],
         messages: [{ role: "user", content: [{ kind: "text", text: req.prompt, origin, trust: "untrusted" }] }],

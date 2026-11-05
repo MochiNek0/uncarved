@@ -50,10 +50,13 @@ export interface JadePluginContext {
   /** 用 jade 的 shell 执行命令，超时或中断时连同子进程一起结束；找不到 shell 时没有 */
   run?: RunCommand;
   /**
-   * 用当前配置的模型发一次请求：不带工具，不记进会话，和会话共用限速和重试；用户切换模型后用新的。
+   * 发一次模型请求：不带工具，不记进会话。默认用当前配置的模型，和会话共用限速和重试，用户切换模型后用新的；
+   * req.model 指定用户在 /model 里保存过的另一个模型（见 CompleteRequest.model）。
    * 返回回复的文字；onText 收到流式输出的片段，拿到想要的内容后可以用 signal 中止
    */
   complete(req: CompleteRequest, signal: AbortSignal): Promise<CompleteResult>;
+  /** 服务提供的模型（请求它的模型列表接口）；服务不支持、出错或超过 10 秒时是空数组，格式不对时抛错 */
+  listModels(service: ModelService): Promise<string[]>;
   /** 设置状态栏上本插件的那一段文字（一行，过长时截断，窗口窄时先被去掉）；undefined 去掉 */
   status(text: string | undefined): void;
   /** 文件快照：写文件的工具写之前记下原内容，/undo 据此恢复。见 FileCheckpoints */
@@ -77,6 +80,7 @@ export interface HostInput {
   text(plugin?: string): string;
   insert(text: string, plugin?: string): void;
   set(text: string, plugin?: string): void;
+  hint(text: string | undefined, plugin?: string): void;
 }
 
 /** 输入框里用户还没提交的文字 */
@@ -87,6 +91,12 @@ export interface InputControl {
   insert(text: string): void;
   /** 换掉全部文字，光标放到末尾；空字符串清空 */
   set(text: string): void;
+  /**
+   * 输入框为空时显示的灰色提示，例如预测的下一条消息；undefined 或空字符串去掉。
+   * 用户在输入框为空时按 Tab 或 → 把它变成输入框里的文字；开始打字、提交、换会话时去掉。
+   * 同一时间只有一条，后设置的覆盖先设置的（不管是哪个插件设置的）
+   */
+  hint(text: string | undefined): void;
 }
 
 /**
@@ -100,6 +110,17 @@ export interface ToolRenderer {
   summary?(input: unknown): string | undefined;
   /** 摘要省略了的参数（例如很长的命令），点击调用行展开后显示在最前面，可以多行；默认没有 */
   details?(input: unknown): string | undefined;
+  /**
+   * 执行时显示的内容，代替默认的 "工具名(摘要)"：第一行跟在 "● " 后面，结果接在它后面；其余的行原样显示在下面，不折叠
+   * （例如 todo_write 显示整个清单）。审批、拒绝时仍显示 "工具名(摘要)"
+   */
+  call?(input: unknown): string | undefined;
+  /**
+   * 运行中的进度：工具用 ToolContext.progress 推送的一项（格式由工具自己定）换成一行，显示在对话的最后，工具结束时去掉；
+   * 返回 undefined 不显示。summary 是 jade 显示别的工具调用时用的摘要（例如子 Agent 调用的工具）。
+   * 没有这个函数时，{ text } 形式的进度按输出逐行显示，其他的不显示
+   */
+  progress?(update: unknown, call: { toolUseId: string; summary(tool: string, input: unknown): string }): string | undefined;
   /** 请用户批准时显示的预览，可以多行、带 ANSI 颜色；默认是参数的 JSON */
   preview?(input: unknown): Awaitable<string | undefined>;
   /**
@@ -109,9 +130,20 @@ export interface ToolRenderer {
   before?(input: unknown): unknown;
   /**
    * 结果：line 接在调用行的 "⎿ " 后面（一行），details 是点击展开后的内容（可以多行）；
-   * 默认显示结果文字的第一行，多出的行折叠起来
+   * 返回 null 时不显示结果（例如 call 已经显示了全部内容）；默认显示结果文字的第一行，多出的行折叠起来
    */
-  result?(r: { input: unknown; text: string; isError: boolean; before?: unknown }): { line: string; details?: string } | undefined;
+  result?(r: { toolUseId: string; input: unknown; text: string; isError: boolean; before?: unknown }): { line: string; details?: string } | null | undefined;
+}
+
+/**
+ * 插件自己的事件（ctx.emit 写入的）在对话里怎么显示。只能为本插件的事件注册：event 是 emit 时的类型，不带 "<插件 id>/" 前缀。
+ * 返回 undefined 时不显示；出错时提示一次。没有渲染器的事件除了 notice 都不显示。
+ * 事件的 data 里有 usage（模型用量）时，不管有没有渲染器都计入本会话的用量
+ */
+export interface EventRenderer {
+  event: string;
+  /** line 显示成一行，details 是点击展开后的内容（可以多行）；都可以带 ANSI 颜色 */
+  render(data: unknown): { line: string; details?: string } | undefined;
 }
 
 /** 插件 dispose 的时限：超过了不再等，显示警告 */
@@ -162,7 +194,27 @@ export interface FileCheckpoints {
 export interface CompleteRequest {
   system?: string;
   prompt: string;
+  /**
+   * 不写时用会话当前的模型。可以是：
+   * - 用户在 /model 里保存过的模型的名字：用它保存的服务、密钥和设置，插件拿不到密钥。找不到时抛错，错误信息列出保存过的模型
+   * - 插件自己给出的服务和模型（ServiceModel），例如插件自己的设置里存的一个免费小模型
+   */
+  model?: string | ServiceModel;
   onText?(delta: string): void;
+}
+
+/** 插件直接给出的模型服务，格式是 jade 内置的三种之一 */
+export interface ModelService {
+  /** openai-compat：任何兼容 /chat/completions 的服务；openai：OpenAI Responses API；anthropic：Claude */
+  kind: "openai-compat" | "openai" | "anthropic";
+  /** openai-compat 必填；openai、anthropic 不填时是官方地址 */
+  baseURL?: string;
+  /** 不需要密钥的服务（例如本地的）可以不填 */
+  apiKey?: string;
+}
+
+export interface ServiceModel extends ModelService {
+  model: string;
 }
 
 export interface CompleteResult {
@@ -252,8 +304,8 @@ export interface JadePlugin extends Plugin {
   commands?: PluginCommand[];
   /** 快捷键，见 PluginKey；和排在前面的插件用了同一个键时忽略 */
   keys?: PluginKey[];
-  /** 本插件的工具在对话里怎么显示，见 ToolRenderer */
-  renderers?: ToolRenderer[];
+  /** 本插件的工具和事件在对话里怎么显示，见 ToolRenderer、EventRenderer */
+  renderers?: (ToolRenderer | EventRenderer)[];
   /**
    * jade 不再用这个实例时调用一次：换会话（/clear、/resume）、重新加载、退出，以及创建了却没用上的实例（例如按 id 停用的）。
    * 在会话的收尾（session.detached 的 hook）之后。停掉定时器、关掉连接和监听；
@@ -497,7 +549,12 @@ function pluginContext(found: FoundPlugin & { id: string }, info: PluginInfo, { 
     ...host,
     ...(found.layer === "user"
       ? {
-          input: input && { text: () => input.text(found.id), insert: (text: string) => input.insert(text, found.id), set: (text: string) => input.set(text, found.id) },
+          input: input && {
+            text: () => input.text(found.id),
+            insert: (text: string) => input.insert(text, found.id),
+            set: (text: string) => input.set(text, found.id),
+            hint: (text: string | undefined) => input.hint(text, found.id),
+          },
           send: send && ((text: string) => send(found.id, text)),
         }
       : {}),

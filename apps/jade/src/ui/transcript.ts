@@ -4,10 +4,7 @@
 // 只负责显示和统计，不驱动运行时；宿主（main.ts）用 lastEnd、turnFailed 决定接下来做什么。
 
 import { readAll, type Block, type EventDataMap, type LogEvent, type LogStore, type Runtime, type TurnEndReason, type Usage } from "uncarved";
-import type { ShellProgress } from "../tools/shell.ts";
-import type { TaskProgress } from "../tools/task.ts";
-import { renderTodos, type Todo } from "../tools/todo.ts";
-import type { ToolRenderer } from "../plugins/loader.ts";
+import type { EventRenderer, ToolRenderer } from "../plugins/loader.ts";
 import type { PendingCall } from "uncarved";
 import { clip, clipStyled, detailsOf, preview, summarize } from "./render.ts";
 import { bold, cyan, dim, green, red, yellow, type Screen } from "./screen.ts";
@@ -27,6 +24,8 @@ export interface TranscriptOptions {
   canRetry(): boolean;
   /** 插件为自己的工具注册的显示方式（随会话的插件实例变） */
   renderer?(tool: string): { plugin: string; renderer: ToolRenderer } | undefined;
+  /** 插件为自己的事件注册的显示方式，按完整的事件类型 */
+  eventRenderer?(type: string): { plugin: string; renderer: EventRenderer } | undefined;
 }
 
 export interface Transcript {
@@ -56,6 +55,17 @@ export interface Transcript {
 /** 工具结果折叠起来的完整内容最多这么多行 */
 const MAX_DETAIL_LINES = 2000;
 
+/** 插件事件里的用量：只取数字字段 */
+function usageOf(u: unknown): Usage | undefined {
+  if (typeof u !== "object" || u === null) return undefined;
+  const out: Usage = {};
+  for (const k of ["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens"] as const) {
+    const v = (u as Record<string, unknown>)[k];
+    if (typeof v === "number" && Number.isFinite(v)) out[k] = v;
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
 const textOf = (blocks: Block[]) => blocks.flatMap((b) => (b.kind === "text" ? [b.text] : [])).join("\n");
 const errorText = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
@@ -67,10 +77,13 @@ export function transcript(opts: TranscriptOptions): Transcript {
     for (const k of Object.keys(usage) as (keyof Usage)[]) usage[k] += u?.[k] ?? 0;
     if (u) screen.status({ spent: { input: usage.inputTokens, output: usage.outputTokens } });
   };
-  /** 一个事件带来的用量：模型回复、压缩时的总结调用、auto 模式的审查；子 Agent 的用量在它自己的日志里 */
+  /**
+   * 一个事件带来的用量：模型回复；插件事件 data 里的 usage（压缩时的总结调用、auto 模式的审查这类插件自己发的请求）；
+   * 子 Agent 的用量在它自己的日志里
+   */
   async function countUsage(e: LogEvent) {
     if (e.type === "model.responded") addUsage((e as LogEvent<"model.responded">).data.usage);
-    else if (e.type === "jade/compact/compacted" || e.type === "jade/policy/reviewed") addUsage((e.data as { usage?: Usage }).usage);
+    else if (e.origin.by === "plugin") addUsage(usageOf((e.data as { usage?: unknown } | null)?.usage));
     else if (e.type === "tool.completed") {
       const child = (e as LogEvent<"tool.completed">).data.child;
       if (child) for (const c of await readAll(store, child.sessionId)) await countUsage(c);
@@ -131,15 +144,9 @@ export function transcript(opts: TranscriptOptions): Transcript {
   const activity = (label: string) => {
     if (!replaying) screen.busy(label);
   };
-  /** 结果不用再显示的工具调用 */
-  const quiet = new Set<string>();
   let streamed = false;
   /** 正在运行、显示着进度的工具 */
   const running = new Set<string>();
-  /** 子 Agent 调用过的工具，结束时放进 task 结果的折叠内容里 */
-  const steps = new Map<string, string[]>();
-  /** 正在运行的子 Agent 的标签，显示在它的进度行开头 */
-  const tasks = new Map<string, string>();
   /** 调用行省略了的参数（例如很长的命令），结果出来后放在折叠内容的最前面 */
   const calls = new Map<string, string>();
   /** renderer 的 before 在执行前记下的东西，结果出来时交给它的 result */
@@ -210,11 +217,8 @@ export function transcript(opts: TranscriptOptions): Transcript {
       for (const k of Object.keys(usage) as (keyof Usage)[]) usage[k] = 0;
       reportsCache = undefined;
       toolNames.clear();
-      quiet.clear();
       for (const id of running) screen.progress(id, undefined);
       running.clear();
-      steps.clear();
-      tasks.clear();
       calls.clear();
       befores.clear();
       inputs.clear();
@@ -263,34 +267,23 @@ export function transcript(opts: TranscriptOptions): Transcript {
       case "awaiting":
         return;
       case "tool-progress":
-        return renderProgress(n.toolUseId, n.update as ShellProgress | TaskProgress);
+        return renderProgress(n.toolUseId, n.update);
       case "event":
         return renderEvent(n.event);
     }
   }
 
-  function renderProgress(toolUseId: string, p: ShellProgress | TaskProgress) {
-    if (typeof p !== "object" || p === null) return;
-    // 每个子 Agent 只有一行进度：标签、调用过几个工具、正在做什么。并行的几个靠标签分清
-    const taskLine = (what: string) => {
-      const n = steps.get(toolUseId)?.length ?? 0;
-      progress(toolUseId, dim(`  ↳ ${tasks.get(toolUseId) ?? "sub-agent"}${n ? ` (${n} tool call${n > 1 ? "s" : ""})` : ""} · ${what}`));
-    };
-    if (p.kind === "task-start") {
-      tasks.set(toolUseId, p.description);
-      return taskLine("starting");
+  /** 工具的进度：有 renderer 的 progress 时由它换成一行；否则 { text } 形式的按输出逐行显示（例如 bash），其他的不显示 */
+  function renderProgress(toolUseId: string, update: unknown) {
+    const name = toolNames.get(toolUseId) ?? "?";
+    if (opts.renderer?.(name)?.renderer.progress) {
+      const line = customSync(name, (r) => r.progress?.(update, { toolUseId, summary }));
+      if (typeof line === "string" && line) progress(toolUseId, clipStyled(line.split("\n")[0]!, 200));
+      return;
     }
-    if (p.kind === "task-model") return taskLine("thinking");
-    if (p.kind === "task-tool") {
-      // 要用户批准的调用在审批时显示
-      if (p.decision === "ask") return;
-      const step = `${p.decision === "deny" ? "✗" : "·"} ${p.name}(${summary(p.name, p.input)})`;
-      steps.set(toolUseId, [...(steps.get(toolUseId) ?? []), step]);
-      return taskLine(step);
-    }
-    // 第三方工具的进度格式 jade 不认识，不显示
-    if (typeof (p as { text?: unknown }).text !== "string") return;
-    for (const l of p.text.replace(/\n$/, "").split("\n")) progress(toolUseId, dim(`  │ ${clip(l, 200)}`), { output: true });
+    const text = (update as { text?: unknown } | null)?.text;
+    if (typeof text !== "string") return;
+    for (const l of text.replace(/\n$/, "").split("\n")) progress(toolUseId, dim(`  │ ${clip(l, 200)}`), { output: true });
   }
 
   function renderEvent(e: LogEvent) {
@@ -330,15 +323,18 @@ export function transcript(opts: TranscriptOptions): Transcript {
         if (d.decision === "deny") screen.log(red(`✗ ${head}`) + dim(d.reason ? ` — ${clip(d.reason, 200)}` : ""), { id: d.toolUseId, details: full });
         else {
           activity(`Running ${name}`);
-          if (name === "todo_write") {
-            // 清单本身就是参数：直接显示，结果不再显示
-            quiet.add(d.toolUseId);
-            screen.log(cyan("● ") + bold("Todos"));
-            screen.log(renderTodos((d.input as { todos?: Todo[] }).todos ?? []).replace(/^/gm, "  "));
-          } else if (d.decidedBy !== "user" || replaying) {
-            // 用户批准的调用在审批时已经显示过；重新显示历史时没有审批这一步
-            // auto 模式下审查放行的带着理由
-            screen.log(cyan("● ") + head + (d.reason ? dim(` — ${clip(d.reason, 160)}`) : ""), { id: d.toolUseId, details: full });
+          // 用户批准的调用在审批时已经显示过；重新显示历史时没有审批这一步
+          if (d.decidedBy !== "user" || replaying) {
+            const own = customSync(name, (r) => r.call?.(d.input));
+            if (typeof own === "string" && own) {
+              // renderer 给的内容：第一行是调用行（结果接在它后面），其余的行不折叠
+              const [first, ...rest] = own.split("\n");
+              screen.log(cyan("● ") + first, { id: d.toolUseId, details: full });
+              if (rest.length) screen.log(rest.join("\n"));
+            } else {
+              // auto 模式下审查放行的带着理由
+              screen.log(cyan("● ") + head + (d.reason ? dim(` — ${clip(d.reason, 160)}`) : ""), { id: d.toolUseId, details: full });
+            }
           }
         }
         return;
@@ -348,19 +344,17 @@ export function transcript(opts: TranscriptOptions): Transcript {
         void countUsage(e);
         activity("Working");
         doneProgress(d.toolUseId);
-        const sub = steps.get(d.toolUseId) ?? [];
-        steps.delete(d.toolUseId);
-        tasks.delete(d.toolUseId);
         const call = calls.get(d.toolUseId);
         calls.delete(d.toolUseId);
         const before = befores.get(d.toolUseId);
         befores.delete(d.toolUseId);
         const input = inputs.get(d.toolUseId);
         inputs.delete(d.toolUseId);
-        if (quiet.delete(d.toolUseId) && !d.isError) return;
         const text = textOf(d.content).trim();
         const name = toolNames.get(d.toolUseId) ?? "?";
-        const mine = customSync(name, (r) => r.result?.({ input, text, isError: d.isError === true, before }));
+        const mine = customSync(name, (r) => r.result?.({ toolUseId: d.toolUseId, input, text, isError: d.isError === true, before }));
+        // null：renderer 不要显示结果
+        if (mine === null) return;
         if (mine && typeof mine.line === "string") {
           const own = typeof mine.details === "string" && mine.details ? [mine.details.replace(/^/gm, "    ")] : [];
           const folded = [...(call ? [call] : []), ...own].join("\n") || undefined;
@@ -371,14 +365,10 @@ export function transcript(opts: TranscriptOptions): Transcript {
         // 结果接在调用的那一行后面；摘要省略了内容时，把完整结果（和子 Agent 调用过的工具）折叠起来，点击展开
         const shown = d.isError ? 4 : 1;
         const width = d.isError ? 200 : 160;
-        const hidden = sub.length > 0 || lines.length > shown || lines.some((l) => l.length > width);
+        const hidden = lines.length > shown || lines.some((l) => l.length > width);
         const details =
           hidden || call
-            ? [
-                ...(call ? [call] : []),
-                ...(sub.length ? [dim(`    sub-agent ran ${sub.length} tool call${sub.length > 1 ? "s" : ""}:`), ...sub.map((l) => dim(`      ${l}`))] : []),
-                ...(hidden ? [detailsOf(lines, d.isError ? red : (s) => s, MAX_DETAIL_LINES)] : []),
-              ].join("\n")
+            ? [...(call ? [call] : []), ...(hidden ? [detailsOf(lines, d.isError ? red : (s) => s, MAX_DETAIL_LINES)] : [])].join("\n")
             : undefined;
         if (d.isError) screen.amend(d.toolUseId, red(`⎿ ${lines.slice(0, shown).map((l) => clip(l, width)).join("\n    ")}`), { details });
         else screen.amend(d.toolUseId, dim(`⎿ ${clip(lines[0] ?? "", width)}${lines.length > 1 ? ` (+${lines.length - 1} lines)` : ""}`), { details });
@@ -387,7 +377,6 @@ export function transcript(opts: TranscriptOptions): Transcript {
       case "tool.interrupted": {
         const d = e.data as EventDataMap["tool.interrupted"];
         doneProgress(d.toolUseId);
-        tasks.delete(d.toolUseId);
         calls.delete(d.toolUseId);
         befores.delete(d.toolUseId);
         inputs.delete(d.toolUseId);
@@ -409,42 +398,29 @@ export function transcript(opts: TranscriptOptions): Transcript {
         if (self.turnFailed && !replaying && opts.canRetry()) screen.log(dim("[send /retry to request again without adding a message]"));
         return;
       }
-      case "jade/compact/compacted": {
-        const d = e.data as { from: number; upTo: number; before: number };
-        void countUsage(e);
-        screen.log(dim(`[compacted ${d.upTo - d.from} messages, ~${d.before} tokens before]`));
-        return;
-      }
-      case "jade/checks/checked": {
-        const d = e.data as { summary: { name: string; problems: number; others?: number; failed?: string }[]; report: string };
-        const bad = d.summary.filter((s) => s.problems > 0 || s.others || s.failed);
-        const details = d.report ? detailsOf(d.report.split("\n").slice(1), (s) => s, MAX_DETAIL_LINES) : undefined;
-        if (bad.length === 0) {
-          screen.log(dim(`  ✓ checks passed: ${d.summary.map((s) => s.name).join(", ")}`), { details });
-        } else {
-          const what = bad.map((s) =>
-            s.failed
-              ? `${s.name} ${s.failed}`
-              : `${s.name}: ${[s.problems > 0 ? `${s.problems} problem${s.problems > 1 ? "s" : ""} in changed files` : "", s.others ? `${s.others} new elsewhere` : ""]
-                  .filter(Boolean)
-                  .join(", ")}`,
-          );
-          screen.log(yellow(`  ⚠ checks: ${what.join("; ")}`), { details });
-        }
-        return;
-      }
-      case "jade/policy/reviewed":
-        // 审查的结果显示在工具调用那一行，这里只计用量
-        void countUsage(e);
-        return;
-      case "jade/compact/trimmed": {
-        const d = e.data as { saved: number };
-        screen.log(dim(`[cleared old tool output, ~${d.saved} tokens]`));
-        return;
-      }
       default:
-        return renderPluginNotice(e);
+        return renderPluginEvent(e);
     }
+  }
+
+  /**
+   * 插件的事件：用量照常统计；插件为它注册了渲染器时由渲染器显示，
+   * 否则只有 ctx.emit("notice", { text, level? }) 写入的提示显示成 [插件 id] 文本
+   */
+  function renderPluginEvent(e: LogEvent) {
+    if (e.origin.by !== "plugin") return;
+    void countUsage(e);
+    const found = opts.eventRenderer?.(e.type);
+    if (!found) return renderPluginNotice(e);
+    let shown: ReturnType<EventRenderer["render"]>;
+    try {
+      shown = found.renderer.render(e.data);
+    } catch (err) {
+      return renderFailed(found.plugin, e.type, err);
+    }
+    if (!shown || typeof shown.line !== "string") return;
+    const details = typeof shown.details === "string" && shown.details ? shown.details.replace(/^/gm, "    ") : undefined;
+    screen.log(shown.line, { details });
   }
 
   /** 插件用 ctx.emit("notice", { text, level? }) 写入的提示，显示成 [插件 id] 文本 */

@@ -3,9 +3,9 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { MemoryLogStore, type LogEvent } from "uncarved";
-import type { ToolRenderer } from "../src/plugins/loader.ts";
+import type { EventRenderer, ToolRenderer } from "../src/plugins/loader.ts";
 import type { Screen, StatusInfo } from "../src/ui/screen.ts";
-import { fsRenderers, shellRenderers, taskRenderers } from "../src/ui/renderers.ts";
+import { checksRenderers, compactRenderers, fsRenderers, shellRenderers, taskRenderers, todoRenderers } from "../src/ui/renderers.ts";
 import { transcript, type TranscriptOptions } from "../src/ui/transcript.ts";
 import { clipStyled } from "../src/ui/render.ts";
 
@@ -69,7 +69,7 @@ test("cache hit rate: a missing field after a report means 0%, but a different m
 });
 
 /** 记下 log / amend / progress 的屏幕，用来看工具调用那一行和进度行 */
-function recording(cwd = "/", renderer?: TranscriptOptions["renderer"]) {
+function recording(cwd = "/", renderer?: TranscriptOptions["renderer"], eventRenderer?: TranscriptOptions["eventRenderer"]) {
   const lines = new Map<string, { text: string; details?: string }>();
   /** 不属于某个工具调用的输出（警告等） */
   const logged: string[] = [];
@@ -92,8 +92,20 @@ function recording(cwd = "/", renderer?: TranscriptOptions["renderer"]) {
     status: noop,
   } as unknown as Screen;
   // 和 jade 里一样带上内置工具的 renderer；传进来的（插件的）优先
-  const own = new Map([...fsRenderers(cwd), ...shellRenderers, ...taskRenderers].map((r) => [r.tool, { plugin: "jade/builtin", renderer: r }]));
-  const t = transcript({ screen, cwd, store: new MemoryLogStore(), contextWindow: () => 100_000, canRetry: () => false, renderer: (tool) => renderer?.(tool) ?? own.get(tool) });
+  const own = new Map([...fsRenderers(cwd), ...shellRenderers, ...taskRenderers(), ...todoRenderers].map((r) => [r.tool, { plugin: "jade/builtin", renderer: r }]));
+  const events = new Map<string, { plugin: string; renderer: EventRenderer }>([
+    ...compactRenderers.map((r) => [`jade/compact/${r.event}`, { plugin: "jade/compact", renderer: r }] as const),
+    ...checksRenderers.map((r) => [`jade/checks/${r.event}`, { plugin: "jade/checks", renderer: r }] as const),
+  ]);
+  const t = transcript({
+    screen,
+    cwd,
+    store: new MemoryLogStore(),
+    contextWindow: () => 100_000,
+    canRetry: () => false,
+    renderer: (tool) => renderer?.(tool) ?? own.get(tool),
+    eventRenderer: (type) => eventRenderer?.(type) ?? events.get(type),
+  });
   const event = (type: string, data: unknown) => t.onNotice({ type: "event", event: { type, data, origin: { by: "kernel" } } as unknown as LogEvent });
   const use = (id: string, name: string, input: unknown) => {
     event("model.responded", { content: [{ kind: "tool_use", id, name, input }], usage: {} });
@@ -132,6 +144,41 @@ test("each sub-agent keeps one progress line with its label and what it is doing
   event("tool.completed", { toolUseId: "t1", content: [{ kind: "text", text: "in a.ts" }], isError: false });
   expect(progress.has("t1")).toBe(false);
   expect(lines.get("t1")!.details).toContain("sub-agent ran 1 tool call:");
+});
+
+test("a renderer's call replaces the call line and shows the rest unfolded; a null result hides the result, errors still show", () => {
+  const { event, use, lines, logged } = recording();
+  use("w1", "todo_write", { todos: [{ content: "read", status: "completed" }, { content: "edit", status: "in_progress" }] });
+  expect(lines.get("w1")!.text).toBe("● Todos");
+  expect(logged.at(-1)).toContain("edit");
+  event("tool.completed", { toolUseId: "w1", content: [{ kind: "text", text: "Todo list updated" }], isError: false });
+  expect(lines.get("w1")!.text).toBe("● Todos");
+  use("w2", "todo_write", { todos: [] });
+  event("tool.completed", { toolUseId: "w2", content: [{ kind: "text", text: "todos must be an array" }], isError: true });
+  expect(lines.get("w2")!.text).toBe("● Todos ⎿ todos must be an array");
+});
+
+test("plugin events show through the plugin's event renderer; their usage counts whether or not they are shown", () => {
+  let broken = false;
+  const deploy: EventRenderer = {
+    event: "deployed",
+    render: (data) => {
+      if (broken) throw new Error("boom");
+      return { line: `deployed ${(data as { env: string }).env}` };
+    },
+  };
+  const { t, logged } = recording("/", undefined, (type) => (type === "x/deploy/deployed" ? { plugin: "x/deploy", renderer: deploy } : undefined));
+  const emit = (type: string, data: unknown, id = "x/deploy") => t.onNotice({ type: "event", event: { type, data, origin: { by: "plugin", id } } } as never);
+  emit("x/deploy/deployed", { env: "prod" });
+  emit("jade/compact/compacted", { from: 0, upTo: 12, before: 9000, usage: { inputTokens: 900, outputTokens: 100 } }, "jade/compact");
+  // 没有渲染器的事件不显示，只统计用量；usage 里不是数字的字段不算
+  emit("x/deploy/billed", { usage: { inputTokens: 5, outputTokens: "lots" } });
+  expect(logged).toEqual(["deployed prod", "[compacted 12 messages, ~9000 tokens before]"]);
+  expect(t.usage).toMatchObject({ inputTokens: 905, outputTokens: 100 });
+  broken = true;
+  emit("x/deploy/deployed", { env: "qa" });
+  emit("x/deploy/deployed", { env: "qa" });
+  expect(logged.filter((l) => l.includes("plugin x/deploy: showing x/deploy/deployed failed"))).toHaveLength(1);
 });
 
 test("a plugin's renderer shows its tool's summary, preview and result; failures fall back to the default once warned", async () => {

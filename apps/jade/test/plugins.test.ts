@@ -6,8 +6,10 @@ import { existsSync, realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { MemoryLogStore, MemoryTrustStore, readAll, Runtime, type Block, type ModelRequest, type ModelResponse, type Provider } from "uncarved";
-import { clearProviders, collectProviders, createJade, DISPOSE_TIMEOUT_MS, discoverPlugins, listModels, loadPlugin, openPluginHost, pluginProviders, providerFromEnv, providerInfo, registerProviders, resolvePlugins, SEARCH_PROVIDERS, visionFromEnv, type FoundPlugin, type LoadedPlugin } from "../src/index.ts";
-import type { HostContext, SessionControl } from "../src/plugins/loader.ts";
+import { clearProviders, collectProviders, createJade, DISPOSE_TIMEOUT_MS, discoverPlugins, listModels, loadPlugin, serviceEnv, openPluginHost, pluginProviders, providerFromEnv, providerInfo, registerProviders, resolvePlugins, SEARCH_PROVIDERS, visionFromEnv, type FoundPlugin, type LoadedPlugin } from "../src/index.ts";
+import type { HostContext, ServiceModel, SessionControl } from "../src/plugins/loader.ts";
+import { savedModelEnv } from "../src/ui/configure.ts";
+import type { SavedService } from "../src/config.ts";
 
 const MODEL = { by: "model", provider: "scripted", model: "scripted-1" } as const;
 type Step = Omit<ModelResponse, "model">;
@@ -322,6 +324,111 @@ describe("in-process plugins", () => {
     expect(s.requests[0]!.messages[0]!.content[0]).toMatchObject({ kind: "text", text: "the chat so far" });
   });
 
+  test("ctx.complete({ model }) uses the model the host resolves, by saved name or as a service; without a resolver or with a bad model it fails", async () => {
+    const { cwd, home } = await dirs();
+    let complete: ((...a: Parameters<HostContext["complete"]>) => ReturnType<HostContext["complete"]>) | undefined;
+    const loaded: LoadedPlugin = {
+      name: "asker",
+      id: "x/asker",
+      dir: path.join(home, "plugins", "asker"),
+      layer: "user",
+      kind: "module",
+      entry: "index.ts",
+      info: { kind: "module", entry: "index.ts", json: {}, bundle: { skills: [], commands: [], unsupported: [] } },
+      create: async (host) => ((complete = host.complete), { id: "x/asker", version: "1.0.0", kernel: "^0.1" }) as never,
+    };
+    const main = scripted([reply("from the main model")]);
+    const small = scripted([reply("from the small model"), reply("from the service")]);
+    const asked: unknown[] = [];
+    const modelFor = async (model: string | ServiceModel) => {
+      asked.push(model);
+      if (typeof model === "object" || model === "tiny") return small.provider;
+      throw new Error(`no saved model is named "${model}"`);
+    };
+    const signal = new AbortController().signal;
+    await createJade({ cwd, home, store: new MemoryLogStore(), provider: main.provider, modelFor, env: {}, extensions: [loaded] });
+    expect(await complete!({ prompt: "hi", model: "tiny" }, signal)).toMatchObject({ text: "from the small model" });
+    expect(small.requests[0]!.messages[0]!.content[0]).toMatchObject({ kind: "text", text: "hi" });
+    await expect(complete!({ prompt: "hi", model: "huge" }, signal)).rejects.toThrow('no saved model is named "huge"');
+    await expect(complete!({ prompt: "hi", model: "" }, signal)).rejects.toThrow("model must be the name of a saved model or a service");
+    await expect(complete!({ prompt: "hi", model: { kind: "openai" } as never }, signal)).rejects.toThrow("model must be the name of a saved model or a service");
+    const service: ServiceModel = { kind: "openai-compat", baseURL: "https://free.example/v1", apiKey: "k", model: "qwen3-8b" };
+    expect(await complete!({ prompt: "hi", model: service }, signal)).toMatchObject({ text: "from the service" });
+    expect(asked).toEqual(["tiny", "huge", service]);
+    // 不写 model 时仍然用当前的模型
+    expect(await complete!({ prompt: "hi" }, signal)).toMatchObject({ text: "from the main model" });
+
+    await createJade({ cwd, home, store: new MemoryLogStore(), provider: main.provider, env: {}, extensions: [loaded] });
+    await expect(complete!({ prompt: "hi", model: "tiny" }, signal)).rejects.toThrow("cannot use other models");
+  });
+
+  test("serviceEnv maps a plugin's service to the variables of its format, and nothing else", () => {
+    expect(serviceEnv({ kind: "openai-compat", baseURL: "https://free.example/v1", apiKey: "k", model: "qwen3-8b" })).toEqual({
+      JADE_PROVIDER: "openai-compat",
+      OPENAI_COMPAT_BASE_URL: "https://free.example/v1",
+      OPENAI_COMPAT_API_KEY: "k",
+      OPENAI_COMPAT_MODEL: "qwen3-8b",
+    });
+    expect(serviceEnv({ kind: "anthropic", apiKey: "sk" })).toEqual({ JADE_PROVIDER: "anthropic", ANTHROPIC_API_KEY: "sk" });
+    expect(() => serviceEnv({ kind: "gemini", model: "x" })).toThrow("must be one of openai-compat, openai, anthropic");
+    expect(() => serviceEnv({ kind: "openai", apiKey: 1 as never })).toThrow("apiKey must be a non-empty string");
+  });
+
+  test("ctx.listModels asks the plugin's service for its models", async () => {
+    const { cwd, home } = await dirs();
+    let host: HostContext | undefined;
+    const loaded: LoadedPlugin = {
+      name: "lister",
+      id: "x/lister",
+      dir: path.join(home, "plugins", "lister"),
+      layer: "user",
+      kind: "module",
+      entry: "index.ts",
+      info: { kind: "module", entry: "index.ts", json: {}, bundle: { skills: [], commands: [], unsupported: [] } },
+      create: async (h) => ((host = h), { id: "x/lister", version: "1.0.0", kernel: "^0.1" }) as never,
+    };
+    await createJade({ cwd, home, store: new MemoryLogStore(), provider: scripted([]).provider, env: {}, extensions: [loaded] });
+    const seen: { url: string; auth?: string }[] = [];
+    const server = Bun.serve({
+      port: 0,
+      fetch(req) {
+        seen.push({ url: new URL(req.url).pathname, auth: req.headers.get("authorization") ?? undefined });
+        return Response.json({ data: [{ id: "qwen3-8b" }, { id: "llama-4-scout" }] });
+      },
+    });
+    try {
+      expect(await host!.listModels({ kind: "openai-compat", baseURL: `http://localhost:${server.port}/v1`, apiKey: "k" })).toEqual(["qwen3-8b", "llama-4-scout"]);
+      expect(seen).toEqual([{ url: "/v1/models", auth: "Bearer k" }]);
+    } finally {
+      server.stop(true);
+    }
+    await expect(host!.listModels({ kind: "gemini" } as never)).rejects.toThrow("must be one of");
+  });
+
+  test("savedModelEnv swaps in the saved service and that model's own settings", () => {
+    const services: SavedService[] = [
+      { env: { JADE_PROVIDER: "openai-compat", OPENAI_COMPAT_BASE_URL: "https://free.example/v1" }, models: [{ name: "tiny", settings: { JADE_RPM: "10" } }] },
+      { env: { JADE_PROVIDER: "anthropic", ANTHROPIC_API_KEY: "sk-saved" }, models: [{ name: "claude-haiku-5-5", settings: {} }] },
+    ];
+    const base = {
+      JADE_PROVIDER: "anthropic",
+      ANTHROPIC_API_KEY: "sk-current",
+      ANTHROPIC_BASE_URL: "https://proxy.example",
+      ANTHROPIC_MODEL: "claude-opus-5-5",
+      JADE_MAX_TOKENS: "64000",
+      JADE_IDLE_TIMEOUT: "30",
+    };
+    const tiny = savedModelEnv(services, "tiny", base)!;
+    expect(tiny).toMatchObject({ JADE_PROVIDER: "openai-compat", OPENAI_COMPAT_BASE_URL: "https://free.example/v1", OPENAI_COMPAT_MODEL: "tiny", JADE_RPM: "10", JADE_IDLE_TIMEOUT: "30" });
+    // 当前服务的密钥、地址和当前模型的设置不带过去
+    expect(tiny.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(tiny.JADE_MAX_TOKENS).toBeUndefined();
+    const haiku = savedModelEnv(services, "claude-haiku-5-5", base)!;
+    expect(haiku).toMatchObject({ ANTHROPIC_API_KEY: "sk-saved", ANTHROPIC_MODEL: "claude-haiku-5-5" });
+    expect(haiku.ANTHROPIC_BASE_URL).toBeUndefined();
+    expect(savedModelEnv(services, "nope", base)).toBeUndefined();
+  });
+
   test("ctx.status is collected; responder, suggest and beforeSend are no longer offered and are ignored with a warning", async () => {
     const { cwd, home } = await dirs();
     const statuses: [string, string | undefined][] = [];
@@ -401,7 +508,7 @@ describe("in-process plugins", () => {
     // jade 用的是检查过、留下的
     expect(ext!.commands.map((c) => c.name)).toEqual(["ok"]);
     expect(ext!.keys.map((k) => k.key)).toEqual(["ctrl+g"]);
-    expect(ext!.renderers.map((r) => r.tool)).toEqual(["x_tool"]);
+    expect(ext!.renderers.map((r) => ("tool" in r ? r.tool : r.event))).toEqual(["x_tool"]);
     expect(jade.renderers.get("x_tool")?.plugin).toBe("x/repo");
     expect(jade.renderers.get("read_file")?.plugin).not.toBe("x/repo");
     const warned = jade.warnings.filter((w) => w.includes("plugin x/repo")).join("\n");
@@ -871,7 +978,7 @@ describe("input box, keys and send", () => {
     );
     return dir;
   }
-  type Seen = Record<string, { input?: { insert(t: string): void }; send?(t: string): void }>;
+  type Seen = Record<string, { input?: { insert(t: string): void; hint(t: string): void }; send?(t: string): void }>;
 
   test("only user plugins get ctx.input and ctx.send; send names the plugin", async () => {
     const { cwd, home } = await dirs();
@@ -887,13 +994,14 @@ describe("input box, keys and send", () => {
       provider: scripted([]).provider,
       env: {},
       extensions: [await loadPlugin({ name: "voice", dir: user, layer: "user" }, opts), await loadPlugin({ name: "repo", dir: repo, layer: "project" }, opts)],
-      input: { text: () => "", insert: (t) => void inserted.push(t), set: () => {} },
+      input: { text: () => "", insert: (t) => void inserted.push(t), set: () => {}, hint: (t, p) => void inserted.push(`hint ${t} from ${p}`) },
       send: (p, t) => void sent.push([p, t]),
     });
     const seen = (globalThis as { __jadeCtx?: Seen }).__jadeCtx!;
     seen.voice!.input!.insert("hello");
+    seen.voice!.input!.hint("run the tests");
     seen.voice!.send!("go");
-    expect(inserted).toEqual(["hello"]);
+    expect(inserted).toEqual(["hello", "hint run the tests from x/voice"]);
     expect(sent).toEqual([["x/voice", "go"]]);
     expect(seen.repo!.input).toBeUndefined();
     expect(seen.repo!.send).toBeUndefined();
@@ -963,7 +1071,7 @@ for await (const line of createInterface({ input: process.stdin })) {
         provider: scripted([]).provider,
         env: {},
         extensions: [user, repo],
-        input: { text: () => text, insert: (t) => void (text += t), set: (t) => void (text = t) },
+        input: { text: () => text, insert: (t) => void (text += t), set: (t) => void (text = t), hint: () => {} },
         send: (p, t) => void sent.push([p, t]),
       });
       expect([...jade.keys].map(([k, v]) => `${k} ${v.plugin} ${v.key.description}`)).toEqual(["ctrl+t x/shout shout", "alt+r x/repo shout"]);
@@ -990,7 +1098,7 @@ for await (const line of createInterface({ input: process.stdin })) {
         provider: scripted([]).provider,
         env: {},
         extensions: [user, repo],
-        input: { text: () => other, insert: (t) => void (other += t), set: (t) => void (other = t) },
+        input: { text: () => other, insert: (t) => void (other += t), set: (t) => void (other = t), hint: () => {} },
       });
       const proc = jade.extensions.find((e) => e.plugin.id === "x/shout")!.plugin;
       expect(next.extensions.find((e) => e.plugin.id === "x/shout")!.plugin).toBe(proc);
@@ -1021,7 +1129,7 @@ for await (const line of createInterface({ input: process.stdin })) {
       provider: scripted([]).provider,
       env: {},
       extensions: [loaded],
-      input: { text: () => text, insert: (t) => void (text += t), set: (t) => void (text = t) },
+      input: { text: () => text, insert: (t) => void (text += t), set: (t) => void (text = t), hint: () => {} },
       send: (p, t) => void sent.push([p, t]),
       onStatus: (_p, t) => void statuses.push(t ?? ""),
     });
@@ -1046,7 +1154,57 @@ for await (const line of createInterface({ input: process.stdin })) {
     const before = r.before!(input);
     const tool = jade.extensions[0]!.plugin.tools!.find((t) => t.name === "add_note")!;
     const out = await tool.execute(input, {} as never);
-    expect(r.result!({ input, text: String(out.content), isError: false, before })).toEqual({ line: "NOTES.md: 1 → 2 notes" });
+    expect(r.result!({ toolUseId: "n1", input, text: String(out.content), isError: false, before })).toEqual({ line: "NOTES.md: 1 → 2 notes" });
+    jade.shutdown();
+  });
+
+  test("the suggest example: /suggest sets its own service and model; after a turn ends it predicts the next message as a hint", async () => {
+    const { cwd, home } = await dirs();
+    const loaded = await loadPlugin({ name: "suggest", dir: await install(home, "suggest"), layer: "user" }, { trust: new MemoryTrustStore(), confirm: async () => false });
+    const hints: (string | undefined)[] = [];
+    // 预测用的小模型：第一次是 /suggest 里的测试请求
+    const small = scripted([reply("OK"), reply('"now run the tests"\nextra line')]);
+    const asked: unknown[] = [];
+    const modelFor = async (m: string | ServiceModel) => (asked.push(m), small.provider);
+    const main = scripted([reply("I fixed the bug in parse().")]);
+    const store = new MemoryLogStore();
+    const jade = await createJade({
+      cwd,
+      home,
+      store,
+      provider: main.provider,
+      modelFor,
+      env: {},
+      extensions: [loaded],
+      input: { text: () => "", insert: () => {}, set: () => {}, hint: (t) => void hints.push(t) },
+    });
+    expect(jade.warnings.filter((w) => w.includes("suggest"))).toEqual([]);
+
+    // /suggest：选格式、填地址和密钥、服务列不出模型时手动输入名字
+    const answers = ["https://free.example/v1", "secret", "tiny-1"];
+    const ui = {
+      interactive: true,
+      log: () => {},
+      select: async <T,>(_t: string, choices: { value: T }[]) => choices[0]!.value,
+      input: async () => answers.shift(),
+    };
+    const ctx = { sessionId: "s", cwd, signal: new AbortController().signal, derived: {}, ui, note: () => {} };
+    expect(await jade.commands.get("suggest")!.command.run("", ctx)).toContain("Suggestions now use tiny-1 (openai-compat, https://free.example/v1)");
+    const service = { kind: "openai-compat", baseURL: "https://free.example/v1", apiKey: "secret", model: "tiny-1" };
+    expect(JSON.parse(await readFile(path.join(home, "suggest.json"), "utf8"))).toEqual(service);
+
+    const rt = await Runtime.create({ store, provider: main.provider, plugins: jade.plugins });
+    await rt.send(msg("fix the parser"));
+    // 预测在后台进行
+    for (let i = 0; i < 50 && !hints.length; i++) await new Promise((r) => setTimeout(r, 10));
+    expect(hints).toEqual(["now run the tests"]);
+    expect(asked.at(-1)).toEqual(service);
+    const prompt = small.requests.at(-1)!.messages[0]!.content[0] as { text: string };
+    expect(prompt.text).toContain("User: fix the parser");
+    expect(prompt.text).toContain("Assistant: I fixed the bug in parse().");
+
+    expect(await jade.commands.get("suggest")!.command.run("off", ctx)).toBe("Suggestions are off.");
+    expect(JSON.parse(await readFile(path.join(home, "suggest.json"), "utf8"))).toMatchObject({ off: true });
     jade.shutdown();
   });
 
@@ -1063,7 +1221,7 @@ for await (const line of createInterface({ input: process.stdin })) {
         provider: scripted([]).provider,
         env: {},
         extensions: [loaded],
-        input: { text: () => text, insert: (t) => void (text += t), set: (t) => void (text = t) },
+        input: { text: () => text, insert: (t) => void (text += t), set: (t) => void (text = t), hint: () => {} },
         send: (p, t) => void sent.push([p, t]),
       });
       expect(jade.warnings.filter((w) => w.includes("text-keys"))).toEqual([]);
@@ -1227,7 +1385,15 @@ describe("tool renderers", () => {
           version: "1.0.0",
           kernel: "^0.1",
           tools: [tool],
-          renderers: [{ tool: "deploy", summary }, { tool: "deploy", summary }, { tool: "bash", summary }, { tool: "deploy", result: "nope" }],
+          renderers: [
+            { tool: "deploy", summary },
+            { tool: "deploy", summary },
+            { tool: "bash", summary },
+            { tool: "deploy", result: "nope" },
+            { event: "deployed", render: () => undefined },
+            { event: "deployed", render: () => undefined },
+            { event: "rolled-back" },
+          ],
         }) as never,
     };
     const jade = await createJade({ cwd, home, store: new MemoryLogStore(), provider: scripted([]).provider, env: {}, extensions: [loaded] });
@@ -1235,7 +1401,11 @@ describe("tool renderers", () => {
     const warnings = jade.warnings.join("\n");
     expect(warnings).toContain('renderer for "deploy" is ignored: the tool already has a renderer');
     expect(warnings).toContain('renderer for "bash" is ignored: a plugin can only render its own tools');
-    expect(warnings).toContain('renderer for "deploy" is ignored: it needs a tool name, and summary, details, preview, before and result must be functions');
+    expect(warnings).toContain('renderer for "deploy" is ignored: it needs a tool name, and summary, details, call, progress, preview, before and result must be functions');
+    // 事件的渲染器按插件 id 加上前缀，只能渲染自己的事件
+    expect([...jade.eventRenderers].filter(([, v]) => !v.plugin.startsWith("jade/")).map(([k, v]) => `${k} ${v.plugin}`)).toEqual(["x/deploy/deployed x/deploy"]);
+    expect(warnings).toContain('renderer for event "deployed" is ignored: the event already has a renderer');
+    expect(warnings).toContain('renderer for event "rolled-back" is ignored: it needs an event type and a render function');
     jade.shutdown();
   });
 });

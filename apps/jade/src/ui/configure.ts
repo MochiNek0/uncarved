@@ -3,7 +3,7 @@
 // 每个模型带自己的设置。/model 可以直接切回去，换了服务或地址之前的也不会丢。
 
 import { hasProvider, parseTokens, readSavedServices, updateEnvFile, writeSavedServices, type SavedModel, type SavedService } from "../config.ts";
-import { EFFORTS, isBuiltinKind, listModels, pluginProvider, pluginProviders, providerInfo, providerKind, rpmFromEnv, visionFromEnv, type ProviderKind } from "../provider.ts";
+import { EFFORTS, isBuiltinKind, KEY_KEY, listModels, MODEL_KEY, URL_KEY, pluginProvider, pluginProviders, providerInfo, providerKind, rpmFromEnv, visionFromEnv, type ProviderKind } from "../provider.ts";
 import { shortPath } from "./render.ts";
 import { dim, green, red, type Screen } from "./screen.ts";
 
@@ -33,9 +33,6 @@ const PROVIDERS: Array<{ kind: ProviderKind; label: string; hint: string }> = [
   { kind: "anthropic", label: "Anthropic", hint: "Claude" },
 ];
 
-const MODEL_KEY: Record<ProviderKind, string> = { "openai-compat": "OPENAI_COMPAT_MODEL", openai: "OPENAI_MODEL", anthropic: "ANTHROPIC_MODEL" };
-const KEY_KEY: Record<ProviderKind, string> = { "openai-compat": "OPENAI_COMPAT_API_KEY", openai: "OPENAI_API_KEY", anthropic: "ANTHROPIC_API_KEY" };
-const URL_KEY: Record<ProviderKind, string> = { "openai-compat": "OPENAI_COMPAT_BASE_URL", openai: "OPENAI_BASE_URL", anthropic: "ANTHROPIC_BASE_URL" };
 
 /** 每个模型自己的设置：切换模型时一起换掉 */
 const MODEL_SETTINGS = ["JADE_MAX_TOKENS", "JADE_EFFORT", "JADE_CONTEXT_WINDOW", "JADE_RPM", "JADE_VISION"];
@@ -74,6 +71,25 @@ const pick = (env: Env, keys: string[]) => {
   for (const k of keys) if (env[k] !== undefined) out[k] = env[k]!;
   return out;
 };
+
+/**
+ * 保存过的名叫 name 的模型的完整配置（插件用 ctx.complete({ model }) 指定模型时用）：在 base 的基础上，
+ * 去掉当前服务和模型的变量，换成保存的服务的变量和这个模型自己的设置。同名的取最近用过的服务上的。
+ * 找不到时 undefined
+ */
+export function savedModelEnv(services: SavedService[], name: string, base: Env = process.env): Env | undefined {
+  for (const s of services) {
+    const m = s.models.find((x) => x.name === name);
+    if (!m) continue;
+    const kind = providerKind(s.env);
+    const mk = modelKey(kind);
+    if (!mk) continue;
+    const env: Env = { ...base };
+    for (const k of [...serviceKeys(providerKind(base)), ...serviceKeys(kind), ...MODEL_SETTINGS]) delete env[k];
+    return { ...env, ...s.env, ...m.settings, JADE_PROVIDER: kind, [mk]: name };
+  }
+  return undefined;
+}
 
 /**
  * 服务的类型、地址和密钥都相同的算同一个；插件服务是类型和它声明的配置项（模型名除外）都相同。

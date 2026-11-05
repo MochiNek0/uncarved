@@ -27,6 +27,8 @@ export const BUILTINS: readonly BuiltinInfo[] = [
   { id: "jade/budget", about: "limits the steps of a turn" },
   { id: "jade/sessions", about: "/clear, /resume, /retry" },
   { id: "jade/undo", about: "/undo (restores the files changed in the last turn)" },
+  { id: "jade/continue", about: "asks the model to continue a reply cut off at the output limit" },
+  { id: "jade/mentions", about: "attaches the files and directories you reference with @ to your message" },
   { id: "jade/repeats", about: "rejects calls repeated in one response and re-opening an unchanged file, warns about repeated failures and read-backs" },
 ];
 

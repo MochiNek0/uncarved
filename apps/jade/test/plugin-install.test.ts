@@ -311,6 +311,8 @@ describe("built-in plugins", () => {
       "jade/budget",
       "jade/sessions",
       "jade/undo",
+      "jade/continue",
+      "jade/mentions",
       "jade/repeats",
     ]);
     expect([...all.commands.keys()]).toEqual(["search", "memory", "skills", "mcp", "checks", "compact", "clear", "resume", "retry", "undo"]);

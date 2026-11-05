@@ -25,6 +25,8 @@ const rt = await Runtime.create({
 | 选项 | 默认值 | 说明 |
 |---|---|---|
 | `client` | `new Anthropic()` | 自定义 SDK 客户端（API key、base URL、代理等） |
+| `apiKey` | 环境变量 `ANTHROPIC_API_KEY` | 不给 `client` 时用它创建客户端 |
+| `baseURL` | 环境变量 `ANTHROPIC_BASE_URL`，再没有是官方地址 | 不给 `client` 时用它创建客户端 |
 | `model` | `claude-opus-5-5` | |
 | `maxTokens` | `64000` | |
 | `effort` | `high` | `low` / `medium` / `high` / `xhigh` / `max` |

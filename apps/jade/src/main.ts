@@ -22,29 +22,30 @@ import {
 } from "uncarved";
 import { realpathSync } from "node:fs";
 import { expandCommand, loadCommands, pluginMenu } from "./commands.ts";
-import { type PluginBundle, type SessionControl } from "./plugins/loader.ts";
+import { type PluginBundle, type ServiceModel, type SessionControl } from "./plugins/loader.ts";
 import { openPluginHost } from "./plugins/host.ts";
 import { readPluginSettings } from "./plugins/install.ts";
 import { PLUGIN_HELP, pluginCli, UsageError } from "./plugin-cli.ts";
 import { describeServer, loadMcpConfig, McpClient, mcpTrustHash } from "./mcp.ts";
 import { loadSkills } from "./skills.ts";
-import { hasProvider, loadEnvFile, parseTokens, updateEnvFile } from "./config.ts";
+import { hasProvider, loadEnvFile, parseTokens, readSavedServices, updateEnvFile } from "./config.ts";
 import { createJade, type Jade } from "./distro.ts";
+import type { TurnContext } from "./plugins/turns.ts";
 import { SessionScope } from "./session-scope.ts";
 import { SessionLifecycle, type Current } from "./session-lifecycle.ts";
 import { describeRule, MODES, POLICY_KEY, type AllowRule, type Mode, type PolicySettings } from "./plugins/policy.ts";
-import { compactThreshold, contextWindowFromEnv, contextWindowInfo, isContextOverflow } from "./context.ts";
+import { compactThreshold, contextWindowFromEnv } from "./context.ts";
 import { InputHistory } from "./history.ts";
-import { attachMentions, mentionCandidates } from "./mentions.ts";
+import { mentionCandidates } from "./mentions.ts";
 import { repoRoot } from "./plugins/prompts.ts";
-import { isBuiltinKind, isRateLimit, pluginProvider, providerFromEnv, providerInfo, providerKind, RateGate, rpmFromEnv, switchable, withRetry } from "./provider.ts";
+import { isBuiltinKind, isRateLimit, pluginProvider, providerFromEnv, providerInfo, serviceEnv, providerKind, RateGate, rpmFromEnv, switchable, withRetry } from "./provider.ts";
 import { ago, discardIfEmpty, matchSession, SessionIndex } from "./sessions.ts";
 import { display } from "./tools/fs.ts";
 import type { ApproveSubagent, SubagentApproval } from "./tools/task.ts";
 import type { Question } from "./tools/ask.ts";
 import type { Check } from "./plugins/checks.ts";
 import { bold, dim, green, plainScreen, red, safeScreen, yellow, type CommandInfo, type Screen } from "./ui/screen.ts";
-import { configurator } from "./ui/configure.ts";
+import { configurator, savedModelEnv } from "./ui/configure.ts";
 import { reviewer } from "./plugins/review.ts";
 import { clip, shortPath } from "./ui/render.ts";
 import { transcript } from "./ui/transcript.ts";
@@ -80,18 +81,12 @@ const INSTANT = new Set(["help", "model", "mode", "plugins", "exit"]);
 /** 内置插件提供的命令（/memory 在 jade/memory 里，等等）：名字保留给它们，自定义命令不能占用 */
 const BUILTIN_PLUGIN_COMMANDS = ["memory", "checks", "mcp", "skills", "compact", "clear", "resume", "retry", "undo", "search"];
 
-const KEYS = `Keys: enter send · \\ or alt+enter new line · ↑↓ history · @ reference a file · esc interrupt (twice to also clear queued messages) · shift+tab cycle ask/auto/plan · ctrl+c twice to exit
+const KEYS = `Keys: enter send · \\ or alt+enter new line · ↑↓ history · @ reference a file · esc interrupt (twice to also clear queued messages) · shift+tab cycle ask/auto/plan · tab or → takes a plugin's gray suggestion · ctrl+c twice to exit
       mouse wheel or PgUp/PgDn scroll the conversation · ctrl+home/ctrl+end jump to the top/bottom · click ▸ expands an item (ctrl+o the latest one) · click in the input moves the cursor · shift+drag selects text
 While jade is working you can keep typing: messages are queued and sent when the current turn ends.`;
 
 /** 终端界面启动时最多等 MCP 服务连接这么久，没连上的在后台接着连 */
 const MCP_STARTUP_WAIT_MS = 5000;
-
-/** 回复被输出上限截断后，自动让模型接着做的次数（每条用户消息） */
-const MAX_CONTINUES = 3;
-const CONTINUE_NOTE =
-  "Your previous reply was cut off because it reached the output token limit. Continue from where you stopped. " +
-  "If you were writing a large file or edit, split it into several smaller write_file/edit_file calls.";
 
 // ---------- 参数 ----------
 
@@ -290,11 +285,14 @@ const provider = switchable({
   complete: () => Promise.reject(new Error("no model is configured; use /model")),
 });
 
+/** /model 保存过的服务和模型 */
+const modelsFile = path.join(home, "models.json");
+
 /** /model 的交互：改配置后换掉 provider、更新上下文窗口和状态栏 */
 const configure = configurator({
   screen,
   envFile,
-  modelsFile: path.join(home, "models.json"),
+  modelsFile,
   apply: async () => {
     provider.set(retrying(await providerFromEnv()));
     contextWindow = contextWindowFromEnv();
@@ -344,6 +342,35 @@ function retrying(inner: Provider) {
       screen.busy(`Waiting to retry (${why} · ${attempt}/${retries}, ${seconds(delayMs)})`);
     },
   });
+}
+
+/** modelFor 创建过的 provider，按完整配置缓存：配置没变时共用同一个，限速也共用 */
+const otherProviders = new Map<string, Promise<Provider>>();
+
+/**
+ * 插件用 ctx.complete({ model }) 指定的模型：名字每次重新读 models.json（/model 可能刚改过），按保存的配置创建；
+ * 对象是插件自己给出的服务。外面包一层重试和这个配置自己的限速，但不在状态行显示等待：这是插件在后台的请求，不是这一轮的
+ */
+async function modelFor(model: string | ServiceModel): Promise<Provider> {
+  const env = typeof model === "string" ? await savedEnv(model) : serviceEnv(model);
+  const key = JSON.stringify(Object.entries(env).sort(([a], [b]) => (a < b ? -1 : 1)));
+  let made = otherProviders.get(key);
+  if (!made) {
+    made = providerFromEnv(env).then((inner) => withRetry(inner, { gate: new RateGate({ rpm: rpmFromEnv(env) }) }));
+    otherProviders.set(key, made);
+    // 创建失败（例如提供服务的插件没加载）的不缓存，下次重新试
+    made.catch(() => otherProviders.delete(key));
+  }
+  return made;
+}
+
+/** 保存过的名叫 name 的模型的配置；找不到时抛错，列出保存过的模型 */
+async function savedEnv(name: string): Promise<Record<string, string | undefined>> {
+  const services = await readSavedServices(modelsFile);
+  const env = savedModelEnv(services, name);
+  if (env) return env;
+  const names = [...new Set(services.flatMap((s) => s.models.map((m) => m.name)))];
+  throw new Error(`no saved model is named ${JSON.stringify(name)}; ${names.length ? `saved models: ${names.join(", ")}` : "no model is saved yet; add one with /model"}`);
 }
 
 const seconds = (ms: number) => (ms >= 60_000 ? `${Math.floor(ms / 60_000)}m${Math.round((ms % 60_000) / 1000) ? `${Math.round((ms % 60_000) / 1000)}s` : ""}` : `${Math.max(1, Math.round(ms / 1000))}s`);
@@ -399,7 +426,12 @@ const scratch = realpathSync.native(await mkdtemp(path.join(os.tmpdir(), "jade-"
 async function prepareScope(mode?: Mode): Promise<SessionScope> {
   const next = new SessionScope({
     showStatus: (plugins) => screen.status({ plugins }),
-    input: screen.draft && { text: () => screen.draft!.text(), insert: (t) => screen.draft!.insert(t), set: (t) => screen.draft!.set(t) },
+    input: screen.draft && {
+      text: () => screen.draft!.text(),
+      insert: (t) => screen.draft!.insert(t),
+      set: (t) => screen.draft!.set(t),
+      hint: (t) => screen.draft!.hint(t),
+    },
     send: screen.draft && pluginSend,
     warn: (w) => warn([w]),
     tidy: (t) => clip(stripVTControlCharacters(t).replace(/\s+/g, " ").trim(), 40),
@@ -409,6 +441,7 @@ async function prepareScope(mode?: Mode): Promise<SessionScope> {
     home,
     store,
     provider,
+    modelFor,
     mode,
     model: currentModel,
     extensions: pluginSources,
@@ -427,6 +460,7 @@ async function prepareScope(mode?: Mode): Promise<SessionScope> {
     approveCheck: process.env.JADE_CHECKS === "off" ? undefined : approveCheck,
     checkConfirmed: (c) => trust.has(checkHash(c)),
     checksUnavailable: process.env.JADE_CHECKS === "off" ? "Edit-time checks are turned off by JADE_CHECKS=off." : undefined,
+    turnUi: { interactive: screen.interactive, log: (text) => screen.log(text), select: (title, choices) => screen.select(title, choices) },
     ...next.hooks,
   }));
   return next;
@@ -645,7 +679,7 @@ async function flushPendingMode() {
 
 // ---------- 渲染 ----------
 
-const view = transcript({ screen, cwd, store, contextWindow: () => contextWindow, compactAt: () => compactAt(), canRetry: () => canRetry(), renderer: (tool) => jade.renderers.get(tool) });
+const view = transcript({ screen, cwd, store, contextWindow: () => contextWindow, compactAt: () => compactAt(), canRetry: () => canRetry(), renderer: (tool) => jade.renderers.get(tool), eventRenderer: (type) => jade.eventRenderers.get(type) });
 rt.subscribe(view.onNotice);
 
 // ---------- 审批 ----------
@@ -1029,7 +1063,6 @@ async function switchSession(id?: string) {
   rt.subscribe(view.onNotice);
   view.reset();
   notes.length = 0;
-  announcedMode = undefined;
   pendingRules.length = 0;
   screen.clear();
   screen.status({ session: sessionId, mode: settings().mode, context: undefined, cache: undefined, spent: undefined, speed: undefined });
@@ -1102,21 +1135,6 @@ async function guarded(fn: () => Promise<void>) {
 /** 宿主替用户告诉模型的事（例如 /undo），随下一条消息发出 */
 const notes: string[] = [];
 
-/** 最近一次告诉模型的权限模式；进入、离开计划模式时要随下一条消息告诉它 */
-let announcedMode: Mode | undefined;
-const PLAN_ON =
-  "The session is now in plan mode. Investigate with read-only tools (and the task tool for broad searches); do not try to modify files " +
-  "or run commands that change anything, such calls are denied. When you understand the task, reply with a concise, concrete plan: " +
-  "the files to change and how, in order, any open questions, and how you will verify the result. Then stop and wait for the user's approval.";
-const PLAN_OFF = "The session has left plan mode; you can now change files and run commands (subject to the user's approval settings).";
-
-function announceMode() {
-  const mode = settings().mode;
-  if (mode === "plan" && announcedMode !== "plan") notes.push(PLAN_ON);
-  else if (mode !== "plan" && announcedMode === "plan") notes.push(PLAN_OFF);
-  announcedMode = mode;
-}
-
 /** Shift+Tab：ask → auto → plan → ask；yolo 也回到 ask。运行中也能切换，从下一个工具调用起生效 */
 const CYCLE: Mode[] = ["ask", "auto", "plan"];
 function cycleMode() {
@@ -1124,46 +1142,26 @@ function cycleMode() {
   setMode(CYCLE[(i + 1) % CYCLE.length]!).catch((err) => screen.log(red(`[error] ${errorText(err)}`)));
 }
 
-/**
- * 计划模式下模型给出计划、这一轮正常结束后，问用户是否按计划执行。
- * 用户已经排了别的输入、或者不能交互时不问
- */
-async function offerPlan() {
-  // 这一轮中途才切到计划模式的，模型并不知道要给计划，不问
-  if (settings().mode !== "plan" || announcedMode !== "plan" || view.lastEnd !== "end" || !screen.interactive || queue.length > 0) return;
-  const last = rt.state.messages.at(-1);
-  if (last?.role !== "assistant" || !last.content.some((b) => b.kind === "text" && b.text.trim())) return;
-  const choice = await screen.select("Execute this plan?", [
-    { label: "Yes, in auto mode", value: "auto" as const, hint: "edits and safe commands run without asking" },
-    { label: "Yes, and ask before each edit", value: "ask" as const, hint: "mode ask" },
-    { label: "No, keep planning", value: "plan" as const, hint: "type what to change" },
-  ]);
-  if (!choice || choice === "plan") return;
-  await rememberMode(choice);
-  await saveSettings({ ...settings(), mode: choice });
-  screen.log(dim(`mode: ${choice}`));
-  await say("The plan is approved. Implement it now.");
-}
 const hostNote = (text: string): Block => ({ kind: "text", text: `[Note from jade] ${text}`, origin: { by: "host" }, trust: "trusted" });
 
 /** 本进程里已经记进会话索引的会话：每个会话每次运行只记一次，索引不随消息数增长 */
 const indexed = new Set<string>();
 
+/** 内置插件参与轮次时看到的会话（换会话后指向新的） */
+const turnContext = (): TurnContext => ({ sessionId, derived: (key) => rt.derived(key), lastMessage: () => rt.state.messages.at(-1) });
+
+/** 发一条用户消息：内置插件附加的内容（计划模式的告知、@ 引用的文件）放在用户的话前后，然后跑一轮 */
 async function say(text: string) {
   if (!indexed.has(sessionId)) {
     indexed.add(sessionId);
     await index.add({ id: sessionId, cwd, title: clip(text.replace(/\s+/g, " "), 80), at: new Date().toISOString() });
   }
-  announceMode();
-  const content: Block[] = notes.splice(0).map(hostNote);
+  const own = notes.splice(0);
+  const extra = await jade.turns.beforeMessage(text, turnContext());
+  const content: Block[] = [...own, ...extra.notes].map(hostNote);
   content.push({ kind: "text", text, origin: { by: "user" }, trust: "trusted" });
-  // @ 引用的文件和目录：内容随消息发出，模型不用再读一遍
-  const refs = await attachMentions(text, { cwd, tools: jade.tools, sessionId, signal: AbortSignal.timeout(30_000) });
-  for (const f of refs.failed) screen.log(yellow(`[@${f.path} not attached: ${clip(f.reason, 200)}]`));
-  if (refs.attached.length) screen.log(dim(`[attached ${refs.attached.map((p) => `@${p}`).join(", ")}]`));
-  content.push(...refs.blocks);
-  await drive({ kind: "message", content });
-  await offerPlan();
+  content.push(...extra.blocks);
+  await drive({ kind: "message", content }, true);
 }
 
 /**
@@ -1193,28 +1191,37 @@ function pluginSend(plugin: string, text: string) {
 /** 上一轮在模型回复之前就失败了：最后一条消息还没有回复 */
 const canRetry = () => rt.phase === "idle" && rt.state.messages.at(-1)?.role === "user";
 
-async function drive(input: UserInput) {
+/**
+ * 跑一轮，再问内置插件接下来做什么（溢出后压缩重试、截断后续写、执行计划），直到没有下一步。
+ * byMessage：这一轮是一条消息开始的，不是 /retry
+ */
+async function drive(input: UserInput, byMessage = false) {
   // 重新加载失败后没有可用的会话（见 reloadSession）
   if (sessions.left) return screen.log(red("[error] there is no open session. Use /clear or /resume to continue."));
   // 计时从这次输入开始，不接着上一条排队消息的
   screen.busy(undefined);
   screen.busy("Working");
-  view.lastEnd = undefined;
-  await guarded(() => rt.send(input));
-  // 请求超出了上下文窗口（窗口估大了，或者一次读进来太多）：压缩后重试一次
-  if (isContextOverflow(view.lastError ?? lastThrown) && canRetry()) {
-    screen.log(
-      yellow("[the request exceeded the model's context window; compacting the history and retrying]") +
-        (contextWindowInfo().source === "env" ? "" : dim(`\n[jade assumed a ${contextWindow}-token window; set the real one with /model → context window]`)),
-    );
-    jade.compact?.request();
-    await guarded(() => rt.send({ kind: "retry" }));
-  }
-  // 回复被输出上限截断：让模型接着做，而不是把半截任务丢给用户
-  for (let i = 0; i < MAX_CONTINUES && view.lastEnd === "max_tokens"; i++) {
-    screen.log(dim(`[asking the model to continue (${i + 1}/${MAX_CONTINUES})]`));
+  let next: UserInput | undefined = input;
+  for (let followUps = 0; next; followUps++) {
+    const send = next;
     view.lastEnd = undefined;
-    await guarded(() => rt.send({ kind: "message", content: [hostNote(CONTINUE_NOTE)] }));
+    await guarded(() => rt.send(send));
+    const after = await jade.turns.afterTurn(
+      { end: view.lastEnd, error: view.lastError ?? lastThrown, canRetry: canRetry(), byMessage, followUps, queued: queue.length > 0 },
+      turnContext(),
+    );
+    next = undefined;
+    if (after?.kind === "retry") next = { kind: "retry" };
+    else if (after?.kind === "continue") next = { kind: "message", content: [hostNote(after.note)] };
+    else if (after?.kind === "say") {
+      await savePendingRules().catch((err) => screen.log(red(`[error] ${errorText(err)}`)));
+      if (after.mode) {
+        await rememberMode(after.mode);
+        await saveSettings({ ...settings(), mode: after.mode });
+        screen.log(dim(`mode: ${after.mode}`));
+      }
+      return say(after.text);
+    }
   }
   await savePendingRules().catch((err) => screen.log(red(`[error] ${errorText(err)}`)));
 }

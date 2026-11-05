@@ -484,6 +484,51 @@ describe("terminal UI", () => {
     expect(screen.draft!.text()).toBe("");
   });
 
+  test("a plugin's hint shows in the empty input; tab or → takes it, typing or a new session drops it", async () => {
+    const { screen, calls, type, output, clear } = setup();
+    screen.draft!.hint("run the tests\nand fix what fails");
+    await sleep(80);
+    // 只显示第一行
+    expect(output()).toContain("run the tests …");
+    await type("\t");
+    expect(screen.draft!.text()).toBe("run the tests\nand fix what fails");
+    await type("\r");
+    expect(calls.submit).toEqual(["run the tests\nand fix what fails"]);
+
+    // → 也能接受；接受之后提示没了，再按 Tab 什么也不做
+    screen.draft!.hint("next");
+    await sleep(80);
+    await type("\x1b[C");
+    expect(screen.draft!.text()).toBe("next");
+    screen.draft!.set("");
+    await sleep(80);
+    await type("\t");
+    expect(screen.draft!.text()).toBe("");
+
+    // 开始打字就去掉，删回空的也不再出现
+    screen.draft!.hint("later");
+    await sleep(80);
+    await type("x");
+    await type("\x7f");
+    clear();
+    await type("\t");
+    expect(screen.draft!.text()).toBe("");
+    expect(output()).not.toContain("later");
+
+    // Shift+Tab 仍然切换模式，不接受提示
+    screen.draft!.hint("again");
+    await sleep(80);
+    await type("\x1b[Z");
+    expect(calls.cycle).toBe(1);
+    expect(screen.draft!.text()).toBe("");
+
+    // 换会话时去掉
+    screen.clear();
+    await sleep(80);
+    await type("\t");
+    expect(screen.draft!.text()).toBe("");
+  });
+
   test("applies every key that arrives in the same chunk", async () => {
     const { calls, type } = setup();
     await type("abcdef");

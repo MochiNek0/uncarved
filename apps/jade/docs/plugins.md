@@ -27,6 +27,7 @@ jade 的插件就是 [uncarved](../../../packages/kernel/README.md) 内核的插
 | [`redact-secrets`](../examples/plugins/redact-secrets) | Python，独立进程 | `tool.after` 改写工具输出 |
 | [`notes`](../examples/plugins/notes/index.ts) | TypeScript，工厂函数 | 工具和它的显示（`renderers`）、快捷键、`ctx.input`、`ctx.send`、`ctx.status`、斜杠命令 |
 | [`text-keys`](../examples/plugins/text-keys) | Python，独立进程 | 进程外插件的斜杠命令和快捷键（读、改输入框，替用户发送） |
+| [`suggest`](../examples/plugins/suggest/index.ts) | TypeScript，工厂函数 | 每轮结束后用自己设置的小模型预测下一条消息，`ctx.input.hint` 灰字显示、Tab 接受；`ctx.complete` 指定服务、`ctx.listModels`、交互式斜杠命令 |
 
 用户用 `jade plugin add` 安装插件，见[安装和发布](#安装和发布)。每个扩展点的作用域、冲突和出错时的处理汇总在[规则一览](#规则一览)。
 
@@ -150,7 +151,7 @@ interface JadePlugin {
   hooks?: HookSpec[];
   commands?: PluginCommand[];   // jade 的扩展：斜杠命令
   keys?: PluginKey[];           // jade 的扩展：快捷键，见下文
-  renderers?: ToolRenderer[];   // jade 的扩展：本插件的工具在对话里怎么显示，见下文
+  renderers?: (ToolRenderer | EventRenderer)[];   // jade 的扩展：本插件的工具和事件在对话里怎么显示，见下文
   dispose?(): void | Promise<void>;  // jade 的扩展：不再用这个实例时收尾，见下文
 }
 ```
@@ -197,7 +198,8 @@ export default factory;
 | `layer` | `"user"` 或 `"project"` |
 | `definePlugin` | 见上文；`id`、`version` 不写时用 `plugin.json` 里的 |
 | `run` | `(command, { cwd?, timeoutMs, signal? }) => Promise<{ code, output, timedOut }>`：用 jade 的 shell 执行命令，超时或中断时连同子进程一起结束。找不到 shell 时没有这个字段 |
-| `complete` | `({ system?, prompt, onText? }, signal) => Promise<{ text, model, usage? }>`：用当前配置的模型发一次请求，见下文 |
+| `complete` | `({ system?, prompt, model?, onText? }, signal) => Promise<{ text, model, usage? }>`：发一次模型请求，默认用当前配置的模型，`model` 可以指定另一个模型，见下文 |
+| `listModels` | `(service) => Promise<string[]>`：服务提供的模型，见下文 |
 | `status` | `(text \| undefined) => void`：设置状态栏上本插件的那一段，见下文 |
 | `checkpoints` | 文件快照：写文件的工具写之前记下原内容，`/undo` 据此恢复，见下文 |
 | `input` | 输入框：`text()`、`insert(text)`、`set(text)`，见下文。只给用户层插件，`jade -p` 时没有 |
@@ -246,7 +248,41 @@ const { text } = await ctx.complete(
 
 - 不带工具，不记进会话；和会话共用限速和重试。用户切换模型后用新的模型。
 - `onText` 收到流式输出的片段。拿到需要的内容（例如第一行）后可以用 `signal` 中止，省 token。
-- 思考力度、输出上限按用户的模型配置，插件不能单独设置。需要别的模型时请自己调用它的 API。
+- 思考力度、输出上限按用户的模型配置，插件不能单独设置。
+
+**用另一个模型**：适合在后台做的小事（起标题、预测下一条消息），用便宜或免费的小模型，不占主模型的额度。`model` 有两种写法。
+
+一是写用户在 `/model` 里保存过的模型的名字：
+
+```ts
+const { text } = await ctx.complete({ prompt: "...", model: "qwen3-8b" }, signal);
+```
+
+- 用的是这个模型保存时的服务、密钥和设置（输出上限、思考力度、每分钟请求数），插件拿不到密钥。用户要先用 `/model` 添加这个模型（添加后可以再切回原来的模型，保存的记录还在）。
+- 同名的模型保存在几个服务上时，用最近用过的那个服务上的。
+- 找不到时抛错，错误信息列出保存过的模型，可以直接显示给用户。插件可以把模型名做成自己的设置（例如一个斜杠命令），让用户选。
+- 每次调用都重新读保存的配置，用户在 `/model` 里改了之后立即生效。
+
+二是插件自己给出服务，格式是 jade 内置的三种之一。地址、密钥由插件自己的设置提供（例如一个斜杠命令让用户填，存在 `ctx.home` 下插件自己的文件里）：
+
+```ts
+interface ServiceModel {
+  kind: "openai-compat" | "openai" | "anthropic"; // 兼容 /chat/completions 的服务、OpenAI Responses API、Claude
+  baseURL?: string;  // openai-compat 必填；另外两种不填时是官方地址
+  apiKey?: string;   // 不需要密钥的服务可以不填
+  model: string;
+}
+
+const service = { kind: "openai-compat", baseURL: "https://free.example/v1", apiKey: cfg.apiKey, model: "qwen3-8b" } as const;
+const { text } = await ctx.complete({ prompt: "...", model: service }, signal);
+const models = await ctx.listModels(service);   // 让用户选模型：请求服务的模型列表
+```
+
+- 只用给出的这几项，不带 jade 自己的配置：不用当前的密钥，也不用用户给当前模型设的输出上限、思考力度。
+- `listModels` 不支持、出错或超过 10 秒时返回空数组，这时请让用户自己输入模型名。`kind` 写错时两者都抛错。
+- 密钥是插件自己保存的，请只存在用户层（`ctx.home` 下），文件权限设成只有自己能读。
+
+两种写法都有自己的重试和限速，不和会话共用：即使和当前模型是同一个服务，限速也是分开算的。等待重试时不在状态行显示。
 
 ### 状态栏：`ctx.status`
 
@@ -287,9 +323,11 @@ async execute(input, toolCtx) {
 ctx.input?.text();             // 输入框里还没提交的文字
 ctx.input?.insert("你好");      // 在光标处插入，光标移到插入的文字后面
 ctx.input?.set("");            // 换掉全部文字（这里是清空），光标放到末尾
+ctx.input?.hint("运行测试");     // 输入框为空时显示的灰色提示；undefined 去掉
 ctx.send?.("运行测试并修好失败的");  // 替用户提交
 ```
 
+- `hint` 是给用户的建议，例如预测的下一条消息：输入框为空时代替原来的提示文字显示（多行的只显示第一行）。用户按 Tab 或 → 把它变成输入框里的文字，可以接着改，再按回车发送；开始打字、提交、`/clear`、`/resume` 时去掉，模型工作时不显示。同一时间只有一条，后设置的覆盖先设置的。用户不接受时它什么也不做，所以不用担心替用户说了话。
 - `send` 和用户在输入框里按回车一样：`/` 开头的是命令；模型正忙时排队。对话里会先显示 `[plugin <id> sent this for you]`。
 - **只给用户层插件**：改输入框、发消息等于替用户说话，项目层插件的上下文里没有这两个字段。终端界面之外（`jade -p`、管道）也没有，所以用之前判断一下。
 - 什么时候调用都行（快捷键、定时器、后台连接里）。工厂函数里（会话还没开始）和换会话后旧实例的调用不生效。
@@ -370,7 +408,7 @@ interface ToolResult {
 - 预期之内的失败（文件不存在、命令返回非零）请返回 `isError: true` 和说明，而不是抛异常。抛出的异常也会作为错误结果交给模型，但说明往往不如自己写的清楚。
 - 结果会进入上下文，请控制长度：输出很长时截断，并告诉模型怎么拿到其余部分。
 
-### 工具在对话里的显示（renderers）
+### 工具和事件在对话里的显示（renderers）
 
 默认情况下，jade 把调用显示成 `● 工具名(path 参数或参数的 JSON)`，审批时显示参数的 JSON，结果显示第一行。插件可以为自己的工具换一种显示，不影响发给模型的内容：
 
@@ -379,18 +417,32 @@ renderers: [{
   tool: "deploy",
   summary: (input) => input.env,                                  // ● deploy(staging)
   details: (input) => input.notes,                                 // 摘要放不下的参数，展开调用时显示在最前面
+  call: (input) => `Deploying ${input.env}\n  ${input.steps.join("\n  ")}`,  // 执行时代替 "deploy(staging)"；第一行是调用行，其余的不折叠
+  progress: (update, { toolUseId, summary }) => `  ↳ ${update.step}`,        // 运行中的进度（工具用 progress 推送的一项）换成一行
   preview: async (input) => `will deploy ${await headCommit()} to ${input.env}`,   // 审批时显示，可以多行、带颜色
   before: (input) => currentVersion(input.env),                    // 执行前同步调用，返回值交给 result
-  result: ({ input, text, isError, before }) =>                   // ⎿ 后面的一行，details 点击展开
+  result: ({ toolUseId, input, text, isError, before }) =>        // ⎿ 后面的一行，details 点击展开；null 表示不显示结果
     isError ? undefined : { line: `${before} → deployed to ${input.env}`, details: text },
 }],
 ```
 
-jade 自己的工具也用这套接口，由提供它们的内置插件带上：例如 `bash` 的 `details` 是多行或很长的命令，`edit_file` 的 `preview` 是审批时的 diff、`before` 记下修改前的文件、`result` 在结果行后面显示增删的行数。所以代替内置插件（`replaces`）时，新插件也可以为它的同名工具提供这些显示。
+插件用 `ctx.emit` 写的事件默认不显示（`notice` 除外）。为自己的事件注册渲染器，就能显示在对话里：
 
-- **只能为本插件 `tools` 里的工具注册**。jade 自己的、MCP 的、别的插件的工具的显示（尤其是审批时的预览）改不了，否则插件能让一条危险的命令在审批框里看起来无害。为别的工具注册的会被忽略并提示。
+```ts
+renderers: [{
+  event: "deployed",                                               // emit("deployed", …)，不带 "<插件 id>/" 前缀
+  render: (data) => ({ line: `deployed ${data.version}`, details: data.log }),   // undefined 表示这一次不显示
+}],
+```
+
+事件的 `data` 里有 `usage`（插件自己调用模型的用量，格式同 `ctx.complete` 返回的 `usage`）时，不管有没有渲染器，都计入状态栏上本会话的用量。
+
+jade 自己的工具和事件也用这套接口，由提供它们的内置插件带上，jade 的对话显示不认识任何内置插件的工具名或事件：例如 `bash` 的 `details` 是多行或很长的命令，`edit_file` 的 `preview` 是审批时的 diff、`before` 记下修改前的文件、`result` 在结果行后面显示增删的行数；`todo_write` 的 `call` 显示整个清单、`result` 返回 `null`；`task` 的 `progress` 显示子 Agent 正在做什么、`result` 把它调用过的工具放进折叠内容；`jade/compact` 的 `compacted`、`jade/checks` 的 `checked` 事件也是各自的渲染器显示的。所以代替内置插件（`replaces`）时，新插件可以为同名的工具、自己的事件提供同样的显示。
+
+- **只能为本插件 `tools` 里的工具、本插件的事件注册**。jade 自己的、MCP 的、别的插件的工具的显示（尤其是审批时的预览）改不了，否则插件能让一条危险的命令在审批框里看起来无害。为别的工具注册的会被忽略并提示；事件的类型总是加上本插件的 id 作前缀，碰不到别的插件的事件。
 - 这些函数都可以不写。返回 `undefined` 时用默认的显示；出错时也用默认的显示，并在对话里提示一次。
-- `summary` 只显示第一行，`result` 的 `line` 也只显示第一行；`details` 和 `preview` 可以多行。`summary`、`details`、`before`、`result` 要同步返回（对话按事件同步显示），`preview` 可以是异步的。
+- `summary`、`progress` 只显示第一行，`result` 和事件的 `line` 也只显示第一行；`details`、`call` 和 `preview` 可以多行。除了 `preview`，都要同步返回（对话按事件同步显示）。
+- 有 `progress` 时进度全部交给它；没有时，`{ text }` 形式的进度按输出逐行显示（`bash` 就是这样），其他形式的不显示。进度不记进日志，重新显示历史时没有。
 - `before` 在工具执行之前调用：用户拒绝的调用不调用；重新显示历史时文件之类已经变了，也不调用，这时 `result` 收到的 `before` 是 `undefined`。
 - `jade -p` 的输出和恢复会话时重新显示的历史也用这些函数。
 
@@ -611,7 +663,7 @@ jade 自己的功能都是插件，和第三方插件用同一套接口（[`src/
 
 | id | 提供 |
 |---|---|
-| `jade/policy` | 权限模式和审批，**不能停用或代替** |
+| `jade/policy` | 权限模式和审批，计划模式的告知和"执行这个计划？"，**不能停用或代替** |
 | `jade/prompts` | 系统提示词、环境信息、AGENTS.md / CLAUDE.md |
 | `jade/fs` | read_file、write_file、edit_file、multi_edit、list_dir、glob、grep |
 | `jade/shell` | bash、bash_output、kill_shell |
@@ -622,10 +674,12 @@ jade 自己的功能都是插件，和第三方插件用同一套接口（[`src/
 | `jade/skills` | skill 工具、提示词里的 skill 列表、`/skills` |
 | `jade/mcp` | MCP 服务的工具、`/mcp` |
 | `jade/checks` | 编辑后检查、`/checks` |
-| `jade/compact` | 接近上下文上限时压缩历史、`/compact` |
+| `jade/compact` | 接近上下文上限时压缩历史、请求超出上下文窗口时压缩后重试、`/compact` |
 | `jade/budget` | 每轮的步数上限 |
 | `jade/sessions` | `/clear`、`/resume`、`/retry` |
 | `jade/undo` | `/undo`（恢复上一轮改过的文件） |
+| `jade/continue` | 回复被输出上限截断时让模型接着做（每条消息最多 3 次） |
+| `jade/mentions` | `@` 引用的文件和目录随消息发出 |
 | `jade/repeats` | 拒绝同一次回复里重复的调用，提醒反复失败的调用 |
 
 用户可以用 `jade plugin disable <id>` 停用其中任何一个（`jade/policy` 除外），停用后它的工具、提示词段落和命令都不再出现。
@@ -647,6 +701,7 @@ export default (ctx) => ctx.definePlugin({ tools: [myWebFetch] });
 - 代替者自己因为别的原因被跳过（例如另一个工具名冲突）时，被代替的内置插件照常加载。
 - `jade/policy` 不能代替：审批是安全边界。想让审批更严格，加一个 `tool.gate` hook，多个 gate 的结果取最严格的那个（deny > ask > allow）。
 - 代替 `jade/prompts` 时，你的 `context.build` hook 要自己提供基础提示词。其他内置插件（记忆、skill 列表、MCP 说明）的段落是接在已有段落后面的，不受影响。
+- `jade/continue`、`jade/mentions`，以及 `jade/compact` 的"超出上下文窗口后压缩重试"，用的是宿主和内置插件之间的轮次接口，还不对第三方开放：代替它们的插件做不了这几件事，只能停用。
 - `/plugins` 和 `jade plugin list` 显示每个内置插件是开着、停用还是被谁代替了。
 
 ## 进程外插件（任何语言）
@@ -794,7 +849,7 @@ jade 发给插件的请求：
 | `hooks` | 会话 | 两层 | 全部执行，顺序见[执行顺序](#hook) | 按内核的规定（`tool.gate` 出错按拒绝处理） |
 | `commands` | 会话 | 两层 | 宿主命令 > 内置插件的命令 > 自定义命令和 skill > 第三方插件（之间先到先得） | 名字不对：忽略这个命令并警告 |
 | `keys` | 会话（同一个键可以并发） | 两层；项目层的回复不能改输入框 | 先到先得；jade 自己用的键不可用 | 格式不对：忽略并警告；执行出错：警告 |
-| `renderers` | 会话 | 两层 | 只能渲染自己的工具，每个工具一个 | 退回默认显示，警告一次 |
+| `renderers` | 会话 | 两层 | 只能渲染自己的工具和事件，每个工具、事件一个 | 退回默认显示，警告一次 |
 | 代替内置插件 | 每个会话按清单的 `replaces` 计算 | 两层 | 可以代替的都代替；被跳过的插件声明的代替不算；`jade/policy` 不可代替 | 代替不存在的内置插件：警告；写在插件对象上：不起作用，警告 |
 | `dispose` | 会话 | 两层（进程外插件没有） | — | 警告；5 秒超时 |
 | `ctx.status` | 会话 | 两层 | 按插件的 `id` 各占一段 | 会话结束后还调用：不起作用，警告一次 |
@@ -804,7 +859,7 @@ jade 发给插件的请求：
 
 不合格的部分只是不生效，jade 不改你的插件对象：返回的对象原样留着，jade 用的是检查过、留下的那部分。
 
-表里没有的字段 jade 不读。早先有过的 `responder`（在终端之外回答审批）、`suggest`（预测下一条消息）、`beforeSend`（发出前改写消息）已经去掉，写了会提示不起作用。
+表里没有的字段 jade 不读。早先有过的 `responder`（在终端之外回答审批）、`suggest`（预测下一条消息）、`beforeSend`（发出前改写消息）已经去掉，写了会提示不起作用。预测下一条消息现在用 `ctx.input.hint`，见示例 [`suggest`](../examples/plugins/suggest/index.ts)。
 
 ## 安全
 

@@ -104,6 +104,8 @@ interface UiState {
   queued: string[];
   dialogs: Dialog[];
   status: StatusInfo;
+  /** 插件设置的灰色提示（ctx.input.hint）：输入框为空时显示，Tab 或 → 接受 */
+  hint?: string;
 }
 
 /** 对话最多保留这么多行（折行前），超出时丢掉最早的一段 */
@@ -352,7 +354,7 @@ class Store {
     this.#owners = [];
     this.#named.clear();
     this.update(
-      { version: this.state.version + 1, live: undefined, progress: [], scroll: 0 },
+      { version: this.state.version + 1, live: undefined, progress: [], scroll: 0, hint: undefined },
       true,
     );
   }
@@ -603,6 +605,7 @@ export function tuiScreen(opts: TuiOptions): Screen {
         const value = text.replace(/\r\n?/g, "\n");
         draft.current?.apply(() => ({ value, cursor: value.length }));
       },
+      hint: (text) => store.update({ hint: text ? text.replace(/\r\n?/g, "\n") : undefined }),
     },
     select: <T,>(title: string, choices: Choice<T>[], o?: { body?: string; signal?: AbortSignal }) => {
       if (longBusy()) notify(title);
@@ -965,6 +968,8 @@ function App({
             handlers={handlers}
             history={history}
             bridge={draft}
+            hint={state.hint}
+            onHintDone={() => store.update({ hint: undefined })}
             busy={Boolean(state.busy)}
             active={!dialog}
             onSubmit={() => store.scrollBy(-max, max)}
@@ -1377,6 +1382,8 @@ function Prompt({
   handlers,
   history: initial,
   bridge,
+  hint,
+  onHintDone,
   busy,
   active,
   onSubmit,
@@ -1387,6 +1394,10 @@ function Prompt({
   history: string[];
   /** 让 tuiScreen 的 draft 读写输入框 */
   bridge: DraftBridge;
+  /** 插件设置的灰色提示 */
+  hint?: string;
+  /** 提示被接受了，或者用户开始打字了：去掉它 */
+  onHintDone(): void;
   busy: boolean;
   active: boolean;
   /** 提交后对话区回到底部 */
@@ -1501,7 +1512,11 @@ function Prompt({
   const firstMatch = around(Math.max(0, matches.indexOf(pick!)), matches.length, menuRows);
   const firstFound = around(Math.max(0, found.indexOf(file!)), found.length, menuRows);
 
+  /** 提示只在空闲、输入框为空、没有在搜索历史时显示，也只有这时能接受 */
+  const hinting = () => hint !== undefined && !busy && current().value === "" && !getSearch();
   const set = (s: EditState) => {
+    // 用户开始打字（或者插件改了输入框）：提示作废
+    if (s.value && hint !== undefined) onHintDone();
     setState(s);
     setSelected(0);
     setNotice(undefined);
@@ -1651,6 +1666,12 @@ function Prompt({
         if (file) return complete(file);
         return submit(state.value.trim());
       }
+      // Tab 或 →：把提示变成输入框里的文字，接着可以改
+      if (((key.tab && !key.shift) || key.rightArrow) && hinting()) {
+        onHintDone();
+        browsing.current = -1;
+        return set({ value: hint!, cursor: hint!.length });
+      }
       if (key.tab && key.shift) return handlers.cycleMode?.();
       if (key.tab) {
         const { pick, file } = derive();
@@ -1717,7 +1738,9 @@ function Prompt({
             width={Math.max(10, columns - 5)}
             prefix="› "
             placeholder={
-              busy
+              hinting()
+                ? hintLine(hint!)
+                : busy
                 ? "Type to queue a message · esc to interrupt"
                 : columns >= 70
                   ? "Message jade · / commands · @ files · ↑ or ctrl+r for history"
@@ -1816,6 +1839,12 @@ function Prompt({
     </Box>
   );
 }
+
+/** 提示在输入框里只显示第一行，后面还有时加 … */
+const hintLine = (hint: string) => {
+  const [first, ...rest] = hint.split("\n");
+  return `${first}${rest.length ? " …" : ""}`;
+};
 
 /** @ 补全最多显示几项 */
 const MENTION_ROWS = 8;

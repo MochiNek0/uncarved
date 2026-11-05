@@ -15,7 +15,7 @@ export interface ScopeHost {
   /** 换掉状态栏上插件的段落（按插件的 id） */
   showStatus(segments: { plugin: string; text: string }[]): void;
   /** 终端界面的输入框；-p 时没有 */
-  input?: { text(): string; insert(text: string): void; set(text: string): void };
+  input?: { text(): string; insert(text: string): void; set(text: string): void; hint(text: string | undefined): void };
   /** 替用户提交一行；-p 时没有 */
   send?(plugin: string, text: string): void;
   warn(text: string): void;
@@ -63,6 +63,7 @@ export class SessionScope {
         text: (plugin?: string) => (this.#live(plugin, "ctx.input") ? host.input!.text() : ""),
         insert: (text: string, plugin?: string) => void (this.#live(plugin, "ctx.input") && host.input!.insert(String(text))),
         set: (text: string, plugin?: string) => void (this.#live(plugin, "ctx.input") && host.input!.set(String(text))),
+        hint: (text: string | undefined, plugin?: string) => void (this.#live(plugin, "ctx.input") && host.input!.hint(text === undefined ? undefined : String(text))),
       },
       send: host.send && ((plugin: string, text: string) => void (this.#live(plugin, "ctx.send") && host.send!(plugin, text))),
     };

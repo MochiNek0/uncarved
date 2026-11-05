@@ -24,6 +24,10 @@ const RESERVED = ["messages", "system", "tools", "stream"];
 
 export interface AnthropicProviderOptions {
   client?: Anthropic;
+  /** 不给 client 时用来创建客户端；不给时 SDK 读 ANTHROPIC_API_KEY */
+  apiKey?: string;
+  /** 不给 client 时用来创建客户端；不给时 SDK 读 ANTHROPIC_BASE_URL，再没有就是官方地址 */
+  baseURL?: string;
   /** 默认 claude-opus-5-5 */
   model?: string;
   /** 默认 64000 */
@@ -41,7 +45,7 @@ export interface AnthropicProviderOptions {
 }
 
 export function anthropicProvider(opts: AnthropicProviderOptions = {}): Provider {
-  const client = opts.client ?? new Anthropic();
+  const client = opts.client ?? new Anthropic({ apiKey: opts.apiKey, baseURL: opts.baseURL });
   const model = opts.model ?? "claude-opus-5-5";
 
   return {

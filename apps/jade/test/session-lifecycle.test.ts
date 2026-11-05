@@ -57,7 +57,7 @@ async function setup() {
   const ui = { status: [] as string[], typed: [] as string[], warnings: [] as string[], errors: [] as string[] };
   const host: ScopeHost = {
     showStatus: (segments) => void (ui.status = segments.map((s) => `${s.plugin}=${s.text}`)),
-    input: { text: () => "", insert: (t) => void ui.typed.push(t), set: (t) => void ui.typed.push(t) },
+    input: { text: () => "", insert: (t) => void ui.typed.push(t), set: (t) => void ui.typed.push(t), hint: (t) => void ui.typed.push(`hint ${t}`) },
     warn: (w) => void ui.warnings.push(w),
   };
   /** 让恢复会话（带 id 的 open）、开始新会话（不带 id 的 open）失败 */

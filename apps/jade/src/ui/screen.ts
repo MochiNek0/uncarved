@@ -69,8 +69,8 @@ export interface Screen {
   select<T>(title: string, choices: Choice<T>[], opts?: { body?: string; signal?: AbortSignal }): Promise<T | undefined>;
   /** 让用户输入一行；取消时返回 undefined。signal 同 select */
   input(title: string, opts?: { initial?: string; mask?: boolean; placeholder?: string; signal?: AbortSignal }): Promise<string | undefined>;
-  /** 输入框里还没提交的文字（插件的 ctx.input 用）；只有终端界面有 */
-  readonly draft?: { text(): string; insert(text: string): void; set(text: string): void };
+  /** 输入框里还没提交的文字和灰色提示（插件的 ctx.input 用）；只有终端界面有 */
+  readonly draft?: { text(): string; insert(text: string): void; set(text: string): void; hint(text: string | undefined): void };
   /** 清空已经显示的对话（开始新会话时） */
   clear(): void;
   close(): Promise<void>;
@@ -163,7 +163,12 @@ export function safeScreen(screen: Screen): Screen {
     input: (title, o) => screen.input(s(title), o && { ...o, initial: opt(o.initial), placeholder: opt(o.placeholder) }),
     // 输入框里的 \r 是换行（旧 Mac 的换行符），不是进度条：先换成 \n，terminalSafe 才不会只留最后一段。
     // 输入框里是要发给模型的纯文字，颜色也去掉
-    draft: screen.draft && { text: () => screen.draft!.text(), insert: (t) => screen.draft!.insert(plain(lf(t))), set: (t) => screen.draft!.set(plain(lf(t))) },
+    draft: screen.draft && {
+      text: () => screen.draft!.text(),
+      insert: (t) => screen.draft!.insert(plain(lf(t))),
+      set: (t) => screen.draft!.set(plain(lf(t))),
+      hint: (t) => screen.draft!.hint(t === undefined ? undefined : plain(lf(t))),
+    },
     clear: () => screen.clear(),
     close: () => screen.close(),
   };

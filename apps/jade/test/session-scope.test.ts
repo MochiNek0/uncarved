@@ -16,7 +16,12 @@ function fakeHost() {
   let draft = "draft";
   const host: ScopeHost = {
     showStatus: (segments) => void shown.push(segments.map((s) => `${s.plugin}=${s.text}`)),
-    input: { text: () => draft, insert: (t) => void typed.push(`insert ${t}`), set: (t) => void ((draft = t), typed.push(`set ${t}`)) },
+    input: {
+      text: () => draft,
+      insert: (t) => void typed.push(`insert ${t}`),
+      set: (t) => void ((draft = t), typed.push(`set ${t}`)),
+      hint: (t) => void typed.push(`hint ${t}`),
+    },
     send: (plugin, text) => void sent.push([plugin, text]),
     warn: (w) => void warnings.push(w),
   };
@@ -38,6 +43,7 @@ describe("session scope", () => {
     expect(ui.shown).toEqual([]);
     input!.insert("x", "me/voice");
     input!.set("y", "me/voice");
+    input!.hint("z", "me/voice");
     send!("me/voice", "go");
     expect(input!.text("me/voice")).toBe("");
     expect(ui.typed).toEqual([]);
@@ -51,9 +57,11 @@ describe("session scope", () => {
     onStatus("me/ci", undefined);
     expect(ui.last()).toEqual(["me/clock=12:01"]);
     input!.insert("x", "me/voice");
+    input!.hint("next", "me/voice");
+    input!.hint(undefined, "me/voice");
     send!("me/voice", "go");
     expect(input!.text("me/voice")).toBe("draft");
-    expect(ui.typed).toEqual(["insert x"]);
+    expect(ui.typed).toEqual(["insert x", "hint next", "hint undefined"]);
     expect(ui.sent).toEqual([["me/voice", "go"]]);
     expect(() => scope.activate()).toThrow("cannot activate the session scope: it is active");
   });

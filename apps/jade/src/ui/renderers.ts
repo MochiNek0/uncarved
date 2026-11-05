@@ -1,14 +1,16 @@
-// jade 自己的工具怎么显示：和插件一样用 ToolRenderer（见 plugins/loader.ts），由提供这些工具的内置插件带上。
-// 没有 renderer 的工具、renderer 没给的部分用 transcript 的默认显示。
+// jade 自己的工具和事件怎么显示：和插件一样用 ToolRenderer、EventRenderer（见 plugins/loader.ts），由提供它们的内置插件带上。
+// 没有 renderer 的工具、renderer 没给的部分用 transcript 的默认显示。transcript 不认识任何内置插件的工具名和事件类型。
 
 import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import type { ToolRenderer } from "../plugins/loader.ts";
+import type { EventRenderer, ToolRenderer } from "../plugins/loader.ts";
 import { applyEditsToText, display, type Edit } from "../tools/fs.ts";
+import type { TaskProgress } from "../tools/task.ts";
+import { renderTodos, type Todo } from "../tools/todo.ts";
 import { diffLines, diffStats, renderDiff } from "./diff.ts";
 import { clip } from "./render.ts";
-import { dim, green, red, yellow } from "./screen.ts";
+import { bold, dim, green, red, yellow } from "./screen.ts";
 
 type Args = Record<string, unknown>;
 const args = (input: unknown) => (input ?? {}) as Args;
@@ -21,6 +23,9 @@ function marked(s: string, mark: string, color: (s: string) => string, max = 30)
   if (all.length > max) shown.push(dim(`  … ${all.length - max} more lines`));
   return shown.join("\n");
 }
+
+/** 折叠起来的完整内容最多这么多行 */
+const MAX_DETAIL_LINES = 2000;
 
 /** 折叠内容里的多行文字（缩进由 transcript 加），最多 max 行 */
 function capped(lines: string[], color: (s: string) => string, max: number): string {
@@ -153,7 +158,13 @@ export const webRenderers: ToolRenderer[] = [
 ];
 
 export const todoRenderers: ToolRenderer[] = [
-  { tool: "todo_write", summary: (input) => `${Array.isArray(args(input).todos) ? (args(input).todos as unknown[]).length : 0} items` },
+  {
+    tool: "todo_write",
+    summary: (input) => `${Array.isArray(args(input).todos) ? (args(input).todos as unknown[]).length : 0} items`,
+    // 清单本身就是参数：执行时直接显示，结果不再显示（出错时照常显示）
+    call: (input) => `${bold("Todos")}\n${renderTodos((args(input).todos as Todo[] | undefined) ?? []).replace(/^/gm, "  ")}`,
+    result: ({ isError }) => (isError ? undefined : null),
+  },
 ];
 
 export const askRenderers: ToolRenderer[] = [
@@ -180,4 +191,87 @@ export const memoryRenderers: ToolRenderer[] = [
   },
 ];
 
-export const taskRenderers: ToolRenderer[] = [{ tool: "task", summary: (input) => String(args(input).description ?? "") }];
+/**
+ * 子 Agent：运行中每个只有一行进度（标签、调用过几个工具、正在做什么），并行的几个靠标签分清；
+ * 结束时把它调用过的工具放进结果的折叠内容里。按调用记的状态在每套插件实例里一份
+ */
+export function taskRenderers(): ToolRenderer[] {
+  const labels = new Map<string, string>();
+  const steps = new Map<string, string[]>();
+  const line = (id: string, what: string) => {
+    const n = steps.get(id)?.length ?? 0;
+    return dim(`  ↳ ${labels.get(id) ?? "sub-agent"}${n ? ` (${n} tool call${n > 1 ? "s" : ""})` : ""} · ${what}`);
+  };
+  return [
+    {
+      tool: "task",
+      summary: (input) => String(args(input).description ?? ""),
+      progress(update, { toolUseId: id, summary }) {
+        const p = update as TaskProgress;
+        if (p?.kind === "task-start") {
+          labels.set(id, p.description);
+          return line(id, "starting");
+        }
+        if (p?.kind === "task-model") return line(id, "thinking");
+        if (p?.kind === "task-tool") {
+          // 要用户批准的调用在审批时显示
+          if (p.decision === "ask") return undefined;
+          const step = `${p.decision === "deny" ? "✗" : "·"} ${p.name}(${summary(p.name, p.input)})`;
+          steps.set(id, [...(steps.get(id) ?? []), step]);
+          return line(id, step);
+        }
+        return undefined;
+      },
+      result({ toolUseId: id, text, isError }) {
+        const sub = steps.get(id) ?? [];
+        steps.delete(id);
+        labels.delete(id);
+        // 没调用过工具时用默认的显示
+        if (!sub.length) return undefined;
+        const lines = text.split("\n");
+        const color = isError ? red : (s: string) => s;
+        return {
+          line: isError ? red(clip(lines[0] ?? "", 200)) : dim(`${clip(lines[0] ?? "", 160)}${lines.length > 1 ? ` (+${lines.length - 1} lines)` : ""}`),
+          details: [
+            dim(`sub-agent ran ${sub.length} tool call${sub.length > 1 ? "s" : ""}:`),
+            ...sub.map((l) => dim(`  ${l}`)),
+            capped(lines, color, MAX_DETAIL_LINES),
+          ].join("\n"),
+        };
+      },
+    },
+  ];
+}
+
+// ---------- 内置插件的事件 ----------
+
+export const compactRenderers: EventRenderer[] = [
+  {
+    event: "compacted",
+    render: (data) => {
+      const d = data as { from: number; upTo: number; before: number };
+      return { line: dim(`[compacted ${d.upTo - d.from} messages, ~${d.before} tokens before]`) };
+    },
+  },
+  { event: "trimmed", render: (data) => ({ line: dim(`[cleared old tool output, ~${(data as { saved: number }).saved} tokens]`) }) },
+];
+
+export const checksRenderers: EventRenderer[] = [
+  {
+    event: "checked",
+    render: (data) => {
+      const d = data as { summary: { name: string; problems: number; others?: number; failed?: string }[]; report: string };
+      const bad = d.summary.filter((s) => s.problems > 0 || s.others || s.failed);
+      const details = d.report ? capped(d.report.split("\n").slice(1), (s) => s, MAX_DETAIL_LINES) : undefined;
+      if (bad.length === 0) return { line: dim(`  ✓ checks passed: ${d.summary.map((s) => s.name).join(", ")}`), details };
+      const what = bad.map((s) =>
+        s.failed
+          ? `${s.name} ${s.failed}`
+          : `${s.name}: ${[s.problems > 0 ? `${s.problems} problem${s.problems > 1 ? "s" : ""} in changed files` : "", s.others ? `${s.others} new elsewhere` : ""]
+              .filter(Boolean)
+              .join(", ")}`,
+      );
+      return { line: yellow(`  ⚠ checks: ${what.join("; ")}`), details };
+    },
+  },
+];

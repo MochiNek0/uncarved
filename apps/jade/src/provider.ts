@@ -184,6 +184,27 @@ type Env = Record<string, string | undefined>;
 
 export const isBuiltinKind = (kind: string): kind is ProviderKind => (PROVIDER_KINDS as readonly string[]).includes(kind);
 
+/** 每种内置服务的模型名、密钥、地址各放在哪个环境变量里 */
+export const MODEL_KEY: Record<ProviderKind, string> = { "openai-compat": "OPENAI_COMPAT_MODEL", openai: "OPENAI_MODEL", anthropic: "ANTHROPIC_MODEL" };
+export const KEY_KEY: Record<ProviderKind, string> = { "openai-compat": "OPENAI_COMPAT_API_KEY", openai: "OPENAI_API_KEY", anthropic: "ANTHROPIC_API_KEY" };
+export const URL_KEY: Record<ProviderKind, string> = { "openai-compat": "OPENAI_COMPAT_BASE_URL", openai: "OPENAI_BASE_URL", anthropic: "ANTHROPIC_BASE_URL" };
+
+/**
+ * 插件直接给出的服务（ctx.complete 的 model、ctx.listModels）换成 providerFromEnv、listModels 认识的环境变量。
+ * 只有给出的这几项，不带 jade 自己的配置（当前的密钥、输出上限等）。格式不对时抛错
+ */
+export function serviceEnv(s: { kind: string; baseURL?: string; apiKey?: string; model?: string }): Env {
+  if (typeof s !== "object" || s === null) throw new Error("the service must be an object { kind, baseURL?, apiKey?, model }");
+  if (!isBuiltinKind(s.kind)) throw new Error(`the service kind must be one of ${PROVIDER_KINDS.join(", ")}, got ${JSON.stringify(s.kind)}`);
+  for (const k of ["baseURL", "apiKey", "model"] as const)
+    if (s[k] !== undefined && (typeof s[k] !== "string" || !s[k])) throw new Error(`the service ${k} must be a non-empty string`);
+  const env: Env = { JADE_PROVIDER: s.kind };
+  if (s.baseURL) env[URL_KEY[s.kind]] = s.baseURL;
+  if (s.apiKey) env[KEY_KEY[s.kind]] = s.apiKey;
+  if (s.model) env[MODEL_KEY[s.kind]] = s.model;
+  return env;
+}
+
 /** 插件提供的模型服务（JadePlugin.providers），用 JADE_PROVIDER=<kind> 选择 */
 export interface ProviderDef {
   /** JADE_PROVIDER 的值：字母、数字、-、_，不能和内置的 openai-compat、openai、anthropic 重名 */
@@ -407,7 +428,14 @@ export async function providerFromEnv(env: Env = process.env): Promise<Provider>
     });
   }
   const { anthropicProvider } = await import("@uncarved/provider-anthropic");
-  return anthropicProvider({ model: env.ANTHROPIC_MODEL, effort: (effort ?? "high") as "low" | "medium" | "high" | "xhigh" | "max", maxTokens });
+  // 地址和密钥从 env 取，不让 SDK 自己读 process.env：ctx.complete 指定的保存过的模型，env 不是 process.env
+  return anthropicProvider({
+    apiKey: env.ANTHROPIC_API_KEY,
+    baseURL: env.ANTHROPIC_BASE_URL ?? "https://api.anthropic.com",
+    model: env.ANTHROPIC_MODEL,
+    effort: (effort ?? "high") as "low" | "medium" | "high" | "xhigh" | "max",
+    maxTokens,
+  });
 }
 
 /** 可以在会话中途换掉的 provider：/model 改配置后，压缩、子 Agent 等持有它的地方都跟着换 */
