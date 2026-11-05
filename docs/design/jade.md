@@ -290,7 +290,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 | `jade/keys` | `keys@1`：`register`、`get`、`list`；`shift+tab` 也可以注册 | — | 快捷键 |
 | `jade/renderers` | `renderers@1`：`tool`、`event`、`forTool`、`forEvent` | — | `ToolRenderer`、`EventRenderer`。`jade/fs`、`jade/shell` 为自己的工具登记，`jade/approval` 用工具的 `preview` 作审批对话框的内容 |
 | `jade/models` | `provider@1`、`models@1`（`current`、`complete`、`list`、`subscribe`）；`/model`：切换保存过的模型、改当前模型的设置、加一个模型；用过的模型记在 `$JADE_HOME/models.json` | 可选 `ui@1`、`commands@1` | `provider.ts`、`ui/configure.ts` |
-| `jade/approval` | `approval@1`（`mode`、`setMode`、`allowRead`：登记不用问就能读的目录，项目层插件不能用）、gate | `ui@1`（可选：没有或不能提问时，要问的调用一律拒绝） | `plugins/policy.ts` 的审批部分 |
+| `jade/approval` | `approval@1`（`mode`、`setMode`、`allowRead`：登记不用问就能读的目录，项目层插件不能用）、gate；auto 模式下判断不了的调用先由模型审查（`review.ts`） | `ui@1`、`models@1`（都可选：没有 `ui@1` 时，要问的调用一律拒绝；没有 `models@1` 或 `review: false` 时不审查） | `plugins/policy.ts`、`plugins/review.ts` |
 | `jade/modes` | `modes@1`（`current`、`set`、`cycle`、`subscribe`），Shift+Tab、`/mode` | `approval@1`；可选 `keys@1`、`commands@1` | Shift+Tab、`/mode`。计划模式的"批准计划后开始改"还没移植 |
 | `jade/plugins` | `/plugins [id]`：每个插件的状态和原因、每个服务的提供者（来自核心的 `jade@1`） | `commands@1`、`jade@1` | — |
 | `jade/sessions` | 命令 `/clear` `/resume` `/retry`；会话索引 `$JADE_HOME/state/sessions.jsonl` | `commands@1` | `plugins/sessions.ts`、`session-lifecycle.ts` |
@@ -311,7 +311,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 
 - `jade/prompts` 不再由宿主"单独构造并拿到全部工具"：它在 `context.build` 里本来就能看到请求里的工具，提示词里提到某个工具的条目只在请求里有这个工具时保留。环境信息里不再写各工具插件的细节（shell 是哪个、有没有 web 工具），那些由工具插件经 `prompts@1` 自己加。
 - `jade/fs` 去掉了检查点（撤销以后由 `jade/undo` 提供）。所以恢复的会话里，改已有文件之前要重新读一遍。
-- 审批的"总是允许"规则记在日志里（`derived`），恢复会话后仍有效；模式是进程级的，来自配置，`jade/modes` 以后经 `approval@1` 改。auto 模式的模型审查暂未移植。
+- 审批的"总是允许"规则记在日志里（`derived`），恢复会话后仍有效；模式是进程级的，来自配置，`jade/modes` 经 `approval@1` 改。auto 模式下，规则判断不了、本来要问用户的调用先让模型审一次（`plugins/approval/review.ts`，`test/review.test.ts`）：审查只能放行或转给用户，出错、超时、回答看不懂时也转给用户；同一个主机的只读工具审查一次放行后，本会话里不再逐次审查。审查的模型调用经 `models@1`，用量经 `reviewed` 事件计入会话。
 - `ask_user` 的对话框经 `ui@1`，不再由宿主私下传入。
 - `jade/task`、`jade/compact` 经 `models@1` 调模型，不再由宿主传 provider。
 - 续写、溢出重试经 `session.afterTurn`，不再需要只给内置插件的 `TurnParticipant`。
@@ -349,7 +349,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
    已完成：`test/tui-frontend.test.ts` 用假终端和假模型跑真实的 bundled 插件：输入消息、在审批对话框里批准（预览是 `jade/fs` 的 diff）、看到回复、`/mode`、`/help`、`/exit`、`@` 补全（候选来自 `jade/fs` 的 `listFiles`，发送时由 `jade/mentions` 附上内容）、`--continue`。`test/registries.test.ts` 覆盖注册、撤销、保留键、`/clear`、`/resume`。插件在状态栏显示自己的段落、`ctx.input`（改输入框）已由 `ui@1.session` 提供，见 `test/session-ui.test.ts`。`/model` 已完成（`test/model.test.ts`），`/plugins` 由单独的 `jade/plugins` 提供（`test/plugins.test.ts`）。
 7. **其余功能插件**逐个移植。每移植一个，都检查它没有用到第三方拿不到的东西。
    大部分已完成：web、todo、ask、task、compact、mcp、skills、checks、memory、undo、mentions、continue、repeats、budget，各有测试（`test/<插件>.test.ts`）。期间核心改了两处：会话队列的竞争（上一条 `send` 刚 resolve 就再 `send`，新输入没人处理），兜底关卡只认 `approval@1` 的提供者（见第 7 节）。
-   暂缺：auto 模式的模型审查（旧 `plugins/review.ts`）、截图工具、计划模式的"批准计划后开始改"、插件的安装和更新（旧 `plugins/install.ts`、`update.ts`）。
+   暂缺：截图工具、计划模式的"批准计划后开始改"、插件的安装和更新（旧 `plugins/install.ts`、`update.ts`）。
    移植中发现的缺口，以后再定：命令拿不到会话日志，也没有"给模型留一句说明"的接口（memory、undo 各自在 `context.project` 里附说明，`/undo` 的已撤销记录存在 `$JADE_HOME/checkpoints`）；子 Agent 的日志不能关联到父会话；`jade/checks` 复制了 jade/shell 找 shell、杀进程树的代码（可以由 jade/shell 提供 `shell@1`）。
 8. ~~功能对齐后改名为 jade~~：已提前完成（2026-11-05）。旧 jade 归档到 `.archive/jade`，新实现直接占用 `apps/jade` 和 `jade` 命令；功能对齐前，jade 只是开发中的版本。
 

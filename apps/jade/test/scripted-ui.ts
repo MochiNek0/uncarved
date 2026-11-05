@@ -46,6 +46,8 @@ export interface Shared {
   /** select 依次给出的回答；用完后选第一项 */
   answers: (string | undefined)[];
   asked: string[];
+  /** 弹出过的对话框（标题和正文） */
+  dialogs: { title: string; detail?: string }[];
   notes: string[];
   interactive: boolean;
 }
@@ -69,7 +71,7 @@ const FAKE_FRONTEND = `export default { process(ctx) {
   ctx.provide("ui@1", {
     get interactive() { return g().interactive; },
     notify: (m) => void g().notes.push(m),
-    select: async (r) => { g().asked.push(r.title); const a = g().answers.shift(); return a === undefined ? r.options[0]?.value : a === "" ? undefined : a; },
+    select: async (r) => { g().asked.push(r.title); g().dialogs.push({ title: r.title, ...(r.detail ? { detail: r.detail } : {}) }); const a = g().answers.shift(); return a === undefined ? r.options[0]?.value : a === "" ? undefined : a; },
     input: async () => undefined,
   });
 } };`;
@@ -85,6 +87,7 @@ export async function scriptedHost(opts: { config?: Record<string, Record<string
     current: { kind: "scripted", model: "s1", via: "a script", contextWindow: 200_000 },
     answers: [],
     asked: [],
+    dialogs: [],
     notes: [],
     interactive: true,
   };

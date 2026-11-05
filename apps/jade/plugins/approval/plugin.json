@@ -4,11 +4,15 @@
   "api": "^1",
   "entry": "./index.ts",
   "provides": ["approval@1"],
-  "optional": ["ui@1", "renderers@1"],
+  "optional": ["ui@1", "renderers@1", "models@1"],
   "config": {
     "mode": {
       "default": "ask",
       "description": "ask: ask before changes; auto: changes inside the working directory and harmless commands go through; plan: change nothing, present a plan; readonly: change nothing; yolo: never ask"
+    },
+    "review": {
+      "default": true,
+      "description": "in auto mode, let the model review the calls the rules cannot decide (it can only allow or pass them to you); false turns the review off"
     }
   }
 }

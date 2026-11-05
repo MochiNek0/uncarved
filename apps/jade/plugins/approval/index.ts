@@ -1,13 +1,16 @@
 // jade/approval：审批。tool.before 把路径统一成绝对路径，tool.gate 按模式和规则决定，要问时经 ui@1 问用户。
+// auto 模式下规则判断不了、本来要问的调用先让模型审一次（review.ts）：它只能放行或转给用户，不能替用户拒绝。
 //
 // 没有这个插件（停用、坏掉、被隔离）时，核心的兜底关卡拒绝所有非只读工具（第 7 节），所以这里出错不会放行。
 // 用户选的"总是允许"记进日志（derived），恢复会话后仍然有效；模式是进程级的，来自配置，可以经 approval@1 改。
 
 import path from "node:path";
-import type { GatedToolCall } from "uncarved";
+import type { GatedToolCall, Message } from "uncarved";
 import { definePlugin, type UI } from "../../src/api.ts";
+import type { Models } from "../models/index.ts";
 import type { Renderers } from "../renderers/index.ts";
 import { describeRule, MODES, policy, type AllowRule, type Mode } from "./policy.ts";
+import { reviewer, type Review } from "./review.ts";
 
 /** approval@1 */
 export interface Approval {
@@ -24,6 +27,17 @@ const ASK_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const MAX_DETAIL_CHARS = 2000;
 /** 等工具的审批预览的时限，过了就用默认的 detail */
 const PREVIEW_TIMEOUT_MS = 5000;
+
+/** 同一台主机上的只读工具审查过一次、放行之后就记住，不再逐次审查 */
+const siteKey = (call: GatedToolCall): string | undefined => {
+  const url = (call.input as { url?: unknown } | null)?.url;
+  if (call.tool.effect !== "read" || typeof url !== "string") return undefined;
+  try {
+    return `${call.name} ${new URL(url).hostname.toLowerCase()}`;
+  } catch {
+    return undefined;
+  }
+};
 
 let mode: Mode = "ask";
 /** 配置里写错的模式：第一个会话打开时告诉用户（process 里可能还拿不到 ui@1：它的提供者可能排在后面激活） */
@@ -65,6 +79,24 @@ export default definePlugin({
       badMode = undefined;
     }
     const renderers = ctx.service<Renderers>("renderers@1");
+    // auto 模式的审查用当前配置的模型；没有 models@1（模型插件被停用）或者配置里关掉时不做审查
+    const models = ctx.service<Models>("models@1");
+    const reviewing = models !== undefined && ctx.config.review !== false;
+    /** 最近一次请求里的消息：auto 模式的审查从中取用户最近的请求 */
+    const recent: { messages: readonly Message[] } = { messages: [] };
+    if (reviewing) {
+      ctx.kernel.hook({
+        kind: "transform",
+        point: "context.build",
+        fn: (req) => {
+          recent.messages = req.messages;
+          return req;
+        },
+      });
+    }
+    const review = reviewing ? reviewer({ models: models!, cwd: ctx.cwd, messages: () => recent.messages }) : undefined;
+    /** 本会话里审查过一次、放行了的主机 */
+    const reviewedSites = new Set<string>();
     let warned = false;
     /** 本进程里刚选的"总是允许"：并发的关卡拿到的 derived 是各自开始时的快照，可能还没有它 */
     const added: AllowRule[] = [];
@@ -87,6 +119,20 @@ export default definePlugin({
         };
         const result = rules.decide(call, { mode, rules: saved() });
         if (result.decision !== "ask") return result;
+        // auto 模式：规则判断不了、本来要问的调用先让模型审一次。审查只能放行或转给用户，不会替用户拒绝
+        let why: string | undefined;
+        if (review && mode === "auto") {
+          const site = siteKey(call);
+          if (site !== undefined && reviewedSites.has(site)) return { decision: "allow", reason: "This host was already approved in this session." };
+          const verdict: Review = await review(call, hook.signal);
+          // 审查调用不经过 model.responded，用量只能记在这里，界面据此计入会话用量
+          if (verdict.usage) await hook.emit("reviewed", { toolUseId: call.toolUseId, usage: verdict.usage });
+          if (verdict.decision === "allow") {
+            if (site !== undefined) reviewedSites.add(site);
+            return { decision: "allow", reason: verdict.reason };
+          }
+          why = verdict.reason;
+        }
         if (!ui?.interactive) {
           if (!warned) {
             warned = true;
@@ -102,10 +148,12 @@ export default definePlugin({
           const again = rules.decide(call, { mode, rules: saved() });
           if (again.decision !== "ask") return again;
           const rule = rules.ruleFor(call);
+          const shown = (await preview(renderers, call)) ?? detail(call);
           const answer = await ui.select(
             {
               title: `Allow ${call.name}?`,
-              detail: (await preview(renderers, call)) ?? detail(call),
+              // 审查转给用户的：先说为什么
+              detail: why ? `${why}\n\n${shown}` : shown,
               options: [
                 { label: "Allow once", value: "once" },
                 { label: `Always allow ${describeRule(rule)} in this session`, value: "always" },
