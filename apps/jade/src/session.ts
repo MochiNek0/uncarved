@@ -1,0 +1,373 @@
+// 会话：uncarved Runtime 的创建、恢复、切换（4.2），会话级作用域，afterTurn / send（4.3），兜底关卡（第 7 节）。
+
+import path from "node:path";
+import { JsonlLogStore } from "@uncarved/store-jsonl";
+import {
+  checkCompat,
+  definePlugin as kernelPlugin,
+  Runtime,
+  type GateResult,
+  type Layer,
+  type LocalHookSpec,
+  type LogStore,
+  type Plugin,
+  type Provider,
+  type RuntimeNotice,
+  type State,
+  type Tool,
+  type UserInput,
+} from "uncarved";
+import { API_VERSION, PluginError, ServiceUnavailable, StaleContext, type PluginModule, type PluginSource, type SessionContext } from "./api.ts";
+import { ambient, invoke, Scope, type Owner } from "./membrane.ts";
+
+/** 核心自己交给内核的插件：兜底关卡 */
+export const CORE_PLUGIN_ID = "jade/core";
+
+/** 兜底关卡拒绝时给模型看的话 */
+export const NO_APPROVAL_REASON =
+  "No permission plugin is active in this session, so only read-only tools may run. Ask the user to enable an approval plugin.";
+
+/** 会话管理器向宿主要的东西 */
+export interface SessionHost {
+  home: string;
+  /** 当前激活的插件，按激活顺序 */
+  active(): { source: PluginSource; module: PluginModule; owner: Owner; mark?: (p: Plugin) => Plugin }[];
+  /** 以 owner 的身份取服务；核心自己取时 owner 是核心 */
+  service<T extends object>(name: string, caller: Owner): T | undefined;
+  core: Owner;
+  /** 插件的会话作用域：宿主隔离插件时一并关闭 */
+  track(plugin: string, scope: Scope): void;
+  untrack(plugin: string, scope: Scope): void;
+  fault(plugin: string, reason: string): void;
+  report(message: string): void;
+}
+
+export interface OpenOptions {
+  /** 恢复这个会话；不写就新建 */
+  resume?: string;
+}
+
+/** 前端手里的会话 */
+export interface Session {
+  readonly id: string;
+  readonly state: State;
+  /** 发一条输入；正在跑时排队。这一轮跑完时 resolve（之后的 afterTurn 不等） */
+  send(input: UserInput): Promise<void>;
+  /** 排队的输入和 afterTurn 全部处理完时 resolve */
+  idle(): Promise<void>;
+  /** 继续日志里没做完的工作（崩溃、重启后） */
+  recover(): Promise<void>;
+  abort(reason?: unknown): void;
+  subscribe(fn: (n: RuntimeNotice) => void): () => void;
+}
+
+const KERNEL_LAYER: Record<PluginSource["layer"], Layer> = { bundled: "distro", user: "user", project: "project" };
+
+interface Part {
+  source: PluginSource;
+  owner: Owner;
+  gates: number;
+  kernel: Plugin;
+}
+
+class LiveSession implements Session {
+  readonly id: string;
+  readonly parts: Part[] = [];
+  rt!: Runtime;
+  #queue: { input: UserInput; resolve: () => void; reject: (e: unknown) => void }[] = [];
+  #after: { fn: () => void | Promise<void>; owner: Owner }[] = [];
+  #pump: Promise<void> | undefined;
+  #report: (m: string) => void;
+
+  constructor(id: string, report: (m: string) => void) {
+    this.id = id;
+    this.#report = report;
+  }
+
+  get state(): State {
+    return this.rt.state;
+  }
+
+  send(input: UserInput): Promise<void> {
+    return new Promise((resolve, reject) => {
+      this.#queue.push({ input, resolve, reject });
+      this.#kick();
+    });
+  }
+
+  afterTurn(fn: () => void | Promise<void>, owner: Owner): void {
+    this.#after.push({ fn, owner });
+    this.#kick();
+  }
+
+  async idle(): Promise<void> {
+    while (this.#pump) await this.#pump;
+  }
+
+  recover(): Promise<void> {
+    return this.rt.recover();
+  }
+
+  abort(reason?: unknown): void {
+    this.rt.abort(reason);
+  }
+
+  subscribe(fn: (n: RuntimeNotice) => void): () => void {
+    return this.rt.subscribe(fn);
+  }
+
+  #kick(): void {
+    this.#pump ??= this.#run().finally(() => {
+      this.#pump = undefined;
+    });
+  }
+
+  /** 一次处理一条输入；每轮之后执行 afterTurn，它们可能又排进新的输入 */
+  async #run(): Promise<void> {
+    await null; // 让调用方先拿到 send 的 Promise
+    for (;;) {
+      const job = this.#queue.shift();
+      if (job) {
+        try {
+          await this.rt.send(job.input);
+          job.resolve();
+        } catch (e) {
+          job.reject(e);
+        }
+      }
+      if (this.#after.length > 0) await this.#runAfter();
+      else if (!job) return;
+    }
+  }
+
+  async #runAfter(): Promise<void> {
+    const batch = this.#after.splice(0);
+    for (const { fn, owner } of batch) {
+      if (owner.scope.closed) continue;
+      try {
+        await invoke(owner, "afterTurn", fn);
+      } catch (e) {
+        this.#report(e instanceof Error ? e.message : String(e));
+      }
+    }
+  }
+}
+
+export class Sessions {
+  readonly #host: SessionHost;
+  #current: LiveSession | undefined;
+  #store: LogStore | undefined;
+  /** 换会话串行进行 */
+  #switching: Promise<unknown> = Promise.resolve();
+
+  constructor(host: SessionHost) {
+    this.#host = host;
+  }
+
+  get current(): Session | undefined {
+    return this.#current;
+  }
+
+  /**
+   * 新建或恢复一个会话，成功后它成为当前会话，旧会话离开（detach，仍可恢复）。
+   * 是一个事务：任何一步失败，新会话的作用域全部撤销，旧会话不受影响（4.2）。
+   * 单个插件的 session() 失败不算：这个插件不参加本会话，会话照常打开
+   */
+  open(opts: OpenOptions = {}): Promise<Session> {
+    const run = this.#switching.then(() => this.#open(opts));
+    this.#switching = run.catch(() => {});
+    return run;
+  }
+
+  /** 当前会话离开（detach，仍可恢复） */
+  async close(): Promise<void> {
+    await this.#switching;
+    const old = this.#current;
+    this.#current = undefined;
+    if (old) await this.#leave(old);
+  }
+
+  async #open(opts: OpenOptions): Promise<Session> {
+    const host = this.#host;
+    const provider = host.service<Provider>("provider@1", host.core);
+    if (!provider) throw new ServiceUnavailable("provider@1", "(none): no active plugin provides a model");
+    const store = host.service<LogStore>("store@1", host.core) ?? (this.#store ??= new JsonlLogStore(path.join(host.home, "sessions")));
+
+    const s = new LiveSession(opts.resume ?? crypto.randomUUID(), host.report);
+    try {
+      for (const p of host.active()) if (p.module.session) await this.#join(s, p);
+      const plugins = [this.#corePlugin(s), ...s.parts.map((p) => p.kernel)];
+      s.rt = opts.resume
+        ? await Runtime.resume({ store, provider, plugins, sessionId: s.id })
+        : await Runtime.create({ store, provider, plugins, sessionId: s.id });
+    } catch (e) {
+      await this.#closeParts(s);
+      throw e;
+    }
+    s.rt.subscribe((n) => {
+      if (n.type === "hook-error") host.report(`plugin ${n.info.plugin} failed at ${n.info.point}: ${n.info.error instanceof Error ? n.info.error.message : String(n.info.error)}`);
+    });
+    // 提交：新会话成为当前会话，然后旧会话离开
+    const old = this.#current;
+    this.#current = s;
+    if (old) await this.#leave(old);
+    return s;
+  }
+
+  /** 一个插件加入会话：执行它的 session()，失败就撤销它这次的注册 */
+  async #join(s: LiveSession, p: { source: PluginSource; module: PluginModule; owner: Owner; mark?: (p: Plugin) => Plugin }): Promise<void> {
+    const host = this.#host;
+    const { manifest, layer } = p.source;
+    const id = manifest.id;
+    const scope = new Scope(id);
+    const owner: Owner = { plugin: id, scope };
+    const tools: Tool[] = [];
+    const hooks: LocalHookSpec[] = [];
+    let open = true;
+    const declared = (name: string, lists: (readonly string[] | undefined)[]) => {
+      if (scope.closed) throw new StaleContext(id);
+      if (!lists.some((l) => l?.includes(name))) throw new Error(`plugin ${id}: ${name} is not declared in plugin.json`);
+    };
+    const ctx: SessionContext = {
+      plugin: id,
+      signal: scope.signal,
+      require: <T extends object>(name: string): T => {
+        declared(name, [manifest.requires]);
+        const h = host.service<T>(name, owner);
+        if (!h) throw new ServiceUnavailable(name, "(none)");
+        return h;
+      },
+      service: <T extends object>(name: string): T | undefined => {
+        declared(name, [manifest.requires, manifest.optional]);
+        return host.service<T>(name, owner);
+      },
+      effect: async (start) => {
+        if (scope.closed) throw new StaleContext(id);
+        const d = await ambient.run(owner, start);
+        if (typeof d === "function") scope.add(d);
+      },
+      session: {
+        id: s.id,
+        afterTurn: (fn) => {
+          if (scope.closed) throw new StaleContext(id);
+          s.afterTurn(fn, owner);
+        },
+        send: (input) => {
+          if (scope.closed) throw new StaleContext(id);
+          if (layer === "project") throw new Error(`plugin ${id}: project plugins cannot send input on the user's behalf`);
+          return s.send(input);
+        },
+      },
+      kernel: {
+        tool: (t) => {
+          if (!open) throw new Error(`plugin ${id}: tools can only be registered while session() runs`);
+          tools.push(t);
+        },
+        hook: (h) => {
+          if (!open) throw new Error(`plugin ${id}: hooks can only be registered while session() runs`);
+          hooks.push(h);
+        },
+      },
+    };
+    host.track(id, scope);
+    try {
+      await invoke(owner, "session", () => p.module.session!(ctx));
+    } catch (e) {
+      open = false;
+      host.untrack(id, scope);
+      await scope.close();
+      const reason = e instanceof PluginError && e.plugin === id ? String((e.cause as Error)?.message ?? e.message) : e instanceof Error ? e.message : String(e);
+      host.report(`plugin ${id} did not join session ${s.id}: ${reason}`);
+      host.fault(id, reason);
+      return;
+    }
+    open = false;
+    // 内核构造 Runtime 时会因为重名工具、不合法的 hook 拒绝整个会话：提前检查，只排除这一个插件
+    const taken = new Set(s.parts.flatMap((x) => x.kernel.tools?.map((t) => t.name) ?? []));
+    const clash = tools.find((t) => taken.has(t.name));
+    const problem = clash
+      ? `tool ${clash.name} is already registered by ${s.parts.find((x) => x.kernel.tools?.some((t) => t.name === clash.name))!.source.manifest.id}`
+      : compatProblem(id, manifest.version, hooks);
+    if (problem) {
+      host.untrack(id, scope);
+      await scope.close();
+      host.report(`plugin ${id} did not join session ${s.id}: ${problem}`);
+      return;
+    }
+    const part: Part = {
+      source: p.source,
+      owner,
+      gates: hooks.filter((h) => h.kind === "gate" && h.point === "tool.gate").length,
+      kernel: this.#confirmed(p, kernelPlugin({
+        id,
+        version: manifest.version,
+        layer: KERNEL_LAYER[layer],
+        tools: tools.map((t) => liveTool(t, owner)),
+        hooks: hooks.map((h) => liveHook(h, owner)),
+      })),
+    };
+    s.parts.push(part);
+  }
+
+  /** 项目层插件交给内核的插件要用确认时拿到的 mark 标记，否则内核拒绝整个会话 */
+  #confirmed(p: { source: PluginSource; mark?: (p: Plugin) => Plugin }, plugin: Plugin): Plugin {
+    if (p.source.layer !== "project") return plugin;
+    if (!p.mark) throw new Error(`plugin ${p.source.manifest.id}: project plugin was not confirmed`);
+    return p.mark(plugin);
+  }
+
+  /** 兜底关卡：本会话里没有任何仍然有效的 tool.gate 时，拒绝非只读工具（第 7 节） */
+  #corePlugin(s: LiveSession): Plugin {
+    const gate = (call: { tool: { effect: string } }): GateResult => {
+      const guarded = s.parts.some((p) => p.gates > 0 && !p.owner.scope.closed);
+      return guarded || call.tool.effect === "read" ? { decision: "abstain" } : { decision: "deny", reason: NO_APPROVAL_REASON };
+    };
+    return kernelPlugin({ id: CORE_PLUGIN_ID, version: API_VERSION, layer: "distro", hooks: [{ kind: "gate", point: "tool.gate", fn: gate }] });
+  }
+
+  /** 离开会话：中止正在跑的工作，等它停下，detach，关闭插件的会话作用域 */
+  async #leave(s: LiveSession): Promise<void> {
+    s.abort();
+    await s.idle();
+    try {
+      await s.rt.detach();
+    } catch (e) {
+      this.#host.report(`session ${s.id}: detach failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    await this.#closeParts(s);
+  }
+
+  async #closeParts(s: LiveSession): Promise<void> {
+    for (const p of [...s.parts].reverse()) {
+      this.#host.untrack(p.owner.plugin, p.owner.scope);
+      for (const e of await p.owner.scope.close()) this.#host.report(e instanceof Error ? e.message : String(e));
+    }
+  }
+}
+
+function compatProblem(id: string, version: string, hooks: LocalHookSpec[]): string | undefined {
+  try {
+    checkCompat(kernelPlugin({ id, version, hooks }));
+    return undefined;
+  } catch (e) {
+    return e instanceof Error ? e.message : String(e);
+  }
+}
+
+/** 插件的工具：以插件身份执行；插件被隔离后返回错误结果（由内核转成 tool_result） */
+function liveTool(t: Tool, owner: Owner): Tool {
+  return { ...t, execute: (input, ctx) => invoke(owner, `tool ${t.name}`, () => t.execute(input, ctx)) };
+}
+
+/**
+ * 插件的 hook：以插件身份执行。插件被隔离（作用域关闭）后这个 hook 视为不存在：gate 弃权、transform 不改、
+ * observe 不做事。审批插件被隔离时，兜底关卡随之生效，所以弃权不会放行写操作
+ */
+function liveHook(h: LocalHookSpec, owner: Owner): LocalHookSpec {
+  const fn = h.fn as (payload: unknown, ctx: unknown) => unknown;
+  const wrapped = (payload: unknown, ctx: unknown) => {
+    if (owner.scope.closed) return h.kind === "gate" ? { decision: "abstain" } : undefined;
+    return ambient.run(owner, () => fn(payload, ctx));
+  };
+  return { ...h, fn: wrapped } as LocalHookSpec;
+}
