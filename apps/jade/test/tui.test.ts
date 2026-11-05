@@ -265,7 +265,7 @@ describe("model configuration", () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "jade-models-"));
     const envFile = path.join(dir, ".env");
     const modelsFile = path.join(dir, "models.json");
-    const keys = ["JADE_PROVIDER", "OPENAI_COMPAT_BASE_URL", "OPENAI_COMPAT_API_KEY", "OPENAI_COMPAT_MODEL", "JADE_MAX_TOKENS", "JADE_EFFORT", "JADE_CONTEXT_WINDOW", "OPENAI_COMPAT_EXTRA_BODY"];
+    const keys = ["JADE_PROVIDER", "OPENAI_COMPAT_BASE_URL", "OPENAI_COMPAT_API_KEY", "OPENAI_COMPAT_MODEL", "JADE_MAX_TOKENS", "JADE_EFFORT", "JADE_CONTEXT_WINDOW", "OPENAI_COMPAT_EXTRA_BODY", "JADE_VISION"];
     const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
     try {
       for (const k of keys) delete process.env[k];
