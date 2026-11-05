@@ -50,6 +50,8 @@ export interface SessionHost {
   active(): { source: PluginSource; module: PluginModule; owner: Owner; mark?: (p: Plugin) => Plugin }[];
   /** 以 owner 的身份取服务；核心自己取时 owner 是核心 */
   service<T extends object>(name: string, caller: Owner): T | undefined;
+  /** 服务的提供者 id */
+  provider(name: string): string | undefined;
   core: Owner;
   /** 插件的会话作用域：宿主隔离插件时一并关闭 */
   track(plugin: string, scope: Scope): void;
@@ -123,6 +125,8 @@ class LiveSession implements Session {
   #kick(): void {
     this.#pump ??= this.#run().finally(() => {
       this.#pump = undefined;
+      // #run 决定退出到这里之间排进来的输入：那时 #pump 还在，send 没有启动新的处理
+      if (this.#queue.length > 0 || this.#after.length > 0) this.#kick();
     });
   }
 
@@ -325,10 +329,17 @@ export class Sessions implements SessionManager {
     return p.mark(plugin);
   }
 
-  /** 兜底关卡：本会话里没有任何仍然有效的 tool.gate 时，拒绝非只读工具（第 7 节） */
+  /**
+   * 兜底关卡（第 7 节）：approval@1 的提供者没有在本会话里注册仍然有效的 tool.gate 时，拒绝非只读工具。
+   * 只认审批插件：其他插件的 gate（例如拒绝重复调用）全部弃权时内核会放行，不能让兜底关卡因此让开。
+   * 项目层的提供者也不算：克隆的仓库不能放宽审批
+   */
   #corePlugin(s: LiveSession): Plugin {
     const gate = (call: { tool: { effect: string } }): GateResult => {
-      const guarded = s.parts.some((p) => p.gates > 0 && !p.owner.scope.closed);
+      const approval = this.#host.provider("approval@1");
+      const guarded = s.parts.some(
+        (p) => p.gates > 0 && !p.owner.scope.closed && p.source.manifest.id === approval && p.source.layer !== "project",
+      );
       return guarded || call.tool.effect === "read" ? { decision: "abstain" } : { decision: "deny", reason: NO_APPROVAL_REASON };
     };
     return kernelPlugin({ id: CORE_PLUGIN_ID, version: API_VERSION, layer: "distro", hooks: [{ kind: "gate", point: "tool.gate", fn: gate }] });

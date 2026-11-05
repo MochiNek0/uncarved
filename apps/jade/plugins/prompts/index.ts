@@ -10,9 +10,9 @@ export interface Prompts {
   /**
    * 往系统提示词里加一段，排在主体、环境信息和指令文件之后，返回撤销函数；调用方的作用域关闭时自动撤销。
    * stable（默认 true）的段落排在 volatile 的前面：会变的段落放在后面，前面的才能命中提示缓存。
-   * 项目层插件加的段落标为不可信
+   * 项目层插件加的段落标为不可信；untrusted 为 true 时也标为不可信（内容来自外部，例如 MCP 服务的说明、仓库里的 skill）
    */
-  add(section: { text: string; stable?: boolean }): () => void;
+  add(section: { text: string; stable?: boolean; untrusted?: boolean }): () => void;
 }
 
 interface Section {
@@ -34,9 +34,9 @@ function segment(text: string, trust: SystemSegment["trust"] = "trusted", stabil
 export default definePlugin({
   process(ctx) {
     ctx.provide("prompts@1", (caller): Prompts => ({
-      add({ text, stable = true }) {
+      add({ text, stable = true, untrusted = false }) {
         if (typeof text !== "string" || !text) throw new Error("prompts.add: text must be a non-empty string");
-        const s: Section = { plugin: caller.plugin, text, stable, trusted: caller.layer !== "project" };
+        const s: Section = { plugin: caller.plugin, text, stable, trusted: caller.layer !== "project" && untrusted !== true };
         sections.push(s);
         const remove = () => {
           const i = sections.indexOf(s);

@@ -1,6 +1,6 @@
 # 设计：jade
 
-> 状态：草案；第 11 节第 1–6 步（核心插件系统、会话、最小发行版、项目层插件的确认、进程外插件、TUI 和注册表插件）已实现，见 `apps/jade` · 2026-11-05
+> 状态：草案；第 11 节第 1–6 步（核心插件系统、会话、最小发行版、项目层插件的确认、进程外插件、TUI 和注册表插件）已实现，第 7 步大部分完成，见 `apps/jade` · 2026-11-06
 >
 > 范围：从零重写 jade 层（`apps/jade`）。旧 jade（0.1.3）已归档到 `.archive/jade`，下文的"旧 jade"和旧文件路径都指那里。uncarved 内核原则上不动；实现过程中发现内核缺的东西，记在第 10 节，逐项决定进不进内核。
 >
@@ -60,7 +60,7 @@
 | 服务注册 | 一个服务名只有一个提供者；冲突在激活前按规则裁决（3.3） |
 | 膜 | 所有跨插件调用经过它：归属、超时、取消、过期检查、错误隔离 |
 | 会话 | 创建、恢复、切换 uncarved `Runtime`，作为一个事务（4.2） |
-| 兜底关卡 | 会话里没有任何插件注册 `tool.gate` 时，拒绝非只读工具（第 7 节） |
+| 兜底关卡 | `approval@1` 的提供者没有在会话里注册 `tool.gate` 时，拒绝非只读工具（第 7 节） |
 | 救援 CLI | `jade plugins list|enable|disable|doctor`、`jade --safe`：都不执行第三方插件代码 |
 
 ### 3.2 核心不做什么
@@ -258,7 +258,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 审批是普通插件 `jade/approval`：它注册 `tool.gate`，并通过 `ui@1` 弹审批对话框。不需要任何特权，安全性靠三条规则：
 
 1. **拒绝优先**（宪法 I-7）：其他插件的 gate 只能让审批更严，不能推翻拒绝。
-2. **兜底关卡**：一个会话里没有任何插件注册 `tool.gate` 时，核心拒绝所有 `effect` 不是 `read` 的工具调用。审批插件坏掉、被停用，结果是"什么都改不了"，而不是"什么都放行"。（uncarved 默认在没有 gate 时放行，这条由 jade 核心补上。）
+2. **兜底关卡**：`approval@1` 的提供者（不能是项目层插件）没有在会话里注册仍然有效的 `tool.gate` 时，核心拒绝所有 `effect` 不是 `read` 的工具调用。审批插件坏掉、被停用、被隔离，结果是"什么都改不了"，而不是"什么都放行"。（uncarved 在所有 gate 弃权时放行，这条由 jade 核心补上。）只认审批服务的提供者，是因为别的插件也会注册 gate（例如 `jade/repeats` 拒绝重复调用），它们平时弃权；若按"有任何 gate"判断，审批插件停用后兜底关卡就失效了。
 3. **层级**：
    - 项目层插件加载前要用户确认（沿用内核的信任机制，经 `importProjectModule`）。确认方式由启动核心的入口经 `HostOptions.trust` 传入；没有确认方式时（例如非交互运行）不加载带代码的项目层插件。用户拒绝记为 `untrusted`，不计入连续崩溃；
    - 项目层不能代替用户层或 bundled 的服务提供者（3.3），所以克隆的仓库换不掉你的审批、你的模型配置、你的前端；
@@ -285,15 +285,21 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 | `jade/keys` | `keys@1`：`register`、`get`、`list`；`shift+tab` 也可以注册 | — | 快捷键 |
 | `jade/renderers` | `renderers@1`：`tool`、`event`、`forTool`、`forEvent` | — | `ToolRenderer`、`EventRenderer`。`jade/fs`、`jade/shell` 为自己的工具登记，`jade/approval` 用工具的 `preview` 作审批对话框的内容 |
 | `jade/models` | `provider@1`、`models@1`（`current`、`complete`、`list`） | `ui@1`（可选） | `provider.ts`、`ui/configure.ts` |
-| `jade/approval` | `approval@1`（`mode`、`setMode`）、gate | `ui@1`（可选：没有或不能提问时，要问的调用一律拒绝） | `plugins/policy.ts` 的审批部分 |
+| `jade/approval` | `approval@1`（`mode`、`setMode`、`allowRead`：登记不用问就能读的目录，项目层插件不能用）、gate | `ui@1`（可选：没有或不能提问时，要问的调用一律拒绝） | `plugins/policy.ts` 的审批部分 |
 | `jade/modes` | `modes@1`（`current`、`set`、`cycle`、`subscribe`），Shift+Tab、`/mode` | `approval@1`；可选 `keys@1`、`commands@1` | Shift+Tab、`/mode`。计划模式的"批准计划后开始改"还没移植 |
 | `jade/sessions` | 命令 `/clear` `/resume` `/retry`；会话索引 `$JADE_HOME/state/sessions.jsonl` | `commands@1` | `plugins/sessions.ts`、`session-lifecycle.ts` |
-| `jade/prompts` | `prompts@1`（其他插件往系统提示词里加段落，项目层插件加的标为不可信） | `models@1`（可选，写上当前模型） | `plugins/prompts.ts` |
-| `jade/fs`、`jade/shell`、`jade/web`、`jade/todo`、`jade/ask` | 工具 | `ui@1`（`ask` 需要）、`renderers@1`（可选） | `tools/*` |
-| `jade/task` | 工具 | `models@1` | `tools/task.ts` |
-| `jade/compact` | hook、`/compact` | `models@1` | `plugins/compact.ts` |
-| `jade/mcp`、`jade/skills`、`jade/memory`、`jade/checks`、`jade/undo` | 工具、命令 | 各自 | 同名 |
-| `jade/continue`、`jade/mentions`、`jade/repeats`、`jade/budget` | hook、`session.afterTurn` | — | 同名 |
+| `jade/prompts` | `prompts@1`（其他插件往系统提示词里加段落；项目层插件加的、或标了 `untrusted` 的段落为不可信） | `models@1`（可选，写上当前模型） | `plugins/prompts.ts` |
+| `jade/fs`、`jade/shell` | 工具 | `renderers@1`、`prompts@1`（可选）；fs 可选 `task@1`（把只读工具另建一套给子 Agent） | `tools/*` |
+| `jade/web` | `web_fetch`、`web_search`、`/search` | 可选 `ui@1`、`prompts@1`、`commands@1`、`renderers@1` | `tools/web.ts`。截图工具未移植 |
+| `jade/todo`、`jade/ask` | 工具 | `ask` 需要 `ui@1`，不能提问时不注册工具 | `tools/todo.ts`、`tools/ask.ts` |
+| `jade/task` | `task` 工具、`task@1`（`tool`：其他插件给子 Agent 登记只读工具） | `models@1` | `tools/task.ts`。子 Agent 是嵌套的 `Runtime`，日志在内存里，不关联到父会话 |
+| `jade/compact` | `context.project` 里清理旧输出、总结；`/compact`；上下文溢出后压缩并经 `afterTurn` 重试 | `models@1` | `plugins/compact.ts` |
+| `jade/mcp` | MCP 服务的工具、`/mcp`；项目层服务启动前确认（`$JADE_HOME/trust.jsonl`） | 可选 `ui@1`、`commands@1`、`prompts@1`、`task@1` | `mcp.ts`。插件自带的 MCP 配置（旧的 PluginBundle）没有了 |
+| `jade/skills` | `skill` 工具、`/skills`、`/<skill 名>`；skill 目录经 `approval@1.allowRead` 可直接读 | 可选 | `skills.ts` |
+| `jade/checks` | 改文件后在 `context.project` 里跑项目检查、`/checks`；命令第一次运行前确认 | 可选 `ui@1`、`approval@1` | `plugins/checks.ts` |
+| `jade/memory`、`jade/undo` | `memory` 工具和 `/memory`；`/undo`（`tool.before`/`tool.after` 记快照） | 可选 | `memory.ts`、`tools/checkpoint.ts` |
+| `jade/mentions` | 在 `context.project` 里把 `@` 引用的文件附到那条用户消息上 | — | `mentions.ts`。附上的内容不算 `read_file` 读过 |
+| `jade/continue`、`jade/repeats`、`jade/budget` | 截断后续写（`afterTurn`）；重复调用；每轮步数上限 | — | `plugins/turns.ts`、`repeats.ts`、`budget.ts` |
 
 几条值得注意的变化：
 
@@ -336,6 +342,9 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 6. **TUI 和注册表插件**：`jade/tui`、`jade/commands`、`jade/keys`、`jade/renderers`、`jade/modes`、`jade/sessions`。
    已完成：`test/tui-frontend.test.ts` 用假终端和假模型跑真实的 bundled 插件：输入消息、在审批对话框里批准（预览是 `jade/fs` 的 diff）、看到回复、`/mode`、`/help`、`/exit`。`test/registries.test.ts` 覆盖注册、撤销、保留键、`/clear`、`/resume`。暂缺：`/model`（模型配置界面）、`/plugins`、`@` 引用文件的补全、`--continue`、插件在状态栏显示自己的段落、`ctx.input`（改输入框）。
 7. **其余功能插件**逐个移植。每移植一个，都检查它没有用到第三方拿不到的东西。
+   大部分已完成：web、todo、ask、task、compact、mcp、skills、checks、memory、undo、mentions、continue、repeats、budget，各有测试（`test/<插件>.test.ts`）。期间核心改了两处：会话队列的竞争（上一条 `send` 刚 resolve 就再 `send`，新输入没人处理），兜底关卡只认 `approval@1` 的提供者（见第 7 节）。
+   暂缺：auto 模式的模型审查（旧 `plugins/review.ts`）、截图工具、计划模式的"批准计划后开始改"、插件的安装和更新（旧 `plugins/install.ts`、`update.ts`）。
+   移植中发现的缺口，以后再定：命令拿不到会话日志，也没有"给模型留一句说明"的接口（memory、undo 各自在 `context.project` 里附说明，`/undo` 的已撤销记录存在 `$JADE_HOME/checkpoints`）；子 Agent 的日志不能关联到父会话；`jade/checks` 复制了 jade/shell 找 shell、杀进程树的代码（可以由 jade/shell 提供 `shell@1`）；web 的只读工具还没经 `task@1` 给子 Agent。
 8. ~~功能对齐后改名为 jade~~：已提前完成（2026-11-05）。旧 jade 归档到 `.archive/jade`，新实现直接占用 `apps/jade` 和 `jade` 命令；功能对齐前，jade 只是开发中的版本。
 
 ## 附录 A：参考调研摘要

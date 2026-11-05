@@ -3,6 +3,7 @@
 // 没有这个插件（停用、坏掉、被隔离）时，核心的兜底关卡拒绝所有非只读工具（第 7 节），所以这里出错不会放行。
 // 用户选的"总是允许"记进日志（derived），恢复会话后仍然有效；模式是进程级的，来自配置，可以经 approval@1 改。
 
+import path from "node:path";
 import type { GatedToolCall } from "uncarved";
 import { definePlugin, type UI } from "../../src/api.ts";
 import type { Renderers } from "../renderers/index.ts";
@@ -12,6 +13,8 @@ import { describeRule, MODES, policy, type AllowRule, type Mode } from "./policy
 export interface Approval {
   mode(): Mode;
   setMode(mode: Mode): void;
+  /** 读这个目录（绝对路径）里的文件不用问，例如 skill 的目录。返回撤销函数，调用方的作用域关闭时自动撤销。项目层插件不能用 */
+  allowRead(dir: string): () => void;
 }
 
 /** derived 里保存"总是允许"规则的键 */
@@ -25,23 +28,37 @@ const PREVIEW_TIMEOUT_MS = 5000;
 let mode: Mode = "ask";
 /** 配置里写错的模式：第一个会话打开时告诉用户（process 里可能还拿不到 ui@1：它的提供者可能排在后面激活） */
 let badMode: string | undefined;
+/** 经 allowRead 登记的目录；policy 每次判断时读它 */
+const readRoots: string[] = [];
 
 export default definePlugin({
   process(ctx) {
     const configured = ctx.config.mode;
     if (typeof configured === "string" && (MODES as readonly string[]).includes(configured)) mode = configured as Mode;
     else if (configured !== undefined) badMode = JSON.stringify(configured);
-    ctx.provide("approval@1", {
+    ctx.provide("approval@1", (caller): Approval => ({
       mode: () => mode,
       setMode(next: Mode) {
         if (!(MODES as readonly string[]).includes(next)) throw new Error(`mode must be one of ${MODES.join(", ")}`);
         mode = next;
       },
-    } satisfies Approval);
+      allowRead(dir: string) {
+        if (caller.layer === "project") throw new Error("approval.allowRead: project plugins cannot widen what runs without asking");
+        if (typeof dir !== "string" || !path.isAbsolute(dir)) throw new Error("approval.allowRead: dir must be an absolute path");
+        const root = path.resolve(dir);
+        readRoots.push(root);
+        const remove = () => {
+          const i = readRoots.indexOf(root);
+          if (i !== -1) readRoots.splice(i, 1);
+        };
+        caller.onDispose(remove);
+        return remove;
+      },
+    }));
   },
 
   session(ctx) {
-    const rules = policy({ cwd: ctx.cwd });
+    const rules = policy({ cwd: ctx.cwd, readRoots });
     const ui = ctx.service<UI>("ui@1");
     if (badMode !== undefined) {
       ui?.notify(`jade/approval: mode must be one of ${MODES.join(", ")}, got ${badMode}; using ask`, "warning");

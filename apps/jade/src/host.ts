@@ -188,6 +188,7 @@ export class PluginHost {
       core: this.#core,
       active: () => this.#active,
       service: (name, caller) => this.#handle(name, caller),
+      provider: (name) => this.plan.providers.get(name),
       track: (plugin, scope) => this.#active.find((a) => a.source.manifest.id === plugin)?.sessions.add(scope),
       untrack: (plugin, scope) => this.#active.find((a) => a.source.manifest.id === plugin)?.sessions.delete(scope),
       fault: (plugin, reason) => {

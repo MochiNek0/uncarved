@@ -44,7 +44,8 @@ const TOOLS = `export default { async session(ctx) {
   await ctx.effect(() => () => globalThis.__log.push("tools closed " + ctx.session.id));
 } };`;
 
-const ALLOW_ALL = `export default { session(ctx) {
+// 审批插件：提供 approval@1，gate 全部放行
+const ALLOW_ALL = `export default { process(ctx) { ctx.provide("approval@1", {}); }, session(ctx) {
   ctx.kernel.hook({ kind: "gate", point: "tool.gate", fn: () => ({ decision: "allow" }) });
 } };`;
 
@@ -81,7 +82,7 @@ describe("approval fallback", () => {
   });
 
   test("with a gate plugin, the fallback steps aside", async () => {
-    const { host } = await setup((w) => w.plugin("bundled", { id: "approval" }, ALLOW_ALL));
+    const { host } = await setup((w) => w.plugin("bundled", { id: "approval", provides: ["approval@1"] }, ALLOW_ALL));
     g.__script!.push(call(use("t1", "poke")), say("done"));
     const s = await host.sessions.open();
     await s.send(msg("go"));
@@ -89,8 +90,19 @@ describe("approval fallback", () => {
     await host.close();
   });
 
+  test("a gate from a plugin that is not the approval provider does not make the fallback step aside", async () => {
+    // 其他插件的 gate 弃权时内核放行；兜底关卡只为 approval@1 的提供者让开
+    const ABSTAIN = `export default { session(ctx) { ctx.kernel.hook({ kind: "gate", point: "tool.gate", fn: () => ({ decision: "abstain" }) }); } };`;
+    const { host } = await setup((w) => w.plugin("bundled", { id: "repeats" }, ABSTAIN));
+    g.__script!.push(call(use("t1", "poke")), say("done"));
+    const s = await host.sessions.open();
+    await s.send(msg("go"));
+    expect(results(s.state).t1).toEqual([true, NO_APPROVAL_REASON]);
+    await host.close();
+  });
+
   test("a quarantined approval plugin falls back to denying writes, not allowing them", async () => {
-    const { host } = await setup((w) => w.plugin("bundled", { id: "approval" }, ALLOW_ALL));
+    const { host } = await setup((w) => w.plugin("bundled", { id: "approval", provides: ["approval@1"] }, ALLOW_ALL));
     g.__script!.push(call(use("t1", "poke")), say("done"));
     const s = await host.sessions.open();
     await host.quarantine("approval", "test");
@@ -101,7 +113,7 @@ describe("approval fallback", () => {
   });
 
   test("a quarantined plugin's tools return errors instead of running", async () => {
-    const { host } = await setup((w) => w.plugin("bundled", { id: "approval" }, ALLOW_ALL));
+    const { host } = await setup((w) => w.plugin("bundled", { id: "approval", provides: ["approval@1"] }, ALLOW_ALL));
     g.__script!.push(call(use("t1", "peek")), say("done"));
     const s = await host.sessions.open();
     await host.quarantine("tools", "test");
@@ -157,6 +169,17 @@ describe("afterTurn and send", () => {
     g.__script!.push(say("a"), say("b"));
     const s = await host.sessions.open();
     await Promise.all([s.send(msg("one")), s.send(msg("two"))]);
+    expect(s.state.messages.length).toBe(4);
+    await host.close();
+  });
+
+  test("an input sent right after the previous send resolves is still processed", async () => {
+    // 前一条的处理循环已决定退出、还没清掉时排进来的输入，不能没人处理
+    const { host } = await setup();
+    g.__script!.push(say("a"), say("b"));
+    const s = await host.sessions.open();
+    await s.send(msg("one"));
+    await s.send(msg("two"));
     expect(s.state.messages.length).toBe(4);
     await host.close();
   });

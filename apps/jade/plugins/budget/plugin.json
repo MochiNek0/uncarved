@@ -1,0 +1,13 @@
+{
+  "id": "jade/budget",
+  "version": "0.2.0",
+  "api": "^1",
+  "entry": "./index.ts",
+  "optional": ["ui@1"],
+  "config": {
+    "maxSteps": {
+      "default": 100,
+      "description": "the most model responses in one turn (after one user message); the turn stops when it is reached"
+    }
+  }
+}

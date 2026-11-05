@@ -2,6 +2,7 @@
 
 import { definePlugin } from "../../src/api.ts";
 import type { Renderers } from "../renderers/index.ts";
+import type { Task } from "../task/index.ts";
 import { fsTools } from "./fs.ts";
 import { fsRenderers } from "./renderers.ts";
 
@@ -23,5 +24,11 @@ export default definePlugin({
       },
     });
     for (const tool of fsTools(ctx.cwd, { responses })) ctx.kernel.tool(tool);
+    // 子 Agent（jade/task）的只读工具：另一套实例，子 Agent 读过的文件不算主会话读过
+    // jade/task 被隔离时它的服务已失效：子 Agent 没有文件工具，文件工具本身照常
+    try {
+      const task = ctx.service<Task>("task@1");
+      if (task) for (const tool of fsTools(ctx.cwd)) if (tool.effect === "read") task.tool(tool);
+    } catch {}
   },
 });
