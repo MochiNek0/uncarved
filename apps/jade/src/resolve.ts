@@ -34,6 +34,8 @@ export interface ResolveOptions {
   safe?: boolean;
   /** 命令行开关，用来选前端 */
   flags?: readonly string[];
+  /** 核心自己提供的服务（jade@1）：插件可以在 requires 里写，别人的 provides 不能占用这个名字 */
+  coreServices?: readonly string[];
 }
 
 const rank = (e: PlanEntry) => LAYERS.indexOf(e.source.layer);
@@ -42,6 +44,7 @@ export function resolve(sources: readonly PluginSource[], opts: ResolveOptions):
   const warnings: string[] = [];
   const entries: PlanEntry[] = [];
   const byId = new Map<string, PlanEntry>();
+  const core = new Set(opts.coreServices ?? []);
   const out = (e: PlanEntry, state: PlanState, reason: string) => {
     e.state = state;
     e.reason = reason;
@@ -57,8 +60,11 @@ export function resolve(sources: readonly PluginSource[], opts: ResolveOptions):
     if (first) out(e, "duplicate", `id ${id} is already used by ${first.source.dir}`);
     else byId.set(id, e);
     if (e.state !== "active") continue;
+    // 核心自己提供的服务不能被插件占用（host 会拒绝 provide，这里提前说明）
+    const taken = (source.manifest.provides ?? []).filter((s) => core.has(s));
     if (opts.safe && source.layer !== "bundled") out(e, "disabled", "safe mode");
     else if (opts.disabled?.has(id)) out(e, "disabled", "disabled in plugins.json");
+    else if (taken.length > 0) out(e, "conflict", `${taken.join(", ")} is provided by jade itself`);
     else if (!satisfiesCaret(api, opts.apiVersion)) out(e, "incompatible", `requires plugin API ${api}, running ${opts.apiVersion}`);
   }
 
@@ -123,7 +129,7 @@ export function resolve(sources: readonly PluginSource[], opts: ResolveOptions):
     let changed = false;
     for (const e of live()) {
       for (const need of e.source.manifest.requires ?? []) {
-        if (providers.has(need)) continue;
+        if (providers.has(need) || core.has(need)) continue;
         const why = entries.find((x) => x.source.manifest.provides?.includes(need));
         out(e, "skipped", why ? `requires ${need}: its provider ${why.source.manifest.id} is ${why.state}` : `requires ${need}, which no plugin provides`);
         changed = true;
@@ -139,6 +145,8 @@ export function resolve(sources: readonly PluginSource[], opts: ResolveOptions):
       continue;
     }
     const map = new Map([...providers].map(([s, e]) => [s, e.source.manifest.id]));
+    // 核心自己提供的服务也列出来，`jade plugins list` 才看得全
+    for (const s of core) map.set(s, "jade");
     const frontend = live().find((e) => e.source.manifest.frontend)?.source.manifest.id;
     return { entries, order: order.sorted.map((e) => e.source), providers: map, warnings, ...(frontend ? { frontend } : {}) };
   }

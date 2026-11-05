@@ -51,6 +51,19 @@ describe("dependencies", () => {
     ]);
     expect(order(p)).toEqual(["approval", "modes", "tui"]);
   });
+
+  test("core services satisfy requires, and no plugin may provide one", () => {
+    const p = plan(
+      [
+        src("bundled", { id: "diagnose", requires: ["jade@1"] }),
+        src("user", { id: "fake-core", provides: ["jade@1"] }),
+      ],
+      { coreServices: ["jade@1"] },
+    );
+    expect(state(p, "diagnose")[0]).toBe("active");
+    expect(p.providers.get("jade@1")).toBe("jade");
+    expect(state(p, "fake-core")).toEqual(["conflict", "jade@1 is provided by jade itself"]);
+  });
 });
 
 describe("service conflicts", () => {

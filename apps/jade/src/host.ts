@@ -10,6 +10,7 @@ import {
   StaleContext,
   type Caller,
   type Disposer,
+  type Jade,
   type PluginLayer,
   type PluginModule,
   type PluginSource,
@@ -54,6 +55,9 @@ export interface HostOptions {
 /** 核心自己的身份：核心通过服务句柄调用插件（例如 frontend@1）时的调用方 */
 const CORE_ID = "jade";
 
+/** 核心自己提供的诊断服务（3.4），名字要和 api.ts 的 Jade 一致 */
+export const JADE_SERVICE = "jade@1";
+
 interface Active {
   source: PluginSource;
   module: PluginModule;
@@ -69,7 +73,7 @@ interface Active {
 export async function planPlugins(opts: Pick<HostOptions, "roots" | "home" | "flags" | "safe">): Promise<{ plan: Plan; broken: BrokenSource[]; faults: Faults }> {
   const [{ sources, broken }, config, faults] = await Promise.all([discover(opts.roots), readPluginsConfig(opts.home), readFaults(opts.home)]);
   const disabled = new Set([...config.disabled, ...faults.autoDisabled]);
-  const plan = resolve(sources, { apiVersion: API_VERSION, disabled, safe: opts.safe, flags: opts.flags });
+  const plan = resolve(sources, { apiVersion: API_VERSION, disabled, safe: opts.safe, flags: opts.flags, coreServices: [JADE_SERVICE] });
   // 区分"用户停用"和"连续崩溃后自动停用"
   for (const e of plan.entries) {
     if (e.state === "disabled" && e.reason !== "safe mode" && !config.disabled.includes(e.source.manifest.id)) {
@@ -103,6 +107,14 @@ export class PluginHost {
     this.#broken = broken;
     this.#faults = faults;
     for (const e of plan.entries) this.#status.set(e.source.dir, { state: e.state, ...(e.reason ? { reason: e.reason } : {}) });
+    // 核心自己的诊断服务：插件在激活阶段就能取（`/plugins` 用它）
+    this.#services.set(JADE_SERVICE, {
+      impl: {
+        plugins: () => this.status().map((p) => ({ ...p })),
+        services: () => [...this.#services].map(([service, e]) => ({ service, provider: e.provider.plugin })).sort((a, b) => a.service.localeCompare(b.service)),
+      } satisfies Jade,
+      provider: this.#core,
+    });
   }
 
   /** 解析并按顺序激活全部插件。单个插件失败不影响其他插件，不抛出 */

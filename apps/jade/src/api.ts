@@ -173,6 +173,27 @@ export interface Frontend {
   run(opts: { argv: readonly string[]; sessions: SessionManager; signal: AbortSignal }): Promise<number | void>;
 }
 
+/**
+ * jade@1：核心自己的诊断信息，由核心提供（不是插件，见 3.4）。只读；`/plugins` 用它，
+ * 和救援 CLI `jade plugins list` 看的是同一份状态
+ */
+export interface Jade {
+  /** 这次启动里每个插件的状态和原因，包括读不出清单的目录 */
+  plugins(): PluginStatus[];
+  /** 服务名 → 提供者 id（含核心自己的 jade@1） */
+  services(): { service: string; provider: string }[];
+}
+
+/** 一个插件在这次启动里的状态（和 PluginState 一致，这里不 import 宿主） */
+export interface PluginStatus {
+  id?: string;
+  version?: string;
+  layer: PluginLayer;
+  dir: string;
+  state: "active" | "disabled" | "duplicate" | "incompatible" | "replaced" | "conflict" | "skipped" | "broken" | "failed" | "untrusted" | "quarantined";
+  reason?: string;
+}
+
 /** ui@1：前端提供的和用户打交道的方式。每个前端都提供它，形状由 jade 定义 */
 export interface UI {
   /** 能不能向用户提问。不能时 select 总是返回 undefined */
