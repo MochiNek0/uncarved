@@ -1,6 +1,6 @@
 # 设计：jade
 
-> 状态：草案；第 11 节第 1–7 步已实现（含从 npm、git 和本地目录安装/更新插件），第 8 步改名已提前完成（2026-11-05）；配置与密钥（第 8 节）里的密钥仍未实现，见正文。
+> 状态：草案；第 11 节第 1–7 步已实现（含从 npm、git 和本地目录安装/更新插件），第 8 步改名已提前完成（2026-11-05）。
 >
 > 范围：从零重写 jade 层（`apps/jade`）。旧 jade（0.1.3）已归档到 `.archive/jade`，下文的"旧 jade"和旧文件路径都指那里。uncarved 内核原则上不动；实现过程中发现内核缺的东西，记在第 10 节，逐项决定进不进内核。
 >
@@ -253,6 +253,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
   | 双向 | `call` | `{ scope, target, method?, args, caller? }`。`target` 是服务名、`"$session"`（`send`、`afterTurn`）或函数句柄 |
   | 双向 | `$/cancel` | 取消一次调用（宿主在工具被中止、hook 超时时发） |
   | 插件 → 宿主 | `provide`、`kernel/tool`、`kernel/hook` | 注册：`provide` 列出方法名，`perCaller` 为 true 时按调用方创建实例；工具的 `execute`、hook 的 `fn` 是函数句柄 |
+  | 插件 → 宿主 | `secrets/get`、`secrets/set` | 读写这个插件自己的密钥（第 8 节）：`{ scope, key, value? }`，`value` 为 null 时删除；宿主按插件 id 取，参数里没有插件 id |
 - 值里的函数表示成句柄 `{ "$fn": id }`，对方用 `call` 调用。句柄属于一个作用域，作用域关闭后失效。函数参数照样过膜：插件交给注册表的回调归插件，出错归它，插件关闭后失效。
 - 加一个新服务不需要改协议：只要它的方法参数和返回值能 JSON 序列化（函数用句柄表示）就能跨进程用。不能序列化的服务（例如要传 React 组件的 TUI 扩展）在清单里标 `"local": true`，进程外插件依赖它时直接报不兼容。（`local` 还没实现，等 `jade/tui` 出现时一起做。）
 - 内核 hook 用 uncarved 的 `RemoteHookSpec`：插件声明 `reads`、`writes`、`timeoutMs`，字段裁剪、回复检查、超时都由内核保证。`ctx.kernel.hook` 因此也接受 `RemoteHookSpec`。
@@ -278,7 +279,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 - 每个插件有自己的配置段。`plugin.json` 的 `config` 列出键：`{ "mode": { "default": "ask", "description": "…", "project": false } }`。配置**按插件、按键合并**：清单里的默认值 < 用户 `$JADE_HOME/config.json` < 项目 `.jade/config.json`，两个文件都是 `{ "<插件 id>": { "<键>": 值 } }`。不整段覆盖。插件从 `ctx.config` 读，进程运行期间不变。
 - 项目层的文件只能设置项目层插件的键，和清单里标了 `"project": true` 的键；其余的忽略并告诉用户一次。所以克隆的仓库改不了你的审批模式。
 - 暂不做 JSON Schema 校验，插件自己检查值（例如 `jade/approval` 遇到不认识的模式时提示并用 `ask`）。
-- 密钥（未实现）：`ctx.secrets.get/set`，按插件 id 分隔存储，插件只能读写自己的。不放进配置文件，也不放进环境变量传给进程外插件（进程外插件经 `call` 读自己的密钥）。在那之前 `jade/models` 沿用旧 jade 的 `$JADE_HOME/.env`（shell 里的环境变量优先），用户已有的配置不用改；`/model` 写的就是这个文件，用过的模型另外记在 `models.json`（不含在配置合并规则里，它是模型插件自己的数据）。
+- 密钥：`ctx.secrets.get/set`（`set(key, undefined)` 删除），按插件 id 分隔存储在 `$JADE_HOME/state/secrets/<id>.json`（id 里的 `/` 编码成 `%2F`），文件 0600（POSIX 上有效）；插件只能读写自己的。这是 API 层的隔离，进程内插件仍能直接读文件，真正的沙箱不在这层。值不放进配置文件，也不通过环境变量传给进程外插件：进程外插件用 `secrets/get`、`secrets/set` 读写同一份，宿主按插件 id 取，参数里没有插件 id。`jade/models` 目前仍沿用旧 jade 的 `$JADE_HOME/.env`（shell 里的环境变量优先），`/model` 写这个文件，用过的模型记在 `models.json`；迁移到 `ctx.secrets` 另做。
 
 ## 9. 现有功能的去向
 

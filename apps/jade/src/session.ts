@@ -28,6 +28,7 @@ import {
   type OpenOptions,
   type PluginModule,
   type PluginSource,
+  type Secrets,
   type Session,
   type SessionContext,
   type SessionManager,
@@ -35,6 +36,7 @@ import {
   type UI,
 } from "./api.ts";
 import { ambient, invoke, Scope, type Owner } from "./membrane.ts";
+import { scopedSecrets } from "./secrets.ts";
 
 /** 核心自己交给内核的插件：兜底关卡 */
 export const CORE_PLUGIN_ID = "jade/core";
@@ -54,6 +56,8 @@ export interface SessionHost {
   service<T extends object>(name: string, caller: Owner): T | undefined;
   /** 服务的提供者 id */
   provider(name: string): string | undefined;
+  /** 一个插件的密钥（第 8 节）；会话 ctx 和进程 ctx 共享同一份 */
+  secrets(plugin: string): Secrets;
   core: Owner;
   /** 插件的会话作用域：宿主隔离插件时一并关闭 */
   track(plugin: string, scope: Scope): void;
@@ -260,6 +264,7 @@ export class Sessions implements SessionManager {
       cwd: host.cwd,
       home: host.home,
       config: host.config(p.source),
+      secrets: scopedSecrets(host.secrets(id), () => scope.closed, id),
       ...(sessionUI
         ? {
             status: (text: string | undefined) => uiCall(() => sessionUI.status(text === undefined ? undefined : String(text))),

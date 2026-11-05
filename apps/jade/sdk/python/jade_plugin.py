@@ -10,6 +10,7 @@ jade 启动插件进程时把这个文件所在的目录加进 PYTHONPATH，插�
     def process(ctx):
         ctx.provide("greeter@1", Greeter())                  # 公开方法都能被其他插件调用
         ctx.service("commands@1").register({"name": "hello", "run": hello})
+        ctx.secrets.set("API_TOKEN", "...")                 # 只有这个插件自己的密钥（第 8 节）
 
     @plugin.session
     def session(ctx):
@@ -79,6 +80,20 @@ class Caller:
         self._disposers.append(fn)
 
 
+class _Secrets:
+    """一个作用域里的 ctx.secrets：按插件 id 隔离，value 为 None 时删除"""
+
+    def __init__(self, conn: "_Connection", scope: str):
+        self._conn = conn
+        self._scope = scope
+
+    def get(self, key: str) -> str | None:
+        return self._conn.request("secrets/get", {"scope": self._scope, "key": key})
+
+    def set(self, key: str, value: str | None) -> None:
+        self._conn.request("secrets/set", {"scope": self._scope, "key": key, "value": value})
+
+
 class _Service:
     """宿主那边一个服务的代理：任何属性都是方法，调用时发给宿主"""
 
@@ -115,6 +130,7 @@ class Context:
         self.cwd: str = params.get("cwd", "")
         self.home: str = params.get("home", "")
         self.config: dict = params.get("config") or {}
+        self.secrets = _Secrets(conn, scope)
         self.session_id: str | None = (params.get("session") or {}).get("id")
         self._on_close: list[Callable[[], Any]] = []
 

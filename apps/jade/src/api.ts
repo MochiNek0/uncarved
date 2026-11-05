@@ -53,6 +53,14 @@ export interface PluginSource {
 /** 清理函数，作用域关闭时逆序执行 */
 export type Disposer = () => void | Promise<void>;
 
+/** 一个插件的密钥（第 8 节）：按插件 id 隔离，插件只能读写自己的那一份 */
+export interface Secrets {
+  /** 读一个密钥；没有时 undefined */
+  get(key: string): Promise<string | undefined>;
+  /** 写一个密钥；value 为 undefined 时删除它 */
+  set(key: string, value: string | undefined): Promise<void>;
+}
+
 /** 进程级和会话级 ctx 共有的部分 */
 export interface ScopeContext {
   /** 本插件的 id */
@@ -65,6 +73,8 @@ export interface ScopeContext {
   readonly home: string;
   /** 本插件的配置：清单里的默认值 < 用户 config.json < 项目 .jade/config.json，按键合并（第 8 节） */
   readonly config: Readonly<Record<string, unknown>>;
+  /** 本插件的密钥：按插件 id 分隔存储，和作用域同生共死（第 8 节） */
+  readonly secrets: Secrets;
   /** 取一个声明在 requires 里的服务，没有声明或没有提供者时抛错 */
   require<T extends object>(service: string): T;
   /** 取一个声明在 requires 或 optional 里的服务，没有提供者时返回 undefined */

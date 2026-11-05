@@ -82,6 +82,12 @@ class Greeter:
     def later(self, callback):
         return callback("from python")
 
+    def set_secret(self, key, value):
+        self._ctx.secrets.set(key, value)
+
+    def get_secret(self, key):
+        return self._ctx.secrets.get(key)
+
     def crash(self):
         os._exit(3)
 
@@ -170,6 +176,23 @@ describe.skipIf(!PYTHON)("out-of-process plugins", () => {
       // 进程内插件调用 Python 的服务；Python 调用进程内插件交给它的回调
       expect(info(host, "js/user").state).toBe("active");
       expect(g.__fromJs).toEqual(["hi, js!", "callback got from python"]);
+    } finally {
+      await host.close();
+    }
+  });
+
+  test("secrets are available over the bridge, scoped to the plugin", async () => {
+    const { w } = await setup({ jsUser: true });
+    const host = await w.start();
+    try {
+      const greeter = host.service<{ set_secret(key: string, value: string | null): Promise<void>; get_secret(key: string): Promise<string | null> }>("greeter@1")!;
+      await greeter.set_secret("TOKEN", "from-python");
+      expect(await greeter.get_secret("TOKEN")).toBe("from-python");
+      expect(await host.secrets("py/greeter").get("TOKEN")).toBe("from-python");
+      expect(await host.secrets("js/user").get("TOKEN")).toBeUndefined();
+      // null 删除
+      await greeter.set_secret("TOKEN", null);
+      expect(await greeter.get_secret("TOKEN")).toBeNull();
     } finally {
       await host.close();
     }

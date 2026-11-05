@@ -15,12 +15,14 @@ import {
   type PluginModule,
   type PluginSource,
   type ProcessContext,
+  type Secrets,
 } from "./api.ts";
 import { pluginConfig, readConfigFile, type ConfigFile } from "./config.ts";
 import { discover, type BrokenSource, type LayerRoot } from "./manifest.ts";
 import { ambient, invoke, Scope, serviceHandle, type Owner } from "./membrane.ts";
 import { startRemote } from "./remote.ts";
 import { resolve, type Plan, type PlanState } from "./resolve.ts";
+import { scopedSecrets, SecretsStore } from "./secrets.ts";
 import { Sessions } from "./session.ts";
 import { countFault, readFaults, readPluginsConfig, writeFaults, type Faults } from "./state.ts";
 
@@ -96,6 +98,8 @@ export class PluginHost {
   /** 按调用方创建的服务实例：调用方作用域 → 服务名 → 实例 */
   readonly #perCaller = new WeakMap<Scope, Map<string, object>>();
   readonly #core: Owner = { plugin: CORE_ID, scope: new Scope(CORE_ID) };
+  /** 每个插件自己的密钥；进程级和会话级 ctx 共享同一个实例 */
+  readonly #secrets: SecretsStore;
   #config: { user: ConfigFile; project: ConfigFile } = { user: {}, project: {} };
   readonly #pluginConfigs = new Map<string, Readonly<Record<string, unknown>>>();
   #sessions: Sessions | undefined;
@@ -106,6 +110,7 @@ export class PluginHost {
     this.plan = plan;
     this.#broken = broken;
     this.#faults = faults;
+    this.#secrets = new SecretsStore(opts.home);
     for (const e of plan.entries) this.#status.set(e.source.dir, { state: e.state, ...(e.reason ? { reason: e.reason } : {}) });
     // 核心自己的诊断服务：插件在激活阶段就能取（`/plugins` 用它）
     this.#services.set(JADE_SERVICE, {
@@ -147,6 +152,11 @@ export class PluginHost {
   /** 核心取服务（例如 frontend@1、provider@1）。没有提供者时返回 undefined */
   service<T extends object>(name: string): T | undefined {
     return this.#handle<T>(name, this.#core);
+  }
+
+  /** 一个插件的密钥；会话级 ctx 也用它，和进程级共享同一份 */
+  secrets(plugin: string): Secrets {
+    return this.#secrets.for(plugin);
   }
 
   /**
@@ -201,6 +211,7 @@ export class PluginHost {
       active: () => this.#active,
       service: (name, caller) => this.#handle(name, caller),
       provider: (name) => this.plan.providers.get(name),
+      secrets: (plugin) => this.#secrets.for(plugin),
       track: (plugin, scope) => this.#active.find((a) => a.source.manifest.id === plugin)?.sessions.add(scope),
       untrack: (plugin, scope) => this.#active.find((a) => a.source.manifest.id === plugin)?.sessions.delete(scope),
       fault: (plugin, reason) => {
@@ -299,6 +310,7 @@ export class PluginHost {
       cwd: this.#cwd,
       home: this.#opts.home,
       config: this.#configOf(source),
+      secrets: scopedSecrets(this.#secrets.for(id), () => owner.scope.closed, id),
       require: <T extends object>(name: string): T => {
         declared(name, [manifest.requires]);
         const h = this.#handle<T>(name, owner);

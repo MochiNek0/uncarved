@@ -3,7 +3,7 @@
 //
 // 协议方法和具体服务无关：
 //   宿主 → 插件：initialize、scope/open、scope/close、call，通知 caller/open、caller/close、$/cancel
-//   插件 → 宿主：provide、kernel/tool、kernel/hook、call（target 是服务名、"$session" 或函数句柄）
+//   插件 → 宿主：provide、kernel/tool、kernel/hook、secrets/get、secrets/set、call（target 是服务名、"$session" 或函数句柄）
 // 值里的函数表示成句柄 { "$fn": id }，对方用 call 调用它。句柄属于一个作用域，作用域关闭后失效。
 
 import { spawn } from "node:child_process";
@@ -209,6 +209,16 @@ export async function startRemote(source: PluginSource, owner: Owner, opts: Remo
           call: (payload: Record<string, unknown>, hctx: HookContext) => rpc.request("call", { scope, target: { $fn: fn }, args: [payload] }, hctx.signal),
         } as RemoteHookSpec;
         (ctx as SessionContext).kernel.hook(spec);
+        return null;
+      }
+      case "secrets/get": {
+        if (typeof p.key !== "string") throw new Error("secrets/get: key must be a string");
+        return (await ctx.secrets.get(p.key)) ?? null;
+      }
+      case "secrets/set": {
+        if (typeof p.key !== "string") throw new Error("secrets/set: key must be a string");
+        if (p.value !== null && typeof p.value !== "string") throw new Error("secrets/set: value must be a string or null");
+        await ctx.secrets.set(p.key, p.value === null ? undefined : p.value);
         return null;
       }
       case "call": {
