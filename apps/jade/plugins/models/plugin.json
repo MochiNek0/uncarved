@@ -4,5 +4,5 @@
   "api": "^1",
   "entry": "./index.ts",
   "provides": ["provider@1", "models@1"],
-  "optional": ["ui@1"]
+  "optional": ["ui@1", "commands@1"]
 }

@@ -273,7 +273,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 - 每个插件有自己的配置段。`plugin.json` 的 `config` 列出键：`{ "mode": { "default": "ask", "description": "…", "project": false } }`。配置**按插件、按键合并**：清单里的默认值 < 用户 `$JADE_HOME/config.json` < 项目 `.jade/config.json`，两个文件都是 `{ "<插件 id>": { "<键>": 值 } }`。不整段覆盖。插件从 `ctx.config` 读，进程运行期间不变。
 - 项目层的文件只能设置项目层插件的键，和清单里标了 `"project": true` 的键；其余的忽略并告诉用户一次。所以克隆的仓库改不了你的审批模式。
 - 暂不做 JSON Schema 校验，插件自己检查值（例如 `jade/approval` 遇到不认识的模式时提示并用 `ask`）。
-- 密钥（未实现）：`ctx.secrets.get/set`，按插件 id 分隔存储，插件只能读写自己的。不放进配置文件，也不放进环境变量传给进程外插件（进程外插件经 `call` 读自己的密钥）。在那之前 `jade/models` 沿用旧 jade 的 `$JADE_HOME/.env`（shell 里的环境变量优先），用户已有的配置不用改。
+- 密钥（未实现）：`ctx.secrets.get/set`，按插件 id 分隔存储，插件只能读写自己的。不放进配置文件，也不放进环境变量传给进程外插件（进程外插件经 `call` 读自己的密钥）。在那之前 `jade/models` 沿用旧 jade 的 `$JADE_HOME/.env`（shell 里的环境变量优先），用户已有的配置不用改；`/model` 写的就是这个文件，用过的模型另外记在 `models.json`（不含在配置合并规则里，它是模型插件自己的数据）。
 
 ## 9. 现有功能的去向
 
@@ -286,7 +286,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 | `jade/commands` | `commands@1`：`register`、`get`、`list`。只登记不执行，前端带着 `{ signal, ui, sessions, print }` 调用 `run` | — | 插件命令（`PluginCommand`）。自定义命令（Markdown 文件）以后由单独的插件注册进来 |
 | `jade/keys` | `keys@1`：`register`、`get`、`list`；`shift+tab` 也可以注册 | — | 快捷键 |
 | `jade/renderers` | `renderers@1`：`tool`、`event`、`forTool`、`forEvent` | — | `ToolRenderer`、`EventRenderer`。`jade/fs`、`jade/shell` 为自己的工具登记，`jade/approval` 用工具的 `preview` 作审批对话框的内容 |
-| `jade/models` | `provider@1`、`models@1`（`current`、`complete`、`list`） | `ui@1`（可选） | `provider.ts`、`ui/configure.ts` |
+| `jade/models` | `provider@1`、`models@1`（`current`、`complete`、`list`、`subscribe`）；`/model`：切换保存过的模型、改当前模型的设置、加一个模型；用过的模型记在 `$JADE_HOME/models.json` | 可选 `ui@1`、`commands@1` | `provider.ts`、`ui/configure.ts` |
 | `jade/approval` | `approval@1`（`mode`、`setMode`、`allowRead`：登记不用问就能读的目录，项目层插件不能用）、gate | `ui@1`（可选：没有或不能提问时，要问的调用一律拒绝） | `plugins/policy.ts` 的审批部分 |
 | `jade/modes` | `modes@1`（`current`、`set`、`cycle`、`subscribe`），Shift+Tab、`/mode` | `approval@1`；可选 `keys@1`、`commands@1` | Shift+Tab、`/mode`。计划模式的"批准计划后开始改"还没移植 |
 | `jade/sessions` | 命令 `/clear` `/resume` `/retry`；会话索引 `$JADE_HOME/state/sessions.jsonl` | `commands@1` | `plugins/sessions.ts`、`session-lifecycle.ts` |
@@ -319,7 +319,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 
 | 项 | 现状 | 倾向 |
 |---|---|---|
-| 会话中途换模型 | `Runtime` 创建时固定 provider | 先在 jade 用一个转发的 Provider 包装解决，不进内核 |
+| 会话中途换模型 | `Runtime` 创建时固定 provider | **已解决，不改内核**：`jade/models` 给核心的 `provider@1` 是一个转发到"当前 provider"的壳，`/model` 换掉里面的实现，下一次请求就用新的。配置建不起 provider 时留着旧的（状态栏和请求都还是旧的） |
 | 无 gate 时默认放行 | 内核规定 | **已解决，不改内核**：jade 核心交给内核一个 `jade/core` 插件，带兜底 gate（第 7 节） |
 | 轮次结束后的调度 | 宿主自己在 `send` resolve 后处理 | **已解决，不改内核**：jade 的会话把输入排队，每轮之后执行 `afterTurn` |
 | 插件在会话中途被隔离 | 内核插件清单在创建时确定 | **已解决，不改内核**：jade 交给内核的 hook 和工具外面包了一层，插件被隔离后 gate 弃权、transform 不改、observe 不做事，工具返回错误。审批插件被隔离时兜底 gate 生效，所以弃权不会放行写操作 |
@@ -342,7 +342,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 5. **进程外插件**：协议和桥。
    验证：Python 写的插件提供一个服务，并注册一条命令。已完成：`test/remote.test.ts` 用 Python 插件提供服务、向进程内插件的注册表注册命令（命令执行中再调用宿主的 `ui@1`）、调用进程内插件给的回调、注册工具和 gate；进程退出时插件被隔离、命令被撤销。也在 Node 下用 `jade -p` 跑通了 Python 插件的工具。
 6. **TUI 和注册表插件**：`jade/tui`、`jade/commands`、`jade/keys`、`jade/renderers`、`jade/modes`、`jade/sessions`。
-   已完成：`test/tui-frontend.test.ts` 用假终端和假模型跑真实的 bundled 插件：输入消息、在审批对话框里批准（预览是 `jade/fs` 的 diff）、看到回复、`/mode`、`/help`、`/exit`、`@` 补全（候选来自 `jade/fs` 的 `listFiles`，发送时由 `jade/mentions` 附上内容）、`--continue`。`test/registries.test.ts` 覆盖注册、撤销、保留键、`/clear`、`/resume`。插件在状态栏显示自己的段落、`ctx.input`（改输入框）已由 `ui@1.session` 提供，见 `test/session-ui.test.ts`。暂缺：`/model`（模型配置界面）、`/plugins`。
+   已完成：`test/tui-frontend.test.ts` 用假终端和假模型跑真实的 bundled 插件：输入消息、在审批对话框里批准（预览是 `jade/fs` 的 diff）、看到回复、`/mode`、`/help`、`/exit`、`@` 补全（候选来自 `jade/fs` 的 `listFiles`，发送时由 `jade/mentions` 附上内容）、`--continue`。`test/registries.test.ts` 覆盖注册、撤销、保留键、`/clear`、`/resume`。插件在状态栏显示自己的段落、`ctx.input`（改输入框）已由 `ui@1.session` 提供，见 `test/session-ui.test.ts`。`/model` 已完成（`test/model.test.ts`）。暂缺：`/plugins`。
 7. **其余功能插件**逐个移植。每移植一个，都检查它没有用到第三方拿不到的东西。
    大部分已完成：web、todo、ask、task、compact、mcp、skills、checks、memory、undo、mentions、continue、repeats、budget，各有测试（`test/<插件>.test.ts`）。期间核心改了两处：会话队列的竞争（上一条 `send` 刚 resolve 就再 `send`，新输入没人处理），兜底关卡只认 `approval@1` 的提供者（见第 7 节）。
    暂缺：auto 模式的模型审查（旧 `plugins/review.ts`）、截图工具、计划模式的"批准计划后开始改"、插件的安装和更新（旧 `plugins/install.ts`、`update.ts`）。

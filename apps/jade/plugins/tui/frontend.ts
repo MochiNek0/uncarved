@@ -270,6 +270,8 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
   }
 
   const offMode = modes?.subscribe((mode) => screen.status({ mode }));
+  // /model 换了配置：状态栏跟着换
+  const offModel = models?.subscribe?.(() => screen.status({ model: models.current()?.model ?? "(no model)" }));
 
   // ---------- 会话 ----------
 
@@ -398,6 +400,7 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
     await work?.catch(() => {});
     keyAbort.abort(new Error("exiting"));
     offMode?.();
+    offModel?.();
     unsubscribe?.();
     await screen.close();
     bridge.detach();
