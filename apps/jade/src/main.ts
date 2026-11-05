@@ -17,7 +17,7 @@ import { FileTrustStore } from "./state.ts";
 const DOUBLE_SIGINT_MS = 2000;
 
 const USAGE = `usage: jade [--safe] [frontend options…]
-       jade plugins [list | enable <id> | disable <id>]
+       jade plugins [list | add <directory> | remove <id> | enable <id> | disable <id>]
 
   --safe        load only the plugins that come with jade
   -v, --version print the version

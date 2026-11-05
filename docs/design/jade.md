@@ -61,7 +61,7 @@
 | 膜 | 所有跨插件调用经过它：归属、超时、取消、过期检查、错误隔离 |
 | 会话 | 创建、恢复、切换 uncarved `Runtime`，作为一个事务（4.2） |
 | 兜底关卡 | `approval@1` 的提供者没有在会话里注册 `tool.gate` 时，拒绝非只读工具（第 7 节） |
-| 救援 CLI | `jade plugins list|enable|disable|doctor`、`jade --safe`：都不执行第三方插件代码 |
+| 救援 CLI | `jade plugins list|add|remove|enable|disable`、`jade --safe`：都不执行第三方插件代码 |
 
 ### 3.2 核心不做什么
 
@@ -232,6 +232,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 
 - **启动顺序**：核心先完成清单解析和依赖计算，再激活插件。任何一个第三方插件失败都不阻止其他插件和前端激活。
 - **安全模式** `jade --safe`：只加载 bundled 插件。救援 CLI 不执行任何插件代码，直接读写 `plugins.json`。
+- **安装**：`jade plugins add <目录>` 把一个带 `plugin.json` 的本地目录复制到 `$JADE_HOME/plugins/<id>`（`/` 写成 `__`），`jade plugins remove <id>` 删掉它；两者都不执行插件代码，安装时顺手清掉它的停用和连续崩溃记录。从 npm 或 git 安装要决定的东西更多（包里的布局、更新时本地改动怎么办），**还没做**：把目录放进去效果一样。
 - **连续崩溃自动停用**：一个插件在连续 3 次启动中都在激活阶段失败或被隔离，核心自动停用它，下次启动时告诉用户，`jade plugins enable <id>` 恢复。记录在 `$JADE_HOME/state/faults.json`。
 - **诊断**：`jade plugins doctor` 列出每个插件的状态（active / failed / skipped / disabled / quarantined）和原因，服务冲突的裁决结果，缺依赖时精确到缺哪个服务。
 
@@ -350,7 +351,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
    已完成：`test/tui-frontend.test.ts` 用假终端和假模型跑真实的 bundled 插件：输入消息、在审批对话框里批准（预览是 `jade/fs` 的 diff）、看到回复、`/mode`、`/help`、`/exit`、`@` 补全（候选来自 `jade/fs` 的 `listFiles`，发送时由 `jade/mentions` 附上内容）、`--continue`。`test/registries.test.ts` 覆盖注册、撤销、保留键、`/clear`、`/resume`。插件在状态栏显示自己的段落、`ctx.input`（改输入框）已由 `ui@1.session` 提供，见 `test/session-ui.test.ts`。`/model` 已完成（`test/model.test.ts`），`/plugins` 由单独的 `jade/plugins` 提供（`test/plugins.test.ts`）。
 7. **其余功能插件**逐个移植。每移植一个，都检查它没有用到第三方拿不到的东西。
    大部分已完成：web、todo、ask、task、compact、mcp、skills、checks、memory、undo、mentions、continue、repeats、budget，各有测试（`test/<插件>.test.ts`）。期间核心改了两处：会话队列的竞争（上一条 `send` 刚 resolve 就再 `send`，新输入没人处理），兜底关卡只认 `approval@1` 的提供者（见第 7 节）。
-   暂缺：插件的安装和更新（旧 `plugins/install.ts`、`update.ts`）。
+   暂缺：从 npm 或 git 安装、更新插件（旧 `plugins/install.ts`、`update.ts`）；本地目录的 `jade plugins add`、`remove` 已经有了（`test/install.test.ts`）。
    移植中发现的缺口，以后再定：命令拿不到会话日志，也没有"给模型留一句说明"的接口（memory、undo 各自在 `context.project` 里附说明，`/undo` 的已撤销记录存在 `$JADE_HOME/checkpoints`）；子 Agent 的日志不能关联到父会话。已经补上的：`jade/checks` 不再复制 jade/shell 找 shell、杀进程树的代码，改由 `shell@1` 提供。
 8. ~~功能对齐后改名为 jade~~：已提前完成（2026-11-05）。旧 jade 归档到 `.archive/jade`，新实现直接占用 `apps/jade` 和 `jade` 命令；功能对齐前，jade 只是开发中的版本。
 
