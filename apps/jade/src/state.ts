@@ -68,8 +68,7 @@ export async function writeFaults(home: string, faults: Faults): Promise<void> {
 }
 
 /** 记一次故障；本次启动里同一个插件只记一次。达到上限时自动停用，返回 true */
-export function countFault(faults: Faults, id: string, reason: string): boolean {
-  const s = faults.streaks[id] ?? { count: 0, last: "" };
+export function countFault(faults: Faults, id: string, reason: string): boolean {  const s = faults.streaks[id] ?? { count: 0, last: "" };
   s.count += 1;
   s.last = reason;
   faults.streaks[id] = s;
@@ -78,6 +77,21 @@ export function countFault(faults: Faults, id: string, reason: string): boolean 
     return true;
   }
   return false;
+}
+
+/** 清掉一个插件的连续崩溃记录（更新后给它一次干净的机会），不动 plugins.json 里的停用记录 */
+export async function forgetFaults(home: string, id: string): Promise<void> {
+  const faults = await readFaults(home);
+  let changed = false;
+  if (faults.streaks[id]) {
+    delete faults.streaks[id];
+    changed = true;
+  }
+  if (faults.autoDisabled.includes(id)) {
+    faults.autoDisabled = faults.autoDisabled.filter((d) => d !== id);
+    changed = true;
+  }
+  if (changed) await writeFaults(home, faults);
 }
 
 /** 项目层插件的确认记录（第 7 节），存在 $JADE_HOME/state/trust.json，按插件目录内容的哈希 */

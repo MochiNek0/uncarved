@@ -1,6 +1,6 @@
 // 发现插件、读取并校验 plugin.json：不执行插件代码（原则 4）。
 
-import { readdir, readFile } from "node:fs/promises";
+import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import type { ConfigKey, Manifest, PluginLayer, PluginSource } from "./api.ts";
 
@@ -22,6 +22,11 @@ const SERVICE = /^[a-z0-9][\w.\-/]*@\d+$/i;
 const RESERVED_IDS: ReadonlySet<string> = new Set(["jade", "jade/core"]);
 const ID = /^[a-z0-9][\w.\-]*(\/[a-z0-9][\w.\-]*)*$/i;
 
+/** 插件 id 的形状；救援 CLI 用它拒绝带路径分隔符或 .. 的 id */
+export function isPluginId(value: string): boolean {
+  return ID.test(value);
+}
+
 /** 按层级顺序发现插件；层级内按目录名排序，结果稳定 */
 export async function discover(roots: LayerRoot[]): Promise<{ sources: PluginSource[]; broken: BrokenSource[] }> {
   const sources: PluginSource[] = [];
@@ -30,12 +35,20 @@ export async function discover(roots: LayerRoot[]): Promise<{ sources: PluginSou
     let names: string[];
     try {
       const entries = await readdir(root, { withFileTypes: true });
-      names = entries.filter((e) => e.isDirectory()).map((e) => e.name).sort();
+      // . 开头的是安装时的临时目录（.staging-*、.old-*），不是插件。
+      // --link 装的是符号链接/junction，Dirent 里不算目录，用 stat 跟过去再判断。
+      names = entries.filter((e) => !e.name.startsWith(".") && (e.isDirectory() || e.isSymbolicLink())).map((e) => e.name).sort();
     } catch {
       continue; // 层级目录不存在：没有插件
     }
     for (const name of names) {
       const dir = path.resolve(root, name);
+      const info = await stat(dir).catch((e: unknown) => e as Error);
+      if (info instanceof Error) {
+        broken.push({ dir, layer, error: `not a readable directory: ${info.message}` });
+        continue;
+      }
+      if (!info.isDirectory()) continue;
       try {
         const raw: unknown = JSON.parse(await readFile(path.join(dir, "plugin.json"), "utf8"));
         sources.push({ manifest: parseManifest(raw), dir, layer });

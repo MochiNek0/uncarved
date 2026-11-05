@@ -17,11 +17,12 @@ import { FileTrustStore } from "./state.ts";
 const DOUBLE_SIGINT_MS = 2000;
 
 const USAGE = `usage: jade [--safe] [frontend options…]
-       jade plugins [list | add <directory> | remove <id> | enable <id> | disable <id>]
+       jade plugins [list | add <source> | update [id…] | remove <id> | enable <id> | disable <id>] [options]
 
   --safe        load only the plugins that come with jade
   -v, --version print the version
 
+Run "jade plugins --help" for the install and update options.
 Everything else is passed to the frontend plugin; see its own --help.`;
 
 const pkgDir = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -48,7 +49,16 @@ export async function main(argv: readonly string[]): Promise<number> {
 
   if (rest[0] === "plugins") {
     try {
-      console.log(await pluginsCommand(rest.slice(1), { roots, home, flags, safe }));
+      console.log(
+        await pluginsCommand(rest.slice(1), {
+          roots,
+          home,
+          flags,
+          safe,
+          trust: new FileTrustStore(path.join(home, "state", "trust.json")),
+          log: (message) => console.error(`jade: ${message}`),
+        }),
+      );
       return 0;
     } catch (e) {
       console.error(e instanceof Error ? e.message : String(e));
