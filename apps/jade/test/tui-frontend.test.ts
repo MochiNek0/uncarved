@@ -12,19 +12,21 @@ import { PluginHost, type Frontend } from "../src/index.ts";
 import { terminal } from "../plugins/tui/frontend.ts";
 
 const BUNDLED = path.resolve(import.meta.dir, "../plugins");
-const g = globalThis as { __script?: unknown[] };
+const g = globalThis as { __script?: unknown[]; __requests?: { messages: { content: { kind: string; text?: string }[] }[] }[] };
 
 let tmp: string[] = [];
 afterEach(async () => {
   delete terminal.io;
   delete g.__script;
+  delete g.__requests;
   for (const d of tmp) await rm(d, { recursive: true, force: true });
   tmp = [];
 });
 
 const MODEL = { by: "model", provider: "scripted", model: "s1" };
 const FAKE_MODEL = `export default { process(ctx) {
-  const provider = { id: "scripted", async complete() {
+  const provider = { id: "scripted", async complete(req) {
+    (globalThis.__requests ??= []).push(structuredClone(req));
     const next = globalThis.__script.shift();
     if (!next) throw new Error("script exhausted");
     return { model: "s1", ...next };
@@ -64,6 +66,97 @@ async function until(check: () => boolean, ms = 5000) {
     await sleep(25);
   }
 }
+
+/** 一个 $JADE_HOME 和工作目录，带假模型插件 */
+async function setup() {
+  const home = realpathSync.native(await mkdtemp(path.join(os.tmpdir(), "jade-tui-")));
+  tmp.push(home);
+  const cwd = path.join(home, "work");
+  await mkdir(cwd);
+  const dir = path.join(home, "plugins", "fake-model");
+  await mkdir(dir, { recursive: true });
+  await writeFile(path.join(dir, "plugin.json"), JSON.stringify({ id: "test/fake-model", version: "1.0.0", api: "^1", entry: "index.mjs", provides: ["provider@1", "models@1"], replaces: ["jade/models"] }));
+  await writeFile(path.join(dir, "index.mjs"), FAKE_MODEL);
+  const start = () =>
+    PluginHost.start({
+      roots: [
+        { layer: "bundled", root: BUNDLED },
+        { layer: "user", root: path.join(home, "plugins") },
+      ],
+      home,
+      cwd,
+      report: () => {},
+    });
+  return { home, cwd, start };
+}
+
+test("--continue resumes the most recent session in this directory", async () => {
+  const { home, start } = await setup();
+  g.__script = [{ content: [{ kind: "text", text: "first answer", origin: MODEL, trust: "trusted" }], stopReason: "end" }];
+
+  const t = fakeTerminal();
+  const first = await start();
+  try {
+    const frontend = first.service<Frontend>("frontend@1")!;
+    const done = frontend.run({ argv: ["hello"], sessions: first.sessions, signal: new AbortController().signal });
+    await until(() => t.output().includes("first answer"));
+    await t.type("/exit");
+    await t.type("\r");
+    expect(await done).toBe(0);
+  } finally {
+    await first.close();
+  }
+
+  // jade/sessions 在收到第一条消息时写下了索引
+  const index = (await readFile(path.join(home, "state", "sessions.jsonl"), "utf8")).trim().split("\n").map((l) => JSON.parse(l) as { id: string; title: string });
+  expect(index.map((e) => e.title)).toEqual(["hello"]);
+
+  const t2 = fakeTerminal();
+  const second = await start();
+  try {
+    const frontend = second.service<Frontend>("frontend@1")!;
+    const done = frontend.run({ argv: ["--continue"], sessions: second.sessions, signal: new AbortController().signal });
+    // 界面顶部写着恢复的是哪个会话
+    await until(() => t2.output().includes(`session ${index[0]!.id}`));
+    await t2.type("/exit");
+    await t2.type("\r");
+    expect(await done).toBe(0);
+  } finally {
+    await second.close();
+  }
+});
+
+test("@ completes a file path, and sending it attaches the file's content", async () => {
+  const { cwd, start } = await setup();
+  await writeFile(path.join(cwd, "readme.md"), "readme says hi\n");
+  g.__script = [{ content: [{ kind: "text", text: "got it", origin: MODEL, trust: "trusted" }], stopReason: "end" }];
+  g.__requests = [];
+
+  const t = fakeTerminal();
+  const host = await start();
+  try {
+    const frontend = host.service<Frontend>("frontend@1")!;
+    const done = frontend.run({ argv: [], sessions: host.sessions, signal: new AbortController().signal });
+    await until(() => t.output().includes("Type / for commands"));
+
+    await t.type("look at @read");
+    // 候选来自工作目录
+    await until(() => t.output().includes("readme.md"));
+    await t.type("\r");
+    await until(() => t.output().includes("look at @readme.md"));
+    await t.type("\r");
+    await until(() => t.output().includes("got it"));
+
+    // jade/mentions 把文件内容附在那条消息上
+    expect(JSON.stringify(g.__requests![0])).toContain("readme says hi");
+
+    await t.type("/exit");
+    await t.type("\r");
+    expect(await done).toBe(0);
+  } finally {
+    await host.close();
+  }
+});
 
 test("a message, an approval dialog, slash commands and /exit through the terminal interface", async () => {
   const home = realpathSync.native(await mkdtemp(path.join(os.tmpdir(), "jade-tui-")));

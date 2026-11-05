@@ -1,5 +1,10 @@
 // @ 引用文件的补全：输入框里打 @ 时找出光标处正在输入的路径、给候选路径排序。
-// 只有纯函数；候选从哪来（列出工作目录的文件）、发送时怎么附上文件内容，由提供补全的一方负责（TuiHandlers.files）。
+// 候选从工作目录来（git 仓库里只看版本控制的，和 glob 一样），发送时附上文件内容由 jade/mentions 负责。
+
+import { display, listFiles } from "../fs/fs.ts";
+
+/** 候选（文件加目录）最多这么多，再多也只是拖慢补全 */
+const MAX_CANDIDATES = 20_000;
 
 /** 光标正在输入的 @ 引用：@ 的下标和已经输入的部分；不在引用里时返回 undefined */
 export function mentionAt(value: string, cursor: number): { start: number; query: string } | undefined {
@@ -39,4 +44,28 @@ function subsequence(text: string, q: string): boolean {
   let i = 0;
   for (const ch of text) if (ch === q[i] && ++i === q.length) return true;
   return false;
+}
+
+/**
+ * @ 补全的候选：工作目录里的文件（git 仓库里只看版本控制的）和它们所在的目录，目录以 / 结尾。
+ * 5 秒还没列完就先给已经找到的（大仓库第一次列得慢，不该让输入框卡住）
+ */
+export async function mentionCandidates(cwd: string, signal: AbortSignal = AbortSignal.timeout(5000)): Promise<string[]> {
+  const files: string[] = [];
+  const dirs = new Set<string>();
+  try {
+    for await (const full of await listFiles(cwd, signal)) {
+      const rel = display(cwd, full);
+      files.push(rel);
+      for (let i = rel.lastIndexOf("/"); i > 0; i = rel.lastIndexOf("/", i - 1)) {
+        const dir = rel.slice(0, i + 1);
+        if (dirs.has(dir)) break;
+        dirs.add(dir);
+      }
+      if (files.length + dirs.size >= MAX_CANDIDATES) break;
+    }
+  } catch {
+    // 列到一半被中止（超时）：用已经找到的
+  }
+  return [...dirs, ...files];
 }

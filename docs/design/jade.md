@@ -281,7 +281,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 
 | 插件 | 提供 | 依赖 | 来自旧 jade |
 |---|---|---|---|
-| `jade/tui` | `frontend@1`（默认）、`ui@1` | `commands@1`、`keys@1`、`renderers@1`；可选 `modes@1`、`models@1` | `ui/*`、`main.ts` 的界面部分（`frontend.ts`）。`tui@1`（local）等第一个要扩展界面的插件出现时再做 |
+| `jade/tui` | `frontend@1`（默认）、`ui@1`（含 `session`：状态栏段落、输入框）；启动参数 `--resume <id>`、`-c/--continue`；`@` 路径补全 | `commands@1`、`keys@1`、`renderers@1`；可选 `modes@1`、`models@1` | `ui/*`、`main.ts` 的界面部分（`frontend.ts`）。`tui@1`（local）等第一个要扩展界面的插件出现时再做 |
 | `jade/print` | `frontend@1`（`-p`）、`ui@1` | — | `-p` 模式 |
 | `jade/commands` | `commands@1`：`register`、`get`、`list`。只登记不执行，前端带着 `{ signal, ui, sessions, print }` 调用 `run` | — | 插件命令（`PluginCommand`）。自定义命令（Markdown 文件）以后由单独的插件注册进来 |
 | `jade/keys` | `keys@1`：`register`、`get`、`list`；`shift+tab` 也可以注册 | — | 快捷键 |
@@ -342,7 +342,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 5. **进程外插件**：协议和桥。
    验证：Python 写的插件提供一个服务，并注册一条命令。已完成：`test/remote.test.ts` 用 Python 插件提供服务、向进程内插件的注册表注册命令（命令执行中再调用宿主的 `ui@1`）、调用进程内插件给的回调、注册工具和 gate；进程退出时插件被隔离、命令被撤销。也在 Node 下用 `jade -p` 跑通了 Python 插件的工具。
 6. **TUI 和注册表插件**：`jade/tui`、`jade/commands`、`jade/keys`、`jade/renderers`、`jade/modes`、`jade/sessions`。
-   已完成：`test/tui-frontend.test.ts` 用假终端和假模型跑真实的 bundled 插件：输入消息、在审批对话框里批准（预览是 `jade/fs` 的 diff）、看到回复、`/mode`、`/help`、`/exit`。`test/registries.test.ts` 覆盖注册、撤销、保留键、`/clear`、`/resume`。暂缺：`/model`（模型配置界面）、`/plugins`、`@` 引用文件的补全、`--continue`。插件在状态栏显示自己的段落、`ctx.input`（改输入框）已由 `ui@1.session` 提供，见 `test/session-ui.test.ts`。
+   已完成：`test/tui-frontend.test.ts` 用假终端和假模型跑真实的 bundled 插件：输入消息、在审批对话框里批准（预览是 `jade/fs` 的 diff）、看到回复、`/mode`、`/help`、`/exit`、`@` 补全（候选来自 `jade/fs` 的 `listFiles`，发送时由 `jade/mentions` 附上内容）、`--continue`。`test/registries.test.ts` 覆盖注册、撤销、保留键、`/clear`、`/resume`。插件在状态栏显示自己的段落、`ctx.input`（改输入框）已由 `ui@1.session` 提供，见 `test/session-ui.test.ts`。暂缺：`/model`（模型配置界面）、`/plugins`。
 7. **其余功能插件**逐个移植。每移植一个，都检查它没有用到第三方拿不到的东西。
    大部分已完成：web、todo、ask、task、compact、mcp、skills、checks、memory、undo、mentions、continue、repeats、budget，各有测试（`test/<插件>.test.ts`）。期间核心改了两处：会话队列的竞争（上一条 `send` 刚 resolve 就再 `send`，新输入没人处理），兜底关卡只认 `approval@1` 的提供者（见第 7 节）。
    暂缺：auto 模式的模型审查（旧 `plugins/review.ts`）、截图工具、计划模式的"批准计划后开始改"、插件的安装和更新（旧 `plugins/install.ts`、`update.ts`）。

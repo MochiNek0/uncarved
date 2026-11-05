@@ -16,13 +16,17 @@ import type { Models } from "../models/index.ts";
 import type { Modes } from "../modes/index.ts";
 import type { Renderers } from "../renderers/index.ts";
 import { InputHistory } from "./history.ts";
+import { mentionCandidates } from "./mentions.ts";
+import { listSessions } from "../sessions/index.ts";
 import { dim, red, safeScreen, yellow, type CommandInfo, type Screen } from "./screen.ts";
 import { transcript, type Transcript } from "./transcript.ts";
 import { tuiScreen } from "./tui.ts";
 
-const USAGE = `usage: jade [prompt] [--resume <session id>]
+const USAGE = `usage: jade [prompt] [--resume <session id> | --continue]
 
 Starts the terminal interface. With a prompt, sends it first.
+  -c, --continue  continue the most recent session in this directory
+  -r, --resume    resume a session by id (inside jade, /resume lists them)
 Run one prompt without the interface: jade -p <prompt>`;
 
 /** 前端自己的命令：帮助和退出。其余命令都来自 commands@1 */
@@ -166,12 +170,13 @@ export function tuiFrontend(services: FrontendServices, bridge: ScreenBridge): F
   };
 }
 
-function parse(argv: readonly string[]): { prompt?: string; resume?: string; help?: boolean } | string {
-  const out: { prompt?: string; resume?: string; help?: boolean } = {};
+function parse(argv: readonly string[]): { prompt?: string; resume?: string; cont?: boolean; help?: boolean } | string {
+  const out: { prompt?: string; resume?: string; cont?: boolean; help?: boolean } = {};
   const words: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (a === "-h" || a === "--help") out.help = true;
+    else if (a === "-c" || a === "--continue") out.cont = true;
     else if (a === "--resume" || a === "-r") {
       const id = argv[++i];
       if (!id) return `${a} needs a session id (inside jade, /resume lists the sessions)`;
@@ -179,6 +184,7 @@ function parse(argv: readonly string[]): { prompt?: string; resume?: string; hel
     } else if (a.startsWith("-")) return `unknown option ${a}`;
     else words.push(a);
   }
+  if (out.cont && out.resume) return "--continue and --resume both pick the session; use one of them";
   if (words.length > 0) out.prompt = words.join(" ");
   return out;
 }
@@ -201,6 +207,12 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
 
   const { cwd, home, commands, keys, renderers, modes, models } = services;
   const sessions = opts.sessions;
+  // --continue：这个目录里最近用过的会话（索引由 jade/sessions 在收到第一条消息时写）
+  const resumed = args.cont ? (await listSessions(path.join(home, "state", "sessions.jsonl"), cwd))[0]?.id : args.resume;
+  if (args.cont && !resumed) {
+    process.stderr.write(`jade: no session to continue in ${cwd}\n`);
+    return 2;
+  }
   const history = new InputHistory(path.join(home, "history.jsonl"), cwd);
   const [past, branch] = await Promise.all([history.load(), gitBranch(cwd)]);
 
@@ -232,6 +244,8 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
           if (ready) onSubmit(text);
           else early.push(text);
         },
+        // 输入 @ 时列工作目录里的文件
+        files: () => mentionCandidates(cwd),
         interrupt: () => ready && interrupt(),
         exit: () => void quit(0),
         cycleMode: () => void key("shift+tab"),
@@ -488,13 +502,13 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
     let opened = false;
     await occupy(async () => {
       try {
-        await manager.open(args.resume ? { resume: args.resume } : {});
+        await manager.open(resumed ? { resume: resumed } : {});
         opened = true;
       } catch (e) {
-        screen.log(red(`[error] ${args.resume ? `could not resume ${args.resume}` : "could not start a session"}: ${errorText(e)}`));
+        screen.log(red(`[error] ${resumed ? `could not resume ${resumed}` : "could not start a session"}: ${errorText(e)}`));
       }
     });
-    if (!opened && args.resume) {
+    if (!opened && resumed) {
       // 恢复不了：新开一个，免得界面里没有会话
       screen.log(dim("Starting a new session instead."));
       await occupy(async () => {
@@ -505,7 +519,7 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
     screen.log(red(`[error] ${errorText(e)}`));
   }
   if (!models?.current()) screen.log(yellow(`No model is configured yet. Put ANTHROPIC_API_KEY=... (or OPENAI_API_KEY=...) in ${path.join(home, ".env")}, then restart jade.`));
-  else if (!args.resume) screen.log(dim("Type / for commands, esc to interrupt."));
+  else if (!resumed) screen.log(dim("Type / for commands, esc to interrupt."));
   ready = true;
   for (const text of [...(args.prompt ? [args.prompt] : []), ...early.splice(0)]) onSubmit(text);
 
