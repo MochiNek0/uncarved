@@ -18,6 +18,8 @@ export interface ReviewOptions {
   messages: () => readonly Message[];
   /** 审查最多等多久，默认 60 秒；超时后转给用户 */
   timeoutMs?: number;
+  /** 第一次请求多久还没有任何输出就放弃、重发一次，默认 20 秒 */
+  startTimeoutMs?: number;
 }
 
 const SYSTEM =
@@ -126,21 +128,53 @@ export function reviewer(opts: ReviewOptions): (call: GatedToolCall, signal: Abo
       `input: ${clip(JSON.stringify(call.input, null, 2), 6000)}`,
       "</action>",
     ].join("\n");
+    const request = {
+      system: [{ text: SYSTEM, stability: "stable" as const, origin: { by: "plugin" as const, id: "jade/policy" }, trust: "trusted" as const }],
+      messages: [{ role: "user" as const, content: [{ kind: "text" as const, text: prompt, origin: { by: "plugin" as const, id: "jade/policy" }, trust: "untrusted" as const }] }],
+      tools: [],
+    };
+    const totalMs = opts.timeoutMs ?? 60_000;
+    // 不用 AbortSignal.timeout：它的定时器不让进程保持运行，没有别的事在跑时（例如测试里）就永远等不到它
+    const expired = new AbortController();
+    const deadline = setTimeout(() => expired.abort(new Error("timed out")), totalMs);
+    const total = AbortSignal.any([signal, expired.signal]);
+    // 共享的模型服务有时让请求排很久的队才开始处理（实测同一个请求 3 秒到 90 多秒），一旦开始几秒内就答完。
+    // 所以第一次请求 startTimeoutMs 内还没有任何输出就放弃，重发一次；重发的那次只受总时限约束
+    let started = false;
+    let retried = false;
+    const waiting = new AbortController();
+    const timer = setTimeout(() => waiting.abort(), opts.startTimeoutMs ?? 20_000);
+    const onDelta = () => {
+      started = true;
+      clearTimeout(timer);
+    };
     try {
-      const res = await opts.provider.complete(
-        {
-          system: [{ text: SYSTEM, stability: "stable", origin: { by: "plugin", id: "jade/policy" }, trust: "trusted" }],
-          messages: [{ role: "user", content: [{ kind: "text", text: prompt, origin: { by: "plugin", id: "jade/policy" }, trust: "untrusted" }] }],
-          tools: [],
-        },
-        { signal: AbortSignal.any([signal, AbortSignal.timeout(opts.timeoutMs ?? 60_000)]) },
-      );
+      let res;
+      try {
+        res = await opts.provider.complete(request, { signal: AbortSignal.any([total, waiting.signal]), onDelta });
+      } catch (err) {
+        if (!waiting.signal.aborted || total.aborted) throw err;
+        retried = true;
+        res = await opts.provider.complete(request, { signal: total, onDelta });
+      }
       const text = res.content.flatMap((b) => (b.kind === "text" ? [b.text] : [])).join("\n");
       return { ...(parseVerdict(text) ?? { decision: "ask", reason: "The automatic review gave no clear answer." }), usage: res.usage };
     } catch (err) {
       // 用户中断：照样交回去，关卡的结果不会再被用到
       if (signal.aborted) throw err;
+      if (total.aborted) {
+        const s = Math.round(totalMs / 1000);
+        return {
+          decision: "ask",
+          reason: started
+            ? `The automatic review timed out: the model service started answering but did not finish within ${s}s.`
+            : `The automatic review timed out: the model service did not start answering within ${s}s${retried ? ", also after a retry" : ""}.`,
+        };
+      }
       return { decision: "ask", reason: `The automatic review failed: ${clip(err instanceof Error ? err.message : String(err), 200)}` };
+    } finally {
+      clearTimeout(timer);
+      clearTimeout(deadline);
     }
   };
 }

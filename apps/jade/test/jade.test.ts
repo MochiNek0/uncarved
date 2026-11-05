@@ -744,6 +744,54 @@ describe("policy", () => {
     expect(parseVerdict('{"decision":"allow"}')).toEqual({ decision: "allow", reason: undefined });
   });
 
+  test("the reviewer resends a request the service has not started answering, and says where a timeout happened", async () => {
+    const origin = { by: "model", provider: "reviewer", model: "m" } as const;
+    const verdict = { model: "m", content: [{ kind: "text" as const, text: '{"decision":"allow","reason":"ok"}', origin, trust: "trusted" as const }], stopReason: "end" as const };
+    const aborted = (signal: AbortSignal) => new Promise<never>((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+    const sleep = (ms: number, signal: AbortSignal) => Promise.race([new Promise((r) => setTimeout(r, ms)), aborted(signal)]);
+    // 每次请求怎么表现：hang 一直不输出；slow 先输出一点，过一会儿才答完；fast 马上答完
+    let plan: ("hang" | "slow" | "fast")[] = [];
+    let calls = 0;
+    const provider: Provider = {
+      id: "reviewer",
+      async complete(_req, { signal, onDelta }) {
+        const how = plan[calls++] ?? "fast";
+        if (how === "hang") return aborted(signal);
+        onDelta?.({ kind: "thinking", text: "hm" });
+        if (how === "slow") await sleep(150, signal);
+        return verdict;
+      },
+    };
+    const review = reviewer({ provider, cwd, messages: () => [], startTimeoutMs: 50, timeoutMs: 1000 });
+    const call = gated("bash", { command: "git commit -m x" });
+    const signal = new AbortController().signal;
+
+    // 第一次没开始就放弃，重发的那次答完
+    plan = ["hang", "fast"];
+    calls = 0;
+    expect(await review(call, signal)).toEqual({ decision: "allow", reason: "ok" });
+    expect(calls).toBe(2);
+    // 已经开始输出的请求超过 startTimeoutMs 也不打断、不重发
+    plan = ["slow"];
+    calls = 0;
+    expect(await review(call, signal)).toEqual({ decision: "allow", reason: "ok" });
+    expect(calls).toBe(1);
+    // 两次都没开始：到总时限转给用户，说明服务一直没开始回答
+    plan = ["hang", "hang"];
+    calls = 0;
+    const silent = await review(call, signal);
+    expect(silent.decision).toBe("ask");
+    expect(silent.reason).toContain("did not start answering within 1s, also after a retry");
+    // 开始了但没答完
+    const stalled = reviewer({ provider, cwd, messages: () => [], startTimeoutMs: 50, timeoutMs: 100 });
+    plan = ["slow"];
+    calls = 0;
+    const late = await stalled(call, signal);
+    expect(late.decision).toBe("ask");
+    expect(late.reason).toContain("started answering but did not finish");
+    expect(calls).toBe(1);
+  });
+
   test("the reviewer sees the content of a script the agent wrote when a command runs it", async () => {
     const { cwd } = await workspace();
     await writeFile(path.join(cwd, "tmp_check.mjs"), "console.log('counting items')\n");
