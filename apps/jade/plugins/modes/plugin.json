@@ -1,9 +1,9 @@
 {
   "id": "jade/modes",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "api": "^1",
   "entry": "./index.ts",
   "provides": ["modes@1"],
   "requires": ["approval@1"],
-  "optional": ["keys@1", "commands@1"]
+  "optional": ["keys@1", "commands@1", "prompts@1", "ui@1"]
 }
