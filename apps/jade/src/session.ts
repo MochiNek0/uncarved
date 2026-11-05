@@ -12,6 +12,7 @@ import {
   type LogStore,
   type Plugin,
   type Provider,
+  type RemoteHookSpec,
   type RuntimeNotice,
   type State,
   type Tool,
@@ -216,7 +217,7 @@ export class Sessions implements SessionManager {
     const scope = new Scope(id);
     const owner: Owner = { plugin: id, scope };
     const tools: Tool[] = [];
-    const hooks: LocalHookSpec[] = [];
+    const hooks: (LocalHookSpec | RemoteHookSpec)[] = [];
     let open = true;
     const declared = (name: string, lists: (readonly string[] | undefined)[]) => {
       if (scope.closed) throw new StaleContext(id);
@@ -344,7 +345,7 @@ export class Sessions implements SessionManager {
   }
 }
 
-function compatProblem(id: string, version: string, hooks: LocalHookSpec[]): string | undefined {
+function compatProblem(id: string, version: string, hooks: (LocalHookSpec | RemoteHookSpec)[]): string | undefined {
   try {
     checkCompat(kernelPlugin({ id, version, hooks }));
     return undefined;
@@ -362,8 +363,14 @@ function liveTool(t: Tool, owner: Owner): Tool {
  * 插件的 hook：以插件身份执行。插件被隔离（作用域关闭）后这个 hook 视为不存在：gate 弃权、transform 不改、
  * observe 不做事。审批插件被隔离时，兜底关卡随之生效，所以弃权不会放行写操作
  */
-function liveHook(h: LocalHookSpec, owner: Owner): LocalHookSpec {
-  const fn = h.fn as (payload: unknown, ctx: unknown) => unknown;
+function liveHook(h: LocalHookSpec | RemoteHookSpec, owner: Owner): LocalHookSpec | RemoteHookSpec {
+  if ("remote" in h && h.remote) {
+    // 进程外：transform 回复空对象表示不改
+    const call = h.call;
+    const gone = h.kind === "gate" ? { decision: "abstain" } : h.kind === "transform" ? {} : undefined;
+    return { ...h, call: (payload, ctx) => (owner.scope.closed ? Promise.resolve(gone) : ambient.run(owner, () => call(payload, ctx))) };
+  }
+  const fn = (h as LocalHookSpec).fn as (payload: unknown, ctx: unknown) => unknown;
   const wrapped = (payload: unknown, ctx: unknown) => {
     if (owner.scope.closed) return h.kind === "gate" ? { decision: "abstain" } : undefined;
     return ambient.run(owner, () => fn(payload, ctx));

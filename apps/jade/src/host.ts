@@ -18,6 +18,7 @@ import {
 import { pluginConfig, readConfigFile, type ConfigFile } from "./config.ts";
 import { discover, type BrokenSource, type LayerRoot } from "./manifest.ts";
 import { ambient, invoke, Scope, serviceHandle, type Owner } from "./membrane.ts";
+import { startRemote } from "./remote.ts";
 import { resolve, type Plan, type PlanState } from "./resolve.ts";
 import { Sessions } from "./session.ts";
 import { countFault, readFaults, readPluginsConfig, writeFaults, type Faults } from "./state.ts";
@@ -244,7 +245,12 @@ export class PluginHost {
 
   async #load(source: PluginSource, owner: Owner): Promise<{ module: PluginModule; mark?: (p: Plugin) => Plugin }> {
     const { manifest, dir } = source;
-    if (manifest.runtime) throw new Error("out-of-process plugins are not supported yet");
+    if (manifest.runtime) {
+      // 进程外的项目层插件：内核的确认只能检查 JS 的 import，管不住另一种语言的代码从目录外加载什么
+      if (source.layer === "project") throw new Error(`out-of-process plugins cannot be loaded from a project yet; put it in ${path.join(this.#opts.home, "plugins")}`);
+      const module = await startRemote(source, owner, { report: (m) => this.#report(m), exited: (reason) => void this.quarantine(manifest.id, reason) });
+      return { module };
+    }
     let mod: { default?: unknown };
     let mark: ((p: Plugin) => Plugin) | undefined;
     if (source.layer === "project") {

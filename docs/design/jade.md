@@ -1,6 +1,6 @@
 # 设计：jade
 
-> 状态：草案；第 11 节第 1–4 步（核心插件系统、会话、最小发行版、项目层插件的确认）已实现，见 `apps/jade` · 2026-11-05
+> 状态：草案；第 11 节第 1–5 步（核心插件系统、会话、最小发行版、项目层插件的确认、进程外插件）已实现，见 `apps/jade` · 2026-11-05
 >
 > 范围：从零重写 jade 层（`apps/jade`）。旧 jade（0.1.3）已归档到 `.archive/jade`，下文的"旧 jade"和旧文件路径都指那里。uncarved 内核原则上不动；实现过程中发现内核缺的东西，记在第 10 节，逐项决定进不进内核。
 >
@@ -232,19 +232,24 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 
 和 pi 不同（pi 不支持进程外扩展），也和 dsh 不同（dsh 的进程边界只在协议端点），jade 把进程外插件作为一等公民：
 
-- 清单里 `"runtime": { "command": "python", "args": ["main.py"] }` 代替 `entry`。其余字段（provides、requires、frontend……）完全一样。
-- 协议：JSON-RPC 2.0，一行一条（按 LF 切分，不用 Node 的 `readline`：它会在 U+2028/2029 处切开）。
+- 清单里 `"runtime": { "command": "python", "args": ["main.py"] }` 代替 `entry`。其余字段（provides、requires、frontend……）完全一样。插件进程的工作目录是插件目录（所以 `args` 可以写相对路径），jade 的工作目录、`$JADE_HOME`、插件配置在 `scope/open` 里给。
+- 实现：核心的桥（`src/remote.ts`）启动插件进程，把它包成一个普通的 `PluginModule`。核心的其余部分不知道插件在进程外：服务裁决、作用域、膜、隔离都一样。
+- 协议：JSON-RPC 2.0，一行一条（`src/rpc.ts`，按 LF 切分，不用 Node 的 `readline`：它会在 U+2028/2029 处切开）。stdout 只传协议消息，stderr 的每一行转告用户。
 - 方法只有通用的几个，**和具体服务无关**：
   | 方向 | 方法 | 用途 |
   |---|---|---|
-  | 宿主 → 插件 | `initialize` | 核对 id、api 版本 |
-  | 宿主 → 插件 | `scope/open`、`scope/close` | 对应 `process(ctx)`、`session(ctx)` 和关闭 |
-  | 双向 | `call` | `{ target: 服务名或函数句柄, method, args }` |
-  | 双向 | `$/cancel` | 取消一次调用 |
-  | 插件 → 宿主 | `provide`、`kernel/tool`、`kernel/hook` | 注册 |
-- 加一个新服务不需要改协议：只要它的方法参数和返回值能 JSON 序列化（函数用句柄表示）就能跨进程用。不能序列化的服务（例如要传 React 组件的 TUI 扩展）在清单里标 `"local": true`，进程外插件依赖它时直接报不兼容。
-- 内核 hook 沿用 uncarved 现有的 `RemoteHookSpec`（字段裁剪、超时由内核保证）。
-- 进程退出：插件记为隔离，核心不自动重启（同崩溃自动停用规则）。
+  | 宿主 → 插件 | `initialize` | `{ plugin, version, api }` → `{ id?, session? }`：核对 id；`session` 为 false 时不为它打开会话作用域。10 秒内不回复算激活失败 |
+  | 宿主 → 插件 | `scope/open`、`scope/close` | `{ scope, kind: "process" \| "session", cwd, home, config, session? }`，对应 `process(ctx)`、`session(ctx)` 和关闭。`scope/open` 回复之前插件发来的注册才算数 |
+  | 宿主 → 插件 | 通知 `caller/open`、`caller/close` | 按调用方提供的服务：新调用方出现、调用方关闭（插件在这里撤销它的注册） |
+  | 双向 | `call` | `{ scope, target, method?, args, caller? }`。`target` 是服务名、`"$session"`（`send`、`afterTurn`）或函数句柄 |
+  | 双向 | `$/cancel` | 取消一次调用（宿主在工具被中止、hook 超时时发） |
+  | 插件 → 宿主 | `provide`、`kernel/tool`、`kernel/hook` | 注册：`provide` 列出方法名，`perCaller` 为 true 时按调用方创建实例；工具的 `execute`、hook 的 `fn` 是函数句柄 |
+- 值里的函数表示成句柄 `{ "$fn": id }`，对方用 `call` 调用。句柄属于一个作用域，作用域关闭后失效。函数参数照样过膜：插件交给注册表的回调归插件，出错归它，插件关闭后失效。
+- 加一个新服务不需要改协议：只要它的方法参数和返回值能 JSON 序列化（函数用句柄表示）就能跨进程用。不能序列化的服务（例如要传 React 组件的 TUI 扩展）在清单里标 `"local": true`，进程外插件依赖它时直接报不兼容。（`local` 还没实现，等 `jade/tui` 出现时一起做。）
+- 内核 hook 用 uncarved 的 `RemoteHookSpec`：插件声明 `reads`、`writes`、`timeoutMs`，字段裁剪、回复检查、超时都由内核保证。`ctx.kernel.hook` 因此也接受 `RemoteHookSpec`。
+- 进程退出：插件记为隔离（它的注册全部撤销，服务变成已失效），核心不自动重启（同崩溃自动停用规则）。宿主关闭插件时先发 `scope/close`，再关 stdin，2 秒后还没退出就结束进程。
+- 项目层的进程外插件暂不加载：内核的确认只能检查 JS 的 import，管不住另一种语言的代码从目录外加载什么（第 10 节）。
+- Python SDK：`sdk/python/jade_plugin.py`，单文件、只用标准库。jade 启动插件进程时把它的目录加进 `PYTHONPATH`。每个请求在自己的线程里处理，处理函数里可以同步调用宿主的服务。
 
 ## 7. 信任与审批
 
@@ -309,6 +314,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 | 轮次结束后的调度 | 宿主自己在 `send` resolve 后处理 | **已解决，不改内核**：jade 的会话把输入排队，每轮之后执行 `afterTurn` |
 | 插件在会话中途被隔离 | 内核插件清单在创建时确定 | **已解决，不改内核**：jade 交给内核的 hook 和工具外面包了一层，插件被隔离后 gate 弃权、transform 不改、observe 不做事，工具返回错误。审批插件被隔离时兜底 gate 生效，所以弃权不会放行写操作 |
 | 重名工具、不合法的 hook 让整个会话打不开 | `Runtime` 构造时抛错 | **已解决，不改内核**：jade 在插件加入会话时先检查，只排除这一个插件 |
+| 项目层的进程外插件 | 内核的确认（哈希整个目录、检查 import 不出目录）只懂 JS | **暂不支持**：项目层的进程外插件激活失败并说明原因。要支持，得先决定"确认一个 Python 插件"确认的是什么（目录哈希够不够、解释器和它的依赖算不算） |
 | 项目层插件的确认 | 内核的 `checkImports`（检查插件不 import 目录外的代码）没有导出；`loadProjectPluginFactory` 要求默认导出内核插件，和 jade 的模块形状不同 | **已解决，内核新增 `importProjectModule`**：确认流程和 `loadProjectPluginFactory` 完全相同（后者改为调用它），但不管模块形状，返回模块和一个可多次使用的 `mark(plugin)`。jade 每个会话用它标记交给内核的插件。安全检查只有内核这一份 |
 
 ## 11. 实施顺序
@@ -324,7 +330,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 4. **项目层插件的确认**（见第 10 节最后一项）。
    验证：未确认的项目层插件不执行任何代码；确认后内容变化需要重新确认；import 目录外的文件被拒绝。
 5. **进程外插件**：协议和桥。
-   验证：Python 写的插件提供一个服务，并注册一条命令。
+   验证：Python 写的插件提供一个服务，并注册一条命令。已完成：`test/remote.test.ts` 用 Python 插件提供服务、向进程内插件的注册表注册命令（命令执行中再调用宿主的 `ui@1`）、调用进程内插件给的回调、注册工具和 gate；进程退出时插件被隔离、命令被撤销。也在 Node 下用 `jade -p` 跑通了 Python 插件的工具。
 6. **TUI 和注册表插件**：`jade/tui`、`jade/commands`、`jade/keys`、`jade/renderers`、`jade/modes`、`jade/sessions`。
 7. **其余功能插件**逐个移植。每移植一个，都检查它没有用到第三方拿不到的东西。
 8. ~~功能对齐后改名为 jade~~：已提前完成（2026-11-05）。旧 jade 归档到 `.archive/jade`，新实现直接占用 `apps/jade` 和 `jade` 命令；功能对齐前，jade 只是开发中的版本。

@@ -1,8 +1,8 @@
 // jade 插件 API：插件能看到的全部类型。设计见 docs/design/jade.md。
 // 插件只从这里 import 类型和 definePlugin，运行时用到的一切都从 ctx 拿（3.5）。
 
-import type { LocalHookSpec, RuntimeNotice, State, Tool, UserInput } from "uncarved";
-export type { LocalHookSpec, RuntimeNotice, State, Tool, UserInput } from "uncarved";
+import type { LocalHookSpec, RemoteHookSpec, RuntimeNotice, State, Tool, UserInput } from "uncarved";
+export type { LocalHookSpec, RemoteHookSpec, RuntimeNotice, State, Tool, UserInput } from "uncarved";
 
 /** 插件 API 的版本，插件在 plugin.json 的 api 字段里用 ^ 范围声明 */
 export const API_VERSION = "1.0.0";
@@ -112,7 +112,8 @@ export interface SessionContext extends ScopeContext {
   /** 交给内核的部分，只能在 session() 执行期间注册：会话的内核插件清单在创建时确定 */
   readonly kernel: {
     tool(tool: Tool): void;
-    hook(hook: LocalHookSpec): void;
+    /** 进程内的 hook，或进程外插件的 RemoteHookSpec（字段裁剪、超时由内核保证） */
+    hook(hook: LocalHookSpec | RemoteHookSpec): void;
   };
 }
 
