@@ -112,6 +112,7 @@
 
 - `Frontend.run({ argv, sessions, signal })` 返回退出码。`argv` 是核心去掉自己的参数（`plugins`、`--safe`）之后的命令行，`sessions` 是核心的会话管理器（`SessionManager`：`open`、`close`、`current`）。
 - `UI`：`interactive`、`notify(message, level)`、`select({ title, detail, options }, signal)`、`input({ title, initial, placeholder, mask }, signal)`。不能提问的前端（`jade/print`）`interactive` 为 false，`select`、`input` 总是返回 `undefined`。
+- `UI.session({ session, plugin })`（可选）：一个插件在一个会话里的界面——状态栏上它的一段（`status(text)`，一行，undefined 去掉）和输入框（`draft`：读、插入、整段替换、灰色提示）。核心为每个加入会话的插件调用一次，插件的作用域关闭时调用返回值的 `dispose()` 收掉它的段落。前端没有这些东西时返回 `undefined`，插件的 `ctx.status`、`ctx.input` 也就是 `undefined`。`jade/tui` 提供它；`jade/print` 没有。
 - `Session.history()` 返回会话日志里的全部事件：前端恢复会话时用它重新显示对话（日志存储归核心，前端拿不到）。
 
 命令行入口（`src/main.ts`）只做：处理 `jade plugins …`、`--safe`、`--version`；把以 `-` 开头的参数作为选前端的开关；项目层插件存在且在终端里运行时提供确认方式（记录在 `$JADE_HOME/state/trust.json`）；前端起来之前的消息打到 stderr，之后交给 `ui@1`；连续两次 Ctrl+C 直接退出。
@@ -179,6 +180,7 @@ pi 后来才补上"agent 停下来之后再执行"和延迟 reload。jade 从一
 
 - `session.afterTurn(fn)`：本轮完全结束（`turn.ended` 已落盘、没有在途工具）后执行一次。续写、溢出重试、建议提示都用它，不再需要旧 jade 只给内置插件的 `TurnParticipant`。
 - 插件想发起新一轮：`session.send(input)`。如果当前正在跑，排到本轮之后。用户层插件才能用；项目层插件不能替用户说话（第 7 节）。
+- 会话里的界面：`ctx.status(text)` 在状态栏上占一段，`ctx.input` 改输入框（读、插入、整段替换、灰色提示）。两者来自前端 `ui@1.session`（3.4），每个插件一份，作用域关闭时自动收掉；前端不提供时都是 `undefined`。
 
 ## 5. 膜与故障隔离
 
@@ -340,7 +342,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 5. **进程外插件**：协议和桥。
    验证：Python 写的插件提供一个服务，并注册一条命令。已完成：`test/remote.test.ts` 用 Python 插件提供服务、向进程内插件的注册表注册命令（命令执行中再调用宿主的 `ui@1`）、调用进程内插件给的回调、注册工具和 gate；进程退出时插件被隔离、命令被撤销。也在 Node 下用 `jade -p` 跑通了 Python 插件的工具。
 6. **TUI 和注册表插件**：`jade/tui`、`jade/commands`、`jade/keys`、`jade/renderers`、`jade/modes`、`jade/sessions`。
-   已完成：`test/tui-frontend.test.ts` 用假终端和假模型跑真实的 bundled 插件：输入消息、在审批对话框里批准（预览是 `jade/fs` 的 diff）、看到回复、`/mode`、`/help`、`/exit`。`test/registries.test.ts` 覆盖注册、撤销、保留键、`/clear`、`/resume`。暂缺：`/model`（模型配置界面）、`/plugins`、`@` 引用文件的补全、`--continue`、插件在状态栏显示自己的段落、`ctx.input`（改输入框）。
+   已完成：`test/tui-frontend.test.ts` 用假终端和假模型跑真实的 bundled 插件：输入消息、在审批对话框里批准（预览是 `jade/fs` 的 diff）、看到回复、`/mode`、`/help`、`/exit`。`test/registries.test.ts` 覆盖注册、撤销、保留键、`/clear`、`/resume`。暂缺：`/model`（模型配置界面）、`/plugins`、`@` 引用文件的补全、`--continue`。插件在状态栏显示自己的段落、`ctx.input`（改输入框）已由 `ui@1.session` 提供，见 `test/session-ui.test.ts`。
 7. **其余功能插件**逐个移植。每移植一个，都检查它没有用到第三方拿不到的东西。
    大部分已完成：web、todo、ask、task、compact、mcp、skills、checks、memory、undo、mentions、continue、repeats、budget，各有测试（`test/<插件>.test.ts`）。期间核心改了两处：会话队列的竞争（上一条 `send` 刚 resolve 就再 `send`，新输入没人处理），兜底关卡只认 `approval@1` 的提供者（见第 7 节）。
    暂缺：auto 模式的模型审查（旧 `plugins/review.ts`）、截图工具、计划模式的"批准计划后开始改"、插件的安装和更新（旧 `plugins/install.ts`、`update.ts`）。

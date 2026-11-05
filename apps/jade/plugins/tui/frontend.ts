@@ -9,7 +9,7 @@ import { readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Block } from "uncarved";
-import type { Frontend, OpenOptions, Session, SessionManager, UI } from "../../src/api.ts";
+import type { Frontend, OpenOptions, Session, SessionManager, SessionUI, UI } from "../../src/api.ts";
 import type { CommandContext, Commands } from "../commands/index.ts";
 import type { Keys } from "../keys/index.ts";
 import type { Models } from "../models/index.ts";
@@ -64,14 +64,21 @@ export interface FrontendServices {
   models?: Models;
 }
 
+/** 状态栏上插件的一段最多显示这么多字符（超出的截断，换行并成空格） */
+const MAX_SEGMENT = 80;
+
 /**
  * ui@1：界面出来之前的提示先攒着，出来之后显示；界面关掉之后写到 stderr。
- * 前端运行期间才能提问
+ * 前端运行期间才能提问；会话里的插件经 UI.session 拿到自己的状态栏段落和输入框（4.3）
  */
 export class ScreenBridge {
   screen: Screen | undefined;
   #early: string[] = [];
   #closed = false;
+  /** 状态栏上各插件的一段：会话 id → 插件 id → 文字 */
+  #segments = new Map<string, Map<string, string>>();
+  /** 界面现在显示哪个会话；换会话时由前端调用 show */
+  #session: string | undefined;
 
   readonly ui: UI = {
     interactive: true,
@@ -89,6 +96,7 @@ export class ScreenBridge {
       if (!this.screen) return undefined;
       return this.screen.input(req.title, { ...(req.initial ? { initial: req.initial } : {}), ...(req.placeholder ? { placeholder: req.placeholder } : {}), ...(req.mask ? { mask: true } : {}), ...(signal ? { signal } : {}) });
     },
+    session: ({ session, plugin }) => this.#sessionUI(session, plugin),
   };
 
   attach(screen: Screen): void {
@@ -100,6 +108,56 @@ export class ScreenBridge {
     this.screen = undefined;
     this.#closed = true;
   }
+
+  /** 界面换到另一个会话：显示它的插件段落（之前那个会话的留着，换回去还在） */
+  show(session: string | undefined): void {
+    this.#session = session;
+    this.#apply();
+  }
+
+  #apply(): void {
+    if (!this.screen) return;
+    const segments = this.#session === undefined ? undefined : this.#segments.get(this.#session);
+    this.screen.status({ plugins: [...(segments ?? [])].map(([plugin, text]) => ({ plugin, text })) });
+  }
+
+  /** 一个插件在一个会话里的界面。作用域关闭时核心调用 dispose，这里把它的段落去掉 */
+  #sessionUI(session: string, plugin: string): SessionUI {
+    const bridge = this;
+    let own = this.#segments.get(session);
+    if (!own) this.#segments.set(session, (own = new Map()));
+    const segments = own;
+    let gone = false;
+    const apply = () => {
+      if (bridge.#session === session) bridge.#apply();
+    };
+    return {
+      status(text) {
+        if (gone) return;
+        if (text === undefined) segments.delete(plugin);
+        else segments.set(plugin, clipSegment(text));
+        apply();
+      },
+      draft: {
+        text: () => bridge.screen?.draft?.text() ?? "",
+        insert: (text) => bridge.screen?.draft?.insert(text),
+        set: (text) => bridge.screen?.draft?.set(text),
+        hint: (text) => bridge.screen?.draft?.hint(text),
+      },
+      dispose() {
+        gone = true;
+        segments.delete(plugin);
+        if (segments.size === 0) bridge.#segments.delete(session);
+        apply();
+      },
+    };
+  }
+}
+
+/** 状态栏的一段是一行：空白并成一个空格，长的截断 */
+function clipSegment(text: string): string {
+  const one = String(text).replace(/\s+/g, " ").trim();
+  return one.length > MAX_SEGMENT ? `${one.slice(0, MAX_SEGMENT - 1)}…` : one;
 }
 
 export function tuiFrontend(services: FrontendServices, bridge: ScreenBridge): Frontend {
@@ -221,6 +279,8 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
     view.reset();
     screen.clear();
     screen.status({ session: s.id, context: undefined, cache: undefined, spent: undefined, speed: undefined });
+    // 状态栏上插件自己的段落跟着换：新会话的显示出来，旧会话的留着（换回去还在）
+    bridge.show(s.id);
     if (resumed) await view.replay(await s.history(), true);
     unsubscribe = s.subscribe(view.onNotice);
     if (!resumed) return;
@@ -257,6 +317,7 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
       unsubscribe?.();
       unsubscribe = undefined;
       current = undefined;
+      bridge.show(undefined);
       await sessions.close();
     },
   };

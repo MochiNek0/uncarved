@@ -31,6 +31,8 @@ import {
   type Session,
   type SessionContext,
   type SessionManager,
+  type SessionUI,
+  type UI,
 } from "./api.ts";
 import { ambient, invoke, Scope, type Owner } from "./membrane.ts";
 
@@ -236,12 +238,34 @@ export class Sessions implements SessionManager {
       if (scope.closed) throw new StaleContext(id);
       if (!lists.some((l) => l?.includes(name))) throw new Error(`plugin ${id}: ${name} is not declared in plugin.json`);
     };
+    // 前端给这个插件在这个会话里的状态栏段落和输入框（4.3）。界面的东西出问题不连累插件：调用失败当作没有
+    const sessionUI = this.#sessionUI(s, id, owner);
+    if (sessionUI) {
+      try {
+        scope.add(() => sessionUI.dispose());
+      } catch {
+        // 作用域已经关了：没有要清理的
+      }
+    }
+    const uiCall = (fn: () => void) => {
+      try {
+        fn();
+      } catch {
+        // 前端不在了（例如它的作用域已关闭）
+      }
+    };
     const ctx: SessionContext = {
       plugin: id,
       signal: scope.signal,
       cwd: host.cwd,
       home: host.home,
       config: host.config(p.source),
+      ...(sessionUI
+        ? {
+            status: (text: string | undefined) => uiCall(() => sessionUI.status(text === undefined ? undefined : String(text))),
+            ...(sessionUI.draft ? { input: sessionUI.draft } : {}),
+          }
+        : {}),
       require: <T extends object>(name: string): T => {
         declared(name, [manifest.requires]);
         const h = host.service<T>(name, owner);
@@ -327,6 +351,19 @@ export class Sessions implements SessionManager {
     if (p.source.layer !== "project") return plugin;
     if (!p.mark) throw new Error(`plugin ${p.source.manifest.id}: project plugin was not confirmed`);
     return p.mark(plugin);
+  }
+
+  /**
+   * 前端给这个插件在这个会话里的状态栏段落和输入框（4.3）。没有 ui@1、或前端不提供会话界面时没有；
+   * 获取失败也只当作没有：界面上的东西坏了不该让插件加入不了会话
+   */
+  #sessionUI(s: LiveSession, plugin: string, owner: Owner): SessionUI | undefined {
+    try {
+      const ui = this.#host.service<UI>("ui@1", owner);
+      return ui?.session?.({ session: s.id, plugin });
+    } catch {
+      return undefined;
+    }
   }
 
   /**

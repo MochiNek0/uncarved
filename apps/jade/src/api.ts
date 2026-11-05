@@ -109,12 +109,31 @@ export interface SessionControl {
 
 export interface SessionContext extends ScopeContext {
   readonly session: SessionControl;
+  /**
+   * 状态栏上这个插件的一段（一行）；undefined 去掉。前端没有状态栏时是 undefined。
+   * 状态栏同时显示几个插件的段落时按调用先后排列（4.3）
+   */
+  readonly status?: (text: string | undefined) => void;
+  /** 输入框里的草稿：读、追加、整段替换、灰色提示；只有终端界面有 */
+  readonly input?: Draft;
   /** 交给内核的部分，只能在 session() 执行期间注册：会话的内核插件清单在创建时确定 */
   readonly kernel: {
     tool(tool: Tool): void;
     /** 进程内的 hook，或进程外插件的 RemoteHookSpec（字段裁剪、超时由内核保证） */
     hook(hook: LocalHookSpec | RemoteHookSpec): void;
   };
+}
+
+/** 输入框（4.3）：只在前端有输入框时给插件 */
+export interface Draft {
+  /** 现在输入框里的文字 */
+  text(): string;
+  /** 在光标处插入一段文字 */
+  insert(text: string): void;
+  /** 换掉整段文字，光标移到末尾 */
+  set(text: string): void;
+  /** 输入框空着时显示的灰色提示，Tab 或 → 接受；undefined 去掉 */
+  hint(text: string | undefined): void;
 }
 
 // ---------- 核心消费的服务契约（3.4） ----------
@@ -164,6 +183,27 @@ export interface UI {
   select<T extends string>(request: SelectRequest<T>, signal?: AbortSignal): Promise<T | undefined>;
   /** 请用户输入一行；不能提问、用户取消或 signal 中止时返回 undefined */
   input(request: InputRequest, signal?: AbortSignal): Promise<string | undefined>;
+  /**
+   * 某个插件在一个会话里的界面（4.3）：状态栏上它的一段、输入框。
+   * 核心为每个加入会话的插件调用一次；不能显示时返回 undefined。插件的作用域关闭时核心调用 dispose
+   */
+  session?(request: SessionRequest): SessionUI | undefined;
+}
+
+/** UI.session 的参数：会话 id 和调用它的插件 */
+export interface SessionRequest {
+  session: string;
+  plugin: string;
+}
+
+/** 一个插件在一个会话里的界面；每个插件一份，所以状态栏的段落不用 key */
+export interface SessionUI {
+  /** 状态栏上这个插件的一段（一行）；undefined 去掉 */
+  status(text: string | undefined): void;
+  /** 输入框；没有输入框的前端（例如 -p）没有 */
+  readonly draft?: Draft;
+  /** 去掉这个插件在这个会话里留下的一切（状态栏的段落、输入框的提示） */
+  dispose(): void;
 }
 
 export interface InputRequest {
