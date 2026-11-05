@@ -14,16 +14,33 @@ import { clip, dim, red } from "./style.ts";
 export interface Task {
   /**
    * 给子 Agent 登记一个只读工具（effect 必须是 "read"），返回撤销函数；登记者的作用域关闭时自动撤销。
-   * 工具名已被登记时抛错。要求批准的情形（工作目录之外的路径、url 参数）由子 Agent 自己判断，经 ui@1 问用户
+   * 工具名已被登记时抛错。要求批准的情形（工作目录之外的路径、url 参数）由子 Agent 自己判断，经 ui@1 问用户。
+   * opts.when：每次启动子 Agent 时调用，返回 false 时这次不给它这个工具（例如没有配置搜索服务时的 web_search）
    */
-  tool(tool: Tool): () => void;
+  tool(tool: Tool, opts?: { when?: () => boolean }): () => void;
 }
 
 const DEFAULT_MAX_STEPS = 40;
 const MAX_DETAIL_LINES = 40;
 
 /** 登记的只读工具，按登记顺序 */
-const registry: { tool: Tool; plugin: string }[] = [];
+const registry: { tool: Tool; plugin: string; when?: () => boolean }[] = [];
+
+/** 这次启动子 Agent 时给它的工具：同名的取最后登记的那个，when 返回 false 或出错的不给 */
+function available(): Tool[] {
+  const latest = new Map<string, (typeof registry)[number]>();
+  for (const r of registry) {
+    latest.delete(r.tool.name);
+    latest.set(r.tool.name, r);
+  }
+  return [...latest.values()].flatMap((r) => {
+    try {
+      return !r.when || r.when() ? [r.tool] : [];
+    } catch {
+      return [];
+    }
+  });
+}
 
 /** 子 Agent 的审批一次问一个：并行的几个子 Agent 不同时弹对话框 */
 let asking: Promise<unknown> = Promise.resolve();
@@ -31,12 +48,14 @@ let asking: Promise<unknown> = Promise.resolve();
 export default definePlugin({
   process(ctx) {
     ctx.provide("task@1", (caller): Task => ({
-      tool(tool) {
+      tool(tool, opts) {
         if (typeof tool?.name !== "string" || typeof tool.execute !== "function") throw new Error("task.tool: a tool needs a name and execute");
         if (tool.effect !== "read") throw new Error(`task.tool: ${tool.name} is not read-only (effect ${JSON.stringify(tool.effect)}); sub-agents only get read-only tools`);
-        const taken = registry.find((r) => r.tool.name === tool.name);
+        // 同一个插件重复登记是正常的：换会话时新会话先登记，旧会话随后撤销它的那份；取最后登记的
+        const taken = registry.find((r) => r.tool.name === tool.name && r.plugin !== caller.plugin);
         if (taken) throw new Error(`task.tool: ${tool.name} is already registered by ${taken.plugin}`);
-        const entry = { tool, plugin: caller.plugin };
+        if (opts?.when !== undefined && typeof opts.when !== "function") throw new Error("task.tool: when must be a function");
+        const entry = { tool, plugin: caller.plugin, ...(opts?.when ? { when: opts.when } : {}) };
         registry.push(entry);
         const revoke = () => {
           const i = registry.indexOf(entry);
@@ -119,7 +138,7 @@ export default definePlugin({
       taskTool({
         cwd: ctx.cwd,
         provider: { id: ctx.plugin, complete: (req, o) => models.complete(req, o) },
-        tools: () => registry.map((r) => r.tool),
+        tools: available,
         maxSteps,
         approve,
         id: ctx.plugin,

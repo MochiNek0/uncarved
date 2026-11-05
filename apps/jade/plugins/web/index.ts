@@ -9,6 +9,7 @@ import { definePlugin, type ScopeContext, type UI } from "../../src/api.ts";
 import type { Commands } from "../commands/index.ts";
 import type { Prompts } from "../prompts/index.ts";
 import type { Renderers } from "../renderers/index.ts";
+import type { Task } from "../task/index.ts";
 import { envWithFile, updateEnvFile, type Env } from "./env.ts";
 import { webRenderers } from "./renderers.ts";
 import { parseOrder, parseResults, SEARCH_PROVIDERS, webTools } from "./web.ts";
@@ -97,6 +98,17 @@ export default definePlugin({
     // keys 换成新的对象（新会话、/search 之前）时也取当前的那个
     const web = webTools({ ...opts, env: () => keys ?? env });
     for (const tool of web.tools) ctx.kernel.tool(tool);
+
+    // 子 Agent（jade/task）也能查网页：另一套实例；web_search 只在配置了搜索服务时给它。
+    // web_fetch 带 url 参数，子 Agent 每次都要问用户（URL 能把读到的内容带出去）。
+    // jade/task 被隔离时它的服务已失效：子 Agent 没有 web 工具，web 工具本身照常
+    try {
+      const task = ctx.service<Task>("task@1");
+      if (task) {
+        const sub = webTools({ ...opts, env: () => keys ?? env });
+        for (const tool of sub.tools) task.tool(tool, tool.name === "web_search" ? { when: () => sub.search().length > 0 } : {});
+      }
+    } catch {}
 
     ctx.kernel.hook({
       kind: "transform",

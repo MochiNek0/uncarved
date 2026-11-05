@@ -9,6 +9,9 @@ import { say, cleanup, scriptedHost, textOf, use } from "./scripted-ui.ts";
 
 afterEach(cleanup);
 import { WRAP_UP } from "../plugins/task/subagent.ts";
+import { SEARCH_PROVIDERS } from "../plugins/web/web.ts";
+
+const SEARCH_KEYS = SEARCH_PROVIDERS.map((p) => p.env);
 
 describe("jade/task", () => {
   test("runs a read-only sub-agent and returns its report; progress shows its tool calls", async () => {
@@ -60,6 +63,31 @@ describe("jade/task", () => {
     const result = shared.requests[5]!.messages.at(-1)!.content[0]!;
     expect(result.kind === "tool_result" && result.isError).toBe(false);
     expect(textOf([result])).toBe("report: nothing found");
+  });
+
+  test("the sub-agent gets web_fetch, and web_search only while a search service is configured", async () => {
+    const saved = Object.fromEntries(SEARCH_KEYS.map((k) => [k, process.env[k]]));
+    for (const k of SEARCH_KEYS) delete process.env[k];
+    try {
+      const { home, host, shared, send } = await scriptedHost();
+      shared.script.push(use("u1", "task", { description: "web", prompt: "look it up" }), say("report"), say("done"));
+      const s = await host.sessions.open();
+      await send(s, "go");
+      const names = shared.requests[1]!.tools.map((t) => t.name);
+      expect(names).toContain("web_fetch");
+      expect(names).not.toContain("web_search");
+
+      // 配了搜索服务（/search 写的就是这个文件），新会话里子 Agent 也能搜
+      await writeFile(path.join(home, ".env"), "TAVILY_API_KEY=t\n");
+      const s2 = await host.sessions.open();
+      shared.script.push(use("u2", "task", { description: "web", prompt: "search it" }), say("report"), say("done"));
+      await send(s2, "again");
+      expect(shared.requests[4]!.tools.map((t) => t.name)).toContain("web_search");
+      // 换会话之后子 Agent 仍有文件工具（新会话的登记不被旧会话的撤销带走）
+      expect(shared.requests[4]!.tools.map((t) => t.name)).toContain("read_file");
+    } finally {
+      for (const [k, v] of Object.entries(saved)) if (v !== undefined) process.env[k] = v;
+    }
   });
 
   test("reads outside the working directory are put to the user; without an answer they are denied", async () => {
