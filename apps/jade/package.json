@@ -19,7 +19,17 @@
     "build": "tsc -p tsconfig.build.json"
   },
   "dependencies": {
+    "@uncarved/provider-anthropic": "workspace:*",
+    "@uncarved/provider-openai-compat": "workspace:*",
+    "@uncarved/provider-openai-responses": "workspace:*",
     "@uncarved/store-jsonl": "workspace:*",
+    "picomatch": "^4.0.3",
     "uncarved": "workspace:*"
+  },
+  "bin": {
+    "jade": "./bin/jade.js"
+  },
+  "devDependencies": {
+    "@types/picomatch": "^4.0.2"
   }
 }

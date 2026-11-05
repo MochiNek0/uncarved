@@ -1,0 +1,15 @@
+{
+  "id": "jade/shell",
+  "version": "0.2.0",
+  "api": "^1",
+  "entry": "./index.ts",
+  "optional": [
+    "ui@1",
+    "prompts@1"
+  ],
+  "config": {
+    "shell": {
+      "description": "the shell the bash tool runs; default $JADE_SHELL, else bash (Git Bash on Windows)"
+    }
+  }
+}

@@ -2,6 +2,7 @@
 
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import type { TrustRecord, TrustStore } from "uncarved";
 
 /** 连续几次启动出故障后自动停用 */
 export const FAULT_LIMIT = 3;
@@ -77,4 +78,27 @@ export function countFault(faults: Faults, id: string, reason: string): boolean 
     return true;
   }
   return false;
+}
+
+/** 项目层插件的确认记录（第 7 节），存在 $JADE_HOME/state/trust.json，按插件目录内容的哈希 */
+export class FileTrustStore implements TrustStore {
+  readonly #file: string;
+  constructor(file: string) {
+    this.#file = file;
+  }
+
+  async has(hash: string): Promise<boolean> {
+    return (await this.#read()).some((r) => r.hash === hash);
+  }
+
+  async add(record: TrustRecord): Promise<void> {
+    const records = (await this.#read()).filter((r) => r.hash !== record.hash);
+    records.push(record);
+    await writeJson(this.#file, { records });
+  }
+
+  async #read(): Promise<TrustRecord[]> {
+    const raw = (await readJson(this.#file)) as { records?: unknown } | undefined;
+    return Array.isArray(raw?.records) ? raw.records.filter((r): r is TrustRecord => typeof r?.hash === "string") : [];
+  }
 }

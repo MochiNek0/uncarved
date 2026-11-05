@@ -1,0 +1,14 @@
+{
+  "id": "jade/approval",
+  "version": "0.4.0",
+  "api": "^1",
+  "entry": "./index.ts",
+  "provides": ["approval@1"],
+  "optional": ["ui@1"],
+  "config": {
+    "mode": {
+      "default": "ask",
+      "description": "ask: ask before changes; auto: changes inside the working directory and harmless commands go through; plan: change nothing, present a plan; readonly: change nothing; yolo: never ask"
+    }
+  }
+}

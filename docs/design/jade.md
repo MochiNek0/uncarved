@@ -1,6 +1,6 @@
 # 设计：jade
 
-> 状态：草案；第 11 节第 1、2、4 步（核心插件系统、会话、项目层插件的确认）已实现，见 `apps/jade` · 2026-11-05
+> 状态：草案；第 11 节第 1–4 步（核心插件系统、会话、最小发行版、项目层插件的确认）已实现，见 `apps/jade` · 2026-11-05
 >
 > 范围：从零重写 jade 层（`apps/jade`）。旧 jade（0.1.3）已归档到 `.archive/jade`，下文的"旧 jade"和旧文件路径都指那里。uncarved 内核原则上不动；实现过程中发现内核缺的东西，记在第 10 节，逐项决定进不进内核。
 >
@@ -106,6 +106,13 @@
 | `store@1`（可选） | 会话日志存储；没有提供者时用核心自带的 jsonl | — |
 
 前端的选择：清单里 `"frontend": { "name": "tui", "default": true }` 或 `{ "name": "print", "flag": "-p" }`。核心按命令行选定一个前端，只激活被选中的那个前端插件提供的 `frontend@1`。
+
+`frontend@1` 和 `ui@1` 的形状由 jade 定义（`api.ts` 的 `Frontend`、`UI`），因为每个前端都要提供它们、很多插件都要用 `ui@1`：
+
+- `Frontend.run({ argv, sessions, signal })` 返回退出码。`argv` 是核心去掉自己的参数（`plugins`、`--safe`）之后的命令行，`sessions` 是核心的会话管理器（`SessionManager`：`open`、`close`、`current`）。
+- `UI`：`interactive`、`notify(message, level)`、`select({ title, detail, options }, signal)`。不能提问的前端（`jade/print`）`interactive` 为 false，`select` 总是返回 `undefined`。
+
+命令行入口（`src/main.ts`）只做：处理 `jade plugins …`、`--safe`、`--version`；把以 `-` 开头的参数作为选前端的开关；项目层插件存在且在终端里运行时提供确认方式（记录在 `$JADE_HOME/state/trust.json`）；前端起来之前的消息打到 stderr，之后交给 `ui@1`；连续两次 Ctrl+C 直接退出。
 
 ### 3.5 插件 API 包
 
@@ -254,8 +261,10 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 
 ## 8. 配置与密钥
 
-- 每个插件有自己的配置段，`plugin.json` 里可以带 JSON Schema。配置**按插件、按键合并**：bundled 默认值 < 用户 `$JADE_HOME/config.json` < 项目 `.jade/config.json`（项目层只能配置项目层插件和清单里标了 `"projectConfigurable"` 的键）。不整段覆盖。
-- 密钥：`ctx.secrets.get/set`，按插件 id 分隔存储，插件只能读写自己的。不放进配置文件，也不放进环境变量传给进程外插件（进程外插件经 `call` 读自己的密钥）。
+- 每个插件有自己的配置段。`plugin.json` 的 `config` 列出键：`{ "mode": { "default": "ask", "description": "…", "project": false } }`。配置**按插件、按键合并**：清单里的默认值 < 用户 `$JADE_HOME/config.json` < 项目 `.jade/config.json`，两个文件都是 `{ "<插件 id>": { "<键>": 值 } }`。不整段覆盖。插件从 `ctx.config` 读，进程运行期间不变。
+- 项目层的文件只能设置项目层插件的键，和清单里标了 `"project": true` 的键；其余的忽略并告诉用户一次。所以克隆的仓库改不了你的审批模式。
+- 暂不做 JSON Schema 校验，插件自己检查值（例如 `jade/approval` 遇到不认识的模式时提示并用 `ask`）。
+- 密钥（未实现）：`ctx.secrets.get/set`，按插件 id 分隔存储，插件只能读写自己的。不放进配置文件，也不放进环境变量传给进程外插件（进程外插件经 `call` 读自己的密钥）。在那之前 `jade/models` 沿用旧 jade 的 `$JADE_HOME/.env`（shell 里的环境变量优先），用户已有的配置不用改。
 
 ## 9. 现有功能的去向
 
@@ -264,15 +273,15 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 | 插件 | 提供 | 依赖 | 来自旧 jade |
 |---|---|---|---|
 | `jade/tui` | `frontend@1`、`ui@1`、`tui@1`（local） | `commands@1`、`keys@1`、`renderers@1` | `ui/*`、`main.ts` 的界面部分 |
-| `jade/print` | `frontend@1`（`-p`）、`ui@1` | — | `-p` 模式 |
+| `jade/print` | `frontend@1`（`-p`）、`ui@1` | — | `-p` 模式。`jade/tui` 出现之前它也是默认前端 |
 | `jade/commands` | `commands@1` | — | `commands.ts` |
 | `jade/keys` | `keys@1` | — | 快捷键 |
 | `jade/renderers` | `renderers@1` | — | `ToolRenderer`、`EventRenderer` |
-| `jade/models` | `provider@1`、`models@1`（`complete`、`list`） | `ui@1`（可选） | `provider.ts`、`ui/configure.ts` |
-| `jade/approval` | `approval@1`、gate | `ui@1` | `plugins/policy.ts` 的审批部分 |
+| `jade/models` | `provider@1`、`models@1`（`current`、`complete`、`list`） | `ui@1`（可选） | `provider.ts`、`ui/configure.ts` |
+| `jade/approval` | `approval@1`（`mode`、`setMode`）、gate | `ui@1`（可选：没有或不能提问时，要问的调用一律拒绝） | `plugins/policy.ts` 的审批部分 |
 | `jade/modes` | `modes@1` | `approval@1`、`keys@1` | 计划模式、Shift+Tab、`/mode` |
 | `jade/sessions` | 命令 `/clear` `/resume` `/retry` | `commands@1` | `plugins/sessions.ts`、`session-lifecycle.ts` |
-| `jade/prompts` | `prompts@1`（其他插件往系统提示词里加段落） | — | `plugins/prompts.ts` |
+| `jade/prompts` | `prompts@1`（其他插件往系统提示词里加段落，项目层插件加的标为不可信） | `models@1`（可选，写上当前模型） | `plugins/prompts.ts` |
 | `jade/fs`、`jade/shell`、`jade/web`、`jade/todo`、`jade/ask` | 工具 | `ui@1`（`ask` 需要）、`renderers@1`（可选） | `tools/*` |
 | `jade/task` | 工具 | `models@1` | `tools/task.ts` |
 | `jade/compact` | hook、`/compact` | `models@1` | `plugins/compact.ts` |
@@ -281,7 +290,9 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 
 几条值得注意的变化：
 
-- `jade/prompts` 不再由宿主"单独构造并拿到全部工具"：它在 `context.build` 里本来就能看到请求里的工具。
+- `jade/prompts` 不再由宿主"单独构造并拿到全部工具"：它在 `context.build` 里本来就能看到请求里的工具，提示词里提到某个工具的条目只在请求里有这个工具时保留。环境信息里不再写各工具插件的细节（shell 是哪个、有没有 web 工具），那些由工具插件经 `prompts@1` 自己加。
+- `jade/fs` 去掉了检查点（撤销以后由 `jade/undo` 提供）。所以恢复的会话里，改已有文件之前要重新读一遍。
+- 审批的"总是允许"规则记在日志里（`derived`），恢复会话后仍有效；模式是进程级的，来自配置，`jade/modes` 以后经 `approval@1` 改。auto 模式的模型审查暂未移植。
 - `ask_user` 的对话框经 `ui@1`，不再由宿主私下传入。
 - `jade/task`、`jade/compact` 经 `models@1` 调模型，不再由宿主传 provider。
 - 续写、溢出重试经 `session.afterTurn`，不再需要只给内置插件的 `TurnParticipant`。
@@ -309,7 +320,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 2. **核心：会话**。Runtime 的创建、恢复、切换事务，兜底 gate，`afterTurn`。
    验证：用假 provider 的端到端测试；审批插件缺失时写工具被拒绝。
 3. **最小可用发行版**：`jade/print`、`jade/models`、`jade/prompts`、`jade/fs`、`jade/shell`、`jade/approval`。
-   验证：`jade -p "..."` 能读写文件。
+   验证：`jade -p "..."` 能读写文件。已完成：`test/distro.test.ts` 用按脚本回复的用户层模型插件真实运行 `bin/jade.js -p`；也用真实模型在 Node 下跑通了先读后写。
 4. **项目层插件的确认**（见第 10 节最后一项）。
    验证：未确认的项目层插件不执行任何代码；确认后内容变化需要重新确认；import 目录外的文件被拒绝。
 5. **进程外插件**：协议和桥。

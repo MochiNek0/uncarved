@@ -1,8 +1,8 @@
 // jade 插件 API：插件能看到的全部类型。设计见 docs/design/jade.md。
 // 插件只从这里 import 类型和 definePlugin，运行时用到的一切都从 ctx 拿（3.5）。
 
-import type { LocalHookSpec, Tool, UserInput } from "uncarved";
-export type { LocalHookSpec, Tool, UserInput } from "uncarved";
+import type { LocalHookSpec, RuntimeNotice, State, Tool, UserInput } from "uncarved";
+export type { LocalHookSpec, RuntimeNotice, State, Tool, UserInput } from "uncarved";
 
 /** 插件 API 的版本，插件在 plugin.json 的 api 字段里用 ^ 范围声明 */
 export const API_VERSION = "1.0.0";
@@ -31,6 +31,15 @@ export interface Manifest {
   replaces?: string[];
   /** 这是一个前端（3.4）：default 为默认前端，flag 为选中它的命令行开关 */
   frontend?: { name: string; default?: boolean; flag?: string };
+  /** 配置项（第 8 节）：键 → 默认值、说明；project 为 true 的键项目层的 .jade/config.json 也能设 */
+  config?: Record<string, ConfigKey>;
+}
+
+export interface ConfigKey {
+  default?: unknown;
+  description?: string;
+  /** 项目层可以设置这个键。项目层插件自己的键不用标 */
+  project?: boolean;
 }
 
 /** 发现的一个插件 */
@@ -50,6 +59,12 @@ export interface ScopeContext {
   readonly plugin: string;
   /** 作用域关闭时中止 */
   readonly signal: AbortSignal;
+  /** 工作目录 */
+  readonly cwd: string;
+  /** $JADE_HOME */
+  readonly home: string;
+  /** 本插件的配置：清单里的默认值 < 用户 config.json < 项目 .jade/config.json，按键合并（第 8 节） */
+  readonly config: Readonly<Record<string, unknown>>;
   /** 取一个声明在 requires 里的服务，没有声明或没有提供者时抛错 */
   require<T extends object>(service: string): T;
   /** 取一个声明在 requires 或 optional 里的服务，没有提供者时返回 undefined */
@@ -62,6 +77,8 @@ export interface ScopeContext {
 export interface Caller {
   /** 调用方插件的 id；核心自己调用时为 "jade" */
   readonly plugin: string;
+  /** 调用方插件的层级；核心自己调用时为 "core"。项目层插件给的东西（例如提示词）应当当作不可信 */
+  readonly layer: PluginLayer | "core";
   /** 调用方的作用域关闭时中止 */
   readonly signal: AbortSignal;
   /** 调用方的作用域关闭时执行，以提供者的身份执行。注册表用它撤销调用方注册的东西 */
@@ -97,6 +114,58 @@ export interface SessionContext extends ScopeContext {
     tool(tool: Tool): void;
     hook(hook: LocalHookSpec): void;
   };
+}
+
+// ---------- 核心消费的服务契约（3.4） ----------
+
+/** 前端拿到的会话 */
+export interface Session {
+  readonly id: string;
+  readonly state: State;
+  /** 发一条输入；正在跑时排队。这一轮跑完时 resolve（之后的 afterTurn 不等） */
+  send(input: UserInput): Promise<void>;
+  /** 排队的输入和 afterTurn 全部处理完时 resolve */
+  idle(): Promise<void>;
+  /** 继续日志里没做完的工作（崩溃、重启后） */
+  recover(): Promise<void>;
+  abort(reason?: unknown): void;
+  subscribe(fn: (n: RuntimeNotice) => void): () => void;
+}
+
+export interface OpenOptions {
+  /** 恢复这个会话；不写就新建 */
+  resume?: string;
+}
+
+/** 会话管理器：新建、恢复、切换（4.2） */
+export interface SessionManager {
+  readonly current: Session | undefined;
+  /** 新建或恢复一个会话，成功后它成为当前会话，旧会话离开（仍可恢复）。失败时旧会话不受影响 */
+  open(opts?: OpenOptions): Promise<Session>;
+  /** 当前会话离开（仍可恢复） */
+  close(): Promise<void>;
+}
+
+/** frontend@1：核心启动后把控制权交给它，返回进程的退出码 */
+export interface Frontend {
+  run(opts: { argv: readonly string[]; sessions: SessionManager; signal: AbortSignal }): Promise<number | void>;
+}
+
+/** ui@1：前端提供的和用户打交道的方式。每个前端都提供它，形状由 jade 定义 */
+export interface UI {
+  /** 能不能向用户提问。不能时 select 总是返回 undefined */
+  readonly interactive: boolean;
+  /** 告诉用户一件事 */
+  notify(message: string, level?: "info" | "warning" | "error"): void;
+  /** 请用户从选项里选一个，返回选中项的 value；不能提问、用户取消或 signal 中止时返回 undefined */
+  select<T extends string>(request: SelectRequest<T>, signal?: AbortSignal): Promise<T | undefined>;
+}
+
+export interface SelectRequest<T extends string> {
+  title: string;
+  /** 选项上方的详细内容，例如要执行的命令、要改的文件 */
+  detail?: string;
+  options: { label: string; value: T }[];
 }
 
 export interface PluginModule {

@@ -15,6 +15,7 @@ import {
   type PluginSource,
   type ProcessContext,
 } from "./api.ts";
+import { pluginConfig, readConfigFile, type ConfigFile } from "./config.ts";
 import { discover, type BrokenSource, type LayerRoot } from "./manifest.ts";
 import { ambient, invoke, Scope, serviceHandle, type Owner } from "./membrane.ts";
 import { resolve, type Plan, type PlanState } from "./resolve.ts";
@@ -37,6 +38,10 @@ export interface HostOptions {
   roots: LayerRoot[];
   /** $JADE_HOME：plugins.json、state/faults.json 所在目录 */
   home: string;
+  /** 工作目录，默认 process.cwd() */
+  cwd?: string;
+  /** 配置文件（第 8 节）：用户层默认 $JADE_HOME/config.json；项目层不写就没有 */
+  config?: { user?: string; project?: string };
   flags?: readonly string[];
   safe?: boolean;
   /** 项目层插件的确认（第 7 节）：确认记录和向用户提问的方式。不提供时不加载带代码的项目层插件 */
@@ -86,6 +91,8 @@ export class PluginHost {
   /** 按调用方创建的服务实例：调用方作用域 → 服务名 → 实例 */
   readonly #perCaller = new WeakMap<Scope, Map<string, object>>();
   readonly #core: Owner = { plugin: CORE_ID, scope: new Scope(CORE_ID) };
+  #config: { user: ConfigFile; project: ConfigFile } = { user: {}, project: {} };
+  readonly #pluginConfigs = new Map<string, Readonly<Record<string, unknown>>>();
   #sessions: Sessions | undefined;
   #writing: Promise<void> = Promise.resolve();
 
@@ -101,6 +108,12 @@ export class PluginHost {
   static async start(opts: HostOptions): Promise<PluginHost> {
     const { plan, broken, faults } = await planPlugins(opts);
     const host = new PluginHost(opts, plan, broken, faults);
+    const [user, project] = await Promise.all([
+      readConfigFile(opts.config?.user ?? path.join(opts.home, "config.json")),
+      opts.config?.project ? readConfigFile(opts.config.project) : { config: {}, error: undefined },
+    ]);
+    host.#config = { user: user.config, project: project.config };
+    for (const e of [user.error, project.error]) if (e) host.#report(e);
     for (const w of plan.warnings) host.#report(w);
     for (const b of broken) host.#report(`plugin at ${b.dir}: ${b.error}`);
     for (const source of plan.order) await host.#activate(source);
@@ -169,6 +182,8 @@ export class PluginHost {
   get sessions(): Sessions {
     return (this.#sessions ??= new Sessions({
       home: this.#opts.home,
+      cwd: this.#cwd,
+      config: (source) => this.#configOf(source),
       core: this.#core,
       active: () => this.#active,
       service: (name, caller) => this.#handle(name, caller),
@@ -262,6 +277,9 @@ export class PluginHost {
     return {
       plugin: id,
       signal: owner.scope.signal,
+      cwd: this.#cwd,
+      home: this.#opts.home,
+      config: this.#configOf(source),
       require: <T extends object>(name: string): T => {
         declared(name, [manifest.requires]);
         const h = this.#handle<T>(name, owner);
@@ -304,6 +322,7 @@ export class PluginHost {
     if (!instance) {
       const info: Caller = {
         plugin: caller.plugin,
+        layer: caller === this.#core ? "core" : (this.plan.entries.find((e) => e.source.manifest.id === caller.plugin)?.source.layer ?? "core"),
         signal: caller.scope.signal,
         onDispose: (d) => caller.scope.add(d, provider),
       };
@@ -316,6 +335,22 @@ export class PluginHost {
       mine.set(name, instance);
     }
     return serviceHandle<T>(name, instance, provider, caller, isLive);
+  }
+
+  get #cwd(): string {
+    return this.#opts.cwd ?? process.cwd();
+  }
+
+  /** 插件的配置；项目层设置了不允许设置的键时告诉用户一次 */
+  #configOf(source: PluginSource): Readonly<Record<string, unknown>> {
+    const id = source.manifest.id;
+    let c = this.#pluginConfigs.get(id);
+    if (!c) {
+      const { config, ignored } = pluginConfig(source, this.#config.user, this.#config.project);
+      if (ignored.length > 0) this.#report(`project config for ${id}: ${ignored.join(", ")} can only be set in your own config.json; ignored`);
+      this.#pluginConfigs.set(id, (c = config));
+    }
+    return c;
   }
 
   // ---------- 故障 ----------

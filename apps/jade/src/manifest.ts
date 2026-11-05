@@ -2,7 +2,7 @@
 
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
-import type { Manifest, PluginLayer, PluginSource } from "./api.ts";
+import type { ConfigKey, Manifest, PluginLayer, PluginSource } from "./api.ts";
 
 export interface LayerRoot {
   layer: PluginLayer;
@@ -93,6 +93,18 @@ export function parseManifest(raw: unknown): Manifest {
       throw new Error(`plugin.json: "frontend" must be { name: string, default?: boolean, flag?: string }`);
     }
     manifest.frontend = { name: f.name, ...(f.default !== undefined ? { default: f.default as boolean } : {}), ...(f.flag !== undefined ? { flag: f.flag as string } : {}) };
+  }
+  if (m.config !== undefined) {
+    const c = m.config as Record<string, unknown> | null;
+    const bad = (k: string) => new Error(`plugin.json: "config.${k}" must be { default?, description?: string, project?: boolean }`);
+    if (typeof c !== "object" || c === null || Array.isArray(c)) throw new Error(`plugin.json: "config" must be an object of keys`);
+    manifest.config = {};
+    for (const [k, raw] of Object.entries(c)) {
+      const v = raw as Record<string, unknown> | null;
+      if (typeof v !== "object" || v === null || Array.isArray(v)) throw bad(k);
+      if ((v.description !== undefined && typeof v.description !== "string") || (v.project !== undefined && typeof v.project !== "boolean")) throw bad(k);
+      manifest.config[k] = { ...v } as ConfigKey;
+    }
   }
   return manifest;
 }

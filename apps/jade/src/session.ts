@@ -17,7 +17,18 @@ import {
   type Tool,
   type UserInput,
 } from "uncarved";
-import { API_VERSION, PluginError, ServiceUnavailable, StaleContext, type PluginModule, type PluginSource, type SessionContext } from "./api.ts";
+import {
+  API_VERSION,
+  PluginError,
+  ServiceUnavailable,
+  StaleContext,
+  type OpenOptions,
+  type PluginModule,
+  type PluginSource,
+  type Session,
+  type SessionContext,
+  type SessionManager,
+} from "./api.ts";
 import { ambient, invoke, Scope, type Owner } from "./membrane.ts";
 
 /** 核心自己交给内核的插件：兜底关卡 */
@@ -30,6 +41,8 @@ export const NO_APPROVAL_REASON =
 /** 会话管理器向宿主要的东西 */
 export interface SessionHost {
   home: string;
+  cwd: string;
+  config(source: PluginSource): Readonly<Record<string, unknown>>;
   /** 当前激活的插件，按激活顺序 */
   active(): { source: PluginSource; module: PluginModule; owner: Owner; mark?: (p: Plugin) => Plugin }[];
   /** 以 owner 的身份取服务；核心自己取时 owner 是核心 */
@@ -40,25 +53,6 @@ export interface SessionHost {
   untrack(plugin: string, scope: Scope): void;
   fault(plugin: string, reason: string): void;
   report(message: string): void;
-}
-
-export interface OpenOptions {
-  /** 恢复这个会话；不写就新建 */
-  resume?: string;
-}
-
-/** 前端手里的会话 */
-export interface Session {
-  readonly id: string;
-  readonly state: State;
-  /** 发一条输入；正在跑时排队。这一轮跑完时 resolve（之后的 afterTurn 不等） */
-  send(input: UserInput): Promise<void>;
-  /** 排队的输入和 afterTurn 全部处理完时 resolve */
-  idle(): Promise<void>;
-  /** 继续日志里没做完的工作（崩溃、重启后） */
-  recover(): Promise<void>;
-  abort(reason?: unknown): void;
-  subscribe(fn: (n: RuntimeNotice) => void): () => void;
 }
 
 const KERNEL_LAYER: Record<PluginSource["layer"], Layer> = { bundled: "distro", user: "user", project: "project" };
@@ -153,7 +147,7 @@ class LiveSession implements Session {
   }
 }
 
-export class Sessions {
+export class Sessions implements SessionManager {
   readonly #host: SessionHost;
   #current: LiveSession | undefined;
   #store: LogStore | undefined;
@@ -231,6 +225,9 @@ export class Sessions {
     const ctx: SessionContext = {
       plugin: id,
       signal: scope.signal,
+      cwd: host.cwd,
+      home: host.home,
+      config: host.config(p.source),
       require: <T extends object>(name: string): T => {
         declared(name, [manifest.requires]);
         const h = host.service<T>(name, owner);
@@ -302,6 +299,8 @@ export class Sessions {
         id,
         version: manifest.version,
         layer: KERNEL_LAYER[layer],
+        // 写日志的能力调用时才检查，推不出来（definePlugin 只补 hook 用到的）；jade 的插件都可以写
+        needs: ["log:record", "log:emit"],
         tools: tools.map((t) => liveTool(t, owner)),
         hooks: hooks.map((h) => liveHook(h, owner)),
       })),
