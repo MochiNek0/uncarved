@@ -32,6 +32,9 @@ export function askUserTool(ask: AskUser): Tool {
             type: "object",
             properties: {
               question: { type: "string", description: "The complete question, ending with a question mark" },
+              // 模型常给每个问题加一个短标题，名字不定；收下但不用，免得整个调用被拒
+              label: { type: "string", description: "Optional short tag; not shown" },
+              header: { type: "string", description: "Optional short tag; not shown" },
               options: {
                 type: "array",
                 items: {

@@ -893,6 +893,17 @@ describe("jade session", () => {
     expect(requests[0]!.system[0]!.text).toContain("ask with ask_user");
   });
 
+  test("ask_user accepts a short tag on a question and ignores it", async () => {
+    const { rt, requests } = await setup(
+      [call(use("q1", "ask_user", { questions: [{ label: "DB", question: "Which database?", options: [{ label: "SQLite" }, { label: "Postgres" }] }] })), reply("ok")],
+      { askUser: async () => ["SQLite"] },
+    );
+    await rt.send(msg("add storage"));
+    const result = requests[1]!.messages.at(-1)!.content[0]!;
+    expect(result.kind === "tool_result" && result.isError).toBeFalsy();
+    expect(result.kind === "tool_result" && result.content.map((c) => (c.kind === "text" ? c.text : "")).join("")).toBe("Q: Which database?\nA: SQLite");
+  });
+
   test("without askUser there is no ask_user tool and the prompt does not mention it", async () => {
     const { rt, requests } = await setup([reply("hi")]);
     await rt.send(msg("hello"));
