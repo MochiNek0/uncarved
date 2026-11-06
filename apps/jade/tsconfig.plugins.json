@@ -1,0 +1,5 @@
+{
+  "extends": "../../tsconfig.build.json",
+  "compilerOptions": { "rootDir": ".", "outDir": ".plugins-build", "declaration": false, "sourceMap": false },
+  "include": ["plugins"]
+}

@@ -47,7 +47,8 @@ export async function main(argv: readonly string[]): Promise<number> {
   const cwd = process.cwd();
   const home = process.env.JADE_HOME || path.join(os.homedir(), ".jade");
   const roots: LayerRoot[] = [
-    { layer: "bundled", root: path.join(pkgDir, "plugins") },
+    // 编译好的宿主（dist/*.js）用编译好的插件：Node 不给 node_modules 里的 .ts 去类型
+    { layer: "bundled", root: path.join(pkgDir, import.meta.url.endsWith(".js") ? "plugins-dist" : "plugins") },
     { layer: "user", root: path.join(home, "plugins") },
     { layer: "project", root: path.join(cwd, ".jade", "plugins") },
   ];

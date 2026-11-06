@@ -1,6 +1,7 @@
 // 用纯 Node 跑发布产物（dist）：bun test 只覆盖源码和 bun 导入条件，覆盖不到 Node 用户实际加载的代码。
 // 先 bun run build，再 node scripts/smoke-node.mjs
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -43,6 +44,16 @@ try {
   );
   const loaded = await loadProjectPlugin(pluginDir, { trust: new MemoryTrustStore(), confirm: async () => true, entry: "index.js" });
   assert.equal(loaded.kernel, `^${KERNEL_VERSION}`);
+
+  // jade 在 Node 下用编译好的内置插件（plugins-dist）：每个都要能激活
+  const jade = spawnSync(process.execPath, [path.join(repo, "apps", "jade", "bin", "jade.js"), "--help"], {
+    cwd: tmp,
+    env: { ...process.env, JADE_HOME: path.join(tmp, "jade-home"), JADE_UPDATE_CHECK: "off" },
+    encoding: "utf8",
+    timeout: 60_000,
+  });
+  assert.equal(jade.status, 0, jade.stderr);
+  assert.doesNotMatch(jade.stderr, /failed to activate|no frontend plugin/, jade.stderr);
 } finally {
   await rm(tmp, { recursive: true, force: true });
   await rm(pluginDir, { recursive: true, force: true });
