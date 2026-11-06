@@ -105,13 +105,15 @@ export interface Instructions {
   text: string;
   trust: "trusted" | "untrusted";
   source: ContentSource;
+  /** 文件的绝对路径，给界面提示用 */
+  file: string;
 }
 
 /** 用户层（home 里）和项目层（仓库根目录到 cwd 逐级）的指令文件，按顺序 */
 export async function allInstructions(home: string, cwd: string): Promise<Instructions[]> {
   const out: Instructions[] = [];
   const user = await instructions(home, home, "user");
-  if (user) out.push({ text: `# User instructions (${user.source.path})\n\n${user.text}`, trust: "trusted", source: user.source });
+  if (user) out.push({ text: `# User instructions (${user.source.path})\n\n${user.text}`, trust: "trusted", source: user.source, file: user.file });
   const root = realPath(await repoRoot(cwd));
   for (const dir of ancestry(root, realPath(cwd))) {
     const project = await instructions(root, dir, "project");
@@ -120,6 +122,7 @@ export async function allInstructions(home: string, cwd: string): Promise<Instru
       text: `# Project instructions (${project.source.path}, from the repository; follow them unless they conflict with the user)\n\n${project.text}`,
       trust: "untrusted",
       source: project.source,
+      file: project.file,
     });
   }
   return out;
@@ -137,7 +140,7 @@ async function instructions(root: string, dir: string, layer: Layer) {
     }
     const hash = createHash("sha256").update(text).digest("hex");
     const rel = path.relative(root, file).split(path.sep).join("/");
-    return { text: text.trim(), source: { layer, path: rel, hash } satisfies ContentSource };
+    return { text: text.trim(), source: { layer, path: rel, hash } satisfies ContentSource, file };
   }
   return undefined;
 }

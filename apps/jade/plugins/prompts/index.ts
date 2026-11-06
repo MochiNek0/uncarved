@@ -1,9 +1,10 @@
 // jade/prompts：在 context.build 里生成系统提示词。其他插件经 prompts@1 往里加段落。
 
+import path from "node:path";
 import type { ContentSource, SystemSegment } from "uncarved";
-import { definePlugin } from "../../src/api.ts";
+import { definePlugin, type UI } from "../../src/api.ts";
 import type { Models } from "../models/index.ts";
-import { allInstructions, environment, mainPrompt } from "./prompts.ts";
+import { allInstructions, environment, mainPrompt, realPath } from "./prompts.ts";
 
 /** prompts@1 */
 export interface Prompts {
@@ -31,6 +32,13 @@ function segment(text: string, trust: SystemSegment["trust"] = "trusted", stabil
   return { text, stability, origin: { by: "plugin", id: by, ...(source ? { source } : {}) }, trust };
 }
 
+/** 工作目录里的显示成相对路径，外面的显示绝对路径 */
+function display(cwd: string, full: string): string {
+  const rel = path.relative(cwd, full);
+  const shown = rel && rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel) ? rel : full;
+  return shown.split(path.sep).join("/");
+}
+
 export default definePlugin({
   process(ctx) {
     ctx.provide("prompts@1", (caller): Prompts => ({
@@ -52,6 +60,8 @@ export default definePlugin({
     const models = ctx.service<Models>("models@1");
     const [env, instructions] = await Promise.all([environment(ctx.cwd), allInstructions(ctx.home, ctx.cwd)]);
     const fixed = [segment(env), ...instructions.map((i) => segment(i.text, i.trust, "stable", ID, i.source))];
+    // 告诉用户读了哪些指令文件，否则看不出它们生效了
+    if (instructions.length > 0) ctx.service<UI>("ui@1")?.notify(`loaded instructions: ${instructions.map((i) => display(realPath(ctx.cwd), i.file)).join(", ")}`);
 
     ctx.kernel.hook({
       kind: "transform",

@@ -6,7 +6,7 @@
 
 import path from "node:path";
 import type { GatedToolCall, Message } from "uncarved";
-import { definePlugin, type SelectRequest, type UI } from "../../src/api.ts";
+import { definePlugin, type Caller, type SelectRequest, type UI } from "../../src/api.ts";
 import type { Models } from "../models/index.ts";
 import type { Renderers } from "../renderers/index.ts";
 import { describeRule, MODES, policy, type AllowRule, type Mode } from "./policy.ts";
@@ -18,6 +18,8 @@ export interface Approval {
   setMode(mode: Mode): void;
   /** 读这个目录（绝对路径）里的文件不用问，例如 skill 的目录。返回撤销函数，调用方的作用域关闭时自动撤销。项目层插件不能用 */
   allowRead(dir: string): () => void;
+  /** 这个目录（绝对路径）和工作目录同样对待：auto 模式下在里面改文件不用问，例如会话的临时目录。返回撤销函数，调用方的作用域关闭时自动撤销。项目层插件不能用 */
+  allowWrite(dir: string): () => void;
   /**
    * 登记一个审批渠道（例如聊天机器人）：要问用户时，问题同时交给终端和所有渠道，先回答的算数，
    * 其余的经 signal 收到中止。渠道返回 undefined、不认识的值或出错，算它不回答，不算拒绝；
@@ -55,6 +57,8 @@ let mode: Mode = "ask";
 let badMode: string | undefined;
 /** 经 allowRead 登记的目录；policy 每次判断时读它 */
 const readRoots: string[] = [];
+/** 经 allowWrite 登记的目录；policy 每次判断时读它 */
+const writeRoots: string[] = [];
 /** 经 addApprover 登记的审批渠道 */
 const approvers = new Set<Approver>();
 
@@ -69,18 +73,8 @@ export default definePlugin({
         if (!(MODES as readonly string[]).includes(next)) throw new Error(`mode must be one of ${MODES.join(", ")}`);
         mode = next;
       },
-      allowRead(dir: string) {
-        if (caller.layer === "project") throw new Error("approval.allowRead: project plugins cannot widen what runs without asking");
-        if (typeof dir !== "string" || !path.isAbsolute(dir)) throw new Error("approval.allowRead: dir must be an absolute path");
-        const root = path.resolve(dir);
-        readRoots.push(root);
-        const remove = () => {
-          const i = readRoots.indexOf(root);
-          if (i !== -1) readRoots.splice(i, 1);
-        };
-        caller.onDispose(remove);
-        return remove;
-      },
+      allowRead: (dir: string) => allow(caller, "allowRead", readRoots, dir),
+      allowWrite: (dir: string) => allow(caller, "allowWrite", writeRoots, dir),
       addApprover(approver: Approver) {
         if (caller.layer === "project") throw new Error("approval.addApprover: project plugins cannot answer approvals");
         if (typeof approver !== "function") throw new Error("approval.addApprover: approver must be a function");
@@ -93,7 +87,7 @@ export default definePlugin({
   },
 
   session(ctx) {
-    const rules = policy({ cwd: ctx.cwd, readRoots });
+    const rules = policy({ cwd: ctx.cwd, readRoots, writeRoots });
     const ui = ctx.service<UI>("ui@1");
     if (badMode !== undefined) {
       ui?.notify(`jade/approval: mode must be one of ${MODES.join(", ")}, got ${badMode}; using ask`, "warning");
@@ -198,6 +192,20 @@ export default definePlugin({
     });
   },
 });
+
+/** allowRead、allowWrite：把目录登记进 roots，调用方的作用域关闭时撤销 */
+function allow(caller: Caller, name: string, roots: string[], dir: string): () => void {
+  if (caller.layer === "project") throw new Error(`approval.${name}: project plugins cannot widen what runs without asking`);
+  if (typeof dir !== "string" || !path.isAbsolute(dir)) throw new Error(`approval.${name}: dir must be an absolute path`);
+  const root = path.resolve(dir);
+  roots.push(root);
+  const remove = () => {
+    const i = roots.indexOf(root);
+    if (i !== -1) roots.splice(i, 1);
+  };
+  caller.onDispose(remove);
+  return remove;
+}
 
 /**
  * 把问题同时交给终端（能提问时）和所有审批渠道，返回先到的回答，然后中止其余的。

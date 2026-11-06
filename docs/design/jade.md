@@ -294,7 +294,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 | `jade/keys` | `keys@1`：`register`、`get`、`list`；`shift+tab` 也可以注册 | — | 快捷键 |
 | `jade/renderers` | `renderers@1`：`tool`、`event`、`forTool`、`forEvent` | — | `ToolRenderer`、`EventRenderer`。`jade/fs`、`jade/shell` 为自己的工具登记，`jade/approval` 用工具的 `preview` 作审批对话框的内容 |
 | `jade/models` | `provider@1`、`models@1`（`current`、`complete`（可选 `model`：用 `/model` 保存过的某个模型和它的设置，不切换当前模型）、`list`、`saved`（`/model` 保存过的模型名）、`subscribe`）；`/model`：切换保存过的模型、改当前模型的设置、加一个模型；用过的模型记在 `$JADE_HOME/models.json` | 可选 `ui@1`、`commands@1` | `provider.ts`、`ui/configure.ts` |
-| `jade/approval` | `approval@1`（`mode`、`setMode`、`allowRead`：登记不用问就能读的目录；`addApprover`：登记审批渠道（例如聊天机器人），要问时问题同时交给终端和渠道，先回答的算数、其余的经 signal 中止，渠道不回答或出错不算拒绝，有渠道时 `-p` 也会问；两者项目层插件都不能用）、gate；auto 模式下判断不了的调用先由模型审查（`review.ts`） | `ui@1`、`models@1`（都可选：没有 `ui@1` 时，要问的调用一律拒绝；没有 `models@1` 或 `review: false` 时不审查） | `plugins/policy.ts`、`plugins/review.ts` |
+| `jade/approval` | `approval@1`（`mode`、`setMode`、`allowRead`：登记不用问就能读的目录；`allowWrite`：登记和工作目录同样对待的目录；`addApprover`：登记审批渠道（例如聊天机器人），要问时问题同时交给终端和渠道，先回答的算数、其余的经 signal 中止，渠道不回答或出错不算拒绝，有渠道时 `-p` 也会问；这三项项目层插件都不能用）、gate；auto 模式下判断不了的调用先由模型审查（`review.ts`） | `ui@1`、`models@1`（都可选：没有 `ui@1` 时，要问的调用一律拒绝；没有 `models@1` 或 `review: false` 时不审查） | `plugins/policy.ts`、`plugins/review.ts` |
 | `jade/modes` | `modes@1`（`current`、`set`、`cycle`、`subscribe`），Shift+Tab、`/mode`；计划模式：往系统提示词里加"先给计划"的段落，`propose_plan` 工具（只在计划模式、能问用户时发给模型）问"执行这个计划？"，批准了就换模式，工具结果让模型开始做 | `approval@1`；可选 `keys@1`、`commands@1`、`prompts@1`、`ui@1` | Shift+Tab、`/mode`、计划模式的批准流程（`test/modes.test.ts`） |
 | `jade/plugins` | `/plugins [id]`：每个插件的状态和原因、每个服务的提供者（来自核心的 `jade@1`） | `commands@1`、`jade@1` | — |
 | `jade/sessions` | 命令 `/clear` `/resume` `/retry`；会话索引 `$JADE_HOME/state/sessions.jsonl` | `commands@1` | `plugins/sessions.ts`、`session-lifecycle.ts` |
@@ -307,6 +307,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 | `jade/compact` | `context.project` 里清理旧输出、总结；`/compact`；上下文溢出后压缩并经 `afterTurn` 重试 | `models@1` | `plugins/compact.ts` |
 | `jade/mcp` | MCP 服务的工具、`/mcp`；项目层服务启动前确认（`$JADE_HOME/trust.jsonl`） | 可选 `ui@1`、`commands@1`、`prompts@1`、`task@1` | `mcp.ts`。插件自带的 MCP 配置（旧的 PluginBundle）没有了 |
 | `jade/skills` | `skill` 工具、`/skills`、`/<skill 名>`；skill 目录经 `approval@1.allowRead` 可直接读 | 可选 | `skills.ts` |
+| `jade/scratch` | 每个会话一个临时目录（系统临时目录下的 `jade-scratch/<会话 id>`，恢复会话时还是同一个，不主动删除），经 `prompts@1` 告诉模型临时文件放这里，经 `approval@1.allowWrite` 和工作目录同样对待 | 可选 `approval@1`、`prompts@1` | 新功能，参考 Claude Code 的 scratchpad（`test/scratch.test.ts`） |
 | `jade/checks` | 改文件后在 `context.project` 里跑项目检查、`/checks`；命令第一次运行前确认 | `shell@1`（运行检查）；可选 `ui@1`、`approval@1`、`renderers@1`、`commands@1` | `plugins/checks.ts` |
 | `jade/memory`、`jade/undo` | `memory` 工具和 `/memory`；`/undo`（`tool.before`/`tool.after` 记快照） | 可选 | `memory.ts`、`tools/checkpoint.ts` |
 | `jade/mentions` | 在 `context.project` 里把 `@` 引用的文件附到那条用户消息上 | — | `mentions.ts`。附上的内容不算 `read_file` 读过 |

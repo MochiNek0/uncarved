@@ -46,6 +46,8 @@ export interface PolicyOptions {
   cwd: string;
   /** 工作目录之外也可以直接读取的目录，只影响只读工具 */
   readRoots?: string[];
+  /** 工作目录之外、和工作目录同样对待的目录（读、写、命令参数），例如会话的临时目录 */
+  writeRoots?: string[];
 }
 
 export interface Policy {
@@ -413,7 +415,7 @@ export function policy(opts: PolicyOptions): Policy {
     // 只有 ".." 这一段才表示上级目录，名为 "..foo" 的目录仍在里面
     return rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
   };
-  const inside = (p: string) => within(opts.cwd, p);
+  const inside = (p: string) => within(opts.cwd, p) || (opts.writeRoots ?? []).some((r) => within(r, p));
   /** glob 的 pattern 是绝对路径或含 ".." 段时，匹配范围会超出 path */
   const globEscapes = (pattern: string) => path.isAbsolute(pattern) || pattern.split(/[\\/]/).includes("..");
   /** 以 "." 或 "[" 开头的通配段可能匹配到 ".."（取决于 bash 版本和选项），按越界处理 */

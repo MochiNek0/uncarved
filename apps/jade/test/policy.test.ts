@@ -80,6 +80,20 @@ describe("policy", () => {
     expect(d("auto", "write_file", { path: path.join(root, "notes.md"), content: "" })).toBe("ask");
   });
 
+  // 会话的临时目录（jade/scratch 经 allowWrite 传入）：和工作目录同样对待
+  test("files under a write root are treated like the working directory", () => {
+    const root = path.resolve("/scratch/s1");
+    const p = policy({ cwd, writeRoots: [root] });
+    const d = (mode: Mode, name: string, input: unknown) => p.decide(gated(name, input), { mode, rules: [] }).decision;
+    const file = path.join(root, "try.py");
+    expect(d("auto", "write_file", { path: file, content: "" })).toBe("allow");
+    expect(d("ask", "write_file", { path: file, content: "" })).toBe("ask");
+    expect(d("ask", "read_file", { path: file })).toBe("allow");
+    expect(d("auto", "bash", { command: `mkdir -p "${path.join(root, "out")}"` })).toBe("allow");
+    expect(d("plan", "write_file", { path: file, content: "" })).toBe("deny");
+    expect(d("auto", "write_file", { path: path.resolve("/scratch/s2/try.py"), content: "" })).toBe("ask");
+  });
+
   test("opening a viewable file in the workspace for the user does not ask; anything else still does", () => {
     const page = path.join(cwd, "out", "pixel.html");
     expect(decide("ask", "bash", { command: `start "" "${page}"` })).toBe("allow");
