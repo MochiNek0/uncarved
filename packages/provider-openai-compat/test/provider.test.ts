@@ -238,6 +238,20 @@ test("顶层 code 非 0 的块（讯飞星火）：抛出不可重试的 Provide
   expect(res.content).toMatchObject([{ kind: "text", text: "hi" }]);
 });
 
+test("每块都带 code 200 的网关：照常读", async () => {
+  const sse =
+    `data: ${JSON.stringify({ code: 200, message: "success", choices: [{ delta: { content: "hi" }, finish_reason: "stop" }] })}
+
+` +
+    `data: ${JSON.stringify({ code: 200, message: "success", usage: { prompt_tokens: 1, completion_tokens: 1 } })}
+
+data: [DONE]
+
+`;
+  const res = await openaiCompatProvider({ baseURL: "https://example.test/v1", model: "m", fetch: rawSSE(sse) }).complete({ system: [], tools: [], messages: [] }, { signal: new AbortController().signal });
+  expect(res.content).toMatchObject([{ kind: "text", text: "hi" }]);
+});
+
 test("服务端没给 tool call id 时生成唯一的 id", async () => {
   const { fetchFn } = fakeServer([
     [

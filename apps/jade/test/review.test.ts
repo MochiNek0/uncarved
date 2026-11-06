@@ -2,9 +2,11 @@
 // 审查只能放行或转给用户；出错、看不懂、超时都转给用户。模型和界面换成假的。
 
 import { afterEach, describe, expect, test } from "bun:test";
+import { realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { parseVerdict } from "../plugins/approval/review.ts";
+import { scratchDir } from "../plugins/scratch/index.ts";
 import { cleanup, say, scriptedHost, use } from "./scripted-ui.ts";
 
 afterEach(cleanup);
@@ -41,6 +43,15 @@ describe("auto-mode review", () => {
     expect(shared.asked).toEqual([]);
     expect(await readFile(outside, "utf8")).toBe("hi");
     expect(shared.requests[2]!.messages.at(-1)!.content[0]!.kind).toBe("tool_result");
+  });
+
+  test("the review is told about the session's scratch directory, which is writable like the working directory", async () => {
+    const { home, host, shared, send } = await scriptedHost({ config: AUTO });
+    shared.script.push(use("u1", "write_file", { path: path.join(home, "outside.txt"), content: "hi" }), say('{"decision": "allow"}'), say("done"));
+    const s = await host.sessions.open();
+    await send(s, "write it");
+    const review = shared.requests[1]!.messages[0]!.content[0] as { text: string };
+    expect(review.text).toContain(`Also writable like the working directory: ${realpathSync.native(scratchDir(s.id))}`);
   });
 
   test("passes the call to the user when the review says ask, showing its reason", async () => {

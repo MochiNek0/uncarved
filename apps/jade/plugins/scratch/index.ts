@@ -14,6 +14,8 @@ export const scratchDir = (session: string): string => path.join(os.tmpdir(), "j
 
 export default definePlugin({
   async session(ctx) {
+    // 恢复时的 id 来自命令行，还没经过校验；只用单级、不含路径分隔符的名字，免得目录落到 jade-scratch 外面
+    if (!/^[A-Za-z0-9_-][A-Za-z0-9._-]*$/.test(ctx.session.id)) return;
     const created = scratchDir(ctx.session.id);
     await mkdir(created, { recursive: true });
     // 提示词和审批都用真实路径：Windows 上 os.tmpdir() 可能是 8.3 短路径

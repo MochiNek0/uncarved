@@ -27,6 +27,11 @@ export interface Approval {
    * 项目层插件不能用
    */
   addApprover(approver: Approver): () => void;
+  /**
+   * 这个只读调用（例如子 Agent 的）在会话 session 里能不能不问就执行：按该会话"总是允许"的规则、
+   * allowRead/allowWrite 登记的目录和 yolo 模式判断。会话不存在或不是只读调用时为 false
+   */
+  allows(session: string, call: GatedToolCall): boolean;
 }
 
 /** 审批的回答：允许一次、本会话里总是允许、拒绝 */
@@ -61,6 +66,8 @@ const readRoots: string[] = [];
 const writeRoots: string[] = [];
 /** 经 addApprover 登记的审批渠道 */
 const approvers = new Set<Approver>();
+/** 打开着的会话：会话 id → 判断只读调用能不能不问就执行（allows） */
+const sessionChecks = new Map<string, (call: GatedToolCall) => boolean>();
 
 export default definePlugin({
   process(ctx) {
@@ -83,10 +90,11 @@ export default definePlugin({
         caller.onDispose(remove);
         return remove;
       },
+      allows: (session: string, call: GatedToolCall) => call.tool?.effect === "read" && (sessionChecks.get(session)?.(call) ?? false),
     }));
   },
 
-  session(ctx) {
+  async session(ctx) {
     const rules = policy({ cwd: ctx.cwd, readRoots, writeRoots });
     const ui = ctx.service<UI>("ui@1");
     if (badMode !== undefined) {
@@ -109,7 +117,7 @@ export default definePlugin({
         },
       });
     }
-    const review = reviewing ? reviewer({ models: models!, cwd: ctx.cwd, messages: () => recent.messages }) : undefined;
+    const review = reviewing ? reviewer({ models: models!, cwd: ctx.cwd, writeRoots: () => writeRoots, messages: () => recent.messages }) : undefined;
     /** 本会话里审查过一次、放行了的调用 */
     const reviewedCalls = new Set<string>();
     let warned = false;
@@ -117,11 +125,23 @@ export default definePlugin({
     const added: AllowRule[] = [];
     /** 一次只问一个问题；排在后面的问之前重新判断，前面刚选的"总是允许"可能已经覆盖它 */
     let asking: Promise<unknown> = Promise.resolve();
+    /** 日志里记下的"总是允许"规则，每次调用工具前取一次：子 Agent 在工具执行期间经 allows 用它 */
+    let logged: AllowRule[] = [];
+    const id = ctx.session.id;
+    const check = (call: GatedToolCall) =>
+      rules.decide(call, { mode: mode === "yolo" ? "yolo" : "readonly", rules: [...logged, ...added] }).decision === "allow";
+    sessionChecks.set(id, check);
+    await ctx.effect(() => () => {
+      if (sessionChecks.get(id) === check) sessionChecks.delete(id);
+    });
 
     ctx.kernel.hook({
       kind: "transform",
       point: "tool.before",
-      fn: (call) => ({ ...call, input: rules.absolutePath(call.input) }),
+      fn: (call, hook) => {
+        logged = (hook.derived[RULES_KEY] as AllowRule[] | undefined) ?? [];
+        return { ...call, input: rules.absolutePath(call.input) };
+      },
     });
     ctx.kernel.hook({
       kind: "gate",

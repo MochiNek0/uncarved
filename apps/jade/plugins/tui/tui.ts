@@ -855,10 +855,16 @@ function App({
   };
 
   // Ink 增量渲染只用相对光标移动，第一帧起点一旦偏了（启动时终端尺寸还没稳定、窗口缩放、别的输出插进来），
-  // 之后每帧都会画错行。启动后、尺寸变化后和按 Ctrl+L 时让一帧比终端高，Ink 会清屏从左上角整帧重画（包在同步输出里），下一帧再恢复
+  // 之后每帧都会画错行。尺寸变化后和按 Ctrl+L 时让一帧比终端高，Ink 会清屏从左上角整帧重画（包在同步输出里），下一帧再恢复。
+  // 启动时不重画：第一帧之前已经清屏、光标在左上角；这两次清屏在不支持同步输出的终端上（Windows 上常见）看得出闪一下
   const [redraws, setRedraws] = useState(0);
   const [repaint, setRepaint] = useState(false);
+  const mounted = useRef(false);
   useEffect(() => {
+    if (!mounted.current) {
+      mounted.current = true;
+      return;
+    }
     const t = setTimeout(() => setRepaint(true), 100);
     return () => clearTimeout(t);
   }, [columns, rows, redraws]);

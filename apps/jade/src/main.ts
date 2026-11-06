@@ -114,7 +114,13 @@ export async function main(argv: readonly string[]): Promise<number> {
     report,
     ...(await trustOptions(home, roots)),
   };
-  host = await PluginHost.start(opts);
+  try {
+    host = await PluginHost.start(opts);
+  } catch (e) {
+    // 例如手改坏了的 plugins.json：说清楚是哪个文件，不打一整段堆栈
+    console.error(`jade: ${e instanceof Error ? e.message : String(e)}`);
+    return 1;
+  }
   const uninstall = host.installProcessHandlers();
 
   const ac = new AbortController();

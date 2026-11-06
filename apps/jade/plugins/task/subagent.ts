@@ -12,6 +12,7 @@ import {
   MemoryLogStore,
   Runtime,
   type EventDataMap,
+  type GatedToolCall,
   type GateResult,
   type Message,
   type Plugin,
@@ -47,6 +48,8 @@ export interface TaskOptions {
   maxSteps: number;
   /** 不给时一律拒绝 */
   approve?: ApproveSubagent;
+  /** 主会话的规则（"总是允许"、可读写的目录、yolo）已经允许的调用不用再问 */
+  allowed?(call: GatedToolCall): boolean;
   /** 子 Agent 插件的 id 前缀 */
   id: string;
   today?: string;
@@ -137,7 +140,7 @@ function plugins(opts: TaskOptions, tools: Tool[], control: { wrapUp: boolean },
           fn: async (call): Promise<GateResult> => {
             if (call.tool.effect !== "read") return { decision: "deny", reason: `${call.name} is not read-only; sub-agents can only read. Describe the change in your report instead.` };
             const why = needsApproval(opts.cwd, call.input);
-            if (!why) return { decision: "allow" };
+            if (!why || opts.allowed?.(call)) return { decision: "allow" };
             const answer = opts.approve ? await opts.approve({ toolUseId: call.toolUseId, name: call.name, input: call.input, why }, signal) : NOBODY;
             return answer.approved ? { decision: "allow" } : { decision: "deny", reason: answer.reason ?? NOBODY.reason };
           },

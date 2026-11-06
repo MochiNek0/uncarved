@@ -1,7 +1,9 @@
 // jade/scratch：会话的临时目录，经插件宿主的端到端测试。
 
 import { describe, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
 import { readFile, rm } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { featureHost, msg, reply, results, textOf, use } from "./feature-host.ts";
 
@@ -27,6 +29,18 @@ describe("scratch", () => {
     } finally {
       await host.close();
       if (dir) await rm(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a session id that is not a plain name (an unchecked --resume argument) gets no scratch directory", async () => {
+    const { host } = await featureHost();
+    const outside = path.join(os.tmpdir(), `jade-escape-${process.pid}`);
+    try {
+      await expect(host.sessions.open({ resume: path.join("..", path.basename(outside)) })).rejects.toThrow();
+      expect(existsSync(outside)).toBe(false);
+    } finally {
+      await host.close();
+      await rm(outside, { recursive: true, force: true });
     }
   }, 30_000);
 });

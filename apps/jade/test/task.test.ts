@@ -12,6 +12,8 @@ import { WRAP_UP } from "../plugins/task/subagent.ts";
 import { SEARCH_PROVIDERS } from "../plugins/web/web.ts";
 
 const SEARCH_KEYS = SEARCH_PROVIDERS.map((p) => p.env);
+/** scriptedHost 默认是 yolo，子 Agent 不会问；要看它问的测试用 ask */
+const ASK = { "jade/approval": { mode: "ask" } };
 
 describe("jade/task", () => {
   test("runs a read-only sub-agent and returns its report; progress shows its tool calls", async () => {
@@ -105,7 +107,7 @@ describe("jade/task", () => {
   });
 
   test("reads outside the working directory are put to the user; without an answer they are denied", async () => {
-    const { home, host, shared, send } = await scriptedHost();
+    const { home, host, shared, send } = await scriptedHost({ config: ASK });
     const outside = path.join(home, "secret.txt");
     await writeFile(outside, "the secret");
     const script = () =>
@@ -131,8 +133,38 @@ describe("jade/task", () => {
     expect(shared.asked).toHaveLength(2);
   });
 
+  test("an \"always allow\" answer in the main session covers the sub-agent too", async () => {
+    const { home, host, shared, send } = await scriptedHost({ config: ASK });
+    const outside = path.join(home, "notes.txt");
+    await writeFile(outside, "the notes");
+    shared.script.push(
+      use("r1", "read_file", { path: outside }),
+      use("u1", "task", { description: "read", prompt: "read the notes" }),
+      use("c1", "read_file", { path: outside }),
+      say("report"),
+      say("done"),
+    );
+    shared.answers.push("always");
+    const s = await host.sessions.open();
+    await send(s, "go");
+    expect(shared.asked).toEqual(["Allow read_file?"]);
+    expect(textOf(shared.requests[3]!.messages.at(-1)!.content)).toContain("the notes");
+  });
+
+  test("in yolo mode the sub-agent does not ask either", async () => {
+    const { home, host, shared, send } = await scriptedHost();
+    const outside = path.join(home, "notes.txt");
+    await writeFile(outside, "the notes");
+    shared.script.push(use("u1", "task", { description: "read", prompt: "read the notes" }), use("c1", "read_file", { path: outside }), say("report"), say("done"));
+    shared.interactive = false;
+    const s = await host.sessions.open();
+    await send(s, "go");
+    expect(shared.asked).toEqual([]);
+    expect(textOf(shared.requests[2]!.messages.at(-1)!.content)).toContain("the notes");
+  });
+
   test("a symlink inside the working directory that points outside is put to the user", async () => {
-    const { home, cwd, host, shared, send } = await scriptedHost();
+    const { home, cwd, host, shared, send } = await scriptedHost({ config: ASK });
     await writeFile(path.join(home, "creds"), "secret");
     try {
       await symlink(path.join(home, "creds"), path.join(cwd, "link"), "file");
@@ -148,7 +180,7 @@ describe("jade/task", () => {
   });
 
   test("a glob whose pattern escapes the working directory is put to the user too", async () => {
-    const { host, shared, send } = await scriptedHost();
+    const { host, shared, send } = await scriptedHost({ config: ASK });
     shared.script.push(use("u1", "task", { description: "find", prompt: "find keys" }), use("c1", "glob", { pattern: "../**/.ssh/*" }), say("report"), say("done"));
     shared.answers.push("no");
     const s = await host.sessions.open();

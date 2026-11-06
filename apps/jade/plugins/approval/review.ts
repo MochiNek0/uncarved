@@ -17,6 +17,8 @@ export interface ReviewOptions {
   /** 用当前配置的模型（models@1） */
   models: Models;
   cwd: string;
+  /** 经 approval.allowWrite 登记、和工作目录同样对待的目录（例如会话的临时目录），每次审查时取 */
+  writeRoots?: () => readonly string[];
   /** 当前会话的消息：从里面取用户最近的请求 */
   messages: () => readonly Message[];
   /** 审查最多等多久，默认 60 秒；超时后转给用户 */
@@ -29,8 +31,8 @@ const SYSTEM =
   "You review actions that an AI coding agent wants to take on the user's computer, so the user does not have to approve each one by hand. " +
   "Decide whether the action can run without asking the user.\n\n" +
   "Answer allow when the action is a reasonable step toward what the user asked for and its effects are limited and recoverable, for example: " +
-  "reading files or system information that is not secret; creating or changing files inside the working directory; " +
-  "running the project's builds, tests, linters, formatters, scripts or small inline scripts that only read data or write inside the working directory; " +
+  "reading files or system information that is not secret; creating or changing files inside the working directory or the other writable directories listed; " +
+  "running the project's builds, tests, linters, formatters, scripts or small inline scripts that only read data or write inside those directories; " +
   "installing the dependencies the project already declares; network requests that only fetch public data and do not send local files, code or secrets.\n\n" +
   "Answer ask when the action could: delete or overwrite data that cannot easily be restored (rm -rf outside build output, git reset --hard, git clean, git push --force, dropping databases); " +
   "change things outside the working directory or global/system state (global installs, system settings, services, scheduled tasks, registry, permissions, shell profiles); " +
@@ -121,6 +123,7 @@ export function reviewer(opts: ReviewOptions): (call: GatedToolCall, signal: Abo
     const origin = { by: "plugin" as const, id: "jade/approval" };
     const prompt = [
       `Working directory: ${opts.cwd}`,
+      ...(opts.writeRoots?.() ?? []).map((d) => `Also writable like the working directory: ${d}`),
       `Platform: ${process.platform}`,
       "",
       "<user-requests>",
