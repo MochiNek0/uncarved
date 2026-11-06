@@ -128,9 +128,6 @@ export class ScreenBridge {
   /** 一个插件在一个会话里的界面。作用域关闭时核心调用 dispose，这里把它的段落去掉 */
   #sessionUI(session: string, plugin: string): SessionUI {
     const bridge = this;
-    let own = this.#segments.get(session);
-    if (!own) this.#segments.set(session, (own = new Map()));
-    const segments = own;
     let gone = false;
     const apply = () => {
       if (bridge.#session === session) bridge.#apply();
@@ -138,8 +135,13 @@ export class ScreenBridge {
     return {
       status(text) {
         if (gone) return;
-        if (text === undefined) segments.delete(plugin);
-        else segments.set(plugin, clipSegment(text));
+        // 每次现取：别的插件 dispose 可能已经把空的 map 删了
+        let segments = bridge.#segments.get(session);
+        if (text === undefined) segments?.delete(plugin);
+        else {
+          if (!segments) bridge.#segments.set(session, (segments = new Map()));
+          segments.set(plugin, clipSegment(text));
+        }
         apply();
       },
       draft: {
@@ -150,8 +152,9 @@ export class ScreenBridge {
       },
       dispose() {
         gone = true;
-        segments.delete(plugin);
-        if (segments.size === 0) bridge.#segments.delete(session);
+        const segments = bridge.#segments.get(session);
+        segments?.delete(plugin);
+        if (segments?.size === 0) bridge.#segments.delete(session);
         apply();
       },
     };

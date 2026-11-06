@@ -156,6 +156,19 @@ describe("ScreenBridge status segments", () => {
     expect(statuses.at(-1)).toEqual({ plugins: [] });
   });
 
+  test("another plugin leaving the session does not lose a later segment", () => {
+    const { screen, statuses } = fakeScreen();
+    const bridge = new ScreenBridge();
+    bridge.attach(screen);
+    bridge.show("s1");
+    const a = bridge.ui.session!({ session: "s1", plugin: "p/a" })!;
+    const b = bridge.ui.session!({ session: "s1", plugin: "p/b" })!;
+    // b 离开时会话里还没有段落
+    b.dispose();
+    a.status("building");
+    expect(statuses.at(-1)).toEqual({ plugins: [{ plugin: "p/a", text: "building" }] });
+  });
+
   test("a segment is one clipped line, and the draft is forwarded to the input box", () => {
     const { screen, statuses, draft } = fakeScreen();
     const bridge = new ScreenBridge();
