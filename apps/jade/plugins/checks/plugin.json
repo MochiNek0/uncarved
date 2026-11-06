@@ -1,0 +1,14 @@
+{
+  "id": "jade/checks",
+  "version": "0.3.0",
+  "api": "^1",
+  "entry": "./index.ts",
+  "requires": ["shell@1"],
+  "optional": ["ui@1", "approval@1", "renderers@1", "commands@1"],
+  "config": {
+    "enabled": {
+      "default": true,
+      "description": "run the project's checks after the agent edits files; JADE_CHECKS=off turns them off too"
+    }
+  }
+}

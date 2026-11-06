@@ -1,0 +1,13 @@
+{
+  "id": "jade/schedule",
+  "version": "0.1.0",
+  "api": "^1",
+  "entry": "./index.ts",
+  "optional": ["commands@1", "ui@1"],
+  "config": {
+    "checkSeconds": {
+      "default": 30,
+      "description": "how often to look for scheduled tasks that are due"
+    }
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "id": "jade/continue",
+  "version": "0.2.0",
+  "api": "^1",
+  "entry": "./index.ts",
+  "optional": ["ui@1"],
+  "config": {
+    "maxContinues": {
+      "default": 3,
+      "description": "how many times in a row the model is asked to continue a reply cut off at the output token limit; 0 turns it off"
+    }
+  }
+}

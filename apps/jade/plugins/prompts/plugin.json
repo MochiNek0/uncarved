@@ -1,0 +1,8 @@
+{
+  "id": "jade/prompts",
+  "version": "0.4.0",
+  "api": "^1",
+  "entry": "./index.ts",
+  "provides": ["prompts@1"],
+  "optional": ["models@1", "ui@1"]
+}

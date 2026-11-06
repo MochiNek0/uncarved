@@ -1,30 +1,23 @@
-export * from "./distro.ts";
-export * from "./provider.ts";
-export * from "./sessions.ts";
-export * from "./memory.ts";
-export * from "./mentions.ts";
-export * from "./plugins/budget.ts";
-export * from "./plugins/compact.ts";
-export * from "./plugins/checks.ts";
-export * from "./plugins/policy.ts";
-export * from "./plugins/review.ts";
-export * from "./plugins/prompts.ts";
-export * from "./plugins/schema.ts";
-export * from "./tools/fs.ts";
-export * from "./tools/grep.ts";
-export * from "./tools/web.ts";
-export * from "./tools/screenshot.ts";
-export * from "./tools/shell.ts";
-export * from "./tools/task.ts";
-export * from "./tools/checkpoint.ts";
-export * from "./tools/todo.ts";
-export * from "./tools/ask.ts";
-export * from "./config.ts";
-export * from "./context.ts";
-export * from "./commands.ts";
-export * from "./plugins/loader.ts";
-export * from "./plugins/install.ts";
-export * from "./plugins/builtins.ts";
-export * from "./mcp.ts";
-export * from "./skills.ts";
-export * from "./plugins/host.ts";
+export * from "./api.ts";
+export { discover, isPluginId, parseManifest, satisfiesCaret, type BrokenSource, type LayerRoot } from "./manifest.ts";
+export { resolve, type Plan, type PlanEntry, type PlanState, type ResolveOptions } from "./resolve.ts";
+export { PluginHost, planPlugins, type HostOptions, type PluginInfo, type PluginState } from "./host.ts";
+export { pluginsCommand } from "./rescue.ts";
+export {
+  addPlugin,
+  installDir,
+  readRecords,
+  removePlugin,
+  updatePlugins,
+  type AddOptions,
+  type Added,
+  type InstallRecord,
+  type UpdateOptions,
+  type UpdateResult,
+  type UpdateStatus,
+} from "./install.ts";
+export { parseSource, type PluginSourceSpec, type SourceKind } from "./source.ts";
+export { treeHash } from "./hash.ts";
+export { CORE_PLUGIN_ID, NO_APPROVAL_REASON, Sessions } from "./session.ts";
+export { pluginConfig, readConfigFile, type ConfigFile } from "./config.ts";
+export { FAULT_LIMIT } from "./state.ts";

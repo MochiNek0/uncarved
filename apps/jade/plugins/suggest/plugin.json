@@ -1,0 +1,18 @@
+{
+  "id": "jade/suggest",
+  "version": "0.1.0",
+  "api": "^1",
+  "entry": "./index.ts",
+  "requires": ["models@1"],
+  "optional": ["ui@1", "commands@1"],
+  "config": {
+    "enabled": {
+      "default": false,
+      "description": "after each turn, predict your next message and show it in gray in the input box (Tab or → accepts it); each prediction is one more model request; /suggest on|off overrides it"
+    },
+    "model": {
+      "default": "",
+      "description": "the model that predicts, by a name saved with /model; empty uses the session's model; /suggest model overrides it"
+    }
+  }
+}

@@ -102,7 +102,7 @@ hook 用到的能力必须在 `needs` 里声明，否则拒绝加载。可用能
 
 `definePlugin(draft)` 可以省去样板字段：`kernel` 缺省为当前内核的 `^` 范围，`needs` 自动加上 hooks 用到的能力（`log:record`、`log:emit` 推不出来，仍要自己写）。
 
-项目层插件的入口模块可以默认导出插件对象，也可以默认导出返回插件对象的函数。`loadProjectPlugin(dir, { context })` 用 `context` 调用一次；`loadProjectPluginFactory(dir, opts)` 返回一个工厂，宿主可以多次创建实例（例如每个会话一套），确认只发生一次。
+项目层插件的入口模块可以默认导出插件对象，也可以默认导出返回插件对象的函数。`loadProjectPlugin(dir, { context })` 用 `context` 调用一次；`loadProjectPluginFactory(dir, opts)` 返回一个工厂，宿主可以多次创建实例（例如每个会话一套），确认只发生一次。宿主的插件模块不是这种形状时，用 `importProjectModule(dir, opts)`：确认流程完全相同，返回入口模块本身和一个 `mark(plugin)`，用它把这份代码创建的插件标记为已确认的项目层插件（可多次调用）。
 
 `kernel` 字段按 semver 的 `^` 规则匹配内核版本：在 0.x 阶段，小版本之间视为不兼容，`^0.1` 只接受 0.1.x。
 

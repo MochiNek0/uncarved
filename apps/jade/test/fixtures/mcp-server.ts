@@ -5,12 +5,12 @@
 //   crash：直接退出进程；
 //   slow：一直不回复（测试中断和 notifications/cancelled）。
 // tools/list 分两页返回，测试分页。往 stdout 打一行非 JSON 的日志，测试客户端会忽略它。
-// 设置 MCP_MARK 时，每次启动往该文件追加一行，测试重连。
+// 设置 MCP_MARK 时，每次启动往该文件追加一行（带进程号），测试重连和退出时关掉服务。
 
 import { appendFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
-if (process.env.MCP_MARK) appendFileSync(process.env.MCP_MARK, "start\n");
+if (process.env.MCP_MARK) appendFileSync(process.env.MCP_MARK, `start ${process.pid}\n`);
 process.stdout.write("starting fake server (not json)\n");
 process.stderr.write("fake server log line\n");
 

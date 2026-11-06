@@ -1,14 +1,17 @@
-// 新版本提示和 jade update：查 npm 上的最新版本，按 jade 的安装方式（npm 或 bun 全局安装）升级。
+// jade 本身的升级：查 npm 上的最新版本，按 jade 的安装方式（npm、bun、pnpm、yarn 全局安装）升级。
+// jade update 直接用这里（核心命令，插件坏了也能升级）；启动时的检查和后台升级在 jade/update 插件里，也用这里。
 // 启动时的检查每天最多一次，结果缓存在 $JADE_HOME/update-check.json，查不到时什么也不说
 
 import { spawn } from "node:child_process";
-import { closeSync, openSync, realpathSync } from "node:fs";
+import { closeSync, openSync, readFileSync, realpathSync } from "node:fs";
 import { mkdir, open, readFile, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { npmCommand, VERSION, which } from "./sys.ts";
+import { npmCommand, which } from "./fetch.ts";
 
 export const PACKAGE = "@uncarved/jade";
+/** 正在运行的 jade 的版本 */
+export const VERSION: string = JSON.parse(readFileSync(path.join(packageDir(), "package.json"), "utf8")).version;
 const LATEST_URL = `https://registry.npmjs.org/${PACKAGE}/latest`;
 const CHECK_EVERY_MS = 24 * 60 * 60 * 1000;
 const TIMEOUT_MS = 5000;

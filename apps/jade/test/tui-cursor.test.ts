@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { PassThrough, Writable } from "node:stream";
-import { tuiScreen } from "../src/ui/tui.tsx";
+import { tuiScreen } from "../plugins/tui/tui.ts";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 

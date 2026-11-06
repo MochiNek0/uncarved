@@ -1,0 +1,7 @@
+{
+  "id": "jade/fs",
+  "version": "0.2.0",
+  "api": "^1",
+  "entry": "./index.ts",
+  "optional": ["renderers@1", "task@1"]
+}

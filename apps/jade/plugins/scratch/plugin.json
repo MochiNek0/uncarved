@@ -1,0 +1,7 @@
+{
+  "id": "jade/scratch",
+  "version": "0.1.0",
+  "api": "^1",
+  "entry": "./index.ts",
+  "optional": ["approval@1", "prompts@1"]
+}

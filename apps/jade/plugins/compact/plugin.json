@@ -1,0 +1,17 @@
+{
+  "id": "jade/compact",
+  "version": "0.3.0",
+  "api": "^1",
+  "entry": "./index.ts",
+  "provides": ["compact@1"],
+  "requires": ["models@1"],
+  "optional": ["commands@1", "renderers@1", "ui@1"],
+  "config": {
+    "thresholdTokens": {
+      "description": "compact when the history reaches this many tokens (a number or e.g. \"120k\"); default: 80% of the model's context window, leaving room for the reply"
+    },
+    "keepTokens": {
+      "description": "after compacting, keep about this many tokens of the most recent messages verbatim; default 30% of the threshold"
+    }
+  }
+}

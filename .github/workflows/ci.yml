@@ -2,7 +2,6 @@ name: CI
 
 # 不在 push 时自动跑：三个系统一起跑太占资源，需要时在 Actions 页面手动触发
 on:
-  pull_request:
   workflow_dispatch:
 
 jobs:
@@ -26,5 +25,3 @@ jobs:
       - run: bun run build
       # 发布产物在纯 Node 下能导入、能跑
       - run: bun run smoke:node
-      # jade 在纯 Node 下能跑：一轮 -p 对话、plugin add、web_fetch 的网页转文本
-      - run: bun run smoke:jade

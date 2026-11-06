@@ -1,0 +1,15 @@
+{
+  "id": "jade/web",
+  "version": "0.3.0",
+  "api": "^1",
+  "entry": "./index.ts",
+  "optional": ["ui@1", "commands@1", "prompts@1", "renderers@1", "task@1"],
+  "config": {
+    "search": {
+      "description": "search services to use, in order: a list or comma-separated names (tinyfish, anysearch, tavily, exa, firecrawl, jina); default: every service with an API key. Keys are read from the environment and $JADE_HOME/.env (/search sets them). $JADE_SEARCH still works"
+    },
+    "results": {
+      "description": "results per web_search, 1-20, default 10; $JADE_SEARCH_RESULTS still works"
+    }
+  }
+}

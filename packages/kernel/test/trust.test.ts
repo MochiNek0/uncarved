@@ -9,6 +9,7 @@ import {
   MemoryTrustStore,
   Runtime,
   UntrustedPlugin,
+  importProjectModule,
   loadProjectPlugin,
   loadProjectPluginFactory,
   subsetPlugin,
@@ -284,4 +285,39 @@ test("工厂返回的不是插件时拒绝", async () => {
   await writeFile(path.join(root, "index.ts"), `export default () => 42;\n`);
   const make = await loadProjectPluginFactory(root, { trust: new MemoryTrustStore(), confirm: async () => true });
   await expect(make()).rejects.toBeInstanceOf(UntrustedPlugin);
+});
+
+// importProjectModule：模块形状由宿主决定，mark 可以多次使用
+
+test("importProjectModule runs no code when not confirmed", async () => {
+  const root = await writePlugin("shape-free");
+  const { confirm, asked } = recordingConfirm(false);
+  await expect(importProjectModule(root, { trust: new MemoryTrustStore(), confirm })).rejects.toThrow(UntrustedPlugin);
+  expect(asked.length).toBe(1);
+  expect(globalThis.__uncarvedTrustRuns).toBe(0);
+});
+
+test("importProjectModule returns the module as is, and mark can confirm several plugins made from it", async () => {
+  const root = path.join(dir, "host-shaped");
+  await mkdir(root, { recursive: true });
+  // 不是内核插件的形状：loadProjectPlugin 会拒绝，importProjectModule 不管
+  await writeFile(path.join(root, "index.ts"), `globalThis.__uncarvedTrustRuns = (globalThis.__uncarvedTrustRuns ?? 0) + 1;
+export default { session() {} };
+`);
+  const { confirm } = recordingConfirm(true);
+  const { module, mark } = await importProjectModule(root, { trust: new MemoryTrustStore(), confirm });
+  expect(typeof (module as { default: { session: unknown } }).default.session).toBe("function");
+  expect(globalThis.__uncarvedTrustRuns).toBe(1);
+
+  for (const sessionId of ["a", "b"]) {
+    const p = mark({ id: "host-shaped", version: "1.0.0", kernel: `^${KERNEL_VERSION.split(".").slice(0, 2).join(".")}` });
+    expect(p.layer).toBe("project");
+    const rt = await Runtime.create({ store: new MemoryLogStore(), provider, plugins: [p], sessionId });
+    expect(rt.state.plugins.map((x) => x.id)).toEqual(["host-shaped"]);
+  }
+});
+
+test("a plugin marked project without mark is still rejected by Runtime", async () => {
+  const p: Plugin = { id: "forged", version: "1.0.0", kernel: `^${KERNEL_VERSION.split(".").slice(0, 2).join(".")}`, layer: "project" };
+  await expect(Runtime.create({ store: new MemoryLogStore(), provider, plugins: [p] })).rejects.toThrow(UntrustedPlugin);
 });
