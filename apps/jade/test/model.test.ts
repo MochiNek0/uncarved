@@ -200,6 +200,40 @@ describe("/model", () => {
     }
   });
 
+  test("complete with a model name uses that saved model and its settings, without switching", async () => {
+    const { host, models } = await setup();
+    respond = () =>
+      new Response([`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: "ok" } }] })}\n\n`, "data: [DONE]\n\n"].join(""), {
+        headers: { "content-type": "text/event-stream" },
+      });
+    const request: ModelRequest = { system: [], messages: [], tools: [] };
+    const signal = new AbortController().signal;
+    try {
+      await models.complete(request, { signal, model: "m2" });
+      expect(urls.at(-1)).toContain("b.example/v1");
+      expect(bodies.at(-1)).toMatchObject({ model: "m2", max_tokens: 64000 });
+      expect(models.current()!.model).toBe("m1");
+
+      // 不指定时还是当前的模型
+      await models.complete(request, { signal });
+      expect(urls.at(-1)).toContain("a.example/v1");
+      expect((bodies.at(-1) as { model?: string }).model).toBe("m1");
+
+      await expect(models.complete(request, { signal, model: "nope" })).rejects.toThrow('model "nope" is not one of the models saved by /model');
+    } finally {
+      await host.close();
+    }
+  });
+
+  test("saved lists the model names complete accepts", async () => {
+    const { host, models } = await setup();
+    try {
+      expect(await models.saved!()).toEqual(["m1", "m2"]);
+    } finally {
+      await host.close();
+    }
+  });
+
   test("the menu changes the current model's settings", async () => {
     const { home, shared, host, ctx, command, models } = await setup();
     try {

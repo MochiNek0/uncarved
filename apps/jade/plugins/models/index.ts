@@ -11,7 +11,8 @@ import type { Commands } from "../commands/index.ts";
 import { contextWindow } from "./context.ts";
 import { envWithFile, hasProvider } from "./config.ts";
 import { configurator } from "./configure.ts";
-import { listModels, providerFromEnv, providerInfo, RateGate, rpmFromEnv, visionFromEnv, withRetry } from "./provider.ts";
+import { isBuiltinKind, listModels, MODEL_KEY, providerFromEnv, providerInfo, providerKind, RateGate, rpmFromEnv, visionFromEnv, withRetry } from "./provider.ts";
+import { readSavedServices, type Env } from "./saved.ts";
 
 /** models@1 */
 export interface Models {
@@ -25,10 +26,15 @@ export interface Models {
     /** 模型能不能看图片（JADE_VISION；不设时按服务推断） */
     vision: boolean;
   } | undefined;
-  /** 用当前配置的模型完成一次请求（带重试和限速，和会话共用） */
-  complete(request: ModelRequest, options: { signal: AbortSignal; onDelta?: (delta: import("uncarved").Delta) => void }): Promise<ModelResponse>;
+  /**
+   * 完成一次请求，带重试和限速。默认用当前配置的模型（限速和会话共用）；
+   * model 是 /model 保存过的模型名（$JADE_HOME/models.json），用它和它自己的设置，找不到时报错
+   */
+  complete(request: ModelRequest, options: { signal: AbortSignal; onDelta?: (delta: import("uncarved").Delta) => void; model?: string }): Promise<ModelResponse>;
   /** 服务提供的模型列表；不支持或出错时为空 */
   list(): Promise<string[]>;
+  /** /model 保存过的模型名（complete 的 model 能用的那些），最近用过的在前 */
+  saved?(): Promise<string[]>;
   /** 配置换了（/model）时调用，返回取消订阅。前端用它更新状态栏 */
   subscribe?(fn: () => void): () => void;
 }
@@ -60,9 +66,8 @@ export default definePlugin({
       );
 
     let made: Promise<Provider> | undefined;
-    const build = (): Promise<Provider> => {
-      // 用创建时的这份配置：之后换了配置，新的一份自己建 provider
-      const snapshot = env;
+    // 用创建时的这份配置：之后换了配置，新的一份自己建 provider
+    const build = (snapshot: Env): Promise<Provider> => {
       return (async () => {
         const gate = new RateGate({ rpm: rpmFromEnv(snapshot), onLearn: (rpm) => ui?.notify(`rate limited: spacing requests to ${rpm} per minute from now on`, "warning") });
         return withRetry(await providerFromEnv(snapshot), {
@@ -77,7 +82,7 @@ export default definePlugin({
     const provider = (): Promise<Provider> => {
       if (!hasProvider(env)) return Promise.reject(notConfigured());
       if (made) return made;
-      const p = build();
+      const p = build(env);
       made = p;
       // 创建失败时下次重试（例如密钥刚写进 .env）
       p.catch(() => {
@@ -86,10 +91,33 @@ export default definePlugin({
       return p;
     };
 
-    const complete: Models["complete"] = (request, options) => provider().then((p) => p.complete(request, options));
+    /** 保存过的模型的 provider，按配置缓存：models.json 里的密钥或设置改了就另建一份 */
+    const savedProviders = new Map<string, Promise<Provider>>();
+    const saved = async (name: string): Promise<Provider> => {
+      for (const s of await readSavedServices(modelsFile)) {
+        const m = s.models.find((x) => x.name === name);
+        const kind = providerKind(s.env);
+        if (!m || !isBuiltinKind(kind)) continue;
+        const snapshot: Env = { ...s.env, ...m.settings, JADE_PROVIDER: kind, [MODEL_KEY[kind]]: m.name };
+        const key = JSON.stringify(snapshot);
+        const cached = savedProviders.get(key);
+        if (cached) return cached;
+        const p = build(snapshot);
+        savedProviders.set(key, p);
+        // 创建失败时下次重试
+        p.catch(() => savedProviders.delete(key));
+        return p;
+      }
+      // 只写在 .env 里、没保存过的当前模型
+      if (hasProvider(env) && providerInfo(env).model === name) return provider();
+      throw new Error(`model ${JSON.stringify(name)} is not one of the models saved by /model (${modelsFile})`);
+    };
+
+    const current: Provider["complete"] = (request, options) => provider().then((p) => p.complete(request, options));
+    const complete: Models["complete"] = (request, { model, ...options }) => (model ? saved(model).then((p) => p.complete(request, options)) : current(request, options));
 
     // 转发的 provider：会话创建时固定的是这个壳，/model 之后下一次请求就用新的配置
-    ctx.provide("provider@1", { id: "jade/models", complete } satisfies Provider);
+    ctx.provide("provider@1", { id: "jade/models", complete: current } satisfies Provider);
 
     ctx.provide("models@1", {
       current() {
@@ -106,6 +134,10 @@ export default definePlugin({
       },
       complete,
       list: () => listModels(env),
+      async saved() {
+        const names = (await readSavedServices(modelsFile)).flatMap((s) => (isBuiltinKind(providerKind(s.env)) ? s.models.map((m) => m.name) : []));
+        return [...new Set(names)];
+      },
       subscribe(fn: () => void) {
         watchers.add(fn);
         return () => void watchers.delete(fn);

@@ -12,12 +12,13 @@ import { PluginHost, type Frontend } from "../src/index.ts";
 import { terminal } from "../plugins/tui/frontend.ts";
 
 const BUNDLED = path.resolve(import.meta.dir, "../plugins");
-const g = globalThis as { __script?: unknown[]; __requests?: { messages: { content: { kind: string; text?: string }[] }[] }[] };
+const g = globalThis as { __hold?: Promise<void>; __script?: unknown[]; __requests?: { messages: { content: { kind: string; text?: string }[] }[] }[] };
 
 let tmp: string[] = [];
 afterEach(async () => {
   delete terminal.io;
   delete g.__script;
+  delete g.__hold;
   delete g.__requests;
   for (const d of tmp) await rm(d, { recursive: true, force: true });
   tmp = [];
@@ -29,6 +30,8 @@ const FAKE_MODEL = `export default { process(ctx) {
     (globalThis.__requests ??= []).push(structuredClone(req));
     const next = globalThis.__script.shift();
     if (!next) throw new Error("script exhausted");
+    // hold: 等测试放行才返回，模拟还在跑的一轮
+    if (next.hold) await globalThis.__hold;
     return { model: "s1", ...next };
   } };
   ctx.provide("provider@1", provider);
@@ -153,6 +156,62 @@ test("@ completes a file path, and sending it attaches the file's content", asyn
     await t.type("/exit");
     await t.type("\r");
     expect(await done).toBe(0);
+  } finally {
+    await host.close();
+  }
+});
+
+test("↑ takes queued messages back into the input; esc twice interrupts and moves them back too", async () => {
+  const { start } = await setup();
+  let release!: () => void;
+  g.__hold = new Promise((r) => (release = r));
+  g.__script = [
+    { hold: true, content: [{ kind: "text", text: "first answer", origin: MODEL, trust: "trusted" }], stopReason: "end" },
+    { content: [{ kind: "text", text: "second answer", origin: MODEL, trust: "trusted" }], stopReason: "end" },
+    { hold: true, content: [{ kind: "text", text: "never shown", origin: MODEL, trust: "trusted" }], stopReason: "end" },
+  ];
+  g.__requests = [];
+
+  const t = fakeTerminal();
+  const host = await start();
+  const ac = new AbortController();
+  try {
+    const frontend = host.service<Frontend>("frontend@1")!;
+    const done = frontend.run({ argv: [], sessions: host.sessions, signal: ac.signal });
+    await until(() => t.output().includes("Type / for commands"));
+
+    await t.type("first\r");
+    await until(() => g.__requests!.length === 1);
+    await t.type("second\r");
+    await until(() => t.output().includes("queued: second"));
+    expect(t.output()).toContain("↑ to edit queued messages");
+
+    // ↑ 取回来改，不打断正在跑的一轮
+    await t.type("\x1b[A");
+    await t.type(" edited");
+    release();
+    await until(() => t.output().includes("first answer"));
+    expect(g.__requests!.length).toBe(1);
+    await t.type("\r");
+    await until(() => t.output().includes("second answer"));
+    expect(JSON.stringify(g.__requests![1])).toContain("second edited");
+
+    // 再排一条，连按两次 esc：打断这一轮，排队的消息回到输入框而不是被删掉
+    g.__hold = new Promise(() => {});
+    await t.type("third\r");
+    await until(() => g.__requests!.length === 3);
+    await t.type("fourth\r");
+    await until(() => t.output().includes("queued: fourth"));
+    await t.type("\x1b");
+    await until(() => t.output().includes("press esc again to edit it"));
+    await t.type("\x1b");
+    await until(() => t.output().includes("moved 1 queued message back to the input"));
+    await until(() => t.output().includes("› fourth"));
+    await sleep(300);
+    expect(g.__requests!.length).toBe(3);
+
+    ac.abort();
+    expect(await done).toBe(130);
   } finally {
     await host.close();
   }

@@ -55,6 +55,8 @@ export interface TuiHandlers {
   submit(text: string): void;
   /** 运行中按 Esc 或 Ctrl+C */
   interrupt(): void;
+  /** 输入框第一行按 ↑：把排队的消息放回输入框；没有排队的消息时返回 false，↑ 照常翻历史 */
+  unqueue?(): boolean;
   /** 空闲时连按两次 Ctrl+C */
   exit(): void;
   /** 输入 @ 时补全用的路径（目录以 / 结尾）；每次开始输入一个新的 @ 引用时取一次 */
@@ -972,6 +974,7 @@ function App({
             hint: state.hint,
             onHintDone: () => store.update({ hint: undefined }),
             busy: Boolean(state.busy),
+            queued: state.queued.length > 0,
             active: !dialog,
             onSubmit: () => store.scrollBy(-max, max),
             flash: copied,
@@ -1357,6 +1360,7 @@ function Prompt({
   hint,
   onHintDone,
   busy,
+  queued,
   active,
   onSubmit,
   flash,
@@ -1372,6 +1376,8 @@ function Prompt({
   /** 提示被接受了，或者用户开始打字了：去掉它 */
   onHintDone(): void;
   busy: boolean;
+  /** 有排队等待发送的消息 */
+  queued: boolean;
   active: boolean;
   /** 提交后对话区回到底部 */
   onSubmit(): void;
@@ -1662,6 +1668,11 @@ function Prompt({
         // 按折行后的屏幕行移动：一大段没有换行的文字也能上下走，到了第一行才翻历史
         const up = moveRow(state, textWidth, -1);
         if (up) return setState(up);
+        // 先取回排队的消息，取完了再翻历史
+        if (handlers.unqueue?.()) {
+          browsing.current = -1;
+          return;
+        }
         if (browsing.current + 1 < history.current.length) {
           if (browsing.current === -1) draft.current = state.value;
           recall(browsing.current + 1);
@@ -1706,11 +1717,13 @@ function Prompt({
             prefix: "› ",
             placeholder: hinting()
               ? hintLine(hint!)
-              : busy
-                ? "Type to queue a message · esc to interrupt"
-                : columns >= 70
-                  ? "Message jade · / commands · @ files · ↑ or ctrl+r for history"
-                  : "Message jade · / commands · @ files",
+              : queued
+                ? "↑ to edit queued messages · esc to interrupt"
+                : busy
+                  ? "Type to queue a message · esc to interrupt"
+                  : columns >= 70
+                    ? "Message jade · / commands · @ files · ↑ or ctrl+r for history"
+                    : "Message jade · / commands · @ files",
             active,
             maxRows: inputRows,
             place,

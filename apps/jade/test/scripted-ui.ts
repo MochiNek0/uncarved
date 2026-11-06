@@ -50,6 +50,12 @@ export interface Shared {
   dialogs: { title: string; detail?: string }[];
   notes: string[];
   interactive: boolean;
+  /** models@1.complete 每次调用的 model 选项（provider@1 的调用不记） */
+  modelOptions: (string | undefined)[];
+  /** 插件经 ctx.input.hint 设置过的灰色提示，按先后 */
+  hints: (string | undefined)[];
+  /** models@1.saved 返回的模型名 */
+  saved: string[];
 }
 
 const FAKE_MODEL = `export default { process(ctx) {
@@ -62,7 +68,14 @@ const FAKE_MODEL = `export default { process(ctx) {
     return { model: "s1", ...next };
   } };
   ctx.provide("provider@1", provider);
-  ctx.provide("models@1", { current: () => g().current, complete: provider.complete, list: async () => [] });
+  ctx.provide("models@1", { current: () => g().current, complete: async (req, opts) => {
+    g().modelOptions.push(opts.model);
+    const res = await provider.complete(req);
+    // 回复的文字当作流式增量推一遍；推的时候被中止就和真的服务一样抛出
+    for (const b of res.content) if (b.kind === "text") opts.onDelta?.({ kind: "text", text: b.text });
+    if (opts.signal?.aborted) throw new Error("aborted");
+    return res;
+  }, list: async () => [], saved: async () => g().saved });
 } };`;
 
 const FAKE_FRONTEND = `export default { process(ctx) {
@@ -73,10 +86,16 @@ const FAKE_FRONTEND = `export default { process(ctx) {
     notify: (m) => void g().notes.push(m),
     select: async (r) => { g().asked.push(r.title); g().dialogs.push({ title: r.title, ...(r.detail ? { detail: r.detail } : {}) }); const a = g().answers.shift(); return a === undefined ? r.options[0]?.value : a === "" ? undefined : a; },
     input: async () => undefined,
+    session: () => ({
+      status: () => {},
+      draft: { text: () => "", insert: () => {}, set: () => {}, hint: (t) => void g().hints.push(t) },
+      dispose: () => {},
+    }),
   });
 } };`;
 
-export async function scriptedHost(opts: { config?: Record<string, Record<string, unknown>> } = {}) {
+/** files：启动前写进 $JADE_HOME 的文件，路径相对 home */
+export async function scriptedHost(opts: { config?: Record<string, Record<string, unknown>>; files?: Record<string, string> } = {}) {
   await cleanup();
   const home = realpathSync.native(await mkdtemp(path.join(os.tmpdir(), "jade-home-")));
   const cwd = realpathSync.native(await mkdtemp(path.join(os.tmpdir(), "jade-cwd-")));
@@ -90,6 +109,9 @@ export async function scriptedHost(opts: { config?: Record<string, Record<string
     dialogs: [],
     notes: [],
     interactive: true,
+    modelOptions: [],
+    hints: [],
+    saved: [],
   };
   (globalThis as { __jadeScriptedUi?: Shared }).__jadeScriptedUi = shared;
   const plugin = async (name: string, manifest: object, code: string) => {
@@ -101,6 +123,10 @@ export async function scriptedHost(opts: { config?: Record<string, Record<string
   await plugin("fake-model", { id: "test/fake-model", provides: ["provider@1", "models@1"], replaces: ["jade/models"] }, FAKE_MODEL);
   await plugin("fake-frontend", { id: "test/fake-frontend", provides: ["frontend@1", "ui@1"], replaces: ["jade/tui"], frontend: { name: "fake", default: true } }, FAKE_FRONTEND);
   await writeFile(path.join(home, "config.json"), JSON.stringify({ "jade/approval": { mode: "yolo" }, ...opts.config }));
+  for (const [file, text] of Object.entries(opts.files ?? {})) {
+    await mkdir(path.dirname(path.join(home, file)), { recursive: true });
+    await writeFile(path.join(home, file), text);
+  }
   const reports: string[] = [];
   const host = await PluginHost.start({
     roots: [

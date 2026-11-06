@@ -36,7 +36,7 @@ const OWN: CommandInfo[] = [
 ];
 
 const KEYS =
-  "Keys: enter send · \\ or alt+enter new line · ↑↓ history · esc interrupt (twice to also clear queued messages) · ctrl+o expand · ctrl+c twice to exit";
+  "Keys: enter send · \\ or alt+enter new line · ↑↓ history · esc interrupt (twice to also move queued messages back to the input) · ↑ on the first line edits queued messages · ctrl+o expand · ctrl+c twice to exit";
 
 /** 第二次 esc 算作"再按一次"的时间窗口 */
 const SECOND_ESC_MS = 3000;
@@ -250,6 +250,7 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
         // 输入 @ 时列工作目录里的文件
         files: () => mentionCandidates(cwd),
         interrupt: () => ready && interrupt(),
+        unqueue: () => takeBack(),
         exit: () => void quit(0),
         cycleMode: () => void key("shift+tab"),
         key: (spec) => key(spec),
@@ -387,13 +388,26 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
     current?.abort(new Error("interrupted by user"));
     screen.busy("Interrupting");
     if (queue.length === 0) return;
+    const n = queue.length;
     if (again) {
-      const n = queue.splice(0).length;
-      screen.queued(queue);
-      screen.log(dim(`[cleared ${n} queued message${n > 1 ? "s" : ""}]`));
+      if (takeBack()) screen.log(dim(`[moved ${n} queued message${n > 1 ? "s" : ""} back to the input]`));
+      else {
+        queue.length = 0;
+        screen.queued(queue);
+        screen.log(dim(`[cleared ${n} queued message${n > 1 ? "s" : ""}]`));
+      }
     } else {
-      screen.log(dim(`[${queue.length} queued message${queue.length > 1 ? "s" : ""} will still be sent; press esc again to clear ${queue.length > 1 ? "them" : "it"}]`));
+      screen.log(dim(`[${n} queued message${n > 1 ? "s" : ""} will still be sent; press esc again to edit ${n > 1 ? "them" : "it"}]`));
     }
+  }
+
+  /** 排队的消息不再自动发送，放回输入框（在已经输入的内容前面，一条一行）；没有可放回的返回 false */
+  function takeBack(): boolean {
+    if (queue.length === 0 || !screen.draft) return false;
+    const typed = screen.draft.text();
+    screen.draft.set([...queue.splice(0), ...(typed.trim() ? [typed] : [])].join("\n"));
+    screen.queued(queue);
+    return true;
   }
 
   async function quit(code: number) {
