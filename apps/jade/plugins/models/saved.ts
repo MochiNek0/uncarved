@@ -88,5 +88,7 @@ export async function updateEnvFile(file: string, updates: Env, env: Env): Promi
 }
 
 function format(key: string, value: string): string {
-  return /[\s#"']/.test(value) ? `${key}="${value.replaceAll("\n", "\\n")}"` : `${key}=${value}`;
+  if (!/[\s#"']/.test(value)) return `${key}=${value}`;
+  // 单引号里的内容原样读回（引号、反斜杠都不转义）；只有换行要用双引号里的 \n
+  return value.includes("\n") ? `${key}="${value.replaceAll("\n", "\\n")}"` : `${key}='${value}'`;
 }

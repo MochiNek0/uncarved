@@ -10,6 +10,8 @@ import type { Provider } from "uncarved";
 import { PluginHost } from "../src/index.ts";
 import type { CommandContext, Commands } from "../plugins/commands/index.ts";
 import type { Models } from "../plugins/models/index.ts";
+import { parseEnv } from "../plugins/models/config.ts";
+import { updateEnvFile } from "../plugins/models/saved.ts";
 import type { ModelRequest } from "uncarved";
 
 const BUNDLED = path.resolve(import.meta.dir, "../plugins");
@@ -264,5 +266,43 @@ describe("/model", () => {
     } finally {
       await host.close();
     }
+  });
+
+  test("a configuration that cannot build a provider is not left in .env for the next launch", async () => {
+    const { home, host, ctx, command } = await setup();
+    try {
+      const file = path.join(home, "models.json");
+      const saved = JSON.parse(await readFile(file, "utf8")) as { services: unknown[] };
+      saved.services.push({
+        env: { JADE_PROVIDER: "openai-compat", OPENAI_COMPAT_BASE_URL: "https://c.example/v1", OPENAI_COMPAT_API_KEY: "kc" },
+        models: [{ name: "m3", settings: { JADE_MAX_TOKENS: "lots" } }],
+      });
+      await writeFile(file, JSON.stringify(saved));
+      await command.run("m3", ctx);
+      expect(await readEnvFile(home)).toBe(ENV_A);
+    } finally {
+      await host.close();
+    }
+  });
+
+  test("with no model configured, /model starts by choosing a service", async () => {
+    const { host, shared, ctx, command } = await setup("");
+    try {
+      await command.run("", ctx);
+      expect(shared.asked[0]).toBe("Which service should jade use?");
+    } finally {
+      await host.close();
+    }
+  });
+});
+
+describe(".env values", () => {
+  test("quotes and backslashes survive a write and a read", async () => {
+    const home = realpathSync.native(await mkdtemp(path.join(os.tmpdir(), "jade-model-")));
+    tmp.push(home);
+    const file = path.join(home, ".env");
+    const values = { A: '{"enable_thinking": true}', B: '{"stop": ["\\n"]}', C: "C:\\new dir", D: "two\nlines" };
+    await updateEnvFile(file, values, {});
+    expect(parseEnv(await readFile(file, "utf8"))).toEqual(values);
   });
 });

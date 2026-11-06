@@ -4,6 +4,7 @@
 // 从旧 jade 的 ui/configure.ts 移植。省掉了旧 jade 的"插件提供的模型服务"（新的 jade 还没有这种服务），
 // 其余流程一样。
 
+import { readFile, rm, writeFile } from "node:fs/promises";
 import { hasProvider, parseTokens } from "./config.ts";
 import { contextWindow } from "./context.ts";
 import { EFFORTS, isBuiltinKind, KEY_KEY, listModels, MODEL_KEY, providerInfo, providerKind, rpmFromEnv, URL_KEY, visionFromEnv, type ProviderKind } from "./provider.ts";
@@ -152,12 +153,15 @@ export function configurator(opts: ConfigureOptions): Configure {
 
   /** 保存配置并换上新的 provider；失败时报告原因，旧的配置和 provider 继续用 */
   async function applyConfig(updates: Env, replacing?: string): Promise<boolean> {
+    const before = await readFile(envFile, "utf8").catch(() => undefined);
     // 传一份拷贝：apply 成功之前插件用的还是旧的那份（失败时状态栏显示的就是实际在用的）
     await updateEnvFile(envFile, updates, { ...opts.env() });
     try {
       await opts.apply();
     } catch (err) {
-      report(`Saved to ${envFile}, but the configuration is incomplete: ${errorText(err)}`);
+      // 放回原来的 .env：不然这次会话还用旧的，下次启动却读到这份用不了的配置
+      await (before === undefined ? rm(envFile, { force: true }) : writeFile(envFile, before)).catch(() => {});
+      report(`Not saved: the configuration is incomplete: ${errorText(err)}`);
       return false;
     }
     const info = providerInfo(opts.env());
@@ -380,6 +384,8 @@ export function configurator(opts: ConfigureOptions): Configure {
 
   async function configureModel(arg: string | undefined) {
     const env = opts.env();
+    // 还没有配置模型：没有"当前的服务"可以换模型，先选服务
+    if (!hasProvider(env)) return void (await configureProvider());
     const info = providerInfo(env);
     // 之前只有 .env 时配置的模型也记下来，之后换了不会丢
     await remember().catch(() => {});
