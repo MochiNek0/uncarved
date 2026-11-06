@@ -312,6 +312,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 | `jade/mentions` | 在 `context.project` 里把 `@` 引用的文件附到那条用户消息上 | — | `mentions.ts`。附上的内容不算 `read_file` 读过 |
 | `jade/continue`、`jade/repeats`、`jade/budget` | 截断后续写（`afterTurn`）；重复调用；每轮步数上限 | — | `plugins/turns.ts`、`repeats.ts`、`budget.ts` |
 | `jade/update` | 启动时查 npm 上有没有更新的 jade（每天最多一次，缓存在 `$JADE_HOME/update-check.json`），有就在后台升级、下次启动生效；配置 `auto: false` 或 `JADE_AUTO_UPDATE=off` 时只提示，`JADE_UPDATE_CHECK=off` 不查。开发版和不能提问的前端（`-p`）既不提示也不升级 | 可选 `ui@1` | `update.ts` 的 `checkForUpdate`（`test/update.test.ts`） |
+| `jade/schedule` | 定时任务：五字段 cron（本机时区），存在 `$JADE_HOME/state/schedules.json`，重启后还在。到点时投到创建它的目录里正在运行的 jade 的当前会话（正在跑就排在本轮之后）；没有 jade 开着就等，下次打开时错过的几次只补一次；`jade -p` 不投递。同一台机器开着几个 jade 时，所有读写经一把目录锁，到点的任务只由一个进程认领、只投递一次；上一次还没跑完的不再认领。`/schedule`（list、add、once、pause、resume、rm、run）和模型工具 `schedule_create`、`schedule_list`、`schedule_edit` 共用这份存储；创建和修改的 effect 是 `external`，auto 模式下也要审 | 可选 `commands@1`、`ui@1` | 新功能，参考 dsh 的 `dsh-schedule`（`test/schedule.test.ts`）。任务的 `target` 现在只有 `cwd` 一种；一个进程能同时挂多个会话之后，再加"后台另开会话"（dsh 的 `new`） |
 
 几条值得注意的变化：
 
@@ -356,7 +357,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 7. **其余功能插件**逐个移植。每移植一个，都检查它没有用到第三方拿不到的东西。
    大部分已完成：web、todo、ask、task、compact、mcp、skills、checks、memory、undo、mentions、continue、repeats、budget，各有测试（`test/<插件>.test.ts`）。期间核心改了两处：会话队列的竞争（上一条 `send` 刚 resolve 就再 `send`，新输入没人处理），兜底关卡只认 `approval@1` 的提供者（见第 7 节）。
    已完成：从 npm、git 和本地目录安装/更新插件（`test/install.test.ts` 覆盖本地目录、git 提交、npm 包、`--link`、`--project`、`--path`、本地改动保护和更新记录）。
-   移植中发现的缺口，以后再定：没有"给模型留一句说明"的接口（memory、undo 各自在 `context.project` 里附说明，`/undo` 的已撤销记录存在 `$JADE_HOME/checkpoints`）；子 Agent 的日志不能关联到父会话。已经补上的：`jade/checks` 不再复制 jade/shell 找 shell、杀进程树的代码，改由 `shell@1` 提供。
+   移植中发现的缺口，以后再定：没有"给模型留一句说明"的接口（memory、undo 各自在 `context.project` 里附说明，`/undo` 的已撤销记录存在 `$JADE_HOME/checkpoints`）；子 Agent 的日志不能关联到父会话；`session()` 执行期间（包括 `ctx.effect` 里立即执行的部分）调用 `session.send` 会失败，因为 Runtime 在全部插件加入之后才建（`jade/schedule` 因此等第一次定时再检查）；一个进程同时只有一个会话、工作目录和项目层插件按进程定，所以后台另开会话、桌面端同时开几个对话都要先让 `SessionManager` 能同时挂同一目录的多个会话。已经补上的：`jade/checks` 不再复制 jade/shell 找 shell、杀进程树的代码，改由 `shell@1` 提供。
 8. ~~功能对齐后改名为 jade~~：已提前完成（2026-11-05）。旧 jade 归档到 `.archive/jade`，新实现直接占用 `apps/jade` 和 `jade` 命令；功能对齐前，jade 只是开发中的版本。
 
 ## 附录 A：参考调研摘要
