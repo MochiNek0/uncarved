@@ -1,6 +1,6 @@
 // jade/sessions：/clear、/resume、/retry，以及 /resume 用的会话索引。
 // 索引是 $JADE_HOME/state/sessions.jsonl，每行 { id, cwd, title, at }：会话在本进程里第一次收到消息时追加一行。
-// 读的时候按 id 合并：标题取最早的一行，时间取最晚的一行。
+// 读的时候按 id 合并：标题取最早的一行，时间取最晚的一行；目录按 cwdKey 比较。
 
 import { appendFile, mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
@@ -19,13 +19,19 @@ export interface SessionSummary {
 
 const TITLE_CHARS = 80;
 
-/** 索引里 cwd 下的会话，最近用过的在前 */
-export async function listSessions(file: string, cwd: string): Promise<SessionSummary[]> {
+/** 比较目录用的键：绝对路径、去掉末尾的分隔符；Windows 上不分大小写 */
+export function cwdKey(cwd: string): string {
+  const p = path.resolve(cwd);
+  return process.platform === "win32" ? p.toLowerCase() : p;
+}
+
+/** 索引里的全部会话按目录分组，键是 cwdKey；每组最近用过的在前 */
+export async function listAllSessions(file: string): Promise<Map<string, SessionSummary[]>> {
   let text = "";
   try {
     text = await readFile(file, "utf8");
   } catch {
-    return [];
+    return new Map();
   }
   const byId = new Map<string, SessionSummary>();
   for (const line of text.split("\n")) {
@@ -36,11 +42,24 @@ export async function listSessions(file: string, cwd: string): Promise<SessionSu
     } catch {
       continue; // 写到一半的行
     }
-    if (typeof e?.id !== "string" || e.cwd !== cwd) continue;
+    if (typeof e?.id !== "string" || typeof e.cwd !== "string") continue;
     const seen = byId.get(e.id);
     byId.set(e.id, seen ? { ...seen, at: e.at > seen.at ? e.at : seen.at } : e);
   }
-  return [...byId.values()].sort((a, b) => b.at.localeCompare(a.at));
+  const byCwd = new Map<string, SessionSummary[]>();
+  for (const s of byId.values()) {
+    const key = cwdKey(s.cwd);
+    const group = byCwd.get(key);
+    if (group) group.push(s);
+    else byCwd.set(key, [s]);
+  }
+  for (const group of byCwd.values()) group.sort((a, b) => b.at.localeCompare(a.at));
+  return byCwd;
+}
+
+/** 索引里 cwd 下的会话，最近用过的在前 */
+export async function listSessions(file: string, cwd: string): Promise<SessionSummary[]> {
+  return (await listAllSessions(file)).get(cwdKey(cwd)) ?? [];
 }
 
 /** 多久以前，例如 "5m ago" */
@@ -113,7 +132,7 @@ export default definePlugin({
         const title = titleOf(e.data as UserInput);
         if (title === undefined) return;
         indexed = true;
-        const entry: SessionSummary = { id: ctx.session.id, cwd: ctx.cwd, title, at: new Date().toISOString() };
+        const entry: SessionSummary = { id: ctx.session.id, cwd: path.resolve(ctx.cwd), title, at: new Date().toISOString() };
         await mkdir(path.dirname(file), { recursive: true });
         await appendFile(file, `${JSON.stringify(entry)}\n`);
       },
