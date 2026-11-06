@@ -234,6 +234,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 - **安全模式** `jade --safe`：只加载 bundled 插件。救援 CLI 不执行任何插件代码，直接读写 `plugins.json`。
 - **安装与更新**：`jade plugins add <来源>` 支持本地目录、npm 包（`name@版本`、`@scope/name`、`npm:<spec>`、`.tgz`）和 git 仓库（`https://…`、`git@…`、`github:user/repo`、`user/repo`，可带 `#分支/tag/提交`）。`--project` 装进 `<仓库>/.jade/plugins` 并把内容哈希记入信任存储，`--path <子目录>` 用于一个大仓库里的某个插件，`--link` 把本地目录链接进来（开发插件用），`--force` 替换同 id 的插件。`jade plugins update [id…]` 按插件目录里的 `.installed.json` 重新下载：git 比提交，npm 比版本，本地目录比内容哈希。记录里存着安装时的内容哈希，装好之后手动改过的插件默认不会被覆盖，要加 `--force`。下载先落在 `.staging-*`，检查清单、装好依赖之后再原子替换，失败不会留下装了一半的插件。
 - **安装不执行插件的代码**：git 只 clone；npm 包和依赖都用 `--ignore-scripts` 安装；本地目录只复制。`jade plugins remove <id>` 删掉插件目录和安装记录。安装会清掉它的停用和连续崩溃记录；更新只清崩溃记录，保留用户显式停用。
+- **升级 jade 本身**：`jade update [--check]` 查 npm 上 `@uncarved/jade` 的最新版本，按 jade 的安装方式（npm、bun、pnpm、yarn 全局安装）升级；仓库里的开发版和 `npm link` 不升级，提示用 git。它和 `jade plugins` 一样不启动插件宿主，插件坏了也能升级（`src/update.ts`）。启动时的检查和后台升级在 `jade/update` 插件里，用的是同一份代码。
 - **连续崩溃自动停用**：一个插件在连续 3 次启动中都在激活阶段失败或被隔离，核心自动停用它，下次启动时告诉用户，`jade plugins enable <id>` 恢复。记录在 `$JADE_HOME/state/faults.json`。
 - **诊断**：`jade plugins list` 列出启动计划里每个插件的状态（active / disabled / skipped / conflict 等）、安装来源、服务冲突的裁决结果和缺依赖的原因；它不激活插件，所以激活阶段的失败和运行期状态要看会话里的 `/plugins`（`jade@1`）。缺依赖或成环而没加载的插件，启动时也会提示一行（例如停用 `jade/shell` 之后的 `jade/checks`）；没选中的前端、以及只因为它缺依赖的插件，是意料之中的，不提示。
 
@@ -310,6 +311,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 | `jade/memory`、`jade/undo` | `memory` 工具和 `/memory`；`/undo`（`tool.before`/`tool.after` 记快照） | 可选 | `memory.ts`、`tools/checkpoint.ts` |
 | `jade/mentions` | 在 `context.project` 里把 `@` 引用的文件附到那条用户消息上 | — | `mentions.ts`。附上的内容不算 `read_file` 读过 |
 | `jade/continue`、`jade/repeats`、`jade/budget` | 截断后续写（`afterTurn`）；重复调用；每轮步数上限 | — | `plugins/turns.ts`、`repeats.ts`、`budget.ts` |
+| `jade/update` | 启动时查 npm 上有没有更新的 jade（每天最多一次，缓存在 `$JADE_HOME/update-check.json`），有就在后台升级、下次启动生效；配置 `auto: false` 或 `JADE_AUTO_UPDATE=off` 时只提示，`JADE_UPDATE_CHECK=off` 不查。开发版和不能提问的前端（`-p`）既不提示也不升级 | 可选 `ui@1` | `update.ts` 的 `checkForUpdate`（`test/update.test.ts`） |
 
 几条值得注意的变化：
 

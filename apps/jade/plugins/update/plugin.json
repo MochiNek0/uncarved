@@ -1,0 +1,13 @@
+{
+  "id": "jade/update",
+  "version": "0.1.0",
+  "api": "^1",
+  "entry": "./index.ts",
+  "optional": ["ui@1"],
+  "config": {
+    "auto": {
+      "default": true,
+      "description": "install a newer jade in the background (it takes effect on the next launch); false only tells you about it. $JADE_AUTO_UPDATE=off still works, and $JADE_UPDATE_CHECK=off turns the check off"
+    }
+  }
+}

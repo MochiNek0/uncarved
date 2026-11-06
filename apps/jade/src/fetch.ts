@@ -158,7 +158,7 @@ function packageManager(): PackageManager {
 }
 
 /** npm 的 node 脚本；没有 npm 时返回 undefined */
-function npmCommand(): string[] | undefined {
+export function npmCommand(): string[] | undefined {
   const dirs = [path.dirname(process.execPath)];
   const onPath = which(process.platform === "win32" ? "npm.cmd" : "npm");
   if (onPath) dirs.push(path.dirname(onPath));
@@ -176,7 +176,7 @@ function npmCommand(): string[] | undefined {
 }
 
 /** 在 PATH 里找一个可执行文件；Windows 上按 PATHEXT 补扩展名 */
-function which(bin: string): string | undefined {
+export function which(bin: string): string | undefined {
   const win = process.platform === "win32";
   const exts = win ? ["", ...(process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean)] : [""];
   const dirs = (process.env.PATH ?? process.env.Path ?? "").split(path.delimiter);

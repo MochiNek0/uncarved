@@ -1,4 +1,4 @@
-// jade 命令行入口：把 jade plugins 的子命令错写到顶层时（jade update、jade remove plugins x），
+// jade 命令行入口：把 jade plugins 的子命令错写到顶层时（jade add x、jade remove plugins x），
 // 不能当成第一条消息发给模型。
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
@@ -24,9 +24,21 @@ afterEach(async () => {
 });
 
 describe("a plugins subcommand written at the top level", () => {
-  test("jade update does not start a session, and says what to run instead", async () => {
-    expect(await main(["update"])).toBe(2);
-    expect(errors.join("\n")).toContain('did you mean "jade plugins update"?');
+  test("jade add does not start a session, and says what to run instead", async () => {
+    expect(await main(["add", "./hello"])).toBe(2);
+    expect(errors.join("\n")).toContain('did you mean "jade plugins add ./hello"?');
+  });
+
+  test("jade update is jade's own upgrade command, not a misspelled plugins update", async () => {
+    // 不联网：未知选项在查 npm 之前就被拒绝
+    expect(await main(["update", "--bogus"])).toBe(2);
+    expect(errors.join("\n")).toContain("jade update: unknown option --bogus");
+    expect(errors.join("\n")).not.toContain("did you mean");
+  });
+
+  test("jade upgrade points to jade update", async () => {
+    expect(await main(["upgrade"])).toBe(2);
+    expect(errors.join("\n")).toContain('did you mean "jade update"?');
   });
 
   test("the word plugins in the wrong place is moved to the front", async () => {

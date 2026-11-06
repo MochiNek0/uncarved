@@ -1,5 +1,5 @@
 // jade 命令行入口：解析核心自己的参数，启动插件宿主，把控制权交给前端插件（3.4）。
-// 核心自己只处理 jade plugins …、--safe、--version（以及把 jade update 这类漏了 plugins 的写法挡下来）；其余参数原样交给前端。
+// 核心自己只处理 jade plugins …、jade update、--safe、--version（以及把 jade remove x 这类漏了 plugins 的写法挡下来）；其余参数原样交给前端。
 
 import { existsSync, readFileSync } from "node:fs";
 import os from "node:os";
@@ -12,12 +12,14 @@ import { PluginHost, type HostOptions } from "./host.ts";
 import type { LayerRoot } from "./manifest.ts";
 import { pluginsCommand } from "./rescue.ts";
 import { FileTrustStore } from "./state.ts";
+import { updateCli } from "./update.ts";
 
 /** 连续两次 Ctrl+C 间隔不超过它时，核心直接退出（第 7 节） */
 const DOUBLE_SIGINT_MS = 2000;
 
 const USAGE = `usage: jade [--safe] [frontend options…]
        jade plugins [list | add <source> | update [id…] | remove <id> | enable <id> | disable <id>] [options]
+       jade update [--check]   upgrade jade itself to the latest version on npm
 
   --safe        load only the plugins that come with jade
   -v, --version print the version
@@ -25,8 +27,11 @@ const USAGE = `usage: jade [--safe] [frontend options…]
 Run "jade plugins --help" for the install and update options.
 Everything else is passed to the frontend plugin; see its own --help.`;
 
-/** jade plugins 的子命令（含别名）：单独写在 jade 后面时多半是漏了 plugins */
-const PLUGIN_SUBCOMMANDS: ReadonlySet<string> = new Set(["list", "ls", "add", "install", "update", "upgrade", "remove", "rm", "uninstall", "enable", "disable"]);
+/**
+ * jade plugins 的子命令（含别名）：单独写在 jade 后面时多半是漏了 plugins。
+ * update、upgrade 不在里面：jade update 升级 jade 本身，jade upgrade 多半也是想升级 jade
+ */
+const PLUGIN_SUBCOMMANDS: ReadonlySet<string> = new Set(["list", "ls", "add", "install", "remove", "rm", "uninstall", "enable", "disable"]);
 
 const pkgDir = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
@@ -68,11 +73,17 @@ export async function main(argv: readonly string[]): Promise<number> {
       return 2;
     }
   }
+  // 不启动插件宿主：插件坏了也能升级 jade
+  if (rest[0] === "update") return updateCli(rest.slice(1));
+  if (rest[0] === "upgrade") {
+    console.error(`jade: "upgrade" is not a jade command; did you mean "jade update"?\nTo send it to the model instead, type it inside jade.`);
+    return 2;
+  }
   if (rest[0] === "help") {
     console.log(USAGE);
     return 0;
   }
-  // jade update、jade remove plugins x：前端会把它当成第一条消息发给模型（auto 模式下模型可能真去删东西）。
+  // jade remove plugins x、jade add foo：前端会把它当成第一条消息发给模型（auto 模式下模型可能真去删东西）。
   // 带引号的消息（jade "add a test"）是一整个参数，不会和子命令名完全相同
   if (rest[0] !== undefined && PLUGIN_SUBCOMMANDS.has(rest[0])) {
     const args = rest.slice(1).filter((a) => a !== "plugins" && a !== "plugin");
