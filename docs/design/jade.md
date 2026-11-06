@@ -235,7 +235,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 - **安装与更新**：`jade plugins add <来源>` 支持本地目录、npm 包（`name@版本`、`@scope/name`、`npm:<spec>`、`.tgz`）和 git 仓库（`https://…`、`git@…`、`github:user/repo`、`user/repo`，可带 `#分支/tag/提交`）。`--project` 装进 `<仓库>/.jade/plugins` 并把内容哈希记入信任存储，`--path <子目录>` 用于一个大仓库里的某个插件，`--link` 把本地目录链接进来（开发插件用），`--force` 替换同 id 的插件。`jade plugins update [id…]` 按插件目录里的 `.installed.json` 重新下载：git 比提交，npm 比版本，本地目录比内容哈希。记录里存着安装时的内容哈希，装好之后手动改过的插件默认不会被覆盖，要加 `--force`。下载先落在 `.staging-*`，检查清单、装好依赖之后再原子替换，失败不会留下装了一半的插件。
 - **安装不执行插件的代码**：git 只 clone；npm 包和依赖都用 `--ignore-scripts` 安装；本地目录只复制。`jade plugins remove <id>` 删掉插件目录和安装记录。安装会清掉它的停用和连续崩溃记录；更新只清崩溃记录，保留用户显式停用。
 - **连续崩溃自动停用**：一个插件在连续 3 次启动中都在激活阶段失败或被隔离，核心自动停用它，下次启动时告诉用户，`jade plugins enable <id>` 恢复。记录在 `$JADE_HOME/state/faults.json`。
-- **诊断**：`jade plugins list` 列出启动计划里每个插件的状态（active / disabled / skipped / conflict 等）、安装来源、服务冲突的裁决结果和缺依赖的原因；它不激活插件，所以激活阶段的失败和运行期状态要看会话里的 `/plugins`（`jade@1`）。
+- **诊断**：`jade plugins list` 列出启动计划里每个插件的状态（active / disabled / skipped / conflict 等）、安装来源、服务冲突的裁决结果和缺依赖的原因；它不激活插件，所以激活阶段的失败和运行期状态要看会话里的 `/plugins`（`jade@1`）。缺依赖或成环而没加载的插件，启动时也会提示一行（例如停用 `jade/shell` 之后的 `jade/checks`）；没选中的前端、以及只因为它缺依赖的插件，是意料之中的，不提示。
 
 ## 6. 进程外插件
 

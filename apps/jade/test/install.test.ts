@@ -410,6 +410,20 @@ describe("plugin directories", () => {
     expect(broken).toEqual([]);
   });
 
+  test("a link whose target is gone is reported as such, with the command that removes it", async () => {
+    const { home, src, roots, opts, plugin } = await world();
+    const target = await plugin("gone", { id: "test/gone" });
+    await pluginsCommand(["add", "--link", target], opts);
+    await rm(target, { recursive: true, force: true });
+    const { broken } = await discover(roots);
+    expect(broken).toHaveLength(1);
+    expect(broken[0]!.error).toBe(`a link to ${path.join(src, "gone")}, which no longer exists; run "jade plugins remove test/gone"`);
+    // 照着提示做就能删掉
+    await pluginsCommand(["remove", "test/gone"], opts);
+    expect((await discover(roots)).broken).toEqual([]);
+    expect(existsSync(path.join(home, "plugins", "test__gone"))).toBe(false);
+  });
+
   test("installDir keeps a plugin id inside the plugins directory", () => {
     const root = path.resolve("/plugins");
     expect(installDir(root, "test/hello")).toBe(path.join(root, "test__hello"));

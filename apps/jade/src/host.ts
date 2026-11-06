@@ -133,6 +133,8 @@ export class PluginHost {
     host.#config = { user: user.config, project: project.config };
     for (const e of [user.error, project.error]) if (e) host.#report(e);
     for (const w of plan.warnings) host.#report(w);
+    // 缺依赖、成环而没加载的插件：例如停用 jade/shell 之后 jade/checks 也不会运行，不能悄悄发生
+    for (const e of plan.entries) if (e.state === "skipped" && !e.expected) host.#report(`plugin ${e.source.manifest.id} is not loaded: ${e.reason}`);
     for (const b of broken) host.#report(`plugin at ${b.dir}: ${b.error}`);
     for (const source of plan.order) await host.#activate(source);
     await host.#saveFaults();

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdir, readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { FAULT_LIMIT, PluginError, PluginHost, pluginsCommand, ServiceUnavailable, StaleContext } from "../src/index.ts";
 import { info, world } from "./helpers.ts";
@@ -55,6 +55,27 @@ describe("activation", () => {
     expect(host.service<{ names(): string[] }>("registry@1")!.names()).toEqual([]);
     expect(host.service("half@1")).toBeUndefined();
     expect(w.reports.join("\n")).toContain("plugin half failed to activate: oops");
+    await host.close();
+  });
+
+  test("a plugin skipped because its provider is disabled is reported at launch", async () => {
+    const w = await world();
+    await w.plugin("bundled", { id: "sh", provides: ["shell@1"] }, `export default { process(ctx) { ctx.provide("shell@1", {}); } };`);
+    await w.plugin("bundled", { id: "checks", requires: ["shell@1"] }, `export default {};`);
+    await writeFile(path.join(w.home, "plugins.json"), JSON.stringify({ disabled: ["sh"] }));
+    const host = await w.start();
+    expect(w.reports).toContain("plugin checks is not loaded: requires shell@1: its provider sh is disabled");
+    await host.close();
+  });
+
+  test("the frontend that is not selected, and what only it serves, are skipped quietly", async () => {
+    const w = await world();
+    await w.plugin("bundled", { id: "tui", provides: ["frontend@1", "tui@1"], frontend: { name: "tui", default: true } }, `export default {};`);
+    await w.plugin("bundled", { id: "print", provides: ["frontend@1"], frontend: { name: "print", flag: "-p" } }, `export default {};`);
+    await w.plugin("bundled", { id: "tui-extra", requires: ["tui@1"] }, `export default {};`);
+    const host = await w.start({ flags: ["-p"] });
+    expect(info(host, "tui-extra")).toMatchObject({ state: "skipped" });
+    expect(w.reports.filter((r) => r.includes("is not loaded"))).toEqual([]);
     await host.close();
   });
 

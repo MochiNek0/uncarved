@@ -1,5 +1,5 @@
 // jade 命令行入口：解析核心自己的参数，启动插件宿主，把控制权交给前端插件（3.4）。
-// 核心自己只处理 jade plugins …、--safe、--version；其余参数原样交给前端。
+// 核心自己只处理 jade plugins …、--safe、--version（以及把 jade update 这类漏了 plugins 的写法挡下来）；其余参数原样交给前端。
 
 import { existsSync, readFileSync } from "node:fs";
 import os from "node:os";
@@ -24,6 +24,9 @@ const USAGE = `usage: jade [--safe] [frontend options…]
 
 Run "jade plugins --help" for the install and update options.
 Everything else is passed to the frontend plugin; see its own --help.`;
+
+/** jade plugins 的子命令（含别名）：单独写在 jade 后面时多半是漏了 plugins */
+const PLUGIN_SUBCOMMANDS: ReadonlySet<string> = new Set(["list", "ls", "add", "install", "update", "upgrade", "remove", "rm", "uninstall", "enable", "disable"]);
 
 const pkgDir = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
@@ -68,6 +71,15 @@ export async function main(argv: readonly string[]): Promise<number> {
   if (rest[0] === "help") {
     console.log(USAGE);
     return 0;
+  }
+  // jade update、jade remove plugins x：前端会把它当成第一条消息发给模型（auto 模式下模型可能真去删东西）。
+  // 带引号的消息（jade "add a test"）是一整个参数，不会和子命令名完全相同
+  if (rest[0] !== undefined && PLUGIN_SUBCOMMANDS.has(rest[0])) {
+    const args = rest.slice(1).filter((a) => a !== "plugins" && a !== "plugin");
+    // 只有一个词时加引号还是同一个参数，只能进 jade 再输入
+    const instead = rest.length > 1 ? `quote the whole message (jade "${rest.join(" ")}") or type it inside jade` : "type it inside jade";
+    console.error(`jade: "${rest[0]}" is not a jade command; did you mean "${["jade plugins", rest[0], ...args].join(" ")}"?\nTo send it to the model instead, ${instead}.`);
+    return 2;
   }
 
   // 前端起来之前，消息打到 stderr；之后交给 ui@1

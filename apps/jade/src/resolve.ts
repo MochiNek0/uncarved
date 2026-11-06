@@ -11,6 +11,8 @@ export interface PlanEntry {
   source: PluginSource;
   state: PlanState;
   reason?: string;
+  /** 意料之中的跳过：没选中的前端，以及只因为它而缺依赖的插件。启动时不提示 */
+  expected?: boolean;
 }
 
 export interface Plan {
@@ -86,7 +88,11 @@ export function resolve(sources: readonly PluginSource[], opts: ResolveOptions):
   const fronts = live().filter((e) => e.source.manifest.frontend);
   const flagged = fronts.filter((e) => opts.flags?.includes(e.source.manifest.frontend!.flag ?? "\0"));
   const chosen = new Set(flagged.length > 0 ? flagged : fronts.filter((e) => e.source.manifest.frontend!.default));
-  for (const e of fronts) if (!chosen.has(e)) out(e, "skipped", `frontend ${e.source.manifest.frontend!.name} is not selected`);
+  for (const e of fronts) {
+    if (chosen.has(e)) continue;
+    out(e, "skipped", `frontend ${e.source.manifest.frontend!.name} is not selected`);
+    e.expected = true;
+  }
 
   // 4. 服务裁决。先按层级排除低层（到不动点），再处理同层冲突
   const providersOf = (service: string) => live().filter((e) => e.source.manifest.provides?.includes(service));
@@ -132,6 +138,7 @@ export function resolve(sources: readonly PluginSource[], opts: ResolveOptions):
         if (providers.has(need) || core.has(need)) continue;
         const why = entries.find((x) => x.source.manifest.provides?.includes(need));
         out(e, "skipped", why ? `requires ${need}: its provider ${why.source.manifest.id} is ${why.state}` : `requires ${need}, which no plugin provides`);
+        if (why?.expected) e.expected = true;
         changed = true;
         break;
       }

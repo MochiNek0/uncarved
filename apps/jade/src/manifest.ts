@@ -1,6 +1,6 @@
 // 发现插件、读取并校验 plugin.json：不执行插件代码（原则 4）。
 
-import { readdir, readFile, stat } from "node:fs/promises";
+import { readdir, readFile, readlink, stat } from "node:fs/promises";
 import path from "node:path";
 import type { ConfigKey, Manifest, PluginLayer, PluginSource } from "./api.ts";
 
@@ -27,6 +27,21 @@ export function isPluginId(value: string): boolean {
   return ID.test(value);
 }
 
+/**
+ * --link 装的插件，链接指向的目录被删了（例如源码仓库里挪走了）：说清楚是链接坏了，并给出删掉它的命令。
+ * 不是这种情况时返回 undefined
+ */
+async function danglingLink(dir: string, name: string, layer: PluginLayer, err: Error): Promise<string | undefined> {
+  if ((err as NodeJS.ErrnoException).code !== "ENOENT") return undefined;
+  const target = await readlink(dir).catch(() => undefined);
+  if (target === undefined) return undefined;
+  // Windows 的 junction 读出来带 \\?\ 前缀和结尾的分隔符
+  const shown = path.resolve(path.dirname(dir), target.replace(/^\\\\\?\\/, ""));
+  // 目录名是 id 里的 / 换成 __（install.ts 的 installDir）
+  const id = name.replaceAll("__", "/");
+  return `a link to ${shown}, which no longer exists; run "jade plugins remove ${id}${layer === "project" ? " --project" : ""}"`;
+}
+
 /** 按层级顺序发现插件；层级内按目录名排序，结果稳定 */
 export async function discover(roots: LayerRoot[]): Promise<{ sources: PluginSource[]; broken: BrokenSource[] }> {
   const sources: PluginSource[] = [];
@@ -45,7 +60,7 @@ export async function discover(roots: LayerRoot[]): Promise<{ sources: PluginSou
       const dir = path.resolve(root, name);
       const info = await stat(dir).catch((e: unknown) => e as Error);
       if (info instanceof Error) {
-        broken.push({ dir, layer, error: `not a readable directory: ${info.message}` });
+        broken.push({ dir, layer, error: (await danglingLink(dir, name, layer, info)) ?? `not a readable directory: ${info.message}` });
         continue;
       }
       if (!info.isDirectory()) continue;
