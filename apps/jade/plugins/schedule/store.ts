@@ -81,12 +81,18 @@ export class ScheduleStore {
   async #locked<T>(fn: () => Promise<T>): Promise<T> {
     await mkdir(path.dirname(this.#lock), { recursive: true });
     const deadline = Date.now() + WAIT_MS;
-    // 记下自己建的锁目录的文件号，释放时只删自己的锁：持有太久被别人当成过期删掉、重新上了锁时，不去删别人的
-    let mine: bigint | undefined;
+    // 在锁目录里放一个随机标记，释放时只删自己的锁：持有太久被别人当成过期删掉、重新上了锁时，不去删别人的。
+    // 不用目录的文件号：Linux 上删掉目录马上重建，常常拿到同一个文件号
+    const mine = randomBytes(8).toString("hex");
     for (;;) {
       try {
         await mkdir(this.#lock);
-        mine = await lockId(this.#lock);
+        try {
+          await writeFile(path.join(this.#lock, "owner"), mine);
+        } catch (e) {
+          await rm(this.#lock, { recursive: true, force: true });
+          throw e;
+        }
         break;
       } catch (e) {
         if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
@@ -99,13 +105,11 @@ export class ScheduleStore {
     try {
       return await fn();
     } finally {
-      if (mine !== undefined && (await lockId(this.#lock)) === mine) await rm(this.#lock, { recursive: true, force: true });
+      const owner = await readFile(path.join(this.#lock, "owner"), "utf8").catch(() => undefined);
+      if (owner === mine) await rm(this.#lock, { recursive: true, force: true });
     }
   }
 }
-
-/** 锁目录的文件号；不在了时 undefined */
-const lockId = (dir: string) => stat(dir, { bigint: true }).then((s) => s.ino, () => undefined);
 
 /**
  * 两个目录是不是同一个：比较绝对路径（不看末尾的分隔符），Windows 上不分大小写。
