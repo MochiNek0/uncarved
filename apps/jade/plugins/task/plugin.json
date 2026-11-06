@@ -5,7 +5,7 @@
   "entry": "./index.ts",
   "provides": ["task@1"],
   "requires": ["models@1"],
-  "optional": ["ui@1", "renderers@1"],
+  "optional": ["ui@1", "renderers@1", "approval@1"],
   "config": {
     "maxSteps": {
       "default": 40,

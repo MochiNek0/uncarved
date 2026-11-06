@@ -292,3 +292,21 @@ test("a message, an approval dialog, slash commands and /exit through the termin
     await host.close();
   }
 });
+
+test("the notice about loaded instruction files survives the screen clear when the session opens", async () => {
+  const { cwd, start } = await setup();
+  await writeFile(path.join(cwd, "AGENTS.md"), "Be brief.");
+  const t = fakeTerminal();
+  const host = await start();
+  try {
+    const done = host.service<Frontend>("frontend@1")!.run({ argv: [], sessions: host.sessions, signal: new AbortController().signal });
+    await until(() => t.output().includes("Type / for commands"));
+    await sleep(100);
+    expect(t.output()).toContain("loaded instructions: AGENTS.md");
+    await t.type("/exit");
+    await t.type("\r");
+    expect(await done).toBe(0);
+  } finally {
+    await host.close();
+  }
+});

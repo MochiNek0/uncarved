@@ -2,7 +2,7 @@
 // 不能当成第一条消息发给模型。
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { main } from "../src/main.ts";
@@ -59,3 +59,9 @@ describe("a plugins subcommand written at the top level", () => {
 });
 
 process.on("exit", () => spy.mockRestore());
+
+test("a broken plugins.json is reported with its path instead of crashing", async () => {
+  await writeFile(path.join(home, "plugins.json"), '{"disabled": [],}');
+  expect(await main(["--safe", "-p", "hi"])).toBe(1);
+  expect(errors.join("\n")).toContain("plugins.json");
+});

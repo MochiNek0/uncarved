@@ -131,8 +131,10 @@ export function openaiCompatProvider(opts: OpenAICompatOptions): Provider {
 
         try {
           for await (const chunk of readSSE(watched(res.body, idle), () => (done = true))) {
-            // 讯飞星火这类服务端 HTTP 200 照回，错误放在块的顶层 code（非 0）、message 里，接着发 [DONE]：不当成空回复
-            const error = chunk.error ?? (typeof chunk.code === "number" && chunk.code !== 0 ? { message: chunk.message, code: chunk.code } : undefined);
+            // 讯飞星火这类服务端 HTTP 200 照回，错误放在块的顶层 code（非 0）、message 里，接着发 [DONE]：不当成空回复。
+            // 有的网关每块都带 code（例如 200 "success"），所以带 choices 的块、code 为 200 的块不算错误
+            const topLevel = typeof chunk.code === "number" && chunk.code !== 0 && chunk.code !== 200 && !chunk.choices?.length;
+            const error = chunk.error ?? (topLevel ? { message: chunk.message, code: chunk.code } : undefined);
             if (error) {
               // 部分服务端把 HTTP 状态码放在 code 里；其他数字是服务端自己的错误码
               const status = typeof error.code === "number" && error.code >= 100 && error.code < 600 ? error.code : undefined;

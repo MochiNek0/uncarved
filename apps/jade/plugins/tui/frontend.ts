@@ -83,6 +83,8 @@ const MAX_SEGMENT = 80;
 export class ScreenBridge {
   screen: Screen | undefined;
   #early: string[] = [];
+  /** 会话打开期间的提示：打开之后要清屏，先攒着，清屏之后再显示 */
+  #held: string[] | undefined;
   #closed = false;
   /** 状态栏上各插件的一段：会话 id → 插件 id → 文字 */
   #segments = new Map<string, Map<string, string>>();
@@ -93,7 +95,8 @@ export class ScreenBridge {
     interactive: true,
     notify: (message, level = "info") => {
       const text = level === "error" ? red(`[error] ${message}`) : level === "warning" ? yellow(`[warning] ${message}`) : dim(message);
-      if (this.screen) this.screen.log(text);
+      if (this.#held) this.#held.push(text);
+      else if (this.screen) this.screen.log(text);
       else if (this.#closed) process.stderr.write(`jade: ${message}\n`);
       else this.#early.push(text);
     },
@@ -111,6 +114,21 @@ export class ScreenBridge {
   attach(screen: Screen): void {
     this.screen = screen;
     for (const t of this.#early.splice(0)) screen.log(t);
+  }
+
+  /** 开始攒提示，直到 release */
+  hold(): void {
+    this.#held ??= [];
+  }
+
+  /** 显示攒下的提示，之后的照常显示 */
+  release(): void {
+    const held = this.#held ?? [];
+    this.#held = undefined;
+    for (const t of held) {
+      if (this.screen) this.screen.log(t);
+      else this.#early.push(t);
+    }
   }
 
   detach(): void {
@@ -312,6 +330,7 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
     // 状态栏上插件自己的段落跟着换：新会话的显示出来，旧会话的留着（换回去还在）
     bridge.show(s.id);
     if (resumed) await view.replay(await s.history(), true);
+    bridge.release();
     unsubscribe = s.subscribe(view.onNotice);
     if (!resumed) return;
     const held = s.state.held;
@@ -339,9 +358,15 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
       return sessions.current;
     },
     async open(o?: OpenOptions) {
-      const s = await sessions.open(o);
-      await adopt(s, o?.resume !== undefined);
-      return s;
+      // 插件在会话打开时发的提示（例如读了哪些指令文件）留到 adopt 清屏之后再显示
+      bridge.hold();
+      try {
+        const s = await sessions.open(o);
+        await adopt(s, o?.resume !== undefined);
+        return s;
+      } finally {
+        bridge.release();
+      }
     },
     async close() {
       unsubscribe?.();

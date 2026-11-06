@@ -5,6 +5,7 @@
 
 import type { Tool, Usage } from "uncarved";
 import { definePlugin, type UI } from "../../src/api.ts";
+import type { Approval } from "../approval/index.ts";
 import type { Models } from "../models/index.ts";
 import type { Renderers } from "../renderers/index.ts";
 import { taskTool, type ApproveSubagent, type TaskProgress } from "./subagent.ts";
@@ -143,6 +144,7 @@ export default definePlugin({
         tools: available,
         maxSteps,
         approve,
+        allowed: (call) => ctx.service<Approval>("approval@1")?.allows(ctx.session.id, call) ?? false,
         id: ctx.plugin,
         usage: (toolUseId, u) => void usage.set(toolUseId, u),
       }),
