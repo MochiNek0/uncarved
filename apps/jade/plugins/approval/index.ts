@@ -28,15 +28,14 @@ const MAX_DETAIL_CHARS = 2000;
 /** 等工具的审批预览的时限，过了就用默认的 detail */
 const PREVIEW_TIMEOUT_MS = 5000;
 
-/** 同一台主机上的只读工具审查过一次、放行之后就记住，不再逐次审查 */
-const siteKey = (call: GatedToolCall): string | undefined => {
+/**
+ * 带 URL 的只读工具审查放行之后，完全相同的调用不再审查。不按主机记：同一主机上换一个路径或查询参数
+ * 就能把本地数据带出去，正是审查要拦的
+ */
+const reviewedKey = (call: GatedToolCall): string | undefined => {
   const url = (call.input as { url?: unknown } | null)?.url;
   if (call.tool.effect !== "read" || typeof url !== "string") return undefined;
-  try {
-    return `${call.name} ${new URL(url).hostname.toLowerCase()}`;
-  } catch {
-    return undefined;
-  }
+  return `${call.name} ${JSON.stringify(call.input)}`;
 };
 
 let mode: Mode = "ask";
@@ -95,8 +94,8 @@ export default definePlugin({
       });
     }
     const review = reviewing ? reviewer({ models: models!, cwd: ctx.cwd, messages: () => recent.messages }) : undefined;
-    /** 本会话里审查过一次、放行了的主机 */
-    const reviewedSites = new Set<string>();
+    /** 本会话里审查过一次、放行了的调用 */
+    const reviewedCalls = new Set<string>();
     let warned = false;
     /** 本进程里刚选的"总是允许"：并发的关卡拿到的 derived 是各自开始时的快照，可能还没有它 */
     const added: AllowRule[] = [];
@@ -122,13 +121,13 @@ export default definePlugin({
         // auto 模式：规则判断不了、本来要问的调用先让模型审一次。审查只能放行或转给用户，不会替用户拒绝
         let why: string | undefined;
         if (review && mode === "auto") {
-          const site = siteKey(call);
-          if (site !== undefined && reviewedSites.has(site)) return { decision: "allow", reason: "This host was already approved in this session." };
+          const key = reviewedKey(call);
+          if (key !== undefined && reviewedCalls.has(key)) return { decision: "allow", reason: "This exact call was already approved in this session." };
           const verdict: Review = await review(call, hook.signal);
           // 审查调用不经过 model.responded，用量只能记在这里，界面据此计入会话用量
           if (verdict.usage) await hook.emit("reviewed", { toolUseId: call.toolUseId, usage: verdict.usage });
           if (verdict.decision === "allow") {
-            if (site !== undefined) reviewedSites.add(site);
+            if (key !== undefined) reviewedCalls.add(key);
             return { decision: "allow", reason: verdict.reason };
           }
           why = verdict.reason;
