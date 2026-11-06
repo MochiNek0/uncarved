@@ -3,11 +3,13 @@
 //
 // 计划模式的两件事也在这里：
 // - 在 plan 模式时经 prompts@1 往系统提示词里加一段，告诉模型先给计划、不要改东西（切出去时去掉）
-// - 这一轮模型给出计划、正常结束后，问用户要不要按计划执行；批准了就先换模式再替用户发一句"开始做"
+// - propose_plan 工具：模型写好要执行的计划后调用它，问用户要不要执行；批准了就换模式，工具结果告诉模型开始做。
+//   由模型声明"这是要执行的计划"，追问、回答问题、只要计划本身（比如健身计划）的回复不会被当成计划去问。
+//   用户的选择在工具结果里，会话日志里看得到
 
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import type { Block } from "uncarved";
+import type { Tool } from "uncarved";
 import { definePlugin, type UI } from "../../src/api.ts";
 import type { Approval } from "../approval/index.ts";
 import type { Commands } from "../commands/index.ts";
@@ -35,14 +37,59 @@ export const DESCRIPTIONS: Record<string, string> = {
 };
 const CYCLE = ["ask", "auto", "plan"];
 
-/** 计划模式时加进系统提示词的段落 */
-export const PLAN_NOTE =
-  "The session is in plan mode. Investigate with read-only tools (and the task tool for broad searches); do not try to modify files " +
-  "or run commands that change anything, such calls are denied. When you understand the task, reply with a concise, concrete plan: " +
-  "the files to change and how, in order, any open questions, and how you will verify the result. Then stop and wait for the user's approval.";
+/** 计划模式时加进系统提示词的段落；不能问用户（-p、非终端）时没有 propose_plan，只让模型给出计划后停下 */
+export function planNote(canPropose: boolean): string {
+  return (
+    "The session is in plan mode. Investigate with read-only tools (and the task tool for broad searches); do not try to modify files " +
+    "or run commands that change anything, such calls are denied. If the request is unclear in a way that changes the plan, ask the user first. " +
+    "When the task needs changes made (files edited, commands run), reply with a concise, concrete plan: the steps in order (for code, the files to change and how), " +
+    "any open questions, and how you will verify the result. " +
+    (canPropose
+      ? "Then call propose_plan so the user can approve it. If nothing needs to be executed (a question, or the plan itself is the answer the user wants), " +
+        "just answer and do not call propose_plan."
+      : "Then stop and wait for the user's approval.")
+  );
+}
 
-/** 批准计划之后替用户发的那句 */
-export const APPROVED_NOTE = "The plan is approved. Implement it now.";
+/** 批准计划之后工具结果里的那句 */
+export const APPROVED_NOTE = "The user approved the plan. Implement it now.";
+/** 没批准时工具结果里的那句 */
+export const NOT_APPROVED = "The user did not approve the plan yet. End your turn and wait for their feedback.";
+
+export const PROPOSE_PLAN = "propose_plan";
+
+/** propose_plan：问用户要不要执行刚写好的计划，批准了就换到用户选的模式 */
+export function proposePlanTool(approval: Approval, ui: UI): Tool {
+  return {
+    name: PROPOSE_PLAN,
+    description:
+      "In plan mode, ask the user to approve the plan you just wrote in your reply, and wait for the answer. Write the full plan in your reply text first; " +
+      "call this only for a plan of changes to execute, not for questions, clarifications or answers that need nothing executed.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    // 不碰文件和进程：plan 模式下不用批准
+    effect: "read",
+    concurrency: "exclusive",
+    idempotent: false,
+    async execute(_input, ctx) {
+      if (approval.mode() !== "plan") return { content: "The session is not in plan mode; no approval is needed.", isError: true };
+      const choice = await ui.select(
+        {
+          title: "Execute this plan?",
+          options: [
+            { label: "Yes, in auto mode", value: "auto", hint: "edits and safe commands run without asking" },
+            { label: "Yes, and ask before each edit", value: "ask", hint: "mode ask" },
+            { label: "No, keep planning", value: "plan", hint: "type what to change" },
+          ],
+        },
+        ctx.signal,
+      );
+      ctx.signal.throwIfAborted();
+      if (choice !== "auto" && choice !== "ask") return { content: NOT_APPROVED };
+      setMode(approval, choice);
+      return { content: `${APPROVED_NOTE} (mode: ${choice})` };
+    },
+  };
+}
 
 /** 模式变化时通知前端和会话里的订阅者（模块每个进程只加载一次，进程级和会话级共用） */
 const listeners = new Set<(mode: string) => void>();
@@ -148,11 +195,20 @@ export default definePlugin({
       if (saved) setMode(approval, saved);
     }
 
+    // 能问用户时才有 propose_plan；它只在 plan 模式下发给模型
+    const canPropose = !!ui?.interactive;
+    if (canPropose) ctx.kernel.tool(proposePlanTool(approval, ui!));
+    ctx.kernel.hook({
+      kind: "transform",
+      point: "context.build",
+      fn: (req) => (approval.mode() === "plan" ? req : { ...req, tools: req.tools.filter((t) => t.name !== PROPOSE_PLAN) }),
+    });
+
     // 计划模式的说明跟着模式进出系统提示词
     let note: (() => void) | undefined;
     const sync = () => {
       const plan = approval.mode() === "plan";
-      if (plan && !note && prompts) note = prompts.add({ text: PLAN_NOTE, stable: false });
+      if (plan && !note && prompts) note = prompts.add({ text: planNote(canPropose), stable: false });
       else if (!plan && note) {
         note();
         note = undefined;
@@ -162,57 +218,5 @@ export default definePlugin({
     const onChange = () => sync();
     listeners.add(onChange);
     ctx.effect(() => () => void listeners.delete(onChange));
-
-    /** 这一轮的请求里模型看到过计划模式的说明（中途才切到计划模式时没有） */
-    let sawPlan = false;
-    ctx.kernel.hook({
-      kind: "transform",
-      point: "context.build",
-      fn: (req) => {
-        sawPlan = approval.mode() === "plan";
-        return req;
-      },
-    });
-
-    /** 最近一次模型回复的正文：没有文字的（只有工具调用）不算计划 */
-    let lastReply = "";
-    ctx.kernel.hook({
-      kind: "observe",
-      point: "event",
-      fn: (e) => {
-        if (e.type === "model.responded") {
-          lastReply = (e.data as { content: Block[] }).content.flatMap((b) => (b.kind === "text" ? [b.text] : [])).join("\n");
-          return;
-        }
-        if (e.type !== "turn.ended") return;
-        // 这一轮模型看到的是计划模式、正常结束、给出了文字，才发现要问。
-        // afterTurn 要在这里登记：会话空闲时登记会马上执行
-        const plan = sawPlan;
-        const text = lastReply;
-        const ended = (e.data as { reason?: string }).reason === "end";
-        sawPlan = false;
-        lastReply = "";
-        if (!ended || !plan || !text.trim() || approval.mode() !== "plan") return;
-        ctx.session.afterTurn(async () => {
-          if (!ui?.interactive) return;
-          const choice = await ui.select(
-            {
-              title: "Execute this plan?",
-              options: [
-                { label: "Yes, in auto mode", value: "auto", hint: "edits and safe commands run without asking" },
-                { label: "Yes, and ask before each edit", value: "ask", hint: "mode ask" },
-                { label: "No, keep planning", value: "plan", hint: "type what to change" },
-              ],
-            },
-            ctx.signal,
-          );
-          if (choice !== "auto" && choice !== "ask") return;
-          setMode(approval, choice);
-          const content: Block[] = [{ kind: "text", text: APPROVED_NOTE, origin: { by: "plugin", id: ctx.plugin }, trust: "trusted" }];
-          // 和 jade/continue 一样：不能 await，afterTurn 跑完之后会话才处理排队的输入
-          ctx.session.send({ kind: "message", content }).catch(() => {});
-        });
-      },
-    });
   },
 });

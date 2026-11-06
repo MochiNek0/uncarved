@@ -542,7 +542,7 @@ export function policy(opts: PolicyOptions): Policy {
           decision: "deny",
           reason:
             mode === "plan"
-              ? `The session is in plan mode, so ${call.name} is not allowed yet. Finish investigating, then present your plan and wait for the user to approve it.`
+              ? `The session is in plan mode, so ${call.name} is not allowed yet. Finish investigating, then present your plan for the user to approve as the plan mode instructions describe (with propose_plan when you have it).`
               : `The session is in read-only mode, so ${call.name} is not allowed. Describe the change instead of making it.`,
         };
       }

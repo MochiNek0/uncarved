@@ -1,11 +1,12 @@
-// jade/modes：计划模式的告知和"执行这个计划？"。模式本身在 jade/approval；这里用真实的 bundled 插件、假模型和假界面。
+// jade/modes：计划模式的告知和 propose_plan 的"执行这个计划？"。模式本身在 jade/approval；这里用真实的 bundled 插件、假模型和假界面。
 
 import { afterEach, describe, expect, test } from "bun:test";
 import path from "node:path";
-import { APPROVED_NOTE, PLAN_NOTE, type Modes } from "../plugins/modes/index.ts";
+import { APPROVED_NOTE, NOT_APPROVED, type Modes } from "../plugins/modes/index.ts";
 import { PluginHost } from "../src/index.ts";
 import type { Approval } from "../plugins/approval/index.ts";
-import { cleanup, say, scriptedHost, textOf, use } from "./scripted-ui.ts";
+import type { ModelRequest } from "uncarved";
+import { cleanup, MODEL, say, scriptedHost, textOf, type Step } from "./scripted-ui.ts";
 
 afterEach(cleanup);
 
@@ -49,60 +50,79 @@ describe("the remembered mode", () => {
   });
 });
 
+/** 模型先写计划再调用 propose_plan（同一个回复里） */
+const propose = (id: string, plan: string): Step => ({
+  content: [
+    { kind: "text", text: plan, origin: MODEL, trust: "trusted" },
+    { kind: "tool_use", id, name: "propose_plan", input: {}, origin: MODEL, trust: "trusted" },
+  ],
+  stopReason: "tool_use",
+});
+const systemOf = (req: ModelRequest) => req.system.map((x) => x.text).join("\n");
+const toolsOf = (req: ModelRequest) => req.tools.map((t) => t.name);
+
 describe("plan mode", () => {
-  test("tells the model it is planning, then asks whether to execute the plan", async () => {
+  test("tells the model it is planning; propose_plan asks whether to execute, and approving switches the mode", async () => {
     const { host, shared, send } = await scriptedHost({ config: PLAN });
-    shared.script.push(say("Here is the plan: change a.ts."), say("Implemented."));
+    shared.script.push(propose("p1", "Here is the plan: change a.ts."), say("Implemented."));
     shared.answers.push("auto");
     const s = await host.sessions.open();
     await send(s, "fix the bug");
 
-    // 第一次请求的系统提示词里有计划模式的说明
-    expect(shared.requests[0]!.system.map((x) => x.text).join("\n")).toContain("The session is in plan mode");
+    // 第一次请求的系统提示词里有计划模式的说明，工具里有 propose_plan
+    expect(systemOf(shared.requests[0]!)).toContain("The session is in plan mode");
+    expect(systemOf(shared.requests[0]!)).toContain("call propose_plan");
+    expect(toolsOf(shared.requests[0]!)).toContain("propose_plan");
     expect(shared.asked).toEqual(["Execute this plan?"]);
 
-    // 批准之后：模式换成 auto，替用户发了"开始做"，系统提示词里不再有那段
+    // 批准之后：模式换成 auto，工具结果让模型开始做，系统提示词和工具里不再有计划模式的东西
     expect(host.service<Approval>("approval@1")!.mode()).toBe("auto");
-    expect(shared.requests[1]).toBeDefined();
-    expect(textOf(shared.requests[1]!.messages.at(-1)!.content)).toBe(APPROVED_NOTE);
-    expect(shared.requests[1]!.system.map((x) => x.text).join("\n")).not.toContain("The session is in plan mode");
+    expect(shared.requests).toHaveLength(2);
+    expect(textOf(shared.requests[1]!.messages.at(-1)!.content)).toBe(`${APPROVED_NOTE} (mode: auto)`);
+    expect(systemOf(shared.requests[1]!)).not.toContain("The session is in plan mode");
+    expect(toolsOf(shared.requests[1]!)).not.toContain("propose_plan");
   });
 
-  test("'No, keep planning' changes nothing", async () => {
+  test("'No, keep planning' changes nothing and tells the model to wait", async () => {
     const { host, shared, send } = await scriptedHost({ config: PLAN });
-    shared.script.push(say("Here is the plan."), say("Still here."));
+    shared.script.push(propose("p1", "Here is the plan."), say("Waiting for your feedback."));
     shared.answers.push("plan");
     const s = await host.sessions.open();
     await send(s, "fix the bug");
 
     expect(shared.asked).toEqual(["Execute this plan?"]);
     expect(host.service<Approval>("approval@1")!.mode()).toBe("plan");
-    // 没有替用户发消息：只有用户那一条
-    expect(shared.requests).toHaveLength(1);
-    const second = await s.send({ kind: "message", content: [{ kind: "text", text: "go on", origin: { by: "user" }, trust: "trusted" }] });
-    await second;
-    await s.idle();
-    // 计划模式下仍然会说"这是计划"
-    expect(shared.asked).toEqual(["Execute this plan?", "Execute this plan?"]);
+    expect(textOf(shared.requests[1]!.messages.at(-1)!.content)).toBe(NOT_APPROVED);
   });
 
-  test("ask mode never asks about a plan", async () => {
+  test("a text reply without propose_plan is not a plan to execute", async () => {
+    // 比如追问，或者用户要的就是计划本身（健身计划）：不问要不要执行
+    const { host, shared, send } = await scriptedHost({ config: PLAN });
+    shared.script.push(say("Weekly plan: Monday chest, Tuesday back, ..."));
+    const s = await host.sessions.open();
+    await send(s, "make me a workout plan");
+    expect(shared.asked).toEqual([]);
+    expect(shared.requests).toHaveLength(1);
+  });
+
+  test("ask mode has neither the plan note nor propose_plan", async () => {
     const { host, shared, send } = await scriptedHost({ config: { "jade/approval": { mode: "ask" } } });
     shared.script.push(say("Here is the plan."));
     const s = await host.sessions.open();
     await send(s, "fix the bug");
     expect(shared.asked).toEqual([]);
-    expect(shared.requests[0]!.system.map((x) => x.text).join("\n")).not.toContain("The session is in plan mode");
+    expect(systemOf(shared.requests[0]!)).not.toContain("The session is in plan mode");
+    expect(toolsOf(shared.requests[0]!)).not.toContain("propose_plan");
   });
 
-  test("a reply that is only tool calls is not a plan", async () => {
+  test("a run that cannot ask the user has no propose_plan and is told to stop after the plan", async () => {
     const { host, shared, send } = await scriptedHost({ config: PLAN });
-    // 只读工具在计划模式下照常放行
-    shared.script.push(use("u1", "list_dir", { path: "." }), say("Here is the plan."));
-    shared.answers.push("keep planning");
+    shared.interactive = false;
+    shared.script.push(say("Here is the plan."));
     const s = await host.sessions.open();
-    await send(s, "look around");
-    // 第一轮以工具调用结束：不问；第二轮给出文字计划才问
-    expect(shared.asked).toEqual(["Execute this plan?"]);
+    await send(s, "fix the bug");
+    expect(systemOf(shared.requests[0]!)).toContain("Then stop and wait for the user's approval.");
+    expect(systemOf(shared.requests[0]!)).not.toContain("propose_plan");
+    expect(toolsOf(shared.requests[0]!)).not.toContain("propose_plan");
   });
 });

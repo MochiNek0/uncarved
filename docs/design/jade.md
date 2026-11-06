@@ -295,7 +295,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 | `jade/renderers` | `renderers@1`：`tool`、`event`、`forTool`、`forEvent` | — | `ToolRenderer`、`EventRenderer`。`jade/fs`、`jade/shell` 为自己的工具登记，`jade/approval` 用工具的 `preview` 作审批对话框的内容 |
 | `jade/models` | `provider@1`、`models@1`（`current`、`complete`、`list`、`subscribe`）；`/model`：切换保存过的模型、改当前模型的设置、加一个模型；用过的模型记在 `$JADE_HOME/models.json` | 可选 `ui@1`、`commands@1` | `provider.ts`、`ui/configure.ts` |
 | `jade/approval` | `approval@1`（`mode`、`setMode`、`allowRead`：登记不用问就能读的目录，项目层插件不能用）、gate；auto 模式下判断不了的调用先由模型审查（`review.ts`） | `ui@1`、`models@1`（都可选：没有 `ui@1` 时，要问的调用一律拒绝；没有 `models@1` 或 `review: false` 时不审查） | `plugins/policy.ts`、`plugins/review.ts` |
-| `jade/modes` | `modes@1`（`current`、`set`、`cycle`、`subscribe`），Shift+Tab、`/mode`；计划模式：往系统提示词里加"先给计划"的段落，一轮正常结束、模型给出计划后问"执行这个计划？"，批准了就换模式并替用户发一句"开始做" | `approval@1`；可选 `keys@1`、`commands@1`、`prompts@1`、`ui@1` | Shift+Tab、`/mode`、计划模式的批准流程（`test/modes.test.ts`） |
+| `jade/modes` | `modes@1`（`current`、`set`、`cycle`、`subscribe`），Shift+Tab、`/mode`；计划模式：往系统提示词里加"先给计划"的段落，`propose_plan` 工具（只在计划模式、能问用户时发给模型）问"执行这个计划？"，批准了就换模式，工具结果让模型开始做 | `approval@1`；可选 `keys@1`、`commands@1`、`prompts@1`、`ui@1` | Shift+Tab、`/mode`、计划模式的批准流程（`test/modes.test.ts`） |
 | `jade/plugins` | `/plugins [id]`：每个插件的状态和原因、每个服务的提供者（来自核心的 `jade@1`） | `commands@1`、`jade@1` | — |
 | `jade/sessions` | 命令 `/clear` `/resume` `/retry`；会话索引 `$JADE_HOME/state/sessions.jsonl` | `commands@1` | `plugins/sessions.ts`、`session-lifecycle.ts` |
 | `jade/prompts` | `prompts@1`（其他插件往系统提示词里加段落；项目层插件加的、或标了 `untrusted` 的段落为不可信） | `models@1`（可选，写上当前模型） | `plugins/prompts.ts` |
@@ -321,7 +321,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 - `ask_user` 的对话框经 `ui@1`，不再由宿主私下传入。
 - `jade/task`、`jade/compact` 经 `models@1` 调模型，不再由宿主传 provider。
 - 续写、溢出重试经 `session.afterTurn`，不再需要只给内置插件的 `TurnParticipant`。
-- 模式管理整个在 `jade/modes`，前端只显示 `modes@1` 给出的状态。计划模式的说明经 `prompts@1` 加段落（`stable: false`），切出计划模式时去掉；"执行这个计划？"在 `turn.ended` 的 observe 里登记 `afterTurn` 再问（会话空闲时登记会立刻执行）。插件看不到前端排队的输入，所以用户已经在输入框里排了别的消息时也会问——这是第 11 节记的缺口之一。
+- 模式管理整个在 `jade/modes`，前端只显示 `modes@1` 给出的状态。计划模式的说明经 `prompts@1` 加段落（`stable: false`），切出计划模式时去掉；"执行这个计划？"由模型调用 `propose_plan` 触发：要执行改动的计划才调用，追问、回答问题、计划本身就是答案（比如健身计划）时不调用，所以不再按"这一轮给出了文字"去猜；用户的选择是工具结果，记在会话日志里。不能问用户时没有这个工具，说明里只让模型给出计划后停下。插件看不到前端排队的输入，所以用户已经在输入框里排了别的消息时也会问——这是第 11 节记的缺口之一。
 
 ## 10. uncarved 可能缺的
 
