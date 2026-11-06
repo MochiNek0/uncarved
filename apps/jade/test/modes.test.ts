@@ -1,13 +1,53 @@
 // jade/modes：计划模式的告知和"执行这个计划？"。模式本身在 jade/approval；这里用真实的 bundled 插件、假模型和假界面。
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { APPROVED_NOTE, PLAN_NOTE } from "../plugins/modes/index.ts";
+import path from "node:path";
+import { APPROVED_NOTE, PLAN_NOTE, type Modes } from "../plugins/modes/index.ts";
+import { PluginHost } from "../src/index.ts";
 import type { Approval } from "../plugins/approval/index.ts";
 import { cleanup, say, scriptedHost, textOf, use } from "./scripted-ui.ts";
 
 afterEach(cleanup);
 
 const PLAN = { "jade/approval": { mode: "plan" } };
+
+/** 同一个 $JADE_HOME 再启动一次（scriptedHost 装的假模型和假界面还在 home/plugins 里） */
+async function restart(home: string, cwd: string) {
+  const host = await PluginHost.start({
+    roots: [
+      { layer: "bundled", root: path.resolve(import.meta.dir, "../plugins") },
+      { layer: "user", root: path.join(home, "plugins") },
+    ],
+    home,
+    cwd,
+    report: () => {},
+  });
+  await host.sessions.open();
+  const mode = host.service<Approval>("approval@1")!.mode();
+  await host.close();
+  return mode;
+}
+
+describe("the remembered mode", () => {
+  test("the mode the user picked is used again after a restart; plan is not remembered", async () => {
+    const { home, cwd, host } = await scriptedHost({ config: { "jade/approval": { mode: "ask" } } });
+    await host.sessions.open();
+    const modes = host.service<Modes>("modes@1")!;
+    modes.set("auto");
+    modes.set("plan");
+    await host.close();
+    expect(await restart(home, cwd)).toBe("auto");
+  });
+
+  test("a run that cannot ask the user keeps the configured mode", async () => {
+    const { home, cwd, host, shared } = await scriptedHost({ config: { "jade/approval": { mode: "ask" } } });
+    await host.sessions.open();
+    host.service<Modes>("modes@1")!.set("auto");
+    await host.close();
+    shared.interactive = false;
+    expect(await restart(home, cwd)).toBe("ask");
+  });
+});
 
 describe("plan mode", () => {
   test("tells the model it is planning, then asks whether to execute the plan", async () => {

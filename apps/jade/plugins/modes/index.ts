@@ -5,6 +5,8 @@
 // - 在 plan 模式时经 prompts@1 往系统提示词里加一段，告诉模型先给计划、不要改东西（切出去时去掉）
 // - 这一轮模型给出计划、正常结束后，问用户要不要按计划执行；批准了就先换模式再替用户发一句"开始做"
 
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import path from "node:path";
 import type { Block } from "uncarved";
 import { definePlugin, type UI } from "../../src/api.ts";
 import type { Approval } from "../approval/index.ts";
@@ -45,9 +47,39 @@ export const APPROVED_NOTE = "The plan is approved. Implement it now.";
 /** 模式变化时通知前端和会话里的订阅者（模块每个进程只加载一次，进程级和会话级共用） */
 const listeners = new Set<(mode: string) => void>();
 
+/**
+ * 用户选的模式记在 $JADE_HOME/mode.json，下次启动接着用（比配置里的 mode 优先）。
+ * plan 是一次任务里的，yolo 不该悄悄带到下一次启动：这两个不记
+ */
+const REMEMBERED = new Set(["ask", "auto", "readonly"]);
+let modeFile: string | undefined;
+/** 记下的模式只在第一个可交互的会话里恢复一次：jade -p 这类不能问用户的运行一直用配置的模式 */
+let restored = false;
+
+function readRemembered(file: string): string | undefined {
+  try {
+    const mode = (JSON.parse(readFileSync(file, "utf8")) as { mode?: unknown }).mode;
+    return typeof mode === "string" && REMEMBERED.has(mode) ? mode : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function remember(mode: string): void {
+  if (!modeFile || !REMEMBERED.has(mode)) return;
+  try {
+    // 同步写：连按几次 Shift+Tab 时，文件里留下的一定是最后一次
+    mkdirSync(path.dirname(modeFile), { recursive: true });
+    writeFileSync(modeFile, `${JSON.stringify({ mode })}\n`);
+  } catch {
+    // 记不下只是下次从配置的模式开始
+  }
+}
+
 function setMode(approval: Approval, mode: string): void {
   if (mode === approval.mode()) return;
   approval.setMode(mode as ReturnType<Approval["mode"]>);
+  remember(mode);
   for (const fn of [...listeners]) {
     try {
       fn(mode);
@@ -60,6 +92,8 @@ function setMode(approval: Approval, mode: string): void {
 export default definePlugin({
   process(ctx) {
     const approval = ctx.require<Approval>("approval@1");
+    modeFile = path.join(ctx.home, "mode.json");
+    restored = false;
     const set = (mode: string) => setMode(approval, mode);
     const cycle = () => {
       const next = CYCLE[(CYCLE.indexOf(approval.mode()) + 1) % CYCLE.length]!;
@@ -107,6 +141,12 @@ export default definePlugin({
     const approval = ctx.require<Approval>("approval@1");
     const prompts = ctx.service<Prompts>("prompts@1");
     const ui = ctx.service<UI>("ui@1");
+
+    if (!restored && ui?.interactive && modeFile) {
+      restored = true;
+      const saved = readRemembered(modeFile);
+      if (saved) setMode(approval, saved);
+    }
 
     // 计划模式的说明跟着模式进出系统提示词
     let note: (() => void) | undefined;
