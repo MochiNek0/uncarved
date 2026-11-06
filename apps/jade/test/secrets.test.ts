@@ -51,6 +51,21 @@ describe("the secrets store", () => {
     expect(await new SecretsStore(home).for("test/a").get("TOKEN")).toBe("s3cret");
   });
 
+  test("two processes on the same home see and keep each other's writes", async () => {
+    const home = await tempHome();
+    // 两个 SecretsStore 就是两个 jade 进程
+    const one = new SecretsStore(home).for("test/a");
+    const two = new SecretsStore(home).for("test/a");
+    expect(await one.get("A")).toBeUndefined();
+    expect(await two.get("A")).toBeUndefined();
+
+    await one.set("A", "1");
+    expect(await two.get("A")).toBe("1");
+    await two.set("B", "2");
+    expect(await one.get("B")).toBe("2");
+    expect(JSON.parse(await readFile(secretFile(home, "test/a"), "utf8"))).toEqual({ A: "1", B: "2" });
+  });
+
   test("undefined deletes a key; odd key names stay ordinary keys", async () => {
     const home = await tempHome();
     const a = new SecretsStore(home).for("test/a");

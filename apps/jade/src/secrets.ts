@@ -12,7 +12,7 @@ import { StaleContext, type Secrets } from "./api.ts";
 const KEY_MAX = 256;
 const VALUE_MAX = 1024 * 1024;
 
-/** 每个插件的密钥存储；同一个 id 始终拿到同一个实例，读到的缓存才一致 */
+/** 每个插件的密钥存储；同一个 id 始终拿到同一个实例，写入才能串行 */
 export class SecretsStore {
   readonly #root: string;
   readonly #plugins = new Map<string, Secrets>();
@@ -53,7 +53,6 @@ class PluginSecrets implements Secrets {
   readonly #root: string;
   readonly #plugin: string;
   readonly #file: string;
-  #data: Record<string, string> | undefined;
   /** 同一个插件的写入串行，避免两次 set 交错覆盖 */
   #writing: Promise<void> = Promise.resolve();
 
@@ -74,31 +73,23 @@ class PluginSecrets implements Secrets {
       if (typeof value !== "string") throw new Error("secrets: value must be a string");
       if (value.length > VALUE_MAX) throw new Error(`secrets: value is longer than ${VALUE_MAX} characters`);
     }
-    // 读、改、写排在上一次写入之后：两次 set 不会互相覆盖，失败时也能把内存里的值放回去
+    // 读、改、写排在上一次写入之后：两次 set 不会互相覆盖。每次都从文件读，另一个 jade 进程写的不会丢
     const run = this.#writing.then(async () => {
       const data = await this.#load();
-      const before = data[key];
       if (value === undefined) delete data[key];
       else data[key] = value;
-      try {
-        await this.#save();
-      } catch (e) {
-        if (before === undefined) delete data[key];
-        else data[key] = before;
-        throw e;
-      }
+      await this.#save(data);
     });
     this.#writing = run.catch(() => {});
     await run;
   }
 
   async #load(): Promise<Record<string, string>> {
-    if (this.#data) return this.#data;
     let raw: unknown;
     try {
       raw = JSON.parse(await readFile(this.#file, "utf8"));
     } catch (e) {
-      if ((e as NodeJS.ErrnoException).code === "ENOENT") return (this.#data = Object.create(null) as Record<string, string>);
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") return Object.create(null) as Record<string, string>;
       throw new Error(`secrets for ${this.#plugin} at ${this.#file}: ${e instanceof Error ? e.message : String(e)}`);
     }
     if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
@@ -107,15 +98,15 @@ class PluginSecrets implements Secrets {
     // 用无原型对象：密钥名写成 __proto__ 也不会碰到原型
     const data = Object.create(null) as Record<string, string>;
     for (const [key, value] of Object.entries(raw)) if (typeof value === "string") data[key] = value;
-    return (this.#data = data);
+    return data;
   }
 
-  async #save(): Promise<void> {
+  async #save(data: Record<string, string>): Promise<void> {
     await mkdir(this.#root, { recursive: true, mode: 0o700 });
     await chmod(this.#root, 0o700).catch(() => {});
     const tmp = `${this.#file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
     try {
-      await writeFile(tmp, `${JSON.stringify(this.#data ?? {}, null, 2)}\n`, { mode: 0o600 });
+      await writeFile(tmp, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
       await rename(tmp, this.#file);
       await chmod(this.#file, 0o600).catch(() => {});
     } finally {
