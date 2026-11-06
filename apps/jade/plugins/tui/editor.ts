@@ -44,6 +44,9 @@ export const edit = {
   right: (s: EditState): EditState => ({ ...s, cursor: next(s.value, s.cursor) }),
   home: (s: EditState): EditState => ({ ...s, cursor: lineStart(s.value, s.cursor) }),
   end: (s: EditState): EditState => ({ ...s, cursor: lineEnd(s.value, s.cursor) }),
+  /** 光标移到下一个词的末尾 / 上一个词的开头，同 shell 的 Alt+F / Alt+B（macOS 终端里 Option+→ / Option+←） */
+  wordRight: (s: EditState): EditState => ({ ...s, cursor: s.cursor + /^\s*\S*/u.exec(s.value.slice(s.cursor))![0].length }),
+  wordLeft: (s: EditState): EditState => ({ ...s, cursor: s.value.slice(0, s.cursor).replace(/\S*\s*$/u, "").length }),
   /** 删除光标前的一个词（连同它和光标之间的空白），同 shell 的 Ctrl+W */
   deleteWord: (s: EditState): EditState => {
     const before = s.value.slice(0, s.cursor);

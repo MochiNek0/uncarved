@@ -132,6 +132,8 @@ export default definePlugin({
         await checkpoints.save(sessionId, { toolUseId: out.call.toolUseId, ...snap, afterHash: sha256(after ?? "") });
       },
     });
+    // 被拒绝、被中断的调用不经过 tool.after：一轮结束时还留着的都不会再用到，不然整个文件的内容一直占着内存
+    ctx.kernel.hook({ kind: "observe", point: "event", fn: (e) => void (e.type === "turn.ended" && before.clear()) });
     ctx.kernel.hook(notes.hook(sessionId, ctx.plugin, ctx.plugin));
   },
 });

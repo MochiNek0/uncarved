@@ -1,6 +1,7 @@
 // 定时任务的存储：$JADE_HOME/state/schedules.json。同一台机器上可能开着好几个 jade，
 // 所有读写都在一把目录锁（schedules.lock，mkdir 是原子的）里进行，到点的任务由先拿到锁的进程认领，只投递一次。
 
+import { randomBytes } from "node:crypto";
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { nextRun } from "./cron.ts";
@@ -56,7 +57,7 @@ export class ScheduleStore {
       const before = JSON.stringify(tasks);
       const out = fn(tasks);
       if (JSON.stringify(tasks) !== before) {
-        const tmp = `${this.file}.${process.pid}.tmp`;
+        const tmp = `${this.file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
         await writeFile(tmp, `${JSON.stringify({ version: 1, tasks } satisfies File, null, 2)}\n`);
         await rename(tmp, this.file);
       }
@@ -80,9 +81,12 @@ export class ScheduleStore {
   async #locked<T>(fn: () => Promise<T>): Promise<T> {
     await mkdir(path.dirname(this.#lock), { recursive: true });
     const deadline = Date.now() + WAIT_MS;
+    // 记下自己建的锁目录的文件号，释放时只删自己的锁：持有太久被别人当成过期删掉、重新上了锁时，不去删别人的
+    let mine: bigint | undefined;
     for (;;) {
       try {
         await mkdir(this.#lock);
+        mine = await lockId(this.#lock);
         break;
       } catch (e) {
         if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
@@ -95,9 +99,21 @@ export class ScheduleStore {
     try {
       return await fn();
     } finally {
-      await rm(this.#lock, { recursive: true, force: true });
+      if (mine !== undefined && (await lockId(this.#lock)) === mine) await rm(this.#lock, { recursive: true, force: true });
     }
   }
+}
+
+/** 锁目录的文件号；不在了时 undefined */
+const lockId = (dir: string) => stat(dir, { bigint: true }).then((s) => s.ino, () => undefined);
+
+/**
+ * 两个目录是不是同一个：比较绝对路径（不看末尾的分隔符），Windows 上不分大小写。
+ * 和 jade/sessions 的 cwdKey 相同，插件之间不共享代码（只能共享类型），所以这里留一份
+ */
+export function sameDir(a: string, b: string): boolean {
+  const key = (p: string) => (process.platform === "win32" ? path.resolve(p).toLowerCase() : path.resolve(p));
+  return key(a) === key(b);
 }
 
 /** 下一次触发时间；没有了时 undefined */
@@ -113,7 +129,7 @@ export function claimDue(store: ScheduleStore, cwd: string, session: string, now
   return store.update((tasks) => {
     const due: Task[] = [];
     for (const t of tasks) {
-      if (t.status !== "active" || t.cwd !== cwd || !t.next || Date.parse(t.next) > now.getTime() || skip.has(t.id)) continue;
+      if (t.status !== "active" || !sameDir(t.cwd, cwd) || !t.next || Date.parse(t.next) > now.getTime() || skip.has(t.id)) continue;
       t.last = { at: now.toISOString(), session };
       t.updatedAt = now.toISOString();
       const next = t.recurring ? nextAt(t.cron, now) : undefined;

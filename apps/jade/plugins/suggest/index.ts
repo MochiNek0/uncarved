@@ -5,6 +5,7 @@
 // 对话从 context.project（每次请求模型前的消息）和 model.after（这一轮最后的回复）取，轮次结束从 turn.ended 事件知道。
 // 从旧 jade 的 examples/plugins/suggest 移植；提示词、对话的整理和截取、回复的清理参考 dsh-ghost-prompt。
 
+import { randomBytes } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Delta, Message, ModelRequest } from "uncarved";
@@ -118,7 +119,7 @@ async function readState(file: string): Promise<Partial<Settings>> {
 
 async function writeState(file: string, s: Settings): Promise<void> {
   await mkdir(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.tmp`;
+  const tmp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
   await writeFile(tmp, `${JSON.stringify({ enabled: s.enabled, model: s.model ?? "" }, null, 2)}\n`);
   await rename(tmp, file);
 }
@@ -199,6 +200,14 @@ export default definePlugin({
     };
     changed.add(onChange);
     ctx.signal.addEventListener("abort", () => changed.delete(onChange));
+    /** 上一次提示过的错误：同样的错误每轮都提示太吵，成功一次后清掉 */
+    let warned: string | undefined;
+    const warn = (e: unknown) => {
+      const message = e instanceof Error ? e.message : String(e);
+      if (message === warned) return;
+      warned = message;
+      ctx.service<UI>("ui@1")?.notify(`jade/suggest: prediction failed (${settings.model ? `model ${settings.model}` : "the session's model"}): ${message}`, "warning");
+    };
 
     async function predict() {
       if (!settings.enabled) return;
@@ -223,18 +232,24 @@ export default definePlugin({
         tools: [],
       };
       let text: string;
+      const timeout = AbortSignal.timeout(TIMEOUT_MS);
       try {
         const res = await models.complete(request, {
-          signal: AbortSignal.any([mine.signal, firstLine.signal, AbortSignal.timeout(TIMEOUT_MS)]),
+          signal: AbortSignal.any([mine.signal, firstLine.signal, timeout]),
           onDelta,
           ...(model ? { model } : {}),
         });
         text = res.content.flatMap((b) => (b.kind === "text" ? [b.text] : [])).join("");
-      } catch {
-        // 只是建议：出错、超时、被中止都不打扰用户。第一行完整后自己停下的，用已经收到的
-        if (!firstLine.signal.aborted || mine.signal.aborted) return;
-        text = streamed;
+      } catch (e) {
+        // 第一行完整后自己停下的，用已经收到的
+        if (firstLine.signal.aborted && !mine.signal.aborted) text = streamed;
+        else {
+          // 超时、被中止不打扰用户；模型出错（配置不对之类）说一次，否则开着却什么都不显示，看不出为什么
+          if (!mine.signal.aborted && !timeout.aborted && !ctx.signal.aborted) warn(e);
+          return;
+        }
       }
+      warned = undefined;
       const hint = tidy(text);
       if (hint && !mine.signal.aborted) input!.hint(hint);
     }

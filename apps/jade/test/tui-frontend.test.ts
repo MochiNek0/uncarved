@@ -129,6 +129,23 @@ test("--continue resumes the most recent session in this directory", async () =>
   }
 });
 
+test("the status bar shows where jade/compact will compact", async () => {
+  const { start } = await setup();
+  g.__script = [{ content: [{ kind: "text", text: "answer", origin: MODEL, trust: "trusted" }], stopReason: "end", usage: { inputTokens: 300, outputTokens: 20 } }];
+  const t = fakeTerminal();
+  const host = await start();
+  try {
+    const done = host.service<Frontend>("frontend@1")!.run({ argv: ["hello"], sessions: host.sessions, signal: new AbortController().signal });
+    await until(() => t.output().includes("answer"));
+    await until(() => t.output().includes("compacts at"));
+    await t.type("/exit");
+    await t.type("\r");
+    expect(await done).toBe(0);
+  } finally {
+    await host.close();
+  }
+});
+
 test("@ completes a file path, and sending it attaches the file's content", async () => {
   const { cwd, start } = await setup();
   await writeFile(path.join(cwd, "readme.md"), "readme says hi\n");

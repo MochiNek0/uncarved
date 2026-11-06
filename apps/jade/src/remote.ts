@@ -179,6 +179,7 @@ export async function startRemote(source: PluginSource, owner: Owner, opts: Remo
         return null;
       }
       case "kernel/tool": {
+        if (scope === "process") throw new Error("kernel/tool is only available in a session scope");
         const t = (p.tool ?? {}) as Record<string, unknown>;
         if (!isHandle(p.execute)) throw new Error("kernel/tool: execute must be a function handle");
         if (t.effect !== "read" && t.effect !== "write" && t.effect !== "external") throw new Error(`kernel/tool ${String(t.name)}: effect must be "read", "write" or "external"`);
@@ -198,6 +199,7 @@ export async function startRemote(source: PluginSource, owner: Owner, opts: Remo
         return null;
       }
       case "kernel/hook": {
+        if (scope === "process") throw new Error("kernel/hook is only available in a session scope");
         const h = (p.hook ?? {}) as Record<string, unknown>;
         if (!isHandle(p.fn)) throw new Error("kernel/hook: fn must be a function handle");
         const fn = p.fn.$fn;

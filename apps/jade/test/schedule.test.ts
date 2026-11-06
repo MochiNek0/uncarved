@@ -1,6 +1,7 @@
 // jade/schedule：cron 计算、跨进程认领、命令和工具，以及到点投到当前会话。
 
 import { describe, expect, test } from "bun:test";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -92,6 +93,34 @@ describe("store", () => {
       expect(byId.get(busy.id)!.next).toBe(at(2026, 11, 1, 1, 0).toISOString());
       // 第二次检查没有新的
       expect(await claimDue(store, "/w", "s", now)).toEqual([expect.objectContaining({ id: busy.id })]);
+    } finally {
+      await done();
+    }
+  });
+
+  test("a jade whose lock was taken over as stale does not remove the new holder's lock when it finishes", async () => {
+    const { home, store, done } = await tempStore();
+    try {
+      const lock = path.join(home, "state", "schedules.lock");
+      await store.update(() => {
+        // 别的 jade 把这把锁当成过期的删掉，自己重新上了锁
+        rmSync(lock, { recursive: true, force: true });
+        mkdirSync(lock);
+        writeFileSync(path.join(lock, "theirs"), "");
+      });
+      expect(existsSync(path.join(lock, "theirs"))).toBe(true);
+    } finally {
+      await done();
+    }
+  });
+
+  test("the directory matches however it is spelled: trailing separator, and case on Windows", async () => {
+    const { store, done } = await tempStore();
+    try {
+      const dir = path.resolve("/Work/Proj");
+      await createTask(store, { prompt: "a", cron: "0 * * * *", cwd: dir }, at(2026, 11, 1));
+      const other = (process.platform === "win32" ? dir.toLowerCase() : dir) + path.sep;
+      expect(await claimDue(store, other, "s", at(2026, 11, 1, 2, 0))).toHaveLength(1);
     } finally {
       await done();
     }

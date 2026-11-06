@@ -23,28 +23,50 @@ const OTHER = "other";
 export const DISMISSED =
   "The user dismissed the questions without answering. Do not ask again: proceed with your best judgment and state your assumptions, or end your turn.";
 
-/** 用 ui@1 逐个问题让用户选一项，或者选"其他"自己输入；任何一个问题取消就算没有回答。signal 中止时抛出 */
+/** 回到上一个问题 */
+const BACK = "back";
+
+/**
+ * 用 ui@1 逐个问题让用户选一项，或者选"其他"自己输入。第二个问题起可以回到上一个问题改答案（已经答过的选项标着）；
+ * 自己输入时取消回到这个问题的选项。选项对话框取消就算没有回答。signal 中止时抛出
+ */
 export function askVia(ui: UI): AskUser {
   return async (questions, signal) => {
     if (!ui.interactive) return undefined;
     const answers: string[] = [];
-    for (const [i, q] of questions.entries()) {
+    let i = 0;
+    while (i < questions.length) {
+      const q = questions[i]!;
+      const previous = answers[i];
+      const typed = previous !== undefined && !q.options.some((o) => o.label === previous) ? previous : undefined;
+      const hint = (description: string | undefined, chosen: boolean) => {
+        const text = [description, chosen ? "your answer" : undefined].filter(Boolean).join(" · ");
+        return text ? { hint: text } : {};
+      };
       const title = questions.length > 1 ? `${q.question} (${i + 1}/${questions.length})` : q.question;
       const choice = await ui.select(
         {
           title,
           options: [
-            ...q.options.map((o, k) => ({ label: o.label, value: String(k), ...(o.description ? { hint: o.description } : {}) })),
-            { label: "Other (type your answer)", value: OTHER },
+            ...q.options.map((o, k) => ({ label: o.label, value: String(k), ...hint(o.description, o.label === previous) })),
+            { label: "Other (type your answer)", value: OTHER, ...(typed ? { hint: `your answer: ${typed}` } : {}) },
+            ...(i > 0 ? [{ label: "← Previous question", value: BACK }] : []),
           ],
         },
         signal,
       );
       signal.throwIfAborted();
-      const answer = choice === undefined ? undefined : choice === OTHER ? (await ui.input({ title: q.question }, signal))?.trim() : q.options[Number(choice)]?.label;
+      if (choice === undefined) return undefined;
+      if (choice === BACK) {
+        i--;
+        continue;
+      }
+      const answer = choice === OTHER ? (await ui.input({ title: q.question, ...(typed ? { initial: typed } : {}) }, signal))?.trim() : q.options[Number(choice)]?.label;
       signal.throwIfAborted();
-      if (!answer) return undefined;
-      answers.push(answer);
+      // 自己输入时取消或什么都没写：回到这个问题重新选
+      if (!answer) continue;
+      answers[i] = answer;
+      i++;
     }
     return answers;
   };

@@ -44,6 +44,26 @@ describe("ask_user", () => {
     expect((await tool.execute({ questions: [{ label: "DB", ...q("Which database?", "SQLite", "Postgres") }, q("Which cache?", "None", "Redis")] }, ctx())).content).toBe(DISMISSED);
   });
 
+  test("the user can go back and change an earlier answer; the earlier choice is marked", async () => {
+    const hints: (string | undefined)[][] = [];
+    const { ui, asked } = fakeUi(["SQLite", "← Previous question", "Postgres", "Redis"]);
+    const select = ui.select.bind(ui);
+    ui.select = (r, s) => (hints.push(r.options.map((o) => o.hint)), select(r, s));
+    const r = await askUserTool(askVia(ui)).execute({ questions: [q("Which database?", "SQLite", "Postgres"), q("Which cache?", "None", "Redis")] }, ctx());
+    expect(r.content).toBe("Q: Which database?\nA: Postgres\n\nQ: Which cache?\nA: Redis");
+    expect(asked).toEqual(["Which database? (1/2)", "Which cache? (2/2)", "Which database? (1/2)", "Which cache? (2/2)"]);
+    // 第一个问题没有"上一个问题"；回去时标出原来的答案
+    expect(hints[0]).toEqual([undefined, undefined, undefined]);
+    expect(hints[2]).toEqual(["your answer", undefined, undefined]);
+  });
+
+  test("cancelling the typed answer goes back to the options instead of dismissing everything", async () => {
+    const { ui, asked } = fakeUi(["Other (type your answer)", "Other (type your answer)"], [undefined, "MySQL"]);
+    const r = await askUserTool(askVia(ui)).execute({ questions: [q("Which database?", "SQLite", "Postgres")] }, ctx());
+    expect(r.content).toBe("Q: Which database?\nA: MySQL");
+    expect(asked).toEqual(["Which database?", "input: Which database?", "Which database?", "input: Which database?"]);
+  });
+
   test("checks the number of questions and options", async () => {
     const tool = askUserTool(async () => ["x"]);
     expect((await tool.execute({ questions: [] }, ctx())).isError).toBe(true);

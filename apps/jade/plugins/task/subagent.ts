@@ -4,6 +4,7 @@
 // 它的日志放在内存里：会话日志存储归 jade 核心，插件拿不到，所以子会话不和父会话的日志关联（不返回 child 引用）。
 // 子 Agent 调用的工具通过 ctx.progress 推给前端显示；要用户批准的调用（工作目录之外的路径、带 URL 的工具）经 ui@1 问。
 
+import { realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -18,6 +19,7 @@ import {
   type State,
   type Tool,
   type ToolResult,
+  type Usage,
 } from "uncarved";
 
 /** ctx.progress 推送的内容 */
@@ -48,6 +50,8 @@ export interface TaskOptions {
   /** 子 Agent 插件的 id 前缀 */
   id: string;
   today?: string;
+  /** 子 Agent 跑完时（成功、失败、中止都算）调用，给出它这次调用模型的用量合计；它的日志在内存里，别处读不到 */
+  usage?(toolUseId: string, usage: Usage): void;
 }
 
 const NOBODY: SubagentApproval = { approved: false, reason: "Nobody can approve this action for a sub-agent. Report what you need instead." };
@@ -81,17 +85,35 @@ export function stepsThisTurn(s: State): number {
   return steps;
 }
 
-/** 路径是否在 dir 里（含 dir 本身） */
-function within(dir: string, p: string): boolean {
-  const rel = path.relative(dir, path.resolve(dir, p));
-  return rel === "" || (rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
+// 下面判断工作目录内外的规则和 jade/approval 的 policy.ts 相同（readonly 模式下的只读工具）。
+// 插件之间不共享代码（只能共享类型），所以这里留一份
+
+/** 真实路径；路径还不存在时，按存在的最近一级上级目录的真实路径拼回去 */
+function real(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    const parent = path.dirname(p);
+    return parent === p ? p : path.join(real(parent), path.basename(p));
+  }
 }
 
-/** 只读工具也要问的情形：读工作目录之外的路径、把参数发到网络上（URL 里可以夹带读到的内容） */
+/** p（相对 cwd）在 cwd 里：按真实路径比较，目录里指向外面的符号链接也算外面 */
+function within(cwd: string, p: string): boolean {
+  const rel = path.relative(real(cwd), real(path.resolve(cwd, p)));
+  // 只有 ".." 这一段才表示上级目录，名为 "..foo" 的目录仍在里面
+  return rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
+}
+
+/**
+ * 只读工具也要问的情形，返回问的理由：读工作目录之外的路径（glob 的 pattern 是绝对路径或含 ".." 段时，
+ * 匹配范围会超出 path）、把参数发到网络上（URL 里可以夹带读到的内容）
+ */
 function needsApproval(cwd: string, input: unknown): string | undefined {
-  const i = (input ?? {}) as { path?: unknown; url?: unknown };
+  const i = (input ?? {}) as { path?: unknown; url?: unknown; pattern?: unknown };
   if (typeof i.url === "string") return `fetch ${i.url}`;
   if (typeof i.path === "string" && !within(cwd, i.path)) return `read ${i.path}, outside the working directory`;
+  if (typeof i.pattern === "string" && (path.isAbsolute(i.pattern) || i.pattern.split(/[\\/]/).includes(".."))) return `read ${i.pattern}, outside the working directory`;
   return undefined;
 }
 
@@ -160,12 +182,15 @@ export function taskTool(opts: TaskOptions): Tool {
       const progress = (p: TaskProgress) => ctx.progress(p);
       progress({ kind: "task-start", sessionId, description });
       const names = new Map<string, string>();
+      const used: Required<Usage> = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
       child.subscribe((n) => {
         if (n.type !== "event") return;
         if (n.event.type === "model.requested") {
           progress({ kind: "task-model" });
         } else if (n.event.type === "model.responded") {
-          for (const b of (n.event.data as EventDataMap["model.responded"]).content) if (b.kind === "tool_use") names.set(b.id, b.name);
+          const data = n.event.data as EventDataMap["model.responded"];
+          for (const b of data.content) if (b.kind === "tool_use") names.set(b.id, b.name);
+          for (const k of Object.keys(used) as (keyof Usage)[]) used[k] += data.usage?.[k] ?? 0;
         } else if (n.event.type === "tool.decided") {
           const d = n.event.data as EventDataMap["tool.decided"];
           progress({ kind: "task-tool", name: names.get(d.toolUseId) ?? "?", input: d.input, decision: d.decision });
@@ -188,6 +213,7 @@ export function taskTool(opts: TaskOptions): Tool {
       } finally {
         ctx.signal.removeEventListener("abort", forward);
         await child.close().catch(() => {});
+        opts.usage?.(ctx.toolUseId, used);
       }
       if (ctx.signal.aborted) throw failure ?? ctx.signal.reason;
 

@@ -48,9 +48,13 @@ class Servers {
     }
   }
 
-  /** 第一次调用时读配置、确认、连接；之后等同一次 */
+  /** 第一次调用时读配置、确认、连接；之后等同一次。失败时关掉已经建的连接，下次调用重来，免得一次失败让 MCP 一直用不了 */
   start(): Promise<void> {
-    this.#started ??= this.#start();
+    this.#started ??= this.#start().catch(async (e: unknown) => {
+      await Promise.all(this.clients.splice(0).map((c) => c.close().catch(() => {})));
+      this.#started = undefined;
+      throw e;
+    });
     return this.#started;
   }
 

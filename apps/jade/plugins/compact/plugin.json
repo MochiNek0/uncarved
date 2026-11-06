@@ -3,6 +3,7 @@
   "version": "0.3.0",
   "api": "^1",
   "entry": "./index.ts",
+  "provides": ["compact@1"],
   "requires": ["models@1"],
   "optional": ["commands@1", "renderers@1", "ui@1"],
   "config": {

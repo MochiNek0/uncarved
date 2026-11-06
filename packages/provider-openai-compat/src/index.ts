@@ -73,6 +73,9 @@ interface StreamChunk {
   } | null;
   /** 部分服务端在流中途出错时发送的块 */
   error?: { message?: string; code?: number | string };
+  /** 讯飞星火：每块都有，0 表示成功 */
+  code?: number;
+  message?: string;
 }
 
 export function openaiCompatProvider(opts: OpenAICompatOptions): Provider {
@@ -128,12 +131,14 @@ export function openaiCompatProvider(opts: OpenAICompatOptions): Provider {
 
         try {
           for await (const chunk of readSSE(watched(res.body, idle), () => (done = true))) {
-            if (chunk.error) {
-              const code = chunk.error.code;
-              throw new ProviderError(`${PROVIDER_ID} stream error: ${chunk.error.message ?? JSON.stringify(chunk.error)}`, {
-                // 部分服务端把 HTTP 状态码放在 code 里
-                retryable: typeof code === "number" && (code === 408 || code === 429 || code >= 500),
-                status: typeof code === "number" ? code : undefined,
+            // 讯飞星火这类服务端 HTTP 200 照回，错误放在块的顶层 code（非 0）、message 里，接着发 [DONE]：不当成空回复
+            const error = chunk.error ?? (typeof chunk.code === "number" && chunk.code !== 0 ? { message: chunk.message, code: chunk.code } : undefined);
+            if (error) {
+              // 部分服务端把 HTTP 状态码放在 code 里；其他数字是服务端自己的错误码
+              const status = typeof error.code === "number" && error.code >= 100 && error.code < 600 ? error.code : undefined;
+              throw new ProviderError(`${PROVIDER_ID} stream error: ${error.message ?? JSON.stringify(error)}`, {
+                retryable: status !== undefined && (status === 408 || status === 429 || status >= 500),
+                status,
               });
             }
             if (chunk.model) model = chunk.model;

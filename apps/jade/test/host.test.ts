@@ -192,6 +192,11 @@ describe("crash loops", () => {
     expect(info(host, "flaky").state).toBe("disabled");
     expect(info(host, "flaky").reason).toContain("jade plugins enable flaky");
     await host.close();
+    // 停用期间的启动没加载它，不清掉它的记录：还看得到是因为什么停用的
+    const later = await w.start();
+    expect(info(later, "flaky").reason).toContain(`disabled after ${FAULT_LIMIT} faulty launches`);
+    expect(info(later, "flaky").reason).toContain("always");
+    await later.close();
 
     expect(await pluginsCommand(["enable", "flaky"], { roots: w.roots, home: w.home })).toBe("enabled flaky");
     const again = await w.start();

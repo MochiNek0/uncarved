@@ -1,5 +1,6 @@
 // $JADE_HOME 下的两份状态：plugins.json（用户停用的插件）和 state/faults.json（连续崩溃的记录，5.4）。
 
+import { randomBytes } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { TrustRecord, TrustStore } from "uncarved";
@@ -37,7 +38,7 @@ async function readJson(file: string): Promise<unknown> {
 /** 先写临时文件再改名，写到一半退出不会留下坏文件 */
 async function writeJson(file: string, value: unknown): Promise<void> {
   await mkdir(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.tmp`;
+  const tmp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
   await writeFile(tmp, JSON.stringify(value, null, 2) + "\n");
   await rename(tmp, file);
 }

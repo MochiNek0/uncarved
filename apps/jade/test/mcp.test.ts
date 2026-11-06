@@ -1,7 +1,7 @@
 // jade/mcp：从旧 jade 的 test/mcp-skills.test.ts 移植 MCP 的部分，加上经插件宿主的端到端测试（配置文件、项目层服务的确认、/mcp）。
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { Block } from "uncarved";
@@ -252,6 +252,28 @@ describe("jade/mcp plugin", () => {
       expect(p!.isError).toBe(true);
     } finally {
       await host.close();
+    }
+  }, 30_000);
+
+  test("a failed start is retried in the next session instead of breaking MCP until jade restarts", async () => {
+    const home = await tempDir("jade-mcp-home-");
+    const cwd = await tempDir("jade-mcp-repo-");
+    await mkdir(path.join(cwd, ".git"));
+    await writeFile(path.join(cwd, ".mcp.json"), JSON.stringify({ mcpServers: { repo: fakeServer } }));
+    // trust.jsonl 写不进去（这里是个目录）：确认之后记录失败
+    await mkdir(path.join(home, "trust.jsonl"));
+    const w = await featureHost({ home, cwd });
+    try {
+      w.state.answers.push("yes", "yes");
+      w.state.script.push(reply("ok"), reply("ok"));
+      await (await w.host.sessions.open()).send(msg("hi"));
+      expect(w.state.requests[0]!.tools.some((t) => t.name.startsWith("mcp__"))).toBe(false);
+
+      await rm(path.join(home, "trust.jsonl"), { recursive: true });
+      await (await w.host.sessions.open()).send(msg("again"));
+      expect(w.state.requests[1]!.tools.map((t) => t.name)).toContain("mcp__repo__echo");
+    } finally {
+      await w.host.close();
     }
   }, 30_000);
 

@@ -12,12 +12,13 @@ import type { Block } from "uncarved";
 import type { Frontend, OpenOptions, Session, SessionManager, SessionUI, UI } from "../../src/api.ts";
 import type { CommandContext, Commands } from "../commands/index.ts";
 import type { Keys } from "../keys/index.ts";
+import type { Compact } from "../compact/index.ts";
 import type { Models } from "../models/index.ts";
 import type { Modes } from "../modes/index.ts";
 import type { Renderers } from "../renderers/index.ts";
 import { InputHistory } from "./history.ts";
 import { mentionCandidates } from "./mentions.ts";
-import { listSessions } from "../sessions/index.ts";
+import type { SessionIndex } from "../sessions/index.ts";
 import { dim, red, safeScreen, yellow, type CommandInfo, type Screen } from "./screen.ts";
 import { transcript, type Transcript } from "./transcript.ts";
 import { tuiScreen } from "./tui.ts";
@@ -66,6 +67,10 @@ export interface FrontendServices {
   renderers: Renderers;
   modes?: Modes;
   models?: Models;
+  /** 自动压缩的阈值，状态栏显示 */
+  compact?: Compact;
+  /** 会话索引（jade/sessions），--continue 用 */
+  index?: SessionIndex;
 }
 
 /** 状态栏上插件的一段最多显示这么多字符（超出的截断，换行并成空格） */
@@ -208,10 +213,14 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
     return 2;
   }
 
-  const { cwd, home, commands, keys, renderers, modes, models } = services;
+  const { cwd, home, commands, keys, renderers, modes, models, compact, index } = services;
   const sessions = opts.sessions;
   // --continue：这个目录里最近用过的会话（索引由 jade/sessions 在收到第一条消息时写）
-  const resumed = args.cont ? (await listSessions(path.join(home, "state", "sessions.jsonl"), cwd))[0]?.id : args.resume;
+  if (args.cont && !index) {
+    process.stderr.write("jade: --continue needs the jade/sessions plugin, which is not enabled\n");
+    return 2;
+  }
+  const resumed = args.cont ? (await index!.list(cwd))[0]?.id : args.resume;
   if (args.cont && !resumed) {
     process.stderr.write(`jade: no session to continue in ${cwd}\n`);
     return 2;
@@ -287,6 +296,7 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
     screen,
     cwd,
     contextWindow: () => models?.current()?.contextWindow ?? 0,
+    ...(compact ? { compactAt: () => compact.threshold() } : {}),
     canRetry,
     renderer: (tool) => renderers.forTool(tool),
     eventRenderer: (type) => renderers.forEvent(type),

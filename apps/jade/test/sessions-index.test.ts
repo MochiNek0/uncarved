@@ -53,3 +53,12 @@ test("a directory matches however its path is written", async () => {
 test("a missing index is empty", async () => {
   expect((await listAllSessions(path.join(os.tmpdir(), "jade-no-such-dir", "sessions.jsonl"))).size).toBe(0);
 });
+
+test("lines without a time are skipped instead of breaking the sort", async () => {
+  const file = await index([
+    { id: "1", cwd: a, title: "ok", at: "2026-01-01T00:00:00Z" },
+    { id: "2", cwd: a, title: "no time" },
+    { id: "3", cwd: a, title: "ok too", at: "2026-01-02T00:00:00Z" },
+  ]);
+  expect((await listSessions(file, a)).map((s) => s.id)).toEqual(["3", "1"]);
+});

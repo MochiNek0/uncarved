@@ -10,14 +10,24 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { statSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { Block, Tool } from "uncarved";
 import { projectDirs } from "./project.ts";
 
 export const PROTOCOL_VERSION = "2025-06-18";
-const CLIENT_INFO = { name: "jade", version: "0.2.0" };
+/** 告诉服务端的客户端版本：jade 的版本（和 jade/tui 一样从 apps/jade/package.json 读） */
+const CLIENT_INFO = {
+  name: "jade",
+  version: (() => {
+    try {
+      return (JSON.parse(readFileSync(new URL("../../package.json", import.meta.url), "utf8")) as { version: string }).version;
+    } catch {
+      return "0.0.0";
+    }
+  })(),
+};
 /** 一次工具调用结果里文本的上限，超过时保留开头 */
 const MAX_RESULT_CHARS = 60_000;
 const STDERR_LINES = 20;

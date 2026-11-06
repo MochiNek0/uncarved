@@ -82,6 +82,8 @@ class LiveSession implements Session {
   #queue: { input: UserInput; resolve: () => void; reject: (e: unknown) => void }[] = [];
   #after: { fn: () => void | Promise<void>; owner: Owner }[] = [];
   #pump: Promise<void> | undefined;
+  /** 离开时的原因；有了以后不再接受输入 */
+  #left: Error | undefined;
   #report: (m: string) => void;
 
   readonly #store: LogStore;
@@ -101,6 +103,7 @@ class LiveSession implements Session {
   }
 
   send(input: UserInput): Promise<void> {
+    if (this.#left) return Promise.reject(this.#left);
     return new Promise((resolve, reject) => {
       this.#queue.push({ input, resolve, reject });
       this.#kick();
@@ -108,8 +111,17 @@ class LiveSession implements Session {
   }
 
   afterTurn(fn: () => void | Promise<void>, owner: Owner): void {
+    if (this.#left) return;
     this.#after.push({ fn, owner });
     this.#kick();
+  }
+
+  /** 离开会话：还没开始的输入全部拒绝、afterTurn 不再执行，再中止正在跑的一轮。之后的 send 直接拒绝 */
+  leave(): void {
+    this.#left ??= new Error(`session ${this.id} was closed before this input ran`);
+    for (const job of this.#queue.splice(0)) job.reject(this.#left);
+    this.#after.length = 0;
+    this.rt.abort(this.#left);
   }
 
   async idle(): Promise<void> {
@@ -394,7 +406,7 @@ export class Sessions implements SessionManager {
 
   /** 离开会话：中止正在跑的工作，等它停下，detach，关闭插件的会话作用域 */
   async #leave(s: LiveSession): Promise<void> {
-    s.abort();
+    s.leave();
     await s.idle();
     try {
       await s.rt.detach();

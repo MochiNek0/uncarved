@@ -5,6 +5,6 @@
   "entry": "./index.ts",
   "provides": ["frontend@1", "ui@1"],
   "requires": ["commands@1", "keys@1", "renderers@1"],
-  "optional": ["modes@1", "models@1"],
+  "optional": ["modes@1", "models@1", "compact@1", "sessions@1"],
   "frontend": { "name": "tui", "default": true }
 }

@@ -2,7 +2,7 @@
 // 子 Agent 的工具来自 task@1 的登记（jade/fs 登记它的只读工具），模型经 models@1。
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { writeFile } from "node:fs/promises";
+import { symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { RuntimeNotice } from "uncarved";
 import { say, cleanup, scriptedHost, textOf, use } from "./scripted-ui.ts";
@@ -45,6 +45,20 @@ describe("jade/task", () => {
       { kind: "task-tool", name: "list_dir", input: { path: "." }, decision: "allow" },
       { kind: "task-model" },
     ]);
+  });
+
+  test("the sub-agent's token usage is logged in the session, so the status bar can count it", async () => {
+    const { host, shared, send } = await scriptedHost();
+    shared.script.push(
+      use("u1", "task", { description: "look", prompt: "list the root" }),
+      { ...use("c1", "list_dir", { path: "." }), usage: { inputTokens: 100, outputTokens: 10 } },
+      say("report", { inputTokens: 200, outputTokens: 20, cacheReadTokens: 50 }),
+      say("done"),
+    );
+    const s = await host.sessions.open();
+    await send(s, "go");
+    const logged = (await s.history()).filter((e) => e.type === "jade/task/subagent").map((e) => e.data);
+    expect(logged).toEqual([{ toolUseId: "u1", usage: { inputTokens: 300, outputTokens: 30, cacheReadTokens: 50, cacheWriteTokens: 0 } }]);
   });
 
   test("a sub-agent that runs out of steps is asked for its report", async () => {
@@ -115,5 +129,31 @@ describe("jade/task", () => {
     await send(s, "once more");
     expect(textOf(shared.requests[10]!.messages.at(-1)!.content)).toContain("Nobody can approve");
     expect(shared.asked).toHaveLength(2);
+  });
+
+  test("a symlink inside the working directory that points outside is put to the user", async () => {
+    const { home, cwd, host, shared, send } = await scriptedHost();
+    await writeFile(path.join(home, "creds"), "secret");
+    try {
+      await symlink(path.join(home, "creds"), path.join(cwd, "link"), "file");
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "EPERM") return; // Windows 没有开发者模式时建不了符号链接
+      throw e;
+    }
+    shared.script.push(use("u1", "task", { description: "read", prompt: "read link" }), use("c1", "read_file", { path: "link" }), say("report"), say("done"));
+    shared.answers.push("no");
+    const s = await host.sessions.open();
+    await send(s, "go");
+    expect(shared.asked).toEqual(["A sub-agent wants to read link, outside the working directory. Allow it?"]);
+  });
+
+  test("a glob whose pattern escapes the working directory is put to the user too", async () => {
+    const { host, shared, send } = await scriptedHost();
+    shared.script.push(use("u1", "task", { description: "find", prompt: "find keys" }), use("c1", "glob", { pattern: "../**/.ssh/*" }), say("report"), say("done"));
+    shared.answers.push("no");
+    const s = await host.sessions.open();
+    await send(s, "go");
+    expect(shared.asked).toEqual(["A sub-agent wants to read ../**/.ssh/*, outside the working directory. Allow it?"]);
+    expect(textOf(shared.requests[2]!.messages.at(-1)!.content)).toBe("The user denied this action.");
   });
 });

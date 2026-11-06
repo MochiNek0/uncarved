@@ -135,19 +135,6 @@ describe("fs tools", () => {
     expect(await readFile(file, "utf8")).toBe("someone else's change\n");
   });
 
-  test("files in the scratch directory can be changed without reading them first", async () => {
-    const cwd = await workspace();
-    const scratch = await workspace();
-    const tools = fsTools(cwd, { scratch });
-    // 模型跑的脚本生成的文件：模型没用 read_file 读过
-    await writeFile(path.join(scratch, "gen.cjs"), "generated\n");
-    expect((await run(tools, "write_file", { path: path.join(scratch, "gen.cjs"), content: "mine\n" })).isError).toBe(false);
-    expect(await readFile(path.join(scratch, "gen.cjs"), "utf8")).toBe("mine\n");
-    // 工作目录里照旧要先读
-    await writeFile(path.join(cwd, "user.txt"), "user\n");
-    expect((await run(tools, "write_file", { path: "user.txt", content: "z" })).isError).toBe(true);
-  });
-
   // 旧版本靠检查点跨进程记住读过、写过的文件；现在只在本进程内有效，新的 fsTools（恢复的会话）要重新读
   test("files read or written by another fsTools instance must be read again", async () => {
     const cwd = await workspace();

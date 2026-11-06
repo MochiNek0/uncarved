@@ -63,14 +63,7 @@ describe("policy", () => {
     expect(p.absolutePath(null)).toBeNull();
   });
 
-  test("the scratch directory counts as inside the working directory", () => {
-    const scratch = path.resolve("/tmp/jade-x");
-    const p = policy({ cwd, scratch });
-    const d = (mode: Mode, name: string, input: unknown) => p.decide(gated(name, input), { mode, rules: [] }).decision;
-    expect(d("ask", "read_file", { path: path.join(scratch, "a.json") })).toBe("allow");
-    expect(d("auto", "write_file", { path: path.join(scratch, "t.mjs"), content: "" })).toBe("allow");
-    expect(d("ask", "bash", { command: `cat ${scratch.replaceAll("\\", "/")}/out.txt` })).toBe("allow");
-    expect(d("auto", "write_file", { path: path.resolve("/tmp/other/t.mjs"), content: "" })).toBe("ask");
+  test("plan mode allows reads and read-only commands, and denies changes with a plan-mode reason", () => {
     expect(decide("plan", "bash", { command: "git log -5" })).toBe("allow");
     expect(decide("plan", "read_file", { path: inside })).toBe("allow");
     const reason = policy({ cwd }).decide(gated("edit_file", { path: inside, old_string: "a", new_string: "b" }), { mode: "plan", rules: [] });

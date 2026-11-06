@@ -36,6 +36,16 @@ describe("editor", () => {
     });
   });
 
+  test("alt+f / alt+b move by words", () => {
+    const value = "git  status --short";
+    expect(edit.wordRight({ value, cursor: 0 }).cursor).toBe(3);
+    expect(edit.wordRight({ value, cursor: 3 }).cursor).toBe(11);
+    expect(edit.wordRight({ value, cursor: 19 }).cursor).toBe(19);
+    expect(edit.wordLeft({ value, cursor: 19 }).cursor).toBe(12);
+    expect(edit.wordLeft({ value, cursor: 12 }).cursor).toBe(5);
+    expect(edit.wordLeft({ value, cursor: 0 }).cursor).toBe(0);
+  });
+
   test("moves between lines and to line ends", () => {
     const s = { value: "first\nsecond line", cursor: 9 };
     expect(edit.home(s).cursor).toBe(6);

@@ -224,15 +224,19 @@ export class PluginHost {
     }));
   }
 
-  /** 逆序关闭全部插件。这次启动里没出故障的插件，连续故障计数清零 */
+  /**
+   * 逆序关闭全部插件。这次启动里跑过、没出故障的插件，连续故障计数清零；
+   * 没有加载的（自动停用、用户停用、安全模式）不算，保留它们的记录和最后一次的错误
+   */
   async close(): Promise<void> {
     if (this.#sessions) await this.#sessions.close();
     await this.#core.scope.close();
+    const ran = new Set(this.#active.map((a) => a.source.manifest.id));
     while (this.#active.length > 0) {
       const a = this.#active.pop()!;
       for (const e of await a.owner.scope.close()) this.#report(String(e instanceof Error ? e.message : e));
     }
-    for (const id of Object.keys(this.#faults.streaks)) if (!this.#faulted.has(id)) delete this.#faults.streaks[id];
+    for (const id of Object.keys(this.#faults.streaks)) if (ran.has(id) && !this.#faulted.has(id)) delete this.#faults.streaks[id];
     await this.#saveFaults();
   }
 

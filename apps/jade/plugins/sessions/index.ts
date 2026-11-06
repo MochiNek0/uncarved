@@ -42,7 +42,7 @@ export async function listAllSessions(file: string): Promise<Map<string, Session
     } catch {
       continue; // 写到一半的行
     }
-    if (typeof e?.id !== "string" || typeof e.cwd !== "string") continue;
+    if (typeof e?.id !== "string" || typeof e.cwd !== "string" || typeof e.at !== "string") continue;
     const seen = byId.get(e.id);
     byId.set(e.id, seen ? { ...seen, at: e.at > seen.at ? e.at : seen.at } : e);
   }
@@ -78,9 +78,16 @@ function titleOf(input: UserInput): string | undefined {
   return text.length > TITLE_CHARS ? `${text.slice(0, TITLE_CHARS)}…` : text;
 }
 
+/** sessions@1 */
+export interface SessionIndex {
+  /** cwd 里的会话，最近用过的在前（jade --continue 取第一个） */
+  list(cwd: string): Promise<SessionSummary[]>;
+}
+
 export default definePlugin({
   process(ctx) {
     const file = path.join(ctx.home, "state", "sessions.jsonl");
+    ctx.provide("sessions@1", { list: (cwd: string) => listSessions(file, cwd) } satisfies SessionIndex);
     const commands = ctx.require<Commands>("commands@1");
 
     commands.register({

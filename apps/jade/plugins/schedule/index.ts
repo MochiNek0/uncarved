@@ -3,11 +3,12 @@
 // 下次打开时错过的几次只补一次。不能提问的前端（jade -p）不投递。
 // 管理入口：/schedule 命令和给模型的 schedule_create、schedule_list、schedule_edit 工具，共用同一份存储。
 
+import path from "node:path";
 import type { Tool, UserInput } from "uncarved";
 import { definePlugin, type UI } from "../../src/api.ts";
 import type { Commands } from "../commands/index.ts";
 import { parseCron } from "./cron.ts";
-import { claimDue, nextAt, ScheduleStore, type Task } from "./store.ts";
+import { claimDue, nextAt, sameDir, ScheduleStore, type Task } from "./store.ts";
 
 const ID = "jade/schedule";
 const TITLE_CHARS = 120;
@@ -42,7 +43,7 @@ export async function createTask(
     prompt,
     cron,
     recurring: opts.recurring ?? true,
-    cwd: opts.cwd,
+    cwd: path.resolve(opts.cwd),
     target: { kind: "cwd" },
     status: "active",
     next,
@@ -101,14 +102,14 @@ export function editTask(
 export function describe(t: Task, cwd: string): string {
   const when = t.status === "active" && t.next ? `next ${new Date(t.next).toLocaleString()}` : t.status;
   const once = t.recurring ? "" : " (once)";
-  const where = t.cwd === cwd ? "" : `  [in ${t.cwd}]`;
+  const where = sameDir(t.cwd, cwd) ? "" : `  [in ${t.cwd}]`;
   return `${t.id}  ${t.cron}${once}  ${when}  ${t.title}${where}`;
 }
 
 function listing(tasks: Task[], cwd: string): string {
   if (tasks.length === 0) return "No scheduled tasks.";
   // 本目录的在前
-  const sorted = [...tasks].sort((a, b) => Number(b.cwd === cwd) - Number(a.cwd === cwd));
+  const sorted = [...tasks].sort((a, b) => Number(sameDir(b.cwd, cwd)) - Number(sameDir(a.cwd, cwd)));
   return sorted.map((t) => describe(t, cwd)).join("\n");
 }
 
@@ -265,6 +266,7 @@ export default definePlugin({
       try {
         due = await claimDue(store, ctx.cwd, ctx.session.id, new Date(), running);
       } catch (e) {
+        if (ctx.signal.aborted) return;
         if (!warned) ui.notify(`schedule: ${err(e)}`, "warning");
         warned = true;
         return;
@@ -276,7 +278,8 @@ export default definePlugin({
         ui.notify(`[scheduled task "${t.title}" (${t.id})]`);
         ctx.session
           .send(delivery(t))
-          .catch((e: unknown) => ui.notify(`scheduled task ${t.id} failed: ${err(e)}`, "error"))
+          // 会话已经离开（换会话、退出）时 ui 已经不能用了
+          .catch((e: unknown) => ctx.signal.aborted || ui.notify(`scheduled task ${t.id} failed: ${err(e)}`, "error"))
           .finally(() => running.delete(t.id));
       }
     };

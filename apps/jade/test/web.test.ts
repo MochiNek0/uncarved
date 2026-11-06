@@ -286,6 +286,22 @@ describe("jade/web plugin", () => {
     }
   });
 
+  test("/search does not change a key set in the shell, which would win again in the next session", async () => {
+    const { home, host } = await scripted([]);
+    const before = process.env.TAVILY_API_KEY;
+    process.env.TAVILY_API_KEY = "from-shell";
+    try {
+      const search = host.service<Commands>("commands@1")!.get("search")!.command;
+      const c: CommandContext = { signal: new AbortController().signal, ui: scriptedUi(["tavily", "set"], "new"), sessions: host.sessions, print: () => {} };
+      expect(await search.run("", c)).toContain("TAVILY_API_KEY is set in your shell environment");
+      await expect(readFile(path.join(home, ".env"), "utf8")).rejects.toThrow();
+    } finally {
+      if (before === undefined) delete process.env.TAVILY_API_KEY;
+      else process.env.TAVILY_API_KEY = before;
+      await host.close();
+    }
+  });
+
   test("keys in $JADE_HOME/.env turn search on; a bad search order falls back to the default order", async () => {
     const { host, requests } = await scripted([say("one")], { env: "EXA_API_KEY=e\n", config: { "jade/web": { search: "bing" } } });
     try {

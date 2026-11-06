@@ -2,10 +2,12 @@
 
 import { definePlugin } from "../../src/api.ts";
 import type { Commands } from "../commands/index.ts";
+import type { Compact } from "../compact/index.ts";
 import type { Keys } from "../keys/index.ts";
 import type { Models } from "../models/index.ts";
 import type { Modes } from "../modes/index.ts";
 import type { Renderers } from "../renderers/index.ts";
+import type { SessionIndex } from "../sessions/index.ts";
 import { ScreenBridge, tuiFrontend } from "./frontend.ts";
 
 export default definePlugin({
@@ -23,6 +25,8 @@ export default definePlugin({
           renderers: ctx.require<Renderers>("renderers@1"),
           ...optional("modes", ctx.service<Modes>("modes@1")),
           ...optional("models", ctx.service<Models>("models@1")),
+          ...optional("compact", ctx.service<Compact>("compact@1")),
+          ...optional("index", ctx.service<SessionIndex>("sessions@1")),
         },
         bridge,
       ),

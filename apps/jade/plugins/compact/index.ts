@@ -16,11 +16,30 @@ const ANTHROPIC_REPLY_TOKENS = 64_000;
 /** 总结要调用模型，比 hook 默认的 30 秒长 */
 const SUMMARY_TIMEOUT_MS = 300_000;
 
+/** compact@1 */
+export interface Compact {
+  /** 历史超过这么多 token 时自动压缩（界面显示用） */
+  threshold(): number;
+}
+
+/** 自动压缩的阈值：配置的 thresholdTokens，否则按当前模型的上下文窗口算 */
+function thresholdFor(config: Record<string, unknown>, models: Models): () => number {
+  const configured = parseTokens(config.thresholdTokens);
+  return () => {
+    if (configured) return configured;
+    const m = models.current();
+    // 别的模型插件可能不给窗口（或给错）
+    if (!m || !(typeof m.contextWindow === "number" && m.contextWindow > 0)) return FALLBACK_THRESHOLD;
+    return compactThreshold(m.contextWindow, m.kind === "anthropic" ? ANTHROPIC_REPLY_TOKENS : 0);
+  };
+}
+
 /** /compact 请求过的会话：下一次投影时无论是否超过阈值都总结一次 */
 const requested = new Set<string>();
 
 export default definePlugin({
   process(ctx) {
+    ctx.provide("compact@1", { threshold: thresholdFor(ctx.config, ctx.require<Models>("models@1")) } satisfies Compact);
     const commands = ctx.service<Commands>("commands@1");
     commands?.register({
       name: "compact",
@@ -49,13 +68,7 @@ export default definePlugin({
     const models = ctx.require<Models>("models@1");
     const configured = parseTokens(ctx.config.thresholdTokens);
     const keepTokens = parseTokens(ctx.config.keepTokens);
-    const threshold = () => {
-      if (configured) return configured;
-      const m = models.current();
-      // 别的模型插件可能不给窗口（或给错）
-      if (!m || !(typeof m.contextWindow === "number" && m.contextWindow > 0)) return FALLBACK_THRESHOLD;
-      return compactThreshold(m.contextWindow, m.kind === "anthropic" ? ANTHROPIC_REPLY_TOKENS : 0);
-    };
+    const threshold = thresholdFor(ctx.config, models);
     const c = compactor({ complete: (req, o) => models.complete(req, o), threshold, keepTokens, id: ctx.plugin });
     const id = ctx.session.id;
 
@@ -93,7 +106,7 @@ export default definePlugin({
         );
         // 不能在这里等 send：它要等这一轮结束，而这一轮在等这个 hook
         ctx.session.afterTurn(() => {
-          ctx.session.send({ kind: "retry" }).catch((err: unknown) => ui?.notify(`retry after compaction failed: ${err instanceof Error ? err.message : String(err)}`, "error"));
+          ctx.session.send({ kind: "retry" }).catch((err: unknown) => ctx.signal.aborted || ui?.notify(`retry after compaction failed: ${err instanceof Error ? err.message : String(err)}`, "error"));
         });
       },
     });

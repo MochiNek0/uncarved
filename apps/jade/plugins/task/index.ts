@@ -3,7 +3,7 @@
 // 子 Agent 用哪些工具：插件经 task@1 登记只读工具（jade/fs 登记 read_file、list_dir、glob、grep），
 // 登记随登记者的作用域撤销。主会话里的工具对象是各插件私有的，子 Agent 拿到的是登记者另给的一份。
 
-import type { Tool } from "uncarved";
+import type { Tool, Usage } from "uncarved";
 import { definePlugin, type UI } from "../../src/api.ts";
 import type { Models } from "../models/index.ts";
 import type { Renderers } from "../renderers/index.ts";
@@ -112,6 +112,8 @@ export default definePlugin({
 
   session(ctx) {
     const models = ctx.require<Models>("models@1");
+    /** 跑完、还没记进日志的子 Agent 用量，按 task 调用的 toolUseId */
+    const usage = new Map<string, Usage>();
     const configured = ctx.config.maxSteps;
     const maxSteps = typeof configured === "number" && Number.isInteger(configured) && configured > 0 ? configured : DEFAULT_MAX_STEPS;
     const approve: ApproveSubagent = (call, signal) => {
@@ -142,7 +144,22 @@ export default definePlugin({
         maxSteps,
         approve,
         id: ctx.plugin,
+        usage: (toolUseId, u) => void usage.set(toolUseId, u),
       }),
     );
+    // 子 Agent 的用量记成本插件的事件（和压缩、审查的用量一样），界面据此计入会话用量；只能在 hook 里记
+    ctx.kernel.hook({
+      kind: "transform",
+      point: "tool.after",
+      fn: async (outcome, hook) => {
+        const u = usage.get(outcome.call.toolUseId);
+        if (!u) return undefined;
+        usage.delete(outcome.call.toolUseId);
+        await hook.emit("subagent", { toolUseId: outcome.call.toolUseId, usage: u });
+        return undefined;
+      },
+    });
+    // 被中断的调用不经过 tool.after，一轮结束时还留着的不会再用到
+    ctx.kernel.hook({ kind: "observe", point: "event", fn: (e) => void (e.type === "turn.ended" && usage.clear()) });
   },
 });

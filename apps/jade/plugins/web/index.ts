@@ -58,6 +58,8 @@ export default definePlugin({
         );
         const p = SEARCH_PROVIDERS.find((x) => x.name === name);
         if (!p) return;
+        // shell 里的变量盖过文件：改文件只在这个会话里看起来生效，下一个会话又变回 shell 里的值
+        if (process.env[p.env]) return `${p.env} is set in your shell environment, which takes precedence over ${file}; change or unset it there.`;
         if (env[p.env]) {
           const choice = await c.ui.select(
             {

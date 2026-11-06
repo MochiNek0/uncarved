@@ -1226,6 +1226,8 @@ function editKey(s: EditState, input: string, key: Key): EditState | undefined {
   if (key.backspace) return key.meta ? edit.deleteWord(s) : edit.backspace(s);
   if (key.delete || (key.ctrl && input === "d")) return edit.del(s);
   if (key.ctrl && input === "w") return edit.deleteWord(s);
+  if (key.meta && !key.ctrl && input === "f") return edit.wordRight(s);
+  if (key.meta && !key.ctrl && input === "b") return edit.wordLeft(s);
   if (key.ctrl && input === "u") return edit.killBefore(s);
   if (key.ctrl && input === "k") return edit.killAfter(s);
   if (

@@ -222,6 +222,30 @@ describe("switching", () => {
     await host.close();
   });
 
+  test("switching away rejects inputs still queued on the old session instead of running them there", async () => {
+    const { host } = await setup((w) =>
+      w.plugin("bundled", { id: "waiter" }, `export default { session(ctx) {
+        ctx.kernel.tool({ name: "wait", effect: "read", description: "wait", inputSchema: { type: "object" }, concurrency: "safe", idempotent: true,
+          async execute(_input, t) {
+            globalThis.__log.push("waiting");
+            await new Promise((r) => t.signal.aborted ? r() : t.signal.addEventListener("abort", r, { once: true }));
+            return { content: "done" };
+          } });
+      } };`),
+    );
+    g.__script!.push(call(use("t1", "wait")), say("never reached"), say("never reached either"));
+    const a = await host.sessions.open();
+    const first = a.send(msg("one")).catch(() => "aborted");
+    const queued = a.send(msg("two")).catch((e: Error) => e.message);
+    while (!g.__log!.includes("waiting")) await new Promise((r) => setTimeout(r, 5));
+    await host.sessions.open();
+    expect(await first).toBe("aborted");
+    expect(await queued).toContain("was closed");
+    expect(g.__script).toHaveLength(2);
+    expect(a.state.messages.some((m) => m.content.some((b) => b.kind === "text" && b.text === "two"))).toBe(false);
+    await host.close();
+  });
+
   test("a failed open rolls back the new session and keeps the old one", async () => {
     const { host } = await setup();
     const a = await host.sessions.open();

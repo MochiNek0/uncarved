@@ -130,6 +130,21 @@ describe("jade/suggest", () => {
     expect(shared.modelOptions).toHaveLength(1);
   });
 
+  test("a failing prediction is reported once, not after every turn", async () => {
+    const { host, shared, send } = await scriptedHost({ config: { "jade/suggest": { enabled: true, model: "small" } } });
+    shared.script.push(say("done"), { error: "max_tokens must be <= 32768" }, say("again"), { error: "max_tokens must be <= 32768" });
+    const s = await host.sessions.open();
+    await send(s, "fix it");
+    await until(() => shared.notes.some((n) => n.includes("max_tokens")));
+    await send(s, "and this");
+    await until(() => shared.modelOptions.length === 2);
+    await new Promise((r) => setTimeout(r, 20));
+    const notes = shared.notes.filter((n) => n.includes("max_tokens"));
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toStartWith("jade/suggest: prediction failed (model small): ");
+    expect(shared.hints.filter(Boolean)).toEqual([]);
+  });
+
   test("does not predict after a failed turn", async () => {
     const { host, shared, send } = await scriptedHost({ config: { "jade/suggest": { enabled: true } } });
     shared.script.push({ error: "boom" });
