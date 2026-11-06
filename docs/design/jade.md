@@ -315,7 +315,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 
 - `jade/prompts` 不再由宿主"单独构造并拿到全部工具"：它在 `context.build` 里本来就能看到请求里的工具，提示词里提到某个工具的条目只在请求里有这个工具时保留。环境信息里不再写各工具插件的细节（shell 是哪个、有没有 web 工具），那些由工具插件经 `prompts@1` 自己加。
 - `jade/fs` 去掉了检查点（撤销以后由 `jade/undo` 提供）。所以恢复的会话里，改已有文件之前要重新读一遍。
-- 审批的"总是允许"规则记在日志里（`derived`），恢复会话后仍有效；模式是进程级的，来自配置，`jade/modes` 经 `approval@1` 改。auto 模式下，规则判断不了、本来要问用户的调用先让模型审一次（`plugins/approval/review.ts`，`test/review.test.ts`）：审查只能放行或转给用户，出错、超时、回答看不懂时也转给用户；同一个主机的只读工具审查一次放行后，本会话里不再逐次审查。审查的模型调用经 `models@1`，用量经 `reviewed` 事件计入会话。
+- 审批的"总是允许"规则记在日志里（`derived`），恢复会话后仍有效；模式是进程级的，来自配置，`jade/modes` 经 `approval@1` 改；用户选的 ask/auto/readonly 记在 `$JADE_HOME/mode.json`，下次启动的第一个可交互会话里恢复（比配置优先；plan、yolo 不记，`jade -p` 这类不能问用户的运行不恢复）。auto 模式下，规则判断不了、本来要问用户的调用先让模型审一次（`plugins/approval/review.ts`，`test/review.test.ts`）：审查只能放行或转给用户，出错、超时、回答看不懂时也转给用户；带 URL 的只读工具审查放行后，本会话里完全相同的调用不再审查（不按主机记：同一主机上换个路径或查询参数就能把数据带出去）。审查的模型调用经 `models@1`，用量经 `reviewed` 事件计入会话。
 - `ask_user` 的对话框经 `ui@1`，不再由宿主私下传入。
 - `jade/task`、`jade/compact` 经 `models@1` 调模型，不再由宿主传 provider。
 - 续写、溢出重试经 `session.afterTurn`，不再需要只给内置插件的 `TurnParticipant`。
