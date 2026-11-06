@@ -297,6 +297,11 @@ export class Sessions implements SessionManager {
           if (layer === "project") throw new Error(`plugin ${id}: project plugins cannot send input on the user's behalf`);
           return s.send(input);
         },
+        abort: (reason) => {
+          if (scope.closed) throw new StaleContext(id);
+          if (layer === "project") throw new Error(`plugin ${id}: project plugins cannot stop turns on the user's behalf`);
+          s.abort(new Error(reason ?? `stopped by plugin ${id}`));
+        },
       },
       kernel: {
         tool: (t) => {

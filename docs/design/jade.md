@@ -182,7 +182,7 @@ preparing ──commit──▶ active ──close──▶ closing ──▶ cl
 pi 后来才补上"agent 停下来之后再执行"和延迟 reload。jade 从一开始就在核心的会话 API 里提供：
 
 - `session.afterTurn(fn)`：本轮完全结束（`turn.ended` 已落盘、没有在途工具）后执行一次。续写、溢出重试、建议提示都用它，不再需要旧 jade 只给内置插件的 `TurnParticipant`。
-- 插件想发起新一轮：`session.send(input)`。如果当前正在跑，排到本轮之后。用户层插件才能用；项目层插件不能替用户说话（第 7 节）。
+- 插件想发起新一轮：`session.send(input)`。如果当前正在跑，排到本轮之后。想停下正在跑的这一轮（例如用户在聊天机器人里喊停）：`session.abort(reason?)`。两者都只有用户层插件能用；项目层插件不能替用户说话、不能替用户喊停（第 7 节）。
 - 会话里的界面：`ctx.status(text)` 在状态栏上占一段，`ctx.input` 改输入框（读、插入、整段替换、灰色提示）。两者来自前端 `ui@1.session`（3.4），每个插件一份，作用域关闭时自动收掉；前端不提供时都是 `undefined`。
 
 ## 5. 膜与故障隔离
@@ -251,7 +251,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
   | 宿主 → 插件 | `initialize` | `{ plugin, version, api }` → `{ id?, session? }`：核对 id；`session` 为 false 时不为它打开会话作用域。10 秒内不回复算激活失败 |
   | 宿主 → 插件 | `scope/open`、`scope/close` | `{ scope, kind: "process" \| "session", cwd, home, config, session? }`，对应 `process(ctx)`、`session(ctx)` 和关闭。`scope/open` 回复之前插件发来的注册才算数 |
   | 宿主 → 插件 | 通知 `caller/open`、`caller/close` | 按调用方提供的服务：新调用方出现、调用方关闭（插件在这里撤销它的注册） |
-  | 双向 | `call` | `{ scope, target, method?, args, caller? }`。`target` 是服务名、`"$session"`（`send`、`afterTurn`）或函数句柄 |
+  | 双向 | `call` | `{ scope, target, method?, args, caller? }`。`target` 是服务名、`"$session"`（`send`、`afterTurn`、`abort`）或函数句柄。宿主调用插件时，参数里的 `AbortSignal` 换成 `null`，信号中止时发 `$/cancel` |
   | 双向 | `$/cancel` | 取消一次调用（宿主在工具被中止、hook 超时时发） |
   | 插件 → 宿主 | `provide`、`kernel/tool`、`kernel/hook` | 注册：`provide` 列出方法名，`perCaller` 为 true 时按调用方创建实例；工具的 `execute`、hook 的 `fn` 是函数句柄 |
   | 插件 → 宿主 | `secrets/get`、`secrets/set` | 读写这个插件自己的密钥（第 8 节）：`{ scope, key, value? }`，`value` 为 null 时删除；宿主按插件 id 取，参数里没有插件 id |
@@ -271,7 +271,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 3. **层级**：
    - 项目层插件加载前要用户确认（沿用内核的信任机制，经 `importProjectModule`）。确认方式由启动核心的入口经 `HostOptions.trust` 传入；没有确认方式时（例如非交互运行）不加载带代码的项目层插件。用户拒绝记为 `untrusted`，不计入连续崩溃；
    - 项目层不能代替用户层或 bundled 的服务提供者（3.3），所以克隆的仓库换不掉你的审批、你的模型配置、你的前端；
-   - 项目层插件不能调用 `session.send`、不能改输入框：克隆仓库不等于授权它替你操作。
+   - 项目层插件不能调用 `session.send`、`session.abort`、不能改输入框、不能登记审批渠道：克隆仓库不等于授权它替你操作。
 
 中断和退出（Ctrl+C）由前端插件实现，但核心兜底：连续两次 SIGINT 在 2 秒内到达时，核心直接中止所有会话并退出，不经过任何插件。插件出问题时用户一定能停下来。
 
@@ -294,7 +294,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 | `jade/keys` | `keys@1`：`register`、`get`、`list`；`shift+tab` 也可以注册 | — | 快捷键 |
 | `jade/renderers` | `renderers@1`：`tool`、`event`、`forTool`、`forEvent` | — | `ToolRenderer`、`EventRenderer`。`jade/fs`、`jade/shell` 为自己的工具登记，`jade/approval` 用工具的 `preview` 作审批对话框的内容 |
 | `jade/models` | `provider@1`、`models@1`（`current`、`complete`、`list`、`subscribe`）；`/model`：切换保存过的模型、改当前模型的设置、加一个模型；用过的模型记在 `$JADE_HOME/models.json` | 可选 `ui@1`、`commands@1` | `provider.ts`、`ui/configure.ts` |
-| `jade/approval` | `approval@1`（`mode`、`setMode`、`allowRead`：登记不用问就能读的目录，项目层插件不能用）、gate；auto 模式下判断不了的调用先由模型审查（`review.ts`） | `ui@1`、`models@1`（都可选：没有 `ui@1` 时，要问的调用一律拒绝；没有 `models@1` 或 `review: false` 时不审查） | `plugins/policy.ts`、`plugins/review.ts` |
+| `jade/approval` | `approval@1`（`mode`、`setMode`、`allowRead`：登记不用问就能读的目录；`addApprover`：登记审批渠道（例如聊天机器人），要问时问题同时交给终端和渠道，先回答的算数、其余的经 signal 中止，渠道不回答或出错不算拒绝，有渠道时 `-p` 也会问；两者项目层插件都不能用）、gate；auto 模式下判断不了的调用先由模型审查（`review.ts`） | `ui@1`、`models@1`（都可选：没有 `ui@1` 时，要问的调用一律拒绝；没有 `models@1` 或 `review: false` 时不审查） | `plugins/policy.ts`、`plugins/review.ts` |
 | `jade/modes` | `modes@1`（`current`、`set`、`cycle`、`subscribe`），Shift+Tab、`/mode`；计划模式：往系统提示词里加"先给计划"的段落，`propose_plan` 工具（只在计划模式、能问用户时发给模型）问"执行这个计划？"，批准了就换模式，工具结果让模型开始做 | `approval@1`；可选 `keys@1`、`commands@1`、`prompts@1`、`ui@1` | Shift+Tab、`/mode`、计划模式的批准流程（`test/modes.test.ts`） |
 | `jade/plugins` | `/plugins [id]`：每个插件的状态和原因、每个服务的提供者（来自核心的 `jade@1`） | `commands@1`、`jade@1` | — |
 | `jade/sessions` | 命令 `/clear` `/resume` `/retry`；会话索引 `$JADE_HOME/state/sessions.jsonl` | `commands@1` | `plugins/sessions.ts`、`session-lifecycle.ts` |

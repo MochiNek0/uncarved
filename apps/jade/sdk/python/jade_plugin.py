@@ -181,6 +181,10 @@ class Context:
         """发起一轮（会话级）。不要在工具或 hook 里调用：它要等当前这一轮结束"""
         self._conn.call(self.scope, "$session", "send", [input])
 
+    def abort(self, reason: str | None = None) -> None:
+        """中止正在跑的这一轮（会话级）；空闲时什么都不做"""
+        self._conn.call(self.scope, "$session", "abort", [reason])
+
     def after_turn(self, fn: Callable[[], Any]) -> None:
         """本轮完全结束后执行一次（会话级）"""
         self._conn.call(self.scope, "$session", "afterTurn", [fn])

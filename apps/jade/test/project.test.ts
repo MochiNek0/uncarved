@@ -6,7 +6,7 @@ import { info, world } from "./helpers.ts";
 
 // 项目层插件：经内核的 importProjectModule 确认后才执行（第 7 节）
 
-const g = globalThis as { __runs?: number; __ctx?: { session: { send(i: unknown): Promise<void> } } };
+const g = globalThis as { __runs?: number; __ctx?: { session: { send(i: unknown): Promise<void>; abort(reason?: string): void } } };
 beforeEach(() => {
   g.__runs = 0;
 });
@@ -72,6 +72,7 @@ test("a confirmed project plugin works in sessions, and a change asks again", as
   expect(s1.id).not.toBe(s2.id);
   // 项目层插件不能替用户说话
   expect(() => g.__ctx!.session.send({ kind: "message", content: [] })).toThrow("project plugins cannot send input");
+  expect(() => g.__ctx!.session.abort()).toThrow("project plugins cannot stop turns");
   await host.close();
   expect(yes.asked).toEqual([dir]);
 

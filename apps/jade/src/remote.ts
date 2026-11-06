@@ -31,6 +31,9 @@ export interface RemoteOptions {
 
 type Fn = (...args: unknown[]) => unknown;
 type Handle = { $fn: string };
+/** 参数里的 AbortSignal 不能序列化：发给插件时换成 null，中止时给插件发 $/cancel */
+const signalIn = (args: unknown[]) => args.find((x): x is AbortSignal => x instanceof AbortSignal);
+const withoutSignals = (args: unknown[]) => args.map((x) => (x instanceof AbortSignal ? null : x));
 const isHandle = (v: unknown): v is Handle =>
   typeof v === "object" && v !== null && !Array.isArray(v) && typeof (v as Handle).$fn === "string" && Object.keys(v).length === 1;
 
@@ -81,7 +84,7 @@ export async function startRemote(source: PluginSource, owner: Owner, opts: Remo
   const remoteFn = (fn: string, scope: string): Fn => {
     return (...a: unknown[]) => {
       if (!scopes.has(scope)) throw new Error(`a function of plugin ${id} was called after its scope closed`);
-      return rpc.request("call", { scope, target: { $fn: fn }, args: encode(a, scope) }).then((r) => decode(r, scope));
+      return rpc.request("call", { scope, target: { $fn: fn }, args: encode(withoutSignals(a), scope) }, signalIn(a)).then((r) => decode(r, scope));
     };
   };
 
@@ -161,7 +164,8 @@ export async function startRemote(source: PluginSource, owner: Owner, opts: Remo
           Object.fromEntries(
             (methods as string[]).map((m) => [
               m,
-              (...a: unknown[]) => rpc.request("call", { scope, target: service, method: m, args: encode(a, scope), ...(caller ? { caller } : {}) }).then((r) => decode(r, scope)),
+              (...a: unknown[]) =>
+                rpc.request("call", { scope, target: service, method: m, args: encode(withoutSignals(a), scope), ...(caller ? { caller } : {}) }, signalIn(a)).then((r) => decode(r, scope)),
             ]),
           );
         // 按调用方创建实例：插件那边收到 caller/open 时用工厂创建，caller/close 时撤销这个调用方的注册
@@ -235,6 +239,7 @@ export async function startRemote(source: PluginSource, owner: Owner, opts: Remo
           if (!session) throw new Error("$session is only available in a session scope");
           if (p.method === "send") result = await session.send(a[0] as Parameters<typeof session.send>[0]);
           else if (p.method === "afterTurn") session.afterTurn(a[0] as () => void);
+          else if (p.method === "abort") session.abort(a[0] === undefined || a[0] === null ? undefined : String(a[0]));
           else throw new Error(`$session has no method ${String(p.method)}`);
         } else if (typeof target === "string") {
           const service = ctx.service<Record<string, unknown>>(target);

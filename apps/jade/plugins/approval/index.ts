@@ -6,7 +6,7 @@
 
 import path from "node:path";
 import type { GatedToolCall, Message } from "uncarved";
-import { definePlugin, type UI } from "../../src/api.ts";
+import { definePlugin, type SelectRequest, type UI } from "../../src/api.ts";
 import type { Models } from "../models/index.ts";
 import type { Renderers } from "../renderers/index.ts";
 import { describeRule, MODES, policy, type AllowRule, type Mode } from "./policy.ts";
@@ -18,7 +18,19 @@ export interface Approval {
   setMode(mode: Mode): void;
   /** 读这个目录（绝对路径）里的文件不用问，例如 skill 的目录。返回撤销函数，调用方的作用域关闭时自动撤销。项目层插件不能用 */
   allowRead(dir: string): () => void;
+  /**
+   * 登记一个审批渠道（例如聊天机器人）：要问用户时，问题同时交给终端和所有渠道，先回答的算数，
+   * 其余的经 signal 收到中止。渠道返回 undefined、不认识的值或出错，算它不回答，不算拒绝；
+   * 终端里取消照旧算拒绝。有渠道时，不能提问的前端（-p）也会问。返回撤销函数，调用方的作用域关闭时自动撤销。
+   * 项目层插件不能用
+   */
+  addApprover(approver: Approver): () => void;
 }
+
+/** 审批的回答：允许一次、本会话里总是允许、拒绝 */
+export type Answer = "once" | "always" | "deny";
+export type Approver = (request: SelectRequest<Answer>, signal: AbortSignal) => Promise<Answer | undefined>;
+const ANSWERS: readonly string[] = ["once", "always", "deny"] satisfies Answer[];
 
 /** derived 里保存"总是允许"规则的键 */
 const RULES_KEY = "jade/approval/rules";
@@ -43,6 +55,8 @@ let mode: Mode = "ask";
 let badMode: string | undefined;
 /** 经 allowRead 登记的目录；policy 每次判断时读它 */
 const readRoots: string[] = [];
+/** 经 addApprover 登记的审批渠道 */
+const approvers = new Set<Approver>();
 
 export default definePlugin({
   process(ctx) {
@@ -64,6 +78,14 @@ export default definePlugin({
           const i = readRoots.indexOf(root);
           if (i !== -1) readRoots.splice(i, 1);
         };
+        caller.onDispose(remove);
+        return remove;
+      },
+      addApprover(approver: Approver) {
+        if (caller.layer === "project") throw new Error("approval.addApprover: project plugins cannot answer approvals");
+        if (typeof approver !== "function") throw new Error("approval.addApprover: approver must be a function");
+        approvers.add(approver);
+        const remove = () => void approvers.delete(approver);
         caller.onDispose(remove);
         return remove;
       },
@@ -132,7 +154,7 @@ export default definePlugin({
           }
           why = verdict.reason;
         }
-        if (!ui?.interactive) {
+        if (!ui?.interactive && approvers.size === 0) {
           if (!warned) {
             warned = true;
             ui?.notify(
@@ -148,7 +170,8 @@ export default definePlugin({
           if (again.decision !== "ask") return again;
           const rule = rules.ruleFor(call);
           const shown = (await preview(renderers, call)) ?? detail(call);
-          const answer = await ui.select(
+          const answer = await ask(
+            ui,
             {
               title: `Allow ${call.name}?`,
               // 审查转给用户的：先说为什么
@@ -175,6 +198,44 @@ export default definePlugin({
     });
   },
 });
+
+/**
+ * 把问题同时交给终端（能提问时）和所有审批渠道，返回先到的回答，然后中止其余的。
+ * 终端里取消（undefined）算拒绝；渠道返回 undefined、不认识的值或出错算它不回答。都不回答时返回 undefined（拒绝）
+ */
+async function ask(ui: UI | undefined, request: SelectRequest<Answer>, signal: AbortSignal): Promise<Answer | undefined> {
+  const done = new AbortController();
+  const stop = () => done.abort(signal.reason);
+  signal.addEventListener("abort", stop, { once: true });
+  try {
+    return await new Promise<Answer | undefined>((resolve, reject) => {
+      const channels: Promise<Answer | undefined | typeof NONE>[] = [];
+      if (ui?.interactive) channels.push(ui.select(request, done.signal).then((a) => (a !== undefined && ANSWERS.includes(a) ? a : "deny")));
+      for (const approver of approvers) {
+        channels.push(
+          Promise.resolve()
+            .then(() => approver(request, done.signal))
+            .then(
+              (a) => (typeof a === "string" && ANSWERS.includes(a) ? (a as Answer) : NONE),
+              () => NONE,
+            ),
+        );
+      }
+      let pending = channels.length;
+      if (pending === 0) return resolve(undefined);
+      for (const c of channels) {
+        c.then((a) => {
+          if (a !== NONE) resolve(a);
+          else if (--pending === 0) resolve(undefined);
+        }, reject);
+      }
+    });
+  } finally {
+    signal.removeEventListener("abort", stop);
+    done.abort(new Error("answered"));
+  }
+}
+const NONE = Symbol("no answer");
 
 /**
  * 工具自己登记的审批预览（例如文件修改的 diff）。没有登记、返回的不是文字、或者出错时返回 undefined，

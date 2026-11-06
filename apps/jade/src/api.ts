@@ -115,6 +115,8 @@ export interface SessionControl {
    * 不要在 hook 或工具里 await 它：它要等当前这一轮结束，而当前这一轮在等你。项目层插件不能用（第 7 节）
    */
   send(input: UserInput): Promise<void>;
+  /** 中止正在跑的这一轮（例如用户在别处喊停）；空闲时什么都不做。项目层插件不能用 */
+  abort(reason?: string): void;
 }
 
 export interface SessionContext extends ScopeContext {

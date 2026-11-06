@@ -4,7 +4,7 @@ import { NO_APPROVAL_REASON, ServiceUnavailable, StaleContext } from "../src/ind
 import { info, world } from "./helpers.ts";
 
 type Step = Omit<ModelResponse, "model">;
-const g = globalThis as { __script?: Step[]; __log?: string[]; __ctx?: { session: { send(i: unknown): Promise<void> } } };
+const g = globalThis as { __script?: Step[]; __log?: string[]; __ctx?: { session: { send(i: unknown): Promise<void>; abort(reason?: string): void } } };
 const MODEL = { by: "model", provider: "scripted", model: "s1" } as const;
 const use = (id: string, name: string, input: unknown = {}): Block => ({ kind: "tool_use", id, name, input, origin: MODEL, trust: "trusted" });
 const say = (text: string): Step => ({ content: [{ kind: "text", text, origin: MODEL, trust: "trusted" }], stopReason: "end" });
@@ -161,6 +161,26 @@ describe("afterTurn and send", () => {
     const texts = s.state.messages.map((m) => m.content.map((b) => (b.kind === "text" ? b.text : "")).join(""));
     expect(texts).toEqual(["go", "part 1", "continue", "part 2"]);
     expect(g.__log).toEqual(["after"]);
+    await host.close();
+  });
+
+  test("a plugin stops the running turn", async () => {
+    const { host } = await setup((w) =>
+      w.plugin("bundled", { id: "stopper" }, `export default { session(ctx) {
+        ctx.kernel.tool({ name: "stop", effect: "read", description: "stop", inputSchema: { type: "object" }, concurrency: "safe", idempotent: true,
+          async execute(_input, t) {
+            ctx.session.abort("stop pressed in chat");
+            await new Promise((r) => t.signal.aborted ? r() : t.signal.addEventListener("abort", r, { once: true }));
+            return { content: "stopped" };
+          } });
+      } };`),
+    );
+    g.__script!.push(call(use("t1", "stop")), say("never reached"));
+    const s = await host.sessions.open();
+    await s.send(msg("go")).catch(() => {});
+    const ended = (await s.history()).filter((e) => e.type === "turn.ended").map((e) => (e.data as { reason: string }).reason);
+    expect(ended).toEqual(["aborted"]);
+    expect(g.__script).toHaveLength(1);
     await host.close();
   });
 

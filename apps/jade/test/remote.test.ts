@@ -2,7 +2,7 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Block, ModelResponse, State } from "uncarved";
@@ -46,10 +46,10 @@ export default { process(ctx) {
       registry.set(cmd.name, { ...cmd, owner: caller.plugin });
       caller.onDispose(() => registry.delete(cmd.name));
     },
-    async run(name, args) {
+    async run(name, args, signal) {
       const c = registry.get(name);
       if (!c) throw new Error("no command " + name);
-      return c.run(args);
+      return signal ? c.run(args, signal) : c.run(args);
     },
     list: () => [...registry.values()].map((c) => c.name + " (" + c.owner + ")"),
   }));
@@ -67,7 +67,8 @@ const JS_USER = `export default { async process(ctx) {
 } };`;
 
 const MAIN_PY = `import os
-from jade_plugin import Plugin
+import time
+from jade_plugin import Plugin, cancelled
 
 plugin = Plugin("py/greeter")
 open("pid.txt", "w").write(str(os.getpid()))
@@ -91,6 +92,15 @@ class Greeter:
     def crash(self):
         os._exit(3)
 
+    def wait(self, signal):
+        return wait_for_cancel("service", signal)
+
+def wait_for_cancel(name, signal):
+    while not cancelled():
+        time.sleep(0.01)
+    open(name + "-cancelled.txt", "w").write(repr(signal))
+    return "cancelled"
+
 @plugin.process
 def process(ctx):
     greeter = Greeter(ctx)
@@ -101,6 +111,7 @@ def process(ctx):
         return greeter.greet(args)
 
     ctx.service("commands@1").register({"name": "hello", "description": "Greets", "run": hello})
+    ctx.service("commands@1").register({"name": "wait", "description": "Waits", "run": lambda args, signal: wait_for_cancel("callback", signal)})
 
 @plugin.session
 def session(ctx):
@@ -132,7 +143,7 @@ async function setup(opts: { layer?: "user" | "project"; command?: string; jsUse
   return { w, dir };
 }
 
-const commands = (host: PluginHost) => host.service<{ run(name: string, args: string): Promise<string>; list(): Promise<string[]> }>("commands@1")!;
+const commands = (host: PluginHost) => host.service<{ run(name: string, args: string, signal?: AbortSignal): Promise<string>; list(): Promise<string[]> }>("commands@1")!;
 
 /** 工具结果：toolUseId → [是否出错, 文字] */
 function results(state: State) {
@@ -169,7 +180,7 @@ describe.skipIf(!PYTHON)("out-of-process plugins", () => {
     const host = await w.start();
     try {
       expect(info(host, "py/greeter").state).toBe("active");
-      expect(await commands(host).list()).toEqual(["hello (py/greeter)"]);
+      expect(await commands(host).list()).toEqual(["hello (py/greeter)", "wait (py/greeter)"]);
       // 命令在 Python 里执行，执行中又调用了宿主的 ui@1
       expect(await commands(host).run("hello", "jade")).toBe("hi, jade!");
       expect(g.__notes).toContain("hello ran with jade");
@@ -198,12 +209,34 @@ describe.skipIf(!PYTHON)("out-of-process plugins", () => {
     }
   });
 
+  test("an AbortSignal passed to a Python service or callback arrives as a cancellation", async () => {
+    const { w, dir } = await setup();
+    const host = await w.start();
+    try {
+      const greeter = host.service<{ wait(signal: AbortSignal): Promise<string> }>("greeter@1")!;
+      for (const [name, start] of [
+        ["service", (s: AbortSignal) => greeter.wait(s)],
+        ["callback", (s: AbortSignal) => commands(host).run("wait", "", s)],
+      ] as const) {
+        const ac = new AbortController();
+        const pending = start(ac.signal);
+        setTimeout(() => ac.abort(new Error("stop")), 100);
+        await expect(pending).rejects.toThrow("stop");
+        // 信号本身不过桥，插件收到 None，再经 $/cancel 知道被取消
+        await until(() => existsSync(path.join(dir, `${name}-cancelled.txt`)));
+        expect(readFileSync(path.join(dir, `${name}-cancelled.txt`), "utf8")).toBe("None");
+      }
+    } finally {
+      await host.close();
+    }
+  });
+
   test("closing the host revokes its registrations and ends its process", async () => {
     const { w, dir } = await setup();
     const host = await w.start();
     const pid = Number(readFileSync(path.join(dir, "pid.txt"), "utf8"));
     expect(alive(pid)).toBe(true);
-    expect(g.__registry!.size).toBe(1);
+    expect(g.__registry!.size).toBe(2);
     await host.close();
     expect(g.__registry!.size).toBe(0);
     await until(() => !alive(pid));
