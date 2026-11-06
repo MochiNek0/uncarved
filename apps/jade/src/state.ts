@@ -68,7 +68,8 @@ export async function writeFaults(home: string, faults: Faults): Promise<void> {
 }
 
 /** 记一次故障；本次启动里同一个插件只记一次。达到上限时自动停用，返回 true */
-export function countFault(faults: Faults, id: string, reason: string): boolean {  const s = faults.streaks[id] ?? { count: 0, last: "" };
+export function countFault(faults: Faults, id: string, reason: string): boolean {
+  const s = faults.streaks[id] ?? { count: 0, last: "" };
   s.count += 1;
   s.last = reason;
   faults.streaks[id] = s;

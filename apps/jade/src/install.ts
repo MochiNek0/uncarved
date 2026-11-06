@@ -13,8 +13,8 @@ import { hashDir, type TrustStore } from "uncarved";
 import { fetchPlugin, inSubdir, readPluginManifest } from "./fetch.ts";
 import { treeHash } from "./hash.ts";
 import { isPluginId } from "./manifest.ts";
-import { parseSource, type SourceKind } from "./source.ts";
-import { readFaults, readPluginsConfig, writeFaults, writePluginsConfig } from "./state.ts";
+import { parseSource, type PluginSourceSpec, type SourceKind } from "./source.ts";
+import { forgetFaults, readPluginsConfig, writePluginsConfig } from "./state.ts";
 
 /** 用户层/项目层插件的目录名：id 里的 / 换成 __ */
 export const installDir = (root: string, id: string) => path.join(root, id.replaceAll("/", "__"));
@@ -26,6 +26,8 @@ export interface InstallRecord {
   dir: string;
   /** 用户写的来源；本地路径是绝对路径 */
   source: string;
+  /** 解析后的来源（git 地址、npm 写法或绝对路径）；更新时直接用它，不再按当前目录重新解析 source */
+  location?: string;
   kind: SourceKind | "link";
   /** git 的分支、tag 或提交 */
   ref?: string;
@@ -115,6 +117,7 @@ export async function addPlugin(spec: string, opts: AddOptions): Promise<Added> 
       id,
       dir: path.basename(target),
       source: source.kind === "local" ? source.location : source.spec,
+      location: source.location,
       kind: source.kind,
       ...(source.ref ? { ref: source.ref } : {}),
       ...(opts.subdir ? { subdir: opts.subdir } : {}),
@@ -203,7 +206,14 @@ async function updateOne(root: string, rec: InstallRecord, opts: UpdateOptions):
     if (exists && rec.hash) modified = (await treeHash(dir)) !== rec.hash;
 
     opts.log?.(`${rec.id}: fetching ${rec.source}`);
-    const source = await parseSource(rec.source, opts.cwd);
+    const kind = rec.kind as SourceKind;
+    // 老记录没有 location，只能按当前目录重新解析；解析出的种类和安装时不同就不更新
+    const source: PluginSourceSpec = rec.location
+      ? { kind, location: rec.location, ...(rec.ref ? { ref: rec.ref } : {}), spec: rec.source }
+      : await parseSource(rec.source, opts.cwd);
+    if (source.kind !== kind) {
+      throw new Error(`${rec.source} was installed as a ${kind} source but now reads as ${source.kind}; remove it and add it again`);
+    }
     const fetched = await fetchPlugin(source, staging, rec.subdir, opts.log);
     if (fetched.manifest.id !== rec.id) {
       throw new Error(`plugin id changed from ${rec.id} to ${fetched.manifest.id}; remove it and add it again`);
@@ -330,19 +340,16 @@ async function trustPlugin(trust: TrustStore, dir: string, log?: (text: string) 
   }
 }
 
-/** 安装、删除之后清掉这个 id 的停用记录和连续崩溃记录 */
-export async function forgetPluginState(home: string, id: string): Promise<void> {
+/** 安装、删除之后清掉这个 id 的停用记录和连续崩溃记录；返回它原来是不是被用户停用了 */
+export async function forgetPluginState(home: string, id: string): Promise<boolean> {
   const config = await readPluginsConfig(home);
-  if (config.disabled.includes(id)) {
+  const wasDisabled = config.disabled.includes(id);
+  if (wasDisabled) {
     config.disabled = config.disabled.filter((d) => d !== id);
     await writePluginsConfig(home, config);
   }
-  const faults = await readFaults(home);
-  if (faults.streaks[id] || faults.autoDisabled.includes(id)) {
-    delete faults.streaks[id];
-    faults.autoDisabled = faults.autoDisabled.filter((d) => d !== id);
-    await writeFaults(home, faults);
-  }
+  await forgetFaults(home, id);
+  return wasDisabled;
 }
 
 const now = () => new Date().toISOString();

@@ -68,9 +68,10 @@ export async function pluginsCommand(args: readonly string[], opts: PluginsComma
         ...(opts.trust ? { trust: opts.trust } : {}),
         ...(opts.log ? { log: opts.log } : {}),
       });
-      await forgetPluginState(opts.home, installed.id);
+      const wasDisabled = await forgetPluginState(opts.home, installed.id);
       let text = `installed ${installed.id}@${installed.version} into ${installed.dir}`;
       if (installed.record.kind !== "local") text += ` (${origin(installed.record)})`;
+      if (wasDisabled) text += `\n${installed.id} was disabled; installing it enabled it again.`;
       if (parsed.project) text += `\nproject plugin: it will run with your permissions in this repository.`;
       return text;
     }

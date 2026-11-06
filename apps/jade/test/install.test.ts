@@ -11,7 +11,7 @@ import { pathToFileURL } from "node:url";
 import { hashDir, MemoryTrustStore } from "uncarved";
 import { discover } from "../src/manifest.ts";
 import { pluginsCommand, type PluginsCommandOptions } from "../src/rescue.ts";
-import { installDir, readRecords } from "../src/install.ts";
+import { addPlugin, installDir, readRecords, updatePlugins } from "../src/install.ts";
 import { parseSource } from "../src/source.ts";
 
 let tmp: string[] = [];
@@ -126,7 +126,8 @@ describe("jade plugins add: local directories", () => {
     await writeFile(path.join(home, "plugins.json"), JSON.stringify({ disabled: ["test/again"] }));
     await mkdir(path.join(home, "state"), { recursive: true });
     await writeFile(path.join(home, "state", "faults.json"), JSON.stringify({ streaks: { "test/again": { count: 3, last: "boom" } }, autoDisabled: ["test/again"] }));
-    await pluginsCommand(["add", await plugin("again", { id: "test/again" })], opts);
+    const text = await pluginsCommand(["add", await plugin("again", { id: "test/again" })], opts);
+    expect(text).toContain("test/again was disabled; installing it enabled it again.");
     expect(JSON.parse(await readFile(path.join(home, "plugins.json"), "utf8"))).toEqual({ disabled: [] });
     expect(JSON.parse(await readFile(path.join(home, "state", "faults.json"), "utf8"))).toEqual({ streaks: {}, autoDisabled: [], unattributed: [] });
   });
@@ -316,7 +317,8 @@ describe("jade plugins add: npm", () => {
     const pack = () => {
       const stage = path.join(home, `pack-${Date.now()}`);
       cpSync(pkg, path.join(stage, "package"), { recursive: true });
-      execFileSync("tar", ["-czf", tarball, "-C", stage, "package"], { stdio: "ignore" });
+      // 相对路径：Git 自带的 GNU tar 会把 C:\… 当成远程主机
+      execFileSync("tar", ["-czf", path.basename(tarball), "-C", path.basename(stage), "package"], { cwd: home, stdio: "ignore" });
       rmSync(stage, { recursive: true, force: true });
     };
 
@@ -335,6 +337,43 @@ describe("jade plugins add: npm", () => {
     expect(text).toContain("updated test/npm 1.0.0 → 1.1.0");
     expect(await readFile(path.join(installed, "index.mjs"), "utf8")).toBe("export const n = 2;\n");
     expect((await readRecords(path.join(home, "plugins")))["test/npm"]).toMatchObject({ version: "1.1.0" });
+  });
+
+  test("update finds a relative .tgz from another working directory", async () => {
+    if (!HAS_TAR) return;
+    const { home } = await world();
+    const pkg = path.join(home, "stage", "package");
+    await mkdir(pkg, { recursive: true });
+    await writeFile(path.join(pkg, "package.json"), JSON.stringify({ name: "jade-test-plugin", version: "1.0.0", type: "module" }));
+    await writeFile(path.join(pkg, "plugin.json"), JSON.stringify({ id: "test/npm", version: "1.0.0", api: "^1", entry: "index.mjs" }));
+    await writeFile(path.join(pkg, "index.mjs"), "export const n = 1;\n");
+    execFileSync("tar", ["-czf", "plugin.tgz", "-C", "stage", "package"], { cwd: home, stdio: "ignore" });
+
+    const root = path.join(home, "plugins");
+    await addPlugin("./plugin.tgz", { root, cwd: home });
+    const elsewhere = path.join(home, "elsewhere");
+    await mkdir(elsewhere);
+    const [result] = await updatePlugins(["test/npm"], { root, cwd: elsewhere });
+    expect(result).toMatchObject({ status: "current" });
+  });
+});
+
+describe("jade plugins update: the recorded source", () => {
+  test("a git record is not turned into a local directory that happens to share its name", async () => {
+    const { home, plugin } = await world();
+    const root = path.join(home, "plugins");
+    await mkdir(path.join(root, "test__git"), { recursive: true });
+    // 用 user/repo 装的 git 插件（老记录只有用户写的原文）
+    await writeFile(
+      path.join(root, ".installed.json"),
+      JSON.stringify({ plugins: { "test/git": { id: "test/git", dir: "test__git", source: "acme/tool", kind: "git", installedAt: "x" } } }),
+    );
+    // 运行 update 的目录里正好有 ./acme/tool
+    const cwd = path.dirname(path.dirname(await plugin("acme/tool", { id: "test/git" })));
+    const [result] = await updatePlugins(["test/git"], { root, cwd });
+    expect(result).toMatchObject({ status: "failed" });
+    expect((await readRecords(root))["test/git"]).toMatchObject({ kind: "git", source: "acme/tool" });
+    expect(existsSync(path.join(root, "test__git", "plugin.json"))).toBe(false);
   });
 });
 
