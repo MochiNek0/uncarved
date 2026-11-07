@@ -34,6 +34,22 @@ describe("jade/compact helpers", () => {
     expect(estimateTokens([media("document", 3_000_000)])).toBeGreaterThan(50_000);
   });
 
+  test("estimates ignore fields that are not sent: origin, trust and the provider's raw copy in ext", () => {
+    const text = "x".repeat(4000);
+    const plain: Message = { role: "assistant", content: [{ kind: "text", text, origin: { by: "runtime" }, trust: "trusted" }] };
+    const withExt: Message = {
+      role: "assistant",
+      content: [{ kind: "text", text, origin: { by: "model", provider: "anthropic", model: "m" }, trust: "trusted", ext: { anthropic: { type: "text", text } } }],
+    };
+    expect(estimateTokens([withExt])).toBe(estimateTokens([plain]));
+    // 工具参数里同名的键照常计入
+    const use = (input: unknown): Message => ({ role: "assistant", content: [{ kind: "tool_use", id: "t", name: "x", input, origin: { by: "runtime" }, trust: "trusted" }] });
+    expect(estimateTokens([use({ origin: text })])).toBeGreaterThan(1000);
+    // opaque 块的内容全在 ext 里
+    const opaque: Message = { role: "assistant", content: [{ kind: "opaque", origin: { by: "runtime" }, trust: "trusted", ext: { p: { data: text } } }] };
+    expect(estimateTokens([opaque])).toBeGreaterThan(1000);
+  });
+
   test("recognizes context overflow errors", () => {
     expect(isContextOverflow(OVERFLOW)).toBe(true);
     expect(isContextOverflow("This model's maximum context length is 128000 tokens. However, your messages resulted in 130000 tokens.")).toBe(true);

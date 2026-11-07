@@ -3,7 +3,7 @@
 import { definePlugin } from "../../src/api.ts";
 import type { Renderers } from "../renderers/index.ts";
 import type { Task } from "../task/index.ts";
-import { fsTools } from "./fs.ts";
+import { fsTools, SeenFiles } from "./fs.ts";
 import { fsRenderers } from "./renderers.ts";
 
 export default definePlugin({
@@ -14,16 +14,19 @@ export default definePlugin({
   },
 
   session(ctx) {
-    // 数模型调用的次数：同一次回复里先读后改的，改的内容是看到读取结果之前写好的
+    // 数模型调用的次数：同一次回复里先读后改的，改的内容是看到读取结果之前写好的。
+    // 同时按最终发给模型的消息让被压缩（jade/compact 总结或清理）掉的读取失效：那些文件要重新读才能改
     const responses = { calls: 0 };
+    const seen = new SeenFiles();
     ctx.kernel.hook({
       kind: "transform",
       point: "model.before",
-      fn: () => {
+      fn: (request) => {
         responses.calls++;
+        seen.prune(request.messages);
       },
     });
-    for (const tool of fsTools(ctx.cwd, { responses })) ctx.kernel.tool(tool);
+    for (const tool of fsTools(ctx.cwd, { responses, seen })) ctx.kernel.tool(tool);
     // 子 Agent（jade/task）的只读工具：另一套实例，子 Agent 读过的文件不算主会话读过
     // jade/task 被隔离时它的服务已失效：子 Agent 没有文件工具，文件工具本身照常
     try {

@@ -6,7 +6,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { Block, Tool, ToolContext } from "uncarved";
-import { applyEditsToText, fsTools, nearMiss } from "../plugins/fs/fs.ts";
+import { applyEditsToText, fsTools, nearMiss, SeenFiles } from "../plugins/fs/fs.ts";
 
 // ---------- 辅助 ----------
 
@@ -172,6 +172,46 @@ describe("fs tools", () => {
     expect((await run(tools, "write_file", { path: "q.txt", content: "b\n" })).isError).toBe(false);
     // 自己写的内容模型知道，同一次回复里接着改没问题
     expect((await run(tools, "edit_file", { path: "q.txt", old_string: "b", new_string: "c" })).isError).toBe(false);
+  });
+
+  test("files whose read was compacted out of the projection must be read again", async () => {
+    const cwd = await workspace();
+    await writeFile(path.join(cwd, "a.txt"), "a\n");
+    await writeFile(path.join(cwd, "b.txt"), "b\n");
+    const seen = new SeenFiles();
+    const tools = fsTools(cwd, { seen });
+    const call = (id: string, name: string, input: unknown) => tools.find((t) => t.name === name)!.execute(input, { ...ctx(), toolUseId: id });
+    await call("r1", "read_file", { path: "a.txt" });
+    await call("r2", "read_file", { path: "b.txt" });
+    // edit_file 不算重新知道整个文件：仍然以 r1 那次读取为准
+    expect((await call("e1", "edit_file", { path: "a.txt", old_string: "a", new_string: "A" })).isError).toBeFalsy();
+
+    const use = (id: string): Block => ({ kind: "tool_use", id, name: "read_file", input: {}, origin: { by: "model", provider: "p", model: "m" }, trust: "trusted" });
+    const result = (id: string, by: "tool" | "plugin"): Block => ({
+      kind: "tool_result",
+      toolUseId: id,
+      isError: false,
+      content: [{ kind: "text", text: "…", origin: by === "tool" ? { by: "tool", name: "read_file" } : { by: "plugin", id: "jade/compact" }, trust: "trusted" }],
+      origin: { by: "tool", name: "read_file" },
+      trust: "trusted",
+    });
+    // 两次读取都还在投影里：照常可以改
+    seen.prune([
+      { role: "assistant", content: [use("r1"), use("r2")] },
+      { role: "user", content: [result("r1", "tool"), result("r2", "tool")] },
+    ]);
+    expect((await call("e2", "edit_file", { path: "b.txt", old_string: "b", new_string: "B" })).isError).toBeFalsy();
+    // r1 被总结掉、r2 的输出被清理：都要重新读，并说明原因
+    seen.prune([
+      { role: "assistant", content: [use("r2")] },
+      { role: "user", content: [result("r2", "plugin")] },
+    ]);
+    for (const p of ["a.txt", "b.txt"]) {
+      const r = await call("w", "write_file", { path: p, content: "x\n" });
+      expect(r).toMatchObject({ isError: true, content: expect.stringContaining("compacted out of the conversation") });
+    }
+    await call("r3", "read_file", { path: "a.txt" });
+    expect((await call("w2", "write_file", { path: "a.txt", content: "x\n" })).isError).toBeFalsy();
   });
 
   test("read_file returns images as image blocks and refuses other binary files", async () => {

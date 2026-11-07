@@ -74,10 +74,16 @@ function mediaTokens(b: { kind: string; source?: unknown }): number {
   return Math.max(IMAGE_TOKENS, Math.ceil(bytes / PDF_BYTES_PER_TOKEN));
 }
 
+/** 块上不发给模型的字段：来源、信任标记，以及 provider 原样保存的原始块（ext，text 和 thinking 会被算两遍） */
+const UNSENT = new Set(["origin", "trust", "ext"]);
+
 /** 粗略估算：英文和代码 4 个字符约 1 个 token，中日韩文字每个字约 1 个 token，图片和 PDF 单独估算 */
 export function estimateTokens(messages: Message[]): number {
   let media = 0;
-  const text = JSON.stringify(messages, (_key, value: unknown) => {
+  const text = JSON.stringify(messages, function (this: unknown, key, value: unknown) {
+    // 只去掉块自己的这些字段：工具参数里同名的键照常计入。opaque 块的内容全在 ext 里，要算
+    const holder = this as { kind?: unknown } | null;
+    if (UNSENT.has(key) && typeof holder?.kind === "string" && holder.kind !== "opaque") return undefined;
     const b = value as { kind?: unknown } | null;
     if (typeof b === "object" && b !== null && (b.kind === "image" || b.kind === "document")) {
       media += mediaTokens(b as { kind: string; source?: unknown });
