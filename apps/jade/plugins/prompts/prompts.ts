@@ -89,7 +89,8 @@ export async function environment(cwd: string, today = localDate()): Promise<str
   const [branch, status, entries] = await gitSnapshot(cwd);
   if (branch) {
     lines.push(`- Git branch: ${branch}`);
-    lines.push(`- Git status at session start: ${status ? `\n${status.split("\n").slice(0, 30).join("\n")}` : "clean"}`);
+    const shown = status === undefined ? "unknown (git status did not finish)" : status ? `\n${status.split("\n").slice(0, 30).join("\n")}` : "clean";
+    lines.push(`- Git status at session start: ${shown}`);
   } else {
     lines.push("- Not a git repository");
   }
@@ -178,7 +179,8 @@ function gitSnapshot(cwd: string) {
     // 三个 git 命令同时跑：Windows 上每启动一次 git 要几十毫秒，启动时会串起来等
     p = Promise.all([
       git(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]),
-      git(cwd, ["status", "--short"]),
+      // 巨型仓库里 git status 可能要很久，会话打开要等它：超时就不给
+      git(cwd, ["status", "--short"], STATUS_TIMEOUT_MS),
       // 让模型一开始就知道仓库的大致样子，不用先盲猜语言、到处 ls
       topLevel(cwd),
     ]);
@@ -238,9 +240,12 @@ export function repoRoot(cwd: string): Promise<string> {
   return p;
 }
 
-async function git(cwd: string, args: string[]): Promise<string | undefined> {
+/** 会话开始时 git status 最多等这么久 */
+const STATUS_TIMEOUT_MS = 3000;
+
+async function git(cwd: string, args: string[], timeoutMs?: number): Promise<string | undefined> {
   try {
-    const { code, stdout } = await run(["git", ...args], { cwd });
+    const { code, stdout } = await run(["git", ...args], timeoutMs === undefined ? { cwd } : { cwd, timeoutMs });
     return code === 0 ? stdout.trim() : undefined;
   } catch {
     return undefined;

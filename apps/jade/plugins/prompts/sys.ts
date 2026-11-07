@@ -57,11 +57,23 @@ export function spawn(cmd: string[], opts: SpawnOptions = {}): Promise<Proc> {
   });
 }
 
-/** 运行一条命令，返回 stdout 文本和退出码；启动失败时 reject */
-export async function run(cmd: string[], opts: { cwd?: string } = {}): Promise<{ code: number | null; stdout: string }> {
+/** 运行一条命令，返回 stdout 文本和退出码；启动失败时 reject。超过 timeoutMs 时杀掉，退出码为 null */
+export async function run(cmd: string[], opts: { cwd?: string; timeoutMs?: number } = {}): Promise<{ code: number | null; stdout: string }> {
   const proc = await spawn(cmd, { cwd: opts.cwd, stderr: "ignore" });
-  const [stdout, code] = await Promise.all([text(proc.stdout), proc.exited]);
-  return { code, stdout };
+  let timedOut = false;
+  const timer =
+    opts.timeoutMs === undefined
+      ? undefined
+      : setTimeout(() => {
+          timedOut = true;
+          proc.kill();
+        }, opts.timeoutMs);
+  try {
+    const [stdout, code] = await Promise.all([text(proc.stdout), proc.exited]);
+    return { code: timedOut ? null : code, stdout };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export async function text(stream: AsyncIterable<Uint8Array>): Promise<string> {

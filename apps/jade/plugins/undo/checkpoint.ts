@@ -121,5 +121,29 @@ export function lastTurnChanges(messages: readonly Message[], checkpoints: reado
   return pending.slice(0, 1);
 }
 
+/**
+ * 一轮里调用过的工具名：含 toolUseId 的那一轮；不给时是最近一轮。
+ * 一轮从用户发的消息开始，到下一条用户消息之前（与 lastTurnChanges 的划分相同）
+ */
+export function turnToolNames(messages: readonly Message[], toolUseId?: string): Set<string> {
+  let names = new Set<string>();
+  let found = toolUseId === undefined;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]!;
+    if (m.role === "assistant") {
+      for (const b of m.content) {
+        if (b.kind !== "tool_use") continue;
+        names.add(b.name);
+        if (b.id === toolUseId) found = true;
+      }
+      continue;
+    }
+    if (!m.content.some((b) => b.kind !== "tool_result" && b.origin.by === "user")) continue;
+    if (found) return names;
+    names = new Set();
+  }
+  return found ? names : new Set();
+}
+
 /** 会话和工具调用的 id 用作文件名 */
 const safe = (id: string) => id.replace(/[^A-Za-z0-9_.-]/g, "_");

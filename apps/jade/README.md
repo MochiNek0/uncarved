@@ -172,7 +172,7 @@ plugin.run()
 | `JADE_UPDATE_CHECK` | shell | 设为 `off` 不检查更新 |
 | `HTTPS_PROXY` / `HTTP_PROXY` | shell | 模型和 web 请求走代理（Node.js 版本太旧、不支持时启动时会提示；Bun 都支持） |
 
-权限模式和压缩阈值是插件配置，写在 `$JADE_HOME/config.json`，例如 `{"jade/approval": {"mode": "auto"}, "jade/compact": {"thresholdTokens": "120k"}}`。会话里用 Shift+Tab 或 `/mode` 选的模式记在 `mode.json`，比配置优先（见上文"权限"）。
+权限模式和压缩阈值是插件配置，写在 `$JADE_HOME/config.json`，例如 `{"jade/approval": {"mode": "auto"}, "jade/compact": {"thresholdTokens": "120k"}}`。会话里用 Shift+Tab 或 `/mode` 选的模式记在 `mode.json`，比配置优先（见上文"权限"）。等审批回答的时限默认 24 小时，过了按拒绝处理，可用 `{"jade/approval": {"askTimeoutMinutes": 30}}` 改短（最长一周）。
 
 网络搜索可选配置多家服务的 key（`TAVILY_API_KEY`、`JINA_API_KEY`、`EXA_API_KEY` 等），配了 key 的服务按顺序试；一个 key 都不设时只有 `web_fetch`，没有 `web_search`。完整列表见 [.env.example](https://github.com/MochiNek0/uncarved/blob/main/.env.example)。
 

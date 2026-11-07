@@ -408,14 +408,34 @@ function real(p: string): string {
 }
 
 export function policy(opts: PolicyOptions): Policy {
-  /** p 在 base 目录里 */
-  const within = (base: string, p: string) => {
-    // 按真实路径比较：目录里指向外面的符号链接也算外面
-    const rel = path.relative(real(base), real(path.resolve(opts.cwd, p)));
+  /**
+   * 作为范围的目录（工作目录、登记的目录、规则里的目录）的真实路径，本会话内记住：复合命令的每个参数都要和它们比，
+   * 每次都 realpathSync 是一串同步 IO。只记已经存在的；要判断的路径本身每次都重新解析，符号链接可能随时被换掉
+   */
+  const bases = new Map<string, string>();
+  const realBase = (dir: string): string => {
+    let r = bases.get(dir);
+    if (r !== undefined) return r;
+    try {
+      r = realpathSync(dir);
+    } catch {
+      return real(dir);
+    }
+    bases.set(dir, r);
+    return r;
+  };
+  /** 真实路径 target 在真实路径 base 里 */
+  const contains = (base: string, target: string) => {
+    const rel = path.relative(base, target);
     // 只有 ".." 这一段才表示上级目录，名为 "..foo" 的目录仍在里面
     return rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
   };
-  const inside = (p: string) => within(opts.cwd, p) || (opts.writeRoots ?? []).some((r) => within(r, p));
+  /** p 在 base 目录里。按真实路径比较：目录里指向外面的符号链接也算外面 */
+  const within = (base: string, p: string) => contains(realBase(base), real(path.resolve(opts.cwd, p)));
+  const inside = (p: string) => {
+    const target = real(path.resolve(opts.cwd, p));
+    return contains(realBase(opts.cwd), target) || (opts.writeRoots ?? []).some((r) => contains(realBase(r), target));
+  };
   /** glob 的 pattern 是绝对路径或含 ".." 段时，匹配范围会超出 path */
   const globEscapes = (pattern: string) => path.isAbsolute(pattern) || pattern.split(/[\\/]/).includes("..");
   /** 以 "." 或 "[" 开头的通配段可能匹配到 ".."（取决于 bash 版本和选项），按越界处理 */

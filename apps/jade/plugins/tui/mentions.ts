@@ -18,6 +18,32 @@ export function mentionAt(value: string, cursor: number): { start: number; query
 /** 补全后的文本：@ 引用加一个空格，含空白的路径加引号 */
 export const mentionText = (p: string) => (/\s/.test(p) ? `@"${p}"` : `@${p}`);
 
+/** 候选路径预先算好的小写形式和文件名（目录去掉末尾的 /），每按一个键都要用，不重复算 */
+interface Prepared {
+  lower: string;
+  base: string;
+}
+const prepared = new WeakMap<readonly string[], Prepared[]>();
+
+function prepare(paths: readonly string[]): Prepared[] {
+  let out = prepared.get(paths);
+  if (!out) {
+    out = paths.map((p) => {
+      const lower = p.toLowerCase();
+      const trimmed = lower.endsWith("/") ? lower.slice(0, -1) : lower;
+      return { lower, base: trimmed.slice(trimmed.lastIndexOf("/") + 1) };
+    });
+    prepared.set(paths, out);
+  }
+  return out;
+}
+
+/**
+ * 上一次排序时命中的全部候选（下标）。query 只是在后面追加了字符时，新的命中一定在这些里面
+ * （包含 q 加字符的也包含 q，按顺序出现的同理），只筛它们，不用再扫一遍全部路径
+ */
+let last: { paths: readonly string[]; q: string; hits: number[] } | undefined;
+
 /**
  * 按 query 给候选路径排序：文件名以 query 开头的最前，其次文件名包含、路径包含，
  * 最后是按顺序出现 query 每个字符的模糊匹配；同一档里短的在前
@@ -25,21 +51,35 @@ export const mentionText = (p: string) => (/\s/.test(p) ? `@"${p}"` : `@${p}`);
 export function rankPaths(paths: string[], query: string, limit: number): string[] {
   const q = query.toLowerCase().replaceAll("\\", "/");
   if (!q) return paths.filter((p) => !p.slice(0, -1).includes("/")).slice(0, limit);
-  const scored: { p: string; score: number }[] = [];
-  for (const p of paths) {
-    const lower = p.toLowerCase();
-    const base = lower.replace(/\/$/, "").split("/").pop()!;
+  const info = prepare(paths);
+  const from = last && last.paths === paths && q.startsWith(last.q) ? last.hits : undefined;
+  const scored: { i: number; score: number }[] = [];
+  const check = (i: number) => {
+    const { lower, base } = info[i]!;
     let score: number;
     if (lower.startsWith(q)) score = 0;
     else if (base.startsWith(q)) score = 1;
     else if (base.includes(q)) score = 2;
     else if (lower.includes(q)) score = 3;
     else if (subsequence(lower, q)) score = 4;
-    else continue;
-    scored.push({ p, score });
+    else return;
+    scored.push({ i, score });
+  };
+  if (from) for (const i of from) check(i);
+  else for (let i = 0; i < paths.length; i++) check(i);
+  last = { paths, q, hits: scored.map((s) => s.i) };
+  const cmp = (a: { i: number; score: number }, b: { i: number; score: number }) =>
+    a.score - b.score || paths[a.i]!.length - paths[b.i]!.length || paths[a.i]!.localeCompare(paths[b.i]!);
+  // 只要前 limit 条：命中常有上万条，全部排序（localeCompare 很慢）每按一个键要十几毫秒
+  const top: { i: number; score: number }[] = [];
+  for (const s of scored) {
+    if (top.length === limit && cmp(s, top[limit - 1]!) >= 0) continue;
+    let at = top.length;
+    while (at > 0 && cmp(s, top[at - 1]!) < 0) at--;
+    top.splice(at, 0, s);
+    if (top.length > limit) top.pop();
   }
-  scored.sort((a, b) => a.score - b.score || a.p.length - b.p.length || a.p.localeCompare(b.p));
-  return scored.slice(0, limit).map((s) => s.p);
+  return top.map((s) => paths[s.i]!);
 }
 
 function subsequence(text: string, q: string): boolean {

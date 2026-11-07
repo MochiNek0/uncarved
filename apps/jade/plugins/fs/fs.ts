@@ -329,6 +329,7 @@ export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
     name: "glob",
     description:
       `Find files by glob pattern (e.g. "src/**/*.ts"), relative to path (default: the working directory). ` +
+      `Unlike grep's include, "*.ts" matches only directly under path; use "**/*.ts" for any depth. ` +
       `Skips files ignored by git, .git and node_modules. Returns at most ${MAX_GLOB} paths.`,
     inputSchema: {
       type: "object",
@@ -359,7 +360,8 @@ export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
         out.push(display(cwd, path.join(root, rel)));
       }
       out.sort();
-      if (out.length === 0) return { content: "No files matched" };
+      // 和 grep 的 include 不同，不含 / 的模式只匹配第一层：模型常按 grep 的习惯写
+      if (out.length === 0) return { content: pattern.includes("/") || pattern.startsWith("**") ? "No files matched" : `No files matched. "${pattern}" only matches directly under ${p === "." ? "the working directory" : p}; use "**/${pattern}" to search at any depth.` };
       return { content: out.join("\n") + (more ? `\n(more than ${MAX_GLOB} matches; narrow the pattern)` : "") };
     },
   };

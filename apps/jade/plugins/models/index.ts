@@ -9,7 +9,7 @@ import type { ModelRequest, ModelResponse, Provider } from "uncarved";
 import { definePlugin, type UI } from "../../src/api.ts";
 import type { Commands } from "../commands/index.ts";
 import { contextWindow } from "./context.ts";
-import { envWithFile, hasProvider } from "./config.ts";
+import { envWithFile, hasProvider, parseTokens } from "./config.ts";
 import { configurator } from "./configure.ts";
 import { isBuiltinKind, listModels, MODEL_KEY, providerFromEnv, providerInfo, providerKind, RateGate, rpmFromEnv, visionFromEnv, withRetry } from "./provider.ts";
 import { readSavedServices, type Env } from "./saved.ts";
@@ -25,6 +25,8 @@ export interface Models {
     contextWindow: number;
     /** 模型能不能看图片（JADE_VISION；不设时按服务推断） */
     vision: boolean;
+    /** 每次回复的输出上限（JADE_MAX_TOKENS，含 .env 里的）；不设或写错时没有，用服务的默认值 */
+    maxTokens?: number;
   } | undefined;
   /**
    * 完成一次请求，带重试和限速。默认用当前配置的模型（限速和会话共用）；
@@ -130,7 +132,20 @@ export default definePlugin({
           // 写错的 JADE_VISION 在创建 provider 时报错，这里当作不能看
           vision = false;
         }
-        return { kind: info.kind, model: info.model, via: via(info.kind, info.baseURL), contextWindow: contextWindow(info.model, env), vision };
+        let maxTokens: number | undefined;
+        try {
+          maxTokens = env.JADE_MAX_TOKENS ? parseTokens("JADE_MAX_TOKENS", env.JADE_MAX_TOKENS) : undefined;
+        } catch {
+          // 写错的在创建 provider 时报错
+        }
+        return {
+          kind: info.kind,
+          model: info.model,
+          via: via(info.kind, info.baseURL),
+          contextWindow: contextWindow(info.model, env),
+          vision,
+          ...(maxTokens === undefined ? {} : { maxTokens }),
+        };
       },
       complete,
       list: () => listModels(env),

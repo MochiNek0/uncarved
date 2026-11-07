@@ -41,8 +41,10 @@ const ANSWERS: readonly string[] = ["once", "always", "deny"] satisfies Answer[]
 
 /** derived 里保存"总是允许"规则的键 */
 const RULES_KEY = "jade/approval/rules";
-/** 等用户回答的时限：内核要求 hook 有有限的超时，超时按拒绝处理 */
+/** 等用户回答的默认时限：内核要求 hook 有有限的超时，超时按拒绝处理。配置 askTimeoutMinutes 可以改 */
 const ASK_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+/** askTimeoutMinutes 的上限：内核的定时器最长约 24.8 天 */
+const MAX_ASK_TIMEOUT_MINUTES = 7 * 24 * 60;
 const MAX_DETAIL_CHARS = 2000;
 /** 等工具的审批预览的时限，过了就用默认的 detail */
 const PREVIEW_TIMEOUT_MS = 5000;
@@ -60,6 +62,9 @@ const reviewedKey = (call: GatedToolCall): string | undefined => {
 let mode: Mode = "ask";
 /** 配置里写错的模式：第一个会话打开时告诉用户（process 里可能还拿不到 ui@1：它的提供者可能排在后面激活） */
 let badMode: string | undefined;
+let askTimeoutMs = ASK_TIMEOUT_MS;
+/** 配置里写错的 askTimeoutMinutes，和 badMode 一样在第一个会话打开时告诉用户 */
+let badTimeout: string | undefined;
 /** 经 allowRead 登记的目录；policy 每次判断时读它 */
 const readRoots: string[] = [];
 /** 经 allowWrite 登记的目录；policy 每次判断时读它 */
@@ -74,6 +79,11 @@ export default definePlugin({
     const configured = ctx.config.mode;
     if (typeof configured === "string" && (MODES as readonly string[]).includes(configured)) mode = configured as Mode;
     else if (configured !== undefined) badMode = JSON.stringify(configured);
+    const minutes = ctx.config.askTimeoutMinutes;
+    askTimeoutMs = ASK_TIMEOUT_MS;
+    badTimeout = undefined;
+    if (typeof minutes === "number" && Number.isFinite(minutes) && minutes > 0 && minutes <= MAX_ASK_TIMEOUT_MINUTES) askTimeoutMs = minutes * 60_000;
+    else if (minutes !== undefined) badTimeout = JSON.stringify(minutes);
     ctx.provide("approval@1", (caller): Approval => ({
       mode: () => mode,
       setMode(next: Mode) {
@@ -100,6 +110,10 @@ export default definePlugin({
     if (badMode !== undefined) {
       ui?.notify(`jade/approval: mode must be one of ${MODES.join(", ")}, got ${badMode}; using ask`, "warning");
       badMode = undefined;
+    }
+    if (badTimeout !== undefined) {
+      ui?.notify(`jade/approval: askTimeoutMinutes must be a number of minutes between 0 and ${MAX_ASK_TIMEOUT_MINUTES}, got ${badTimeout}; using 24 hours`, "warning");
+      badTimeout = undefined;
     }
     const renderers = ctx.service<Renderers>("renderers@1");
     // auto 模式的审查用当前配置的模型；没有 models@1（模型插件被停用）或者配置里关掉时不做审查
@@ -146,7 +160,7 @@ export default definePlugin({
     ctx.kernel.hook({
       kind: "gate",
       point: "tool.gate",
-      timeoutMs: ASK_TIMEOUT_MS,
+      timeoutMs: askTimeoutMs,
       fn: async (call, hook) => {
         const saved = () => {
           const logged = (hook.derived[RULES_KEY] as AllowRule[] | undefined) ?? [];

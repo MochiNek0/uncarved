@@ -145,6 +145,14 @@ describe("jade -p", () => {
     expect(r.stderr).toContain("error: script exhausted");
   });
 
+  test("--resume with an unknown session says so without the plugin wrapper", async () => {
+    const w = await setup([]);
+    const r = w.run("-p", "--resume", "no-such-session", "hi");
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain("jade: could not resume no-such-session: session no-such-session not found");
+    expect(r.stderr).not.toContain("plugin jade/print");
+  });
+
   test("without a prompt prints usage", async () => {
     const w = await setup([]);
     const r = w.run("-p", "--help");

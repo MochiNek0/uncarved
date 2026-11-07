@@ -8,7 +8,7 @@ import path from "node:path";
 import type { Block, Message } from "uncarved";
 import type { UI } from "../src/index.ts";
 import type { CommandContext, Commands } from "../plugins/commands/index.ts";
-import { lastTurnChanges, type Checkpoint } from "../plugins/undo/checkpoint.ts";
+import { lastTurnChanges, turnToolNames, type Checkpoint } from "../plugins/undo/checkpoint.ts";
 import { say, cleanup, scriptedHost, textOf, use } from "./scripted-ui.ts";
 
 afterEach(cleanup);
@@ -49,6 +49,20 @@ describe("turn-level undo", () => {
 
   test("a partly undone turn finishes first", () => {
     expect(lastTurnChanges(messages, cps, new Set(["d"])).map((c) => c.toolUseId)).toEqual(["c", "b"]);
+  });
+
+  test("turnToolNames lists the tools of the turn holding a call, or of the last turn", () => {
+    const msgs: Message[] = [
+      { role: "user", content: [text("first")] },
+      { role: "assistant", content: [{ ...useBlock("a"), name: "bash" } as Block, useBlock("b")] },
+      { role: "user", content: [result("a"), result("b")] },
+      { role: "user", content: [text("second")] },
+      { role: "assistant", content: [useBlock("c")] },
+    ];
+    expect([...turnToolNames(msgs, "b")].sort()).toEqual(["bash", "edit_file"]);
+    expect([...turnToolNames(msgs, "c")]).toEqual(["edit_file"]);
+    expect([...turnToolNames(msgs)]).toEqual(["edit_file"]);
+    expect([...turnToolNames(msgs, "missing")]).toEqual([]);
   });
 });
 
@@ -107,6 +121,14 @@ describe("jade/undo in a session", () => {
     shared.answers.push("yes");
     expect(plain(await run())).toContain("Undid 1 change");
     expect(existsSync(a)).toBe(false);
+  });
+
+  test("says that shell commands of the undone turn are not undone", async () => {
+    const { host, shared, send, run } = await setup();
+    shared.script.push(use("u1", "bash", { command: "echo hi" }), use("u2", "write_file", { path: "a.txt", content: "x" }), say("done"));
+    const s = await host.sessions.open();
+    await send(s, "do it");
+    expect(plain(await run())).toContain("This turn also ran shell commands; what they changed is not undone.");
   });
 
   test("failed and denied writes leave nothing to undo", async () => {

@@ -14,7 +14,6 @@
 
 import { lookup as dnsLookup } from "node:dns/promises";
 import { isIP } from "node:net";
-import { Parser } from "htmlparser2";
 import type { Block, Tool } from "uncarved";
 import type { Env } from "./env.ts";
 
@@ -229,7 +228,7 @@ async function download(fetchImpl: typeof fetch, lookup: Lookup, target: URL, si
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     return {
-      content: `HTTP ${res.status} ${res.statusText} from ${url.href}${body ? `\n${clip(htmlToMarkdown(body).text || body, 1000)}` : ""}`,
+      content: `HTTP ${res.status} ${res.statusText} from ${url.href}${body ? `\n${clip((await htmlToMarkdown(body)).text || body, 1000)}` : ""}`,
       isError: true,
       retry: res.status === 403 || res.status === 429 || res.status >= 500,
     };
@@ -250,7 +249,7 @@ async function download(fetchImpl: typeof fetch, lookup: Lookup, target: URL, si
   const charset = /charset=([^;]+)/i.exec(res.headers.get("content-type") ?? "")?.[1]?.trim();
   const raw = decode(buf, charset);
   if (type === "text/html" || type === "application/xhtml+xml" || (!type && /^\s*<(!doctype|html)/i.test(raw))) {
-    const { title, text } = htmlToMarkdown(raw, url.href);
+    const { title, text } = await htmlToMarkdown(raw, url.href);
     return { at: Date.now(), url: url.href, title, text, thin: text.length < THIN_CHARS };
   }
   if (type.startsWith("text/") || /json|xml|javascript|yaml|toml/.test(type) || !type) {
@@ -303,9 +302,11 @@ const BLOCKS = new Set(["p", "div", "section", "article", "main", "header", "ul"
 
 /**
  * 用 htmlparser2 把网页转成 markdown 风格的文本：标题、段落、列表、链接、代码块，去掉脚本、样式和导航。
- * 不追求还原排版，只要模型能读。Node 和 Bun 都能用（Bun 的 HTMLRewriter 在 Node 里没有）
+ * 不追求还原排版，只要模型能读。Node 和 Bun 都能用（Bun 的 HTMLRewriter 在 Node 里没有）。
+ * htmlparser2 第一次用到时才加载：导入要几十毫秒，每次启动都付不值得
  */
-export function htmlToMarkdown(html: string, base?: string): { title?: string; text: string } {
+export async function htmlToMarkdown(html: string, base?: string): Promise<{ title?: string; text: string }> {
+  const { Parser } = await import("htmlparser2");
   const out: string[] = [];
   let skip = 0;
   let pre = 0;

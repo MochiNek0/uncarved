@@ -54,6 +54,9 @@ describe("fs tools", () => {
     expect(await readFile(path.join(cwd, "src/a.ts"), "utf8")).toBe("const a = 1;\nlet b = 2;\n");
 
     expect((await run(tools, "glob", { pattern: "**/*.ts" })).text).toBe("src/a.ts");
+    // 不含 / 的模式只匹配第一层：没命中时提示 **/
+    expect((await run(tools, "glob", { pattern: "*.ts" })).text).toBe(`No files matched. "*.ts" only matches directly under the working directory; use "**/*.ts" to search at any depth.`);
+    expect((await run(tools, "glob", { pattern: "src/*.js" })).text).toBe("No files matched");
     expect((await run(tools, "grep", { pattern: "let \\w", include: "**/*.ts" })).text).toBe("src/a.ts:2:let b = 2;");
   });
 

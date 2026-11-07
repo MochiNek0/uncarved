@@ -44,7 +44,8 @@ const USAGE = `usage: jade [prompt] [--resume <session id> | --continue]
 Starts the terminal interface. With a prompt, sends it first.
   -c, --continue  continue the most recent session in this directory
   -r, --resume    resume a session by id (inside jade, /resume lists them)
-Run one prompt without the interface: jade -p <prompt>`;
+Run one prompt without the interface: jade -p <prompt> (jade -p --help for more)
+jade's own commands (plugins, update, --safe): jade help`;
 
 /** 前端自己的命令：帮助和退出。其余命令都来自 commands@1 */
 const OWN: CommandInfo[] = [
@@ -330,6 +331,7 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
     screen,
     cwd,
     contextWindow: () => models?.current()?.contextWindow ?? 0,
+    maxTokens: () => models?.current()?.maxTokens,
     ...(compact ? { compactAt: () => compact.threshold() } : {}),
     canRetry,
     renderer: (tool) => renderers.forTool(tool),

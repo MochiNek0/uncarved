@@ -25,7 +25,8 @@ const USAGE = `usage: jade [--safe] [frontend options…]
   -v, --version print the version
 
 Run "jade plugins --help" for the install and update options.
-Everything else is passed to the frontend plugin; see its own --help.`;
+Everything else is passed to the frontend plugin: "jade --help" shows the terminal interface's options,
+"jade -p --help" the options for running one prompt.`;
 
 /**
  * jade plugins 的子命令（含别名）：单独写在 jade 后面时多半是漏了 plugins。
