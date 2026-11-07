@@ -172,8 +172,8 @@ describe("web_fetch", () => {
     }
   });
 
-  test("htmlToMarkdown drops empty links and decodes numeric entities", () => {
-    expect(htmlToMarkdown(`<p><a href="/x"><img src="i.png"></a>&#20013;&#x6587; &amp; more</p>`).text).toBe("中文 & more");
+  test("htmlToMarkdown drops empty links and decodes numeric entities", async () => {
+    expect((await htmlToMarkdown(`<p><a href="/x"><img src="i.png"></a>&#20013;&#x6587; &amp; more</p>`)).text).toBe("中文 & more");
   });
 });
 

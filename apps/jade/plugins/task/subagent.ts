@@ -11,11 +11,13 @@ import {
   definePlugin as kernelPlugin,
   MemoryLogStore,
   Runtime,
+  type Block,
   type EventDataMap,
   type GatedToolCall,
   type GateResult,
   type Message,
   type Plugin,
+  ProviderError,
   type Provider,
   type State,
   type Tool,
@@ -55,7 +57,28 @@ export interface TaskOptions {
   today?: string;
   /** 子 Agent 跑完时（成功、失败、中止都算）调用，给出它这次调用模型的用量合计；它的日志在内存里，别处读不到 */
   usage?(toolUseId: string, usage: Usage): void;
+  /** 当前模型的上下文窗口（token）；不知道时 undefined */
+  contextWindow?(): number | undefined;
 }
+
+/** 子会话的运行状态，插件的 hook 和 execute 共用 */
+interface Control {
+  /** 在要报告：只再要一次回复，较早的工具输出可能不放进去 */
+  wrapUp: boolean;
+  /** 最近一次模型调用的输入加输出 token，即下一次请求至少有多大 */
+  lastTokens?: number;
+}
+
+/** 历史到了上下文窗口的这个比例就停下来写报告：子 Agent 没有压缩，再读几个大文件就会超出窗口 */
+const WRAP_UP_AT = 0.7;
+/** 写报告时工具输出最多占窗口的这个比例，更早的不放进去，保证报告这次请求放得下 */
+const REPORT_TOOL_SHARE = 0.5;
+/** 不知道窗口时按这个算 */
+const FALLBACK_WINDOW = 128_000;
+/** 粗略估算：英文和代码约 4 个字符 1 个 token */
+const CHARS_PER_TOKEN = 4;
+/** 不放进报告请求的工具输出换成这句 */
+export const OMITTED = "[Output omitted to fit the context window. Use what you noted from it in your later messages.]";
 
 const NOBODY: SubagentApproval = { approved: false, reason: "Nobody can approve this action for a sub-agent. Report what you need instead." };
 
@@ -120,8 +143,33 @@ function needsApproval(cwd: string, input: unknown): string | undefined {
   return undefined;
 }
 
+/**
+ * 从最新的往前保留工具输出，合计不超过 maxChars；更早的换成 OMITTED。只改投影（I-4），工具结果不是模型块（I-6）。
+ * 没有超出时原样返回
+ */
+export function fitToolResults(messages: Message[], maxChars: number, plugin: string): Message[] {
+  const size = (b: Block) => JSON.stringify(b.kind === "tool_result" ? b.content : "").length;
+  let used = 0;
+  let cut = -1;
+  for (let i = messages.length - 1; i >= 0 && cut < 0; i--) {
+    for (const b of messages[i]!.content) {
+      if (b.kind !== "tool_result") continue;
+      used += size(b);
+      if (used > maxChars) cut = i;
+    }
+  }
+  if (cut < 0) return messages;
+  const note: Block = { kind: "text", text: OMITTED, origin: { by: "plugin", id: plugin }, trust: "trusted" };
+  return messages.map((m, i) =>
+    i > cut || !m.content.some((b) => b.kind === "tool_result")
+      ? m
+      : { ...m, content: m.content.map((b) => (b.kind === "tool_result" && b.content.length > 0 ? { ...b, content: [note] } : b)) },
+  );
+}
+
 /** 子 Agent 的插件：只读工具、提示词、关卡、步数上限。每个子会话一套新的 */
-function plugins(opts: TaskOptions, tools: Tool[], control: { wrapUp: boolean }, signal: AbortSignal): Plugin[] {
+function plugins(opts: TaskOptions, tools: Tool[], control: Control, signal: AbortSignal): Plugin[] {
+  const window = () => opts.contextWindow?.() ?? FALLBACK_WINDOW;
   const names = tools.map((t) => t.name);
   const system = subagentPrompt(names, opts.maxSteps);
   const env = ["# Environment", `- Working directory: ${opts.cwd}`, `- Platform: ${process.platform} (${os.release()})`, `- Today: ${opts.today ?? localDate()}`].join("\n");
@@ -145,8 +193,21 @@ function plugins(opts: TaskOptions, tools: Tool[], control: { wrapUp: boolean },
             return answer.approved ? { decision: "allow" } : { decision: "deny", reason: answer.reason ?? NOBODY.reason };
           },
         },
-        // 步数上限；wrapUp 时只再要一次回复（报告）
-        { kind: "gate", point: "turn.continue", fn: (s) => (stepsThisTurn(s) >= (control.wrapUp ? 1 : opts.maxSteps) ? { decision: "deny" } : { decision: "abstain" }) },
+        // 步数上限；wrapUp 时只再要一次回复（报告）。历史接近上下文窗口时也停下，之后要报告
+        {
+          kind: "gate",
+          point: "turn.continue",
+          fn: (s) =>
+            stepsThisTurn(s) >= (control.wrapUp ? 1 : opts.maxSteps) || (control.lastTokens ?? 0) >= window() * WRAP_UP_AT
+              ? { decision: "deny" }
+              : { decision: "abstain" },
+        },
+        // 要报告时工具输出可能已经很多（上面停下时、或者已经超出窗口）：只放进最近的一部分
+        {
+          kind: "transform",
+          point: "context.project",
+          fn: (messages) => (control.wrapUp ? fitToolResults(messages, window() * REPORT_TOOL_SHARE * CHARS_PER_TOKEN, `${opts.id}/subagent`) : messages),
+        },
       ],
     }),
   ];
@@ -175,7 +236,7 @@ export function taskTool(opts: TaskOptions): Tool {
     idempotent: true,
     async execute(input, ctx): Promise<ToolResult> {
       const { description, prompt } = input as { description: string; prompt: string };
-      const control = { wrapUp: false };
+      const control: Control = { wrapUp: false };
       const child = await Runtime.create({
         store: new MemoryLogStore(),
         provider: opts.provider,
@@ -194,6 +255,8 @@ export function taskTool(opts: TaskOptions): Tool {
           const data = n.event.data as EventDataMap["model.responded"];
           for (const b of data.content) if (b.kind === "tool_use") names.set(b.id, b.name);
           for (const k of Object.keys(used) as (keyof Usage)[]) used[k] += data.usage?.[k] ?? 0;
+          // 输入 token 已含缓存部分（各 provider 的 Usage 约定）；这次的输出也会进下一次请求
+          if (data.usage) control.lastTokens = (data.usage.inputTokens ?? 0) + (data.usage.outputTokens ?? 0);
         } else if (n.event.type === "tool.decided") {
           const d = n.event.data as EventDataMap["tool.decided"];
           progress({ kind: "task-tool", name: names.get(d.toolUseId) ?? "?", input: d.input, decision: d.decision });
@@ -204,15 +267,27 @@ export function taskTool(opts: TaskOptions): Tool {
       else ctx.signal.addEventListener("abort", forward, { once: true });
       let failure: unknown;
       const turn = (text: string) => child.send({ kind: "message", content: [{ kind: "text", text, origin: { by: "runtime" }, trust: "trusted" }] });
+      let recovered: string | undefined;
       try {
-        await turn(prompt);
-        // 步数用完时最后一条回复通常只有工具调用：再要一次报告，否则前面的调研全白做了
-        if (!lastText(child.state.messages)) {
-          control.wrapUp = true;
-          await turn(WRAP_UP);
+        try {
+          await turn(prompt);
+        } catch (err) {
+          failure = err;
         }
-      } catch (err) {
-        failure = err;
+        // 步数用完或历史接近窗口时，最后一条回复通常只有工具调用；出错（例如超出上下文窗口）时也没有报告。
+        // 再要一次报告，否则前面的调研全白做了。重试已经用完的错误（限流、服务不可用）不再要：再试一次也一样，还要再等很久
+        const cause = unwrap(failure);
+        const exhausted = cause instanceof ProviderError && cause.retryable;
+        if (!ctx.signal.aborted && !exhausted && !lastText(child.state.messages)) {
+          control.wrapUp = true;
+          try {
+            await turn(WRAP_UP);
+            if (failure !== undefined) recovered = cause instanceof Error ? cause.message : String(cause);
+            failure = undefined;
+          } catch (err) {
+            failure ??= err;
+          }
+        }
       } finally {
         ctx.signal.removeEventListener("abort", forward);
         await child.close().catch(() => {});
@@ -226,9 +301,20 @@ export function taskTool(opts: TaskOptions): Tool {
         const msg = failure instanceof Error ? failure.message : String(failure);
         return { content: `Sub-agent failed: ${msg}${text ? `\nLast output:\n${text}` : ""}`, isError: true };
       }
+      if (recovered && text) return { content: `(The sub-agent stopped on an error: ${recovered}. This report was written afterwards from what it had found.)\n\n${text}` };
       return { content: text || "(sub-agent returned no text)", isError: !text };
     },
   };
+}
+
+/**
+ * 模型调用经 models@1 跨插件，错误被宿主的膜包成 PluginError（原来的错误在 cause 里）。
+ * 插件不从宿主 import 值，按 name 认
+ */
+function unwrap(err: unknown): unknown {
+  let e = err;
+  for (let i = 0; i < 5 && e instanceof Error && e.name === "PluginError" && e.cause !== undefined; i++) e = e.cause;
+  return e;
 }
 
 const textOf = (m: Message) => m.content.flatMap((b) => (b.kind === "text" ? [b.text] : [])).join("\n").trim();

@@ -45,7 +45,9 @@ export interface AnthropicProviderOptions {
 }
 
 export function anthropicProvider(opts: AnthropicProviderOptions = {}): Provider {
-  const client = opts.client ?? new Anthropic({ apiKey: opts.apiKey, baseURL: opts.baseURL });
+  // SDK 自己的重试关掉：重试和限流归包装 Provider（宪法第九章、4.7），两层叠加会把等待时间乘上几倍，
+  // SDK 遇到 429 自己重试也绕开了包装者的限流
+  const client = opts.client ?? new Anthropic({ apiKey: opts.apiKey, baseURL: opts.baseURL, maxRetries: 0 });
   const model = opts.model ?? "claude-opus-5-5";
 
   return {
@@ -93,7 +95,7 @@ export function anthropicProvider(opts: AnthropicProviderOptions = {}): Provider
         }
         msg = await stream.finalMessage();
       } catch (err) {
-        throw toProviderError(err, signal);
+        throw toProviderError(err, signal, (client as { baseURL?: string }).baseURL);
       }
 
       const origin: Origin = { by: "model", provider: PROVIDER_ID, model: msg.model };
@@ -116,7 +118,7 @@ export function anthropicProvider(opts: AnthropicProviderOptions = {}): Provider
 }
 
 /** SDK 的错误转成 ProviderError；读流中途的其他错误（连接中断等）可以重试；取消照原样抛出 */
-function toProviderError(err: unknown, signal: AbortSignal): unknown {
+function toProviderError(err: unknown, signal: AbortSignal, baseURL?: string): unknown {
   if (signal.aborted || err instanceof Anthropic.APIUserAbortError) return err;
   if (!(err instanceof Anthropic.APIError)) {
     return new ProviderError(`${PROVIDER_ID} stream failed: ${err instanceof Error ? err.message : String(err)}`, {
@@ -125,7 +127,9 @@ function toProviderError(err: unknown, signal: AbortSignal): unknown {
     });
   }
   const status = err.status;
-  return new ProviderError(`${PROVIDER_ID} ${status === undefined ? "request failed" : `HTTP ${status}`}: ${err.message}`, {
+  // 连不上时说出连的是哪里：地址或代理配错时用户才知道该查什么
+  const what = status !== undefined ? `HTTP ${status}` : baseURL ? `could not reach ${baseURL}` : "request failed";
+  return new ProviderError(`${PROVIDER_ID} ${what}: ${err.message}`, {
     // 没有状态码的是连接错误
     retryable: status === undefined || status === 408 || status === 429 || status >= 500,
     status,

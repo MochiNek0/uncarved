@@ -51,19 +51,32 @@ async function setup(script: unknown[], config?: unknown) {
   await writeFile(path.join(dir, "index.mjs"), FAKE_MODEL);
   await writeFile(path.join(dir, "script.json"), JSON.stringify(script));
   if (config) await writeFile(path.join(home, "config.json"), JSON.stringify(config));
-  const run = (...args: string[]) => {
-    const r = spawnSync(process.execPath, [BIN, ...args], { cwd, env: { ...process.env, JADE_HOME: home }, encoding: "utf8", timeout: 30_000 });
+  const runWith = (input: string | undefined, ...args: string[]) => {
+    const r = spawnSync(process.execPath, [BIN, ...args], { cwd, env: { ...process.env, JADE_HOME: home }, encoding: "utf8", timeout: 30_000, ...(input !== undefined ? { input } : {}) });
     return { code: r.status, stdout: r.stdout, stderr: r.stderr };
   };
+  const run = (...args: string[]) => runWith(undefined, ...args);
   const requests = async () =>
     (await readFile(path.join(dir, "requests.jsonl"), "utf8"))
       .trim()
       .split("\n")
       .map((l) => JSON.parse(l) as { system: string[]; tools: string[]; last: { content: { kind: string; content?: { text: string }[] }[] } });
-  return { home, cwd, run, requests };
+  return { home, cwd, run, runWith, requests };
 }
 
 describe("jade -p", () => {
+  test("stdin is read with \"-\" (after the prompt), or when there is no prompt; otherwise it is left alone", async () => {
+    const w = await setup([say("a"), say("b"), say("c")]);
+    const text = async (i: number) => ((await w.requests())[i]!.last.content as unknown as { text: string }[])[0]!.text;
+    expect(w.runWith("the log", "-p", "-", "explain").code).toBe(0);
+    expect(await text(0)).toBe("explain\n\nthe log");
+    // 没写 "-"：有 prompt 时不读 stdin（脚本里 stdin 常是没人关的管道）
+    expect(w.runWith("the log", "-p", "explain").code).toBe(0);
+    expect(await text(1)).toBe("explain");
+    expect(w.runWith("just stdin", "-p").code).toBe(0);
+    expect(await text(2)).toBe("just stdin");
+  });
+
   test("writes a file when the approval mode allows changes in the working directory", async () => {
     const w = await setup([use("write_file", { path: "hello.txt", content: "hi\n" }), say("Created hello.txt.")], { "jade/approval": { mode: "auto" } });
     const r = w.run("-p", "create hello.txt");
@@ -130,6 +143,14 @@ describe("jade -p", () => {
     const r = w.run("-p", "hi");
     expect(r.code).toBe(1);
     expect(r.stderr).toContain("error: script exhausted");
+  });
+
+  test("--resume with an unknown session says so without the plugin wrapper", async () => {
+    const w = await setup([]);
+    const r = w.run("-p", "--resume", "no-such-session", "hi");
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain("jade: could not resume no-such-session: session no-such-session not found");
+    expect(r.stderr).not.toContain("plugin jade/print");
   });
 
   test("without a prompt prints usage", async () => {

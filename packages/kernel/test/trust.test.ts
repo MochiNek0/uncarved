@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -9,6 +10,7 @@ import {
   MemoryTrustStore,
   Runtime,
   UntrustedPlugin,
+  hashDir,
   importProjectModule,
   loadProjectPlugin,
   loadProjectPluginFactory,
@@ -320,4 +322,20 @@ export default { session() {} };
 test("a plugin marked project without mark is still rejected by Runtime", async () => {
   const p: Plugin = { id: "forged", version: "1.0.0", kernel: `^${KERNEL_VERSION.split(".").slice(0, 2).join(".")}`, layer: "project" };
   await expect(Runtime.create({ store: new MemoryLogStore(), provider, plugins: [p] })).rejects.toThrow(UntrustedPlugin);
+});
+
+test("hashDir 并发读取，结果与按路径顺序逐个计入相同", async () => {
+  const root = path.join(dir, "many");
+  await mkdir(path.join(root, "sub"), { recursive: true });
+  for (let i = 0; i < 100; i++) await writeFile(path.join(root, i % 3 ? "sub" : "", `f${i}.txt`), `file ${i}\n`.repeat(i));
+  const files = (await readdir(root, { recursive: true, withFileTypes: true }))
+    .filter((e) => e.isFile())
+    .map((e) => path.relative(root, path.join(e.parentPath, e.name)).split(path.sep).join("/"))
+    .sort();
+  const h = createHash("sha256");
+  for (const rel of files) {
+    const content = await readFile(path.join(root, rel));
+    h.update(`${rel}\0${content.length}\0`).update(content);
+  }
+  expect(await hashDir(root)).toEqual({ hash: h.digest("hex"), files });
 });

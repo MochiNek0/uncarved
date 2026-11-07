@@ -9,7 +9,7 @@
 import type { Stats } from "node:fs";
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { Block, Tool } from "uncarved";
+import type { Block, Message, Tool } from "uncarved";
 import { grepTool } from "./grep.ts";
 import { globMatcher, run } from "./sys.ts";
 
@@ -49,6 +49,8 @@ export interface FsOptions {
   responses?: { readonly calls: number };
   /** grep 用的 ripgrep，默认 "rg"；null 表示不用（测试） */
   rg?: string | null;
+  /** 记录读过的文件；给了才能在压缩后让它们失效（见 SeenFiles.prune） */
+  seen?: SeenFiles;
 }
 
 /** 读过或写过的文件当时的样子；只在本会话、本进程内有效，恢复的会话要重新读 */
@@ -57,16 +59,54 @@ interface Seen {
   size: number;
   /** 读取时的 responses.calls；写入的文件模型知道内容，记为 -1 */
   call: number;
+  /**
+   * 模型从哪一次调用知道这个文件的内容：read_file 或 write_file 的 toolUseId。
+   * edit_file 只改了一部分，模型知道的仍是之前那次读取（加上改动），所以沿用原来的
+   */
+  id?: string;
+}
+
+/** 本会话读过、写过的文件 */
+export class SeenFiles {
+  readonly files = new Map<string, Seen>();
+  /** 因为压缩而失效的文件：再改时说明原因，而不是说"没读过" */
+  readonly dropped = new Set<string>();
+
+  /**
+   * 压缩或清理之后，模型看不到当初读到（写入）的内容了，但 mtime 和 size 没变，修改仍会放行；
+   * write_file 可能凭摘要里的记忆写出整个文件。这里按最终的投影检查：那次调用已被总结掉（投影里没有它的 tool_use），
+   * 或者结果已被清理（tool_result 里没有工具自己给的内容，只剩插件的占位说明），就当作没读过
+   */
+  prune(projection: Message[]): void {
+    const uses = new Set<string>();
+    const cleared = new Set<string>();
+    for (const m of projection) {
+      for (const b of m.content) {
+        if (b.kind === "tool_use") uses.add(b.id);
+        else if (b.kind === "tool_result" && !b.content.some((c) => c.origin.by === "tool")) cleared.add(b.toolUseId);
+      }
+    }
+    for (const [full, s] of this.files) {
+      if (s.id === undefined || (uses.has(s.id) && !cleared.has(s.id))) continue;
+      this.files.delete(full);
+      this.dropped.add(full);
+    }
+  }
 }
 
 export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
   const at = (p: unknown) => resolveIn(cwd, p as string);
-  const seen = new Map<string, Seen>();
-  /** 文件没变时保留更早的 call：之前的回复里读过，这次回复里又读一遍，不影响修改 */
-  const remember = (full: string, info: Stats, call: number) => {
+  const tracked = opts.seen ?? new SeenFiles();
+  const seen = tracked.files;
+  /**
+   * 文件没变时保留更早的 call：之前的回复里读过，这次回复里又读一遍，不影响修改。
+   * id 为 undefined 表示沿用原来的（edit_file）
+   */
+  const remember = (full: string, info: Stats, call: number, id: string | undefined) => {
     const s = seen.get(full);
     const same = s !== undefined && s.mtimeMs === info.mtimeMs && s.size === info.size;
-    seen.set(full, { mtimeMs: info.mtimeMs, size: info.size, call: same ? Math.min(s.call, call) : call });
+    seen.set(full, { mtimeMs: info.mtimeMs, size: info.size, call: same ? Math.min(s.call, call) : call, id: id ?? s?.id });
+    tracked.dropped.delete(full);
   };
   /** 不能修改已有文件的原因；可以修改时返回 undefined。text 是文件现在的内容 */
   const staleness = (full: string, info: Stats): string | undefined => {
@@ -79,6 +119,9 @@ export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
         return `${shown} was read in the same response as this change, so the change was written before its content was seen. Check the read_file result, then make the change in your next response.`;
       }
       return undefined;
+    }
+    if (tracked.dropped.has(full)) {
+      return `The earlier read of ${shown} was compacted out of the conversation, so its content is no longer in context. Read it again before changing it.`;
     }
     return `${shown} exists but has not been read in this session. Read it with read_file before changing it.`;
   };
@@ -98,7 +141,7 @@ export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
     effect: "read",
     concurrency: "safe",
     idempotent: true,
-    async execute(input) {
+    async execute(input, ctx) {
       const { path: p, offset = 1, limit = MAX_LINES } = input as { path: string; offset?: number; limit?: number };
       if (limit < 1) return { content: "limit must be at least 1", isError: true };
       const full = at(p);
@@ -130,7 +173,7 @@ export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
         return { content: `${display(cwd, full)} is a binary file (${buf.length} bytes) and cannot be shown as text`, isError: true };
       }
       const text = buf.toString("utf8");
-      remember(full, info, opts.responses?.calls ?? -1);
+      remember(full, info, opts.responses?.calls ?? -1, ctx?.toolUseId);
       if (text.length === 0) return { content: "(empty file)" };
       const lines = text.split(/\r?\n/);
       if (lines.at(-1) === "") lines.pop();
@@ -170,7 +213,7 @@ export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
     concurrency: "exclusive",
     // 写入完整内容，重复执行结果相同
     idempotent: true,
-    async execute(input) {
+    async execute(input, ctx) {
       const { path: p, content: given } = input as { path: string; content: string };
       const full = at(p);
       const info = await statOrUndefined(full);
@@ -183,7 +226,7 @@ export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
       if (problem) return { content: problem, isError: true };
       await mkdir(path.dirname(full), { recursive: true });
       await writeFile(full, content);
-      remember(full, await stat(full), -1);
+      remember(full, await stat(full), -1, ctx?.toolUseId);
       // 和 read_file 一样数行：末尾的换行不算多出一行
       const lines = content === "" ? 0 : content.split(/\r?\n/).length - (/\r?\n$/.test(content) ? 1 : 0);
       return { content: `Wrote ${lines} lines to ${display(cwd, full)}` };
@@ -210,7 +253,7 @@ export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
       total += r.count;
     }
     await writeFile(full, next);
-    remember(full, await stat(full), -1);
+    remember(full, await stat(full), -1, undefined);
     return { content: `Edited ${shown} (${total} replacement${total === 1 ? "" : "s"})` };
   };
 
@@ -286,6 +329,7 @@ export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
     name: "glob",
     description:
       `Find files by glob pattern (e.g. "src/**/*.ts"), relative to path (default: the working directory). ` +
+      `Unlike grep's include, "*.ts" matches only directly under path; use "**/*.ts" for any depth. ` +
       `Skips files ignored by git, .git and node_modules. Returns at most ${MAX_GLOB} paths.`,
     inputSchema: {
       type: "object",
@@ -316,7 +360,8 @@ export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
         out.push(display(cwd, path.join(root, rel)));
       }
       out.sort();
-      if (out.length === 0) return { content: "No files matched" };
+      // 和 grep 的 include 不同，不含 / 的模式只匹配第一层：模型常按 grep 的习惯写
+      if (out.length === 0) return { content: pattern.includes("/") || pattern.startsWith("**") ? "No files matched" : `No files matched. "${pattern}" only matches directly under ${p === "." ? "the working directory" : p}; use "**/${pattern}" to search at any depth.` };
       return { content: out.join("\n") + (more ? `\n(more than ${MAX_GLOB} matches; narrow the pattern)` : "") };
     },
   };
@@ -366,7 +411,9 @@ function replaceIn(text: string, { old_string, new_string, replace_all }: Edit, 
   const pattern = new RegExp(old_string.split(/\r?\n/).map(escapeRegExp).join("\\r?\\n"), "g");
   const count = text.match(pattern)?.length ?? 0;
   if (count === 0) return `old_string not found in ${shown}${nearMiss(text, old_string)}`;
-  if (count > 1 && !replace_all) return `old_string occurs ${count} times in ${shown}; add context to make it unique or set replace_all`;
+  if (count > 1 && !replace_all) {
+    return `old_string occurs ${count} times in ${shown} (${linesOf(text, pattern, 5)}); add context to make it unique or set replace_all`;
+  }
   // new_string 的换行沿用被替换那段的；那段只有一行时沿用整个文件的，单行改成多行也不会混进 LF
   const fileEol = eolOf(text, "\n");
   const to = (matched: string) => (new_string.includes("\r\n") ? new_string : new_string.replaceAll("\n", eolOf(matched, fileEol)));
@@ -374,11 +421,30 @@ function replaceIn(text: string, { old_string, new_string, replace_all }: Edit, 
   return { text: text.replace(replace_all ? pattern : new RegExp(pattern.source), to), count: replace_all ? count : 1 };
 }
 
+/** pattern 前 max 处匹配所在的行号，例如 "lines 3, 17, 40" */
+function linesOf(text: string, pattern: RegExp, max: number): string {
+  const found: number[] = [];
+  let line = 1;
+  let from = 0;
+  for (const m of text.matchAll(new RegExp(pattern.source, "g"))) {
+    for (let i = from; i < m.index; i++) if (text.charCodeAt(i) === 10) line++;
+    from = m.index;
+    found.push(line);
+    if (found.length === max) break;
+  }
+  return `line${found.length > 1 ? "s" : ""} ${found.join(", ")}${found.length === max ? ", …" : ""}`;
+}
+
 /**
  * old_string 找不到时帮模型定位：忽略空白后能匹配到哪几行，或者第一行出现在哪里。
  * 只给提示，不自动按模糊匹配修改：那样可能改错地方
  */
 export function nearMiss(text: string, needle: string): string {
+  // 最常见的一种：把 read_file 每行开头的行号和制表符一起抄进来了
+  const raw = needle.split(/\r?\n/).filter((l) => l.trim() !== "");
+  if (raw.length > 0 && raw.every((l) => /^\s*\d+\t/.test(l))) {
+    return ". It seems to include read_file's line-number prefixes (the number and tab at the start of each line); they are not part of the file. Remove them and keep the rest exactly";
+  }
   const norm = (l: string) => l.trim().replace(/\s+/g, " ");
   const lines = text.split(/\r?\n/).map(norm);
   const want = needle.split(/\r?\n/).map(norm);

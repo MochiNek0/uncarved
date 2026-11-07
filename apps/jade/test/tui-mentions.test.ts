@@ -67,4 +67,11 @@ describe("@ reference helpers", () => {
     // 空 query：只给顶层的文件和目录（保持候选原来的顺序）
     expect(rankPaths([...paths, "a.ts"], "", 10).sort()).toEqual(["a.ts", "util/"]);
   });
+
+  test("rankPaths gives the same result when the query grows one key at a time, and after it shrinks", () => {
+    const paths = Array.from({ length: 300 }, (_, i) => `pkg${i % 7}/src/${["util", "main", "Ui", "tools"][i % 4]}${i}.ts`);
+    // 每次换一个新数组：不用上一次的结果
+    const fresh = (q: string) => rankPaths([...paths], q, 1000);
+    for (const q of ["u", "ut", "uti", "util", "util1", "ut", "m", "mi", "src/u", "SRC/U"]) expect(rankPaths(paths, q, 1000)).toEqual(fresh(q));
+  });
 });

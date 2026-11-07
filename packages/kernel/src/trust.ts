@@ -150,7 +150,7 @@ export interface ProjectModule {
 /**
  * 确认并导入一个项目层插件目录的入口模块，模块的形状由宿主决定（7.1）。
  * 依次：对整个目录计算哈希、检查入口在目录内、检查 import 不出目录、未确认过的内容请求确认、
- * 确认后再核对一次哈希、导入。任何一步不通过都抛 UntrustedPlugin，且不执行插件的任何代码。
+ * 等过确认的再核对一次哈希（早已确认过的不再算）、导入。任何一步不通过都抛 UntrustedPlugin，且不执行插件的任何代码。
  * 只想加载默认导出内核插件的模块时，用 loadProjectPlugin / loadProjectPluginFactory
  */
 export async function importProjectModule(dir: string, opts: TrustOptions & { entry?: string }): Promise<ProjectModule> {
@@ -160,9 +160,14 @@ export async function importProjectModule(dir: string, opts: TrustOptions & { en
   const entry = path.relative(root, path.resolve(root, opts.entry ?? "index.ts")).split(path.sep).join("/");
   if (!files.includes(entry)) throw new UntrustedPlugin(root, `entry ${JSON.stringify(opts.entry ?? "index.ts")} is not a file in the plugin directory`);
   await checkImports(root, files);
+  const known = await opts.trust.has(hash);
   const grant = await requireTrust({ path: root, hash, files }, opts);
-  // 等用户确认可能要很久，期间目录可能被改：确认的必须就是要导入的内容
-  if ((await hashDir(root)).hash !== hash) throw new UntrustedPlugin(root, "changed while waiting for confirmation");
+  // 等用户确认可能要很久，期间目录可能被改：确认的必须就是要导入的内容。
+  // 早已确认过、没有等待的不再算一遍：带依赖的目录每次启动要多花一两秒，而且算的期间同样可能被改，并不更安全
+  if (!known && (await hashDir(root)).hash !== hash) {
+    grants.delete(grant);
+    throw new UntrustedPlugin(root, "changed while waiting for confirmation");
+  }
 
   const prev = imported.get(root);
   if (prev !== undefined && prev !== hash) throw new UntrustedPlugin(root, "changed since it was imported; restart to load it");
@@ -278,9 +283,24 @@ export async function hashDir(root: string): Promise<{ hash: string; files: stri
   }
   files.sort();
   const h = createHash("sha256");
-  for (const rel of files) {
-    const content = await readFile(path.join(root, rel));
-    h.update(`${rel}\0${content.length}\0`).update(content);
+  // 并发读取、按顺序计入：串行读几千个文件（带依赖的插件目录）要一秒以上
+  const reads: Promise<Buffer>[] = [];
+  const start = (i: number) => {
+    if (i < files.length) reads[i] = readFile(path.join(root, files[i]!));
+  };
+  for (let i = 0; i < HASH_CONCURRENCY; i++) start(i);
+  try {
+    for (const [i, rel] of files.entries()) {
+      const content = await reads[i]!;
+      start(i + HASH_CONCURRENCY);
+      h.update(`${rel}\0${content.length}\0`).update(content);
+    }
+  } finally {
+    // 出错提前退出时，还在读的不要变成未处理的拒绝
+    for (const r of reads) r?.catch(() => {});
   }
   return { hash: h.digest("hex"), files };
 }
+
+/** hashDir 同时读取的文件数 */
+const HASH_CONCURRENCY = 32;

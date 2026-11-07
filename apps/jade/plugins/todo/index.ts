@@ -46,9 +46,9 @@ export function todoTool(): Tool {
       required: ["todos"],
       additionalProperties: false,
     },
-    // 不碰文件和进程
+    // 不碰文件和进程；可以和同一批的读并发（用到清单的地方按模型给出的顺序取最后一次调用，与执行顺序无关）
     effect: "read",
-    concurrency: "exclusive",
+    concurrency: "safe",
     idempotent: true,
     async execute(input) {
       const todos = (input as { todos?: unknown }).todos;

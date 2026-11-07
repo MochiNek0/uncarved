@@ -293,6 +293,36 @@ test("a message, an approval dialog, slash commands and /exit through the termin
   }
 });
 
+test("without a model, the first screen points at /model", async () => {
+  const { home, start } = await setup();
+  // 换成没有配置模型、但提供 /model 的模型插件
+  await writeFile(
+    path.join(home, "plugins", "fake-model", "plugin.json"),
+    JSON.stringify({ id: "test/fake-model", version: "1.0.0", api: "^1", entry: "index.mjs", provides: ["provider@1", "models@1"], optional: ["commands@1"], replaces: ["jade/models"] }),
+  );
+  await writeFile(
+    path.join(home, "plugins", "fake-model", "index.mjs"),
+    `export default { process(ctx) {
+      const complete = async () => { throw new Error("no model"); };
+      ctx.provide("provider@1", { id: "none", complete });
+      ctx.provide("models@1", { current: () => undefined, complete, list: async () => [] });
+      ctx.service("commands@1")?.register({ name: "model", description: "set up a model", run() {} });
+    } };`,
+  );
+  const t = fakeTerminal();
+  const host = await start();
+  try {
+    const done = host.service<Frontend>("frontend@1")!.run({ argv: [], sessions: host.sessions, signal: new AbortController().signal });
+    await until(() => t.output().includes("No model is configured yet"));
+    expect(t.output().replace(/\s+/g, " ")).toContain("Type /model to set one up");
+    await t.type("/exit");
+    await t.type("\r");
+    expect(await done).toBe(0);
+  } finally {
+    await host.close();
+  }
+});
+
 test("the notice about loaded instruction files survives the screen clear when the session opens", async () => {
   const { cwd, start } = await setup();
   await writeFile(path.join(cwd, "AGENTS.md"), "Be brief.");

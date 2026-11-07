@@ -21,14 +21,32 @@ import { mentionCandidates } from "./mentions.ts";
 import type { SessionIndex } from "../sessions/index.ts";
 import { dim, red, safeScreen, yellow, type CommandInfo, type Screen } from "./screen.ts";
 import { transcript, type Transcript } from "./transcript.ts";
-import { tuiScreen } from "./tui.ts";
+
+/**
+ * 界面（ink、React）用到时才加载：--help、参数出错、不在终端里时都不需要它，导入一次要几百毫秒。
+ * React 在加载时按 NODE_ENV 选开发版或生产版，开发版做大量检查，流式输出时 CPU 翻倍。
+ * 用户没设 NODE_ENV 时只在加载期间设成 production，加载完还原，免得传给之后 shell 工具、MCP 等子进程。
+ * ink 依赖的 yoga 有顶层 await，只能异步加载，做不到同步设置再还原：加载期间还没有会话，工具和 MCP 都没启动，
+ * 这时可能启动的子进程只有 git（不读它）和后台的 npm 自动升级（全局安装本来就不装 devDependencies）。
+ * 编译好的 plugins-dist 里 ink、react 已打包成生产版（vendor.ts），这里设 NODE_ENV 只对直接跑源码（bun）时有用
+ */
+async function loadTui(): Promise<typeof import("./tui.ts")> {
+  if (process.env.NODE_ENV !== undefined) return import("./tui.ts");
+  process.env.NODE_ENV = "production";
+  try {
+    return await import("./tui.ts");
+  } finally {
+    delete process.env.NODE_ENV;
+  }
+}
 
 const USAGE = `usage: jade [prompt] [--resume <session id> | --continue]
 
 Starts the terminal interface. With a prompt, sends it first.
   -c, --continue  continue the most recent session in this directory
   -r, --resume    resume a session by id (inside jade, /resume lists them)
-Run one prompt without the interface: jade -p <prompt>`;
+Run one prompt without the interface: jade -p <prompt> (jade -p --help for more)
+jade's own commands (plugins, update, --safe): jade help`;
 
 /** 前端自己的命令：帮助和退出。其余命令都来自 commands@1 */
 const OWN: CommandInfo[] = [
@@ -244,7 +262,7 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
     return 2;
   }
   const history = new InputHistory(path.join(home, "history.jsonl"), cwd);
-  const [past, branch] = await Promise.all([history.load(), gitBranch(cwd)]);
+  const [past, branch, { tuiScreen }] = await Promise.all([history.load(), gitBranch(cwd), loadTui()]);
 
   /** 菜单里的命令：前端自己的 + 注册表里的，每次打开菜单时取 */
   const commandList = (): CommandInfo[] => [
@@ -314,6 +332,7 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
     screen,
     cwd,
     contextWindow: () => models?.current()?.contextWindow ?? 0,
+    maxTokens: () => models?.current()?.maxTokens,
     ...(compact ? { compactAt: () => compact.threshold() } : {}),
     canRetry,
     renderer: (tool) => renderers.forTool(tool),
@@ -573,7 +592,11 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
   } catch (e) {
     screen.log(red(`[error] ${errorText(e)}`));
   }
-  if (!models?.current()) screen.log(yellow(`No model is configured yet. Put ANTHROPIC_API_KEY=... (or OPENAI_API_KEY=...) in ${path.join(home, ".env")}, then restart jade.`));
+  if (!models?.current()) {
+    // /model（jade/models 提供）当场就能配好，不用重启；没有这条命令时只能改文件
+    const file = `put ANTHROPIC_API_KEY=... (or OPENAI_API_KEY=...) in ${path.join(home, ".env")}, then restart jade`;
+    screen.log(yellow(commands.list().some((c) => c.name === "model") ? `No model is configured yet. Type /model to set one up, or ${file}.` : `No model is configured yet. To set one up, ${file}.`));
+  }
   else if (!resumed) screen.log(dim("Type / for commands, esc to interrupt."));
   ready = true;
   for (const text of [...(args.prompt ? [args.prompt] : []), ...early.splice(0)]) onSubmit(text);

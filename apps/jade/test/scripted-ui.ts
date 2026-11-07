@@ -128,22 +128,27 @@ export async function scriptedHost(opts: { config?: Record<string, Record<string
     await writeFile(path.join(home, file), text);
   }
   const reports: string[] = [];
-  const host = await PluginHost.start({
-    roots: [
-      { layer: "bundled", root: BUNDLED },
-      { layer: "user", root: path.join(home, "plugins") },
-    ],
-    home,
-    cwd,
-    report: (m) => reports.push(m),
-  });
-  hosts.push(host);
+  const start = async () => {
+    const h = await PluginHost.start({
+      roots: [
+        { layer: "bundled", root: BUNDLED },
+        { layer: "user", root: path.join(home, "plugins") },
+      ],
+      home,
+      cwd,
+      report: (m) => reports.push(m),
+    });
+    hosts.push(h);
+    return h;
+  };
+  const host = await start();
   /** 发一条消息，等会话空闲（包括 afterTurn 排进来的重试）；这一轮失败时不抛出 */
   const send = async (s: Session, text: string) => {
     await s.send({ kind: "message", content: userText(text) }).catch(() => {});
     await s.idle();
   };
-  return { home, cwd, host, shared, reports, send };
+  /** 同一个 home 再启动一个宿主，相当于重启 jade（例如测试改写过的日志要由新的日志存储读取） */
+  return { home, cwd, host, shared, reports, send, restart: start };
 }
 
 /** 一条消息里的全部文字 */

@@ -19,6 +19,8 @@ export interface TranscriptOptions {
   contextWindow(): number;
   /** 自动压缩的阈值（状态栏显示用） */
   compactAt?(): number;
+  /** 每次回复的输出上限（回复被截断时的提示用）；没有时说是服务的默认值 */
+  maxTokens?(): number | undefined;
   /** 上一轮失败后能否用 /retry 重新请求 */
   canRetry(): boolean;
   /** 插件为自己的工具注册的显示方式（随会话的插件实例变） */
@@ -391,7 +393,9 @@ export function transcript(opts: TranscriptOptions): Transcript {
         if (d.reason === "stopped") screen.log(yellow("[stopped: step budget for this turn used up; send a message to continue]"));
         else if (d.reason === "aborted") screen.log(yellow("[interrupted]"));
         else if (d.reason === "max_tokens") {
-          const limit = process.env.JADE_MAX_TOKENS ? `${process.env.JADE_MAX_TOKENS} tokens` : "the provider's default";
+          // 不读 process.env：写在 $JADE_HOME/.env 里的只有 models 插件知道
+          const max = opts.maxTokens?.();
+          const limit = max ? `${max} tokens` : "the provider's default";
           screen.log(yellow(`[reply cut off at the output limit (${limit}); raise it with /model if this keeps happening]`));
         } else if (d.reason !== "end") screen.log(yellow(`[turn ended: ${d.reason}${d.error ? ` — ${d.error}` : ""}]`));
         if (self.turnFailed && !replaying && opts.canRetry()) screen.log(dim("[send /retry to request again without adding a message]"));

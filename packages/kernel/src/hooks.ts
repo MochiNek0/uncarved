@@ -213,7 +213,10 @@ export class HookBus {
     return best;
   }
 
-  /** 并发执行，调用方不等待，错误只记录。未完成的 observe 由 idle() 等待 */
+  /**
+   * 并发执行，调用方不等待，错误只记录。未完成的 observe 由 idle() 等待。
+   * 返回之前就为每个 hook 拷贝好 payload：运行时直接交出状态和日志事件本身，不再先拷一份（I-5）
+   */
   observe<P extends ObservePoint>(point: P, payload: ObservePayloads[P], ctx: HookContextFor): void {
     for (const h of this.ordered(point)) {
       if (h.spec.kind !== "observe") continue;

@@ -27,9 +27,9 @@ const APPROVER = {
 } };`,
 };
 
-async function run(answers: string[], interactive: boolean, uiAnswers: (string | undefined)[] = []) {
+async function run(answers: string[], interactive: boolean, uiAnswers: (string | undefined)[] = [], config?: object) {
   g.__approver = { answers, seen: [], aborted: 0 };
-  const w = await featureHost({ plugins: [APPROVER] });
+  const w = await featureHost({ plugins: [APPROVER], ...(config ? { config } : {}) });
   w.state.interactive = interactive;
   w.state.answers = uiAnswers;
   w.state.script.push({ content: [use("w", "write_file", { path: "hello.txt", content: "hi\n" })], stopReason: "tool_use" }, reply("done"));
@@ -73,5 +73,18 @@ describe("approvers", () => {
     const allowed = await run(["maybe"], true, ["once"]);
     expect(allowed.written).toBe(true);
     expect(allowed.state.selects).toHaveLength(1);
+  }, 30_000);
+
+  test("askTimeoutMinutes bounds the wait for an answer; past it the call is denied", async () => {
+    const r = await run(["hang"], false, [], { "jade/approval": { askTimeoutMinutes: 0.005 } });
+    expect(r.written).toBe(false);
+    expect(r.approver.aborted).toBe(1);
+    expect(r.state.notes.join(" ")).not.toContain("askTimeoutMinutes");
+  }, 30_000);
+
+  test("a bad askTimeoutMinutes is reported and the default is used", async () => {
+    const r = await run(["once"], false, [], { "jade/approval": { askTimeoutMinutes: "soon" } });
+    expect(r.written).toBe(true);
+    expect(r.state.notes.join(" ")).toContain('askTimeoutMinutes must be a number of minutes between 0 and 10080, got "soon"; using 24 hours');
   }, 30_000);
 });

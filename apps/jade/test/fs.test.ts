@@ -6,7 +6,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { Block, Tool, ToolContext } from "uncarved";
-import { fsTools, nearMiss } from "../plugins/fs/fs.ts";
+import { applyEditsToText, fsTools, nearMiss, SeenFiles } from "../plugins/fs/fs.ts";
 
 // ---------- 辅助 ----------
 
@@ -54,6 +54,9 @@ describe("fs tools", () => {
     expect(await readFile(path.join(cwd, "src/a.ts"), "utf8")).toBe("const a = 1;\nlet b = 2;\n");
 
     expect((await run(tools, "glob", { pattern: "**/*.ts" })).text).toBe("src/a.ts");
+    // 不含 / 的模式只匹配第一层：没命中时提示 **/
+    expect((await run(tools, "glob", { pattern: "*.ts" })).text).toBe(`No files matched. "*.ts" only matches directly under the working directory; use "**/*.ts" to search at any depth.`);
+    expect((await run(tools, "glob", { pattern: "src/*.js" })).text).toBe("No files matched");
     expect((await run(tools, "grep", { pattern: "let \\w", include: "**/*.ts" })).text).toBe("src/a.ts:2:let b = 2;");
   });
 
@@ -174,6 +177,46 @@ describe("fs tools", () => {
     expect((await run(tools, "edit_file", { path: "q.txt", old_string: "b", new_string: "c" })).isError).toBe(false);
   });
 
+  test("files whose read was compacted out of the projection must be read again", async () => {
+    const cwd = await workspace();
+    await writeFile(path.join(cwd, "a.txt"), "a\n");
+    await writeFile(path.join(cwd, "b.txt"), "b\n");
+    const seen = new SeenFiles();
+    const tools = fsTools(cwd, { seen });
+    const call = (id: string, name: string, input: unknown) => tools.find((t) => t.name === name)!.execute(input, { ...ctx(), toolUseId: id });
+    await call("r1", "read_file", { path: "a.txt" });
+    await call("r2", "read_file", { path: "b.txt" });
+    // edit_file 不算重新知道整个文件：仍然以 r1 那次读取为准
+    expect((await call("e1", "edit_file", { path: "a.txt", old_string: "a", new_string: "A" })).isError).toBeFalsy();
+
+    const use = (id: string): Block => ({ kind: "tool_use", id, name: "read_file", input: {}, origin: { by: "model", provider: "p", model: "m" }, trust: "trusted" });
+    const result = (id: string, by: "tool" | "plugin"): Block => ({
+      kind: "tool_result",
+      toolUseId: id,
+      isError: false,
+      content: [{ kind: "text", text: "…", origin: by === "tool" ? { by: "tool", name: "read_file" } : { by: "plugin", id: "jade/compact" }, trust: "trusted" }],
+      origin: { by: "tool", name: "read_file" },
+      trust: "trusted",
+    });
+    // 两次读取都还在投影里：照常可以改
+    seen.prune([
+      { role: "assistant", content: [use("r1"), use("r2")] },
+      { role: "user", content: [result("r1", "tool"), result("r2", "tool")] },
+    ]);
+    expect((await call("e2", "edit_file", { path: "b.txt", old_string: "b", new_string: "B" })).isError).toBeFalsy();
+    // r1 被总结掉、r2 的输出被清理：都要重新读，并说明原因
+    seen.prune([
+      { role: "assistant", content: [use("r2")] },
+      { role: "user", content: [result("r2", "plugin")] },
+    ]);
+    for (const p of ["a.txt", "b.txt"]) {
+      const r = await call("w", "write_file", { path: p, content: "x\n" });
+      expect(r).toMatchObject({ isError: true, content: expect.stringContaining("compacted out of the conversation") });
+    }
+    await call("r3", "read_file", { path: "a.txt" });
+    expect((await call("w2", "write_file", { path: "a.txt", content: "x\n" })).isError).toBeFalsy();
+  });
+
   test("read_file returns images as image blocks and refuses other binary files", async () => {
     const cwd = await workspace();
     await writeFile(path.join(cwd, "p.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0, 1]));
@@ -256,6 +299,22 @@ describe("edit hints and multi_edit", () => {
     expect(nearMiss(text, "function f() {\n    return 1;\n}")).toContain("lines 1-3 if whitespace is ignored");
     expect(nearMiss(text, "function f() {\n  return 2;\n}")).toContain('first line "function f() {" appears at line 1');
     expect(nearMiss(text, "something else")).toBe("");
+  });
+
+  test("nearMiss recognizes read_file's line-number prefixes copied into old_string", () => {
+    const text = "function f() {\n\treturn 1;\n}\n";
+    expect(nearMiss(text, "1\tfunction f() {\n2\t\treturn 1;")).toContain("line-number prefixes");
+    // 只有部分行像行号时不算
+    expect(nearMiss(text, "1\tfunction f() {\nreturn 1;")).not.toContain("line-number prefixes");
+  });
+
+  test("a non-unique old_string reports where it occurs", () => {
+    const text = "a\nx = 1\nb\nx = 1\nc\nx = 1\n";
+    expect(applyEditsToText(text, [{ old_string: "x = 1", new_string: "x = 2" }], "f.ts")).toBe(
+      "old_string occurs 3 times in f.ts (lines 2, 4, 6); add context to make it unique or set replace_all",
+    );
+    const many = "y\n".repeat(7);
+    expect(applyEditsToText(many, [{ old_string: "y", new_string: "z" }], "f.ts")).toContain("(lines 1, 2, 3, 4, 5, …)");
   });
 
   test("edit_file explains a near miss", async () => {

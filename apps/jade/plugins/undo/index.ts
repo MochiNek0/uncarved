@@ -9,12 +9,15 @@ import { realpathSync } from "node:fs";
 import path from "node:path";
 import { definePlugin } from "../../src/api.ts";
 import type { Commands } from "../commands/index.ts";
-import { Checkpoints, lastTurnChanges, sha256, type Checkpoint } from "./checkpoint.ts";
+import { Checkpoints, lastTurnChanges, sha256, turnToolNames, type Checkpoint } from "./checkpoint.ts";
 import { Notes } from "./notes.ts";
 import { dim, green } from "./style.ts";
 
 /** 会改文件、参数里有 path 的工具 */
 export const WRITE_TOOLS = new Set(["write_file", "edit_file", "multi_edit"]);
+
+/** shell 命令改了什么无从得知，撤销不了；这一轮跑过时提醒一句 */
+const SHELL_NOTE = "This turn also ran shell commands; what they changed is not undone.";
 
 const notes = new Notes();
 
@@ -49,13 +52,14 @@ export default definePlugin({
     const cwd = realPath(ctx.cwd);
     ctx.service<Commands>("commands@1")?.register({
       name: "undo",
-      description: "restore every file the agent changed in its last turn (run again to go further back)",
+      description: "restore the files the agent wrote or edited in its last turn, not changes made by shell commands (run again to go further back)",
       async run(_args, { sessions, ui, signal }) {
         const s = sessions.current;
         if (!s) return "No session is open.";
         const undone = await checkpoints.undone(s.id);
         const cps = lastTurnChanges(s.state.messages, await checkpoints.list(s.id), undone);
-        if (cps.length === 0) return dim("Nothing to undo.");
+        if (cps.length === 0) return dim(turnToolNames(s.state.messages).has("bash") ? `Nothing to undo. ${SHELL_NOTE}` : "Nothing to undo.");
+        const shellToo = turnToolNames(s.state.messages, cps[0]!.toolUseId).has("bash");
         /** 文件 → 这一轮最早的快照（恢复成它的 before）；cps 是最新的在前 */
         const files = new Map<string, Checkpoint>();
         for (const cp of cps) files.set(cp.path, cp);
@@ -92,7 +96,7 @@ export default definePlugin({
           cp.before === null ? `deleted ${show(cp.path)} (you had created it)` : `restored ${show(cp.path)} to its content before your changes`,
         );
         notes.add(s.id, `The user undid your changes from your last turn: ${what.join("; ")}. Read these files again before changing them.`);
-        return green(`Undid ${cps.length} change${cps.length > 1 ? "s" : ""} from the last turn:`) + "\n" + dim(list);
+        return green(`Undid ${cps.length} change${cps.length > 1 ? "s" : ""} from the last turn:`) + "\n" + dim(list) + (shellToo ? `\n${dim(SHELL_NOTE)}` : "");
       },
     });
   },

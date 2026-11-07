@@ -16,6 +16,17 @@ if (!process.versions.bun) {
   });
 }
 
+// 代理：Bun 的 fetch 自己读 HTTPS_PROXY 等变量；Node 的 fetch 默认不读（要 NODE_USE_ENV_PROXY=1），这里替它打开。
+// 只改本进程的网络设置，不改环境变量，子进程照旧按自己的规则处理
+if (!process.versions.bun && !process.env.NODE_USE_ENV_PROXY) {
+  const e = process.env;
+  if (e.HTTPS_PROXY || e.https_proxy || e.HTTP_PROXY || e.http_proxy) {
+    const http = await import("node:http");
+    if (typeof http.setGlobalProxyFromEnv === "function") http.setGlobalProxyFromEnv();
+    else console.error("jade: a proxy is set (HTTPS_PROXY), but this Node.js cannot apply it to jade's requests; use a newer Node.js, or Bun");
+  }
+}
+
 const { main } = await import(process.versions.bun ? "../src/main.ts" : "../dist/main.js");
 // 插件留下的句柄（定时器、子进程）不应让 jade 退不出去
 process.exit(await main(process.argv.slice(2)));
