@@ -54,6 +54,28 @@ test("an empty error result says why: a tool that does not exist", async () => {
   }
 });
 
+test("an empty error result says why: a gate that failed is not mistaken for a missing tool", async () => {
+  // 关卡 hook 抛错时内核按拒绝处理，不带 reason
+  const BROKEN_GATE = `export default { session(ctx) {
+  ctx.kernel.tool({ name: "peek", effect: "read", description: "peek", inputSchema: { type: "object" }, concurrency: "safe", idempotent: true,
+    async execute() { return { content: "peek ok" }; } });
+  ctx.kernel.hook({ kind: "gate", point: "tool.gate", fn: () => { throw new Error("gate broke"); } });
+} };`;
+  const { host, state } = await featureHost({ plugins: [{ manifest: { id: "test/broken-gate" }, code: BROKEN_GATE }] });
+  try {
+    state.script.push({ content: [use("u1", "peek", {})], stopReason: "tool_use" }, reply("ok"));
+    const s = await host.sessions.open();
+    await s.send(msg("hi"));
+    const [r] = results(state.requests[1]!);
+    expect(r!.isError).toBe(true);
+    expect(textOf(r!.content)).not.toContain("There is no tool named");
+    expect(textOf(r!.content)).toContain("gave no reason");
+    expect(s.state.derived["jade/prompts/empty-results"]).toBeUndefined();
+  } finally {
+    await host.close();
+  }
+});
+
 describe("explainEmptyResults", () => {
   const model = { by: "model", provider: "p", model: "m" } as const;
   const empty = (id: string, origin: Origin): Block => ({ kind: "tool_result", toolUseId: id, content: [], isError: true, origin, trust: "trusted" });
@@ -90,11 +112,15 @@ describe("explainEmptyResults", () => {
     expect(explainEmptyResults(messages, {}, "jade/prompts")).toBe(messages);
   });
 
-  test("whyEmpty only picks runtime denials without a reason and interruptions", () => {
+  test("whyEmpty only picks the runtime's own denials without a reason and interruptions", () => {
+    // 内核写的 tool.decided 一律是 runtime 来源；关卡的决定带 decidedBy
     const ev = (type: string, data: unknown, origin: Origin) => ({ v: 1, id: "e", seq: 1, at: "", type, data, origin }) as LogEvent;
-    expect(whyEmpty(ev("tool.decided", { toolUseId: "a", decision: "deny" }, { by: "runtime" }))).toEqual({ toolUseId: "a", why: "unknown-tool" });
-    expect(whyEmpty(ev("tool.decided", { toolUseId: "a", decision: "deny" }, { by: "plugin", id: "x" }))).toBeUndefined();
-    expect(whyEmpty(ev("tool.decided", { toolUseId: "a", decision: "allow" }, { by: "runtime" }))).toBeUndefined();
+    const runtime: Origin = { by: "runtime" };
+    expect(whyEmpty(ev("tool.decided", { toolUseId: "a", decision: "deny" }, runtime))).toEqual({ toolUseId: "a", why: "unknown-tool" });
+    // 关卡出错或超时：拒绝、没有 reason，但有 decidedBy
+    expect(whyEmpty(ev("tool.decided", { toolUseId: "a", decision: "deny", decidedBy: "jade/approval" }, runtime))).toBeUndefined();
+    expect(whyEmpty(ev("tool.decided", { toolUseId: "a", decision: "deny", reason: "no" }, runtime))).toBeUndefined();
+    expect(whyEmpty(ev("tool.decided", { toolUseId: "a", decision: "allow" }, runtime))).toBeUndefined();
     expect(whyEmpty(ev("tool.interrupted", { toolUseId: "b" }, { by: "runtime" }))).toEqual({ toolUseId: "b", why: "interrupted" });
   });
 });

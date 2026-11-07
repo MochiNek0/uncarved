@@ -2,10 +2,11 @@
 // 容易原样重试。这里在投影里按原因补一句说明（I-4：只改投影，不改日志）。
 //
 // 空结果有四种来源，块本身只能分出最后一种（origin 不是 runtime）：
-// - 调用了不存在的工具：运行时直接拒绝（tool.decided，origin runtime，没有 reason）
+// - 调用了不存在的工具：运行时直接拒绝（tool.decided 没有 reason，也没有 decidedBy）
 // - 崩溃恢复时，执行到一半的非幂等工具记为 tool.interrupted
 // - 这一轮先结束了（用户中断、出错、输出被截断），没有结果的调用由内核补成空的错误结果
-// - 关卡拒绝但没给原因（例如关卡 hook 出错，按拒绝处理）
+// - 关卡拒绝但没给原因（例如关卡 hook 出错或超时，按拒绝处理；tool.decided 有 decidedBy）
+// tool.decided 的 origin 一律是 runtime，分不出前一种和最后一种，要看 decidedBy（与内核 step.ts 的判断相同）。
 // 前两种只有日志事件分得出来，由 observe 记进 derived，投影时按它说明；恢复会话后同样成立，
 // 投影也只取决于日志，每次算出的结果相同，不破坏提示缓存。
 
@@ -16,9 +17,9 @@ export type Reasons = Readonly<Record<string, Why>>;
 
 /** 从事件判断空结果的原因；不是这两种返回 undefined */
 export function whyEmpty(e: LogEvent): { toolUseId: string; why: Why } | undefined {
-  if (e.type === "tool.decided" && e.origin.by === "runtime") {
-    const d = e.data as { toolUseId: string; decision: string; reason?: string };
-    if (d.decision === "deny" && !d.reason) return { toolUseId: d.toolUseId, why: "unknown-tool" };
+  if (e.type === "tool.decided") {
+    const d = e.data as { toolUseId: string; decision: string; reason?: string; decidedBy?: string };
+    if (d.decision === "deny" && !d.reason && d.decidedBy === undefined) return { toolUseId: d.toolUseId, why: "unknown-tool" };
   }
   if (e.type === "tool.interrupted") return { toolUseId: (e.data as { toolUseId: string }).toolUseId, why: "interrupted" };
   return undefined;
