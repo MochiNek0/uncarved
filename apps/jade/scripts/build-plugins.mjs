@@ -20,9 +20,11 @@ await cp(path.join(tmp, "plugins"), out, { recursive: true });
 await cp(path.join(pkg, "plugins"), out, { recursive: true, filter: (src) => !src.endsWith(".ts") });
 await rm(tmp, { recursive: true, force: true });
 
+const vendors = [];
 for (const entry of await readdir(out, { recursive: true, withFileTypes: true })) {
   if (!entry.isFile()) continue;
   const file = path.join(entry.parentPath, entry.name);
+  if (entry.name === "vendor.js") vendors.push(file);
   if (entry.name.endsWith(".js")) {
     const src = await readFile(file, "utf8");
     await writeFile(file, src.replace(/(["'])\.\.\/\.\.\/src\//g, "$1../../dist/"));
@@ -31,4 +33,10 @@ for (const entry of await readdir(out, { recursive: true, withFileTypes: true })
     if (typeof manifest.entry === "string") manifest.entry = manifest.entry.replace(/\.ts$/, ".js");
     await writeFile(file, JSON.stringify(manifest, null, 2) + "\n");
   }
+}
+
+// 插件目录里的 vendor.js 连同依赖打成一个文件（scripts/bundle-vendor.ts）：Node 逐个加载小模块很慢。
+// 打包要 Bun；仓库本来就用 Bun 安装、测试和发布
+if (vendors.length > 0) {
+  execFileSync("bun", [path.join(pkg, "scripts", "bundle-vendor.ts"), ...vendors], { stdio: "inherit" });
 }

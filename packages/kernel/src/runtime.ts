@@ -178,7 +178,8 @@ export class Runtime {
     }
     const rt = new Runtime(opts, initialState(opts.sessionId ?? newId()));
     await rt.#commit("session.started", { plugins: rt.#manifest, parent }, RUNTIME);
-    rt.#hooks.observe("session.start", structuredClone(rt.#state), rt.#hookCtx);
+    // observe 自己为每个 hook 同步拷贝，这里直接交出状态
+    rt.#hooks.observe("session.start", rt.#state, rt.#hookCtx);
     await rt.#settle();
     return rt;
   }
@@ -299,7 +300,7 @@ export class Runtime {
   async close(): Promise<void> {
     // 插件变化未被接受的会话也可以结束，所以不走 #enter
     await this.#exclusive(async () => {
-      this.#hooks.observe("session.end", structuredClone(this.#state), this.#hookCtx);
+      this.#hooks.observe("session.end", this.#state, this.#hookCtx);
       await this.#settle();
       await this.#commit("session.ended", {}, RUNTIME);
     });
@@ -468,7 +469,7 @@ export class Runtime {
       { content: res.content, stopReason: res.stopReason, usage: res.usage },
       { by: "model", provider: res.provider ?? this.#provider.id, model: res.model },
     );
-    this.#hooks.observe("model.after", structuredClone(res), this.#hookCtx);
+    this.#hooks.observe("model.after", res, this.#hookCtx);
   }
 
   async #decideTool(call: PendingCall): Promise<void> {
@@ -594,7 +595,7 @@ export class Runtime {
       // 否则 #settle 永远等不完
       if (depth > 0) this.#cascade++;
       if (depth < MAX_EVENT_DEPTH && this.#cascade <= MAX_CASCADE_EVENTS) {
-        this.#hooks.observe("event", structuredClone(event), this.#ctxAt(depth + 1));
+        this.#hooks.observe("event", event, this.#ctxAt(depth + 1));
       } else if (!this.#cascadeWarned) {
         this.#cascadeWarned = true;
         this.#notify({ type: "warning", code: "event-loop" });

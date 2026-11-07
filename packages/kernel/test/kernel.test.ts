@@ -1741,6 +1741,52 @@ describe("hook 之间的隔离", () => {
     await rt.send(say("hi"));
     expect(seen).toBe(1);
   });
+
+  test("observe 改了拿到的状态、事件或回复，改不到运行时的状态和日志（I-5）", async () => {
+    const { provider } = scripted([{ content: [text("ok")], stopReason: "end" }]);
+    const store = new MemoryLogStore();
+    const wipe = (v: unknown) => {
+      for (const k of Object.keys(v as object)) delete (v as Record<string, unknown>)[k];
+    };
+    const rt = await Runtime.create({
+      store,
+      provider,
+      plugins: [
+        plugin("mutator", {
+          hooks: [
+            { kind: "observe", point: "session.start", fn: wipe },
+            { kind: "observe", point: "session.end", fn: wipe },
+            { kind: "observe", point: "model.after", fn: wipe },
+            {
+              kind: "observe",
+              point: "event",
+              // 等一拍再改：运行时交出原对象之后仍不能被改到
+              fn: async (e: LogEvent) => {
+                await new Promise((resolve) => setTimeout(resolve, 0));
+                wipe(e.data);
+                wipe(e);
+              },
+            },
+          ],
+        }),
+      ],
+    });
+    await rt.send(say("hi"));
+    const before = rt.state;
+    expect(before.messages.at(-1)?.content).toEqual([text("ok")]);
+    await rt.close();
+    const logged: LogEvent[] = [];
+    for await (const e of store.read(before.sessionId)) logged.push(e);
+    expect(logged.map((e) => e.type)).toEqual([
+      "session.started",
+      "input.received",
+      "model.requested",
+      "model.responded",
+      "turn.ended",
+      "session.ended",
+    ]);
+    expect(rebuild(before.sessionId, logged.slice(0, -1))).toEqual(before);
+  });
 });
 
 describe("边界情况", () => {

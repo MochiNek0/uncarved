@@ -5,6 +5,7 @@
 // 不用 JSX：插件以 .ts 源码加载，Node 的类型剥离不处理 .tsx，所以组件用 createElement（h）写。
 
 import { writeSync } from "node:fs";
+import type { DOMElement, Key } from "ink";
 import {
   Box,
   render,
@@ -14,10 +15,6 @@ import {
   useInput,
   usePaste,
   useWindowSize,
-  type DOMElement,
-  type Key,
-} from "ink";
-import {
   createContext,
   createElement as h,
   useContext,
@@ -26,7 +23,7 @@ import {
   useRef,
   useState,
   useSyncExternalStore,
-} from "react";
+} from "./vendor.ts";
 import stringWidth from "string-width";
 import wrapAnsi from "wrap-ansi";
 import { mentionAt, mentionText, rankPaths } from "./mentions.ts";

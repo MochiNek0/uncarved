@@ -27,7 +27,8 @@ import { transcript, type Transcript } from "./transcript.ts";
  * React 在加载时按 NODE_ENV 选开发版或生产版，开发版做大量检查，流式输出时 CPU 翻倍。
  * 用户没设 NODE_ENV 时只在加载期间设成 production，加载完还原，免得传给之后 shell 工具、MCP 等子进程。
  * ink 依赖的 yoga 有顶层 await，只能异步加载，做不到同步设置再还原：加载期间还没有会话，工具和 MCP 都没启动，
- * 这时可能启动的子进程只有 git（不读它）和后台的 npm 自动升级（全局安装本来就不装 devDependencies）
+ * 这时可能启动的子进程只有 git（不读它）和后台的 npm 自动升级（全局安装本来就不装 devDependencies）。
+ * 编译好的 plugins-dist 里 ink、react 已打包成生产版（vendor.ts），这里设 NODE_ENV 只对直接跑源码（bun）时有用
  */
 async function loadTui(): Promise<typeof import("./tui.ts")> {
   if (process.env.NODE_ENV !== undefined) return import("./tui.ts");
