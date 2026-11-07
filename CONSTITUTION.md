@@ -124,10 +124,14 @@ step(state: State, event: LogEvent) => { state: State; effects: Effect[] }
 
 | Effect | 由运行时执行，结果作为事件回填 |
 |---|---|
-| `CallModel` | → `model.responded` |
-| `CallTool` | → `tool.completed` |
-| `AwaitInput` | → `input.received`（可能要等几个小时） |
-| `Emit` | 推送瞬时事件给订阅者 |
+| `CallModel` | 投影上下文、调 Provider → `model.responded` |
+| `DecideTools` | 逐个走 `tool.before`、`tool.gate` → `tool.decided`（含 `ask` 转入 `AwaitInput`） |
+| `RunTools` | 并发执行（`concurrency: "safe"`）或顺序执行被允许的工具 → `tool.completed` |
+| `AwaitInput` | 只通知订阅者，不驱动；等用户输入 → `input.received`（可能要等几个小时） |
+| `DecideContinue` | 走 `turn.continue` 关卡；`allow`/`abstain` 继续，否则 → `turn.ended` |
+| `EndTurn` | → `turn.ended` |
+
+流式增量（delta）、工具执行进度等瞬时通知由运行时直接推送给订阅者，不经过 Effect 队列。
 
 ### 4.2 运行时
 

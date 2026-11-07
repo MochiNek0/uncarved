@@ -147,6 +147,7 @@ export default definePlugin({
         allowed: (call) => ctx.service<Approval>("approval@1")?.allows(ctx.session.id, call) ?? false,
         id: ctx.plugin,
         usage: (toolUseId, u) => void usage.set(toolUseId, u),
+        contextWindow: () => models.current()?.contextWindow,
       }),
     );
     // 子 Agent 的用量记成本插件的事件（和压缩、审查的用量一样），界面据此计入会话用量；只能在 hook 里记

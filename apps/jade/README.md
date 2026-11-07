@@ -21,7 +21,7 @@ npm install -g @uncarved/jade
 
 ## 配置模型
 
-复制 [.env.example](.env.example) 到 `~/.jade/.env`（即 `$JADE_HOME/.env`）后填写，或在 jade 里用 `/model` 配置（会写进同一个文件）。三家任选其一：
+复制 [.env.example](https://github.com/MochiNek0/uncarved/blob/main/.env.example) 到 `~/.jade/.env`（即 `$JADE_HOME/.env`）后填写，或在 jade 里用 `/model` 配置（会写进同一个文件）。三家任选其一：
 
 | 服务 | 环境变量 |
 |---|---|
@@ -36,6 +36,7 @@ npm install -g @uncarved/jade
 ```sh
 jade                       # 启动终端界面（默认前端），交互式对话
 jade -p "把 README 翻成英文"   # 非交互：把消息发给模型后打印结果退出
+cat err.log | jade -p - "解释这个错误"   # "-"：把 stdin 接在消息后面（不写 "-" 时，有消息就不读 stdin）
 jade -c                    # 继续最近一次会话
 jade --resume <id>         # 恢复指定会话
 jade --safe                # 只加载自带的插件（排查故障用）
@@ -153,24 +154,27 @@ plugin.run()
 
 ## 环境变量
 
-| 变量 | 说明 |
-|---|---|
-| `JADE_HOME` | 配置与状态目录，默认 `~/.jade` |
-| `JADE_PROVIDER` | `anthropic` / `openai` / `openai-compat`，不设时自动选 |
-| `JADE_MAX_TOKENS` | 每次回复的输出上限，可写 `32000` / `64K` / `1M` |
-| `JADE_EFFORT` | 思考力度（Claude：`low`–`max`；OpenAI：`minimal`–`high`） |
-| `JADE_MODE` | 新会话默认权限模式 |
-| `JADE_CONTEXT_WINDOW` | 模型上下文窗口，不设时按模型名推断 |
-| `JADE_COMPACT_TOKENS` | 压缩阈值，不设时取上下文窗口的 80% |
-| `JADE_SHELL` | shell 工具用的 shell，默认 bash（Windows 上是 Git Bash） |
-| `JADE_BROWSER` | screenshot 工具用的浏览器（Chrome / Edge / Chromium） |
-| `JADE_SEARCH` | 搜索服务顺序，逗号分隔 |
-| `JADE_SEARCH_RESULTS` | 每次搜索返回条数，默认 10 |
-| `JADE_AUTO_UPDATE` | 设为 `off` 关闭后台自动升级 |
-| `JADE_UPDATE_CHECK` | 设为 `off` 不检查更新 |
-| `HTTPS_PROXY` | web 请求走代理 |
+"写在哪"一栏：`.env` 表示既可以写进 `$JADE_HOME/.env`，也可以设在 shell 里（shell 里的优先）；"shell" 表示只能设在 shell 里，写进 `.env` 无效。
 
-网络搜索可选配置多家服务的 key（`TAVILY_API_KEY`、`JINA_API_KEY`、`EXA_API_KEY` 等），配了 key 的服务按顺序试；一个 key 都不设时只有 `web_fetch`，没有 `web_search`。完整列表见 [.env.example](.env.example)。
+| 变量 | 写在哪 | 说明 |
+|---|---|---|
+| `JADE_HOME` | shell | 配置与状态目录，默认 `~/.jade` |
+| `JADE_PROVIDER` | `.env` | `anthropic` / `openai` / `openai-compat`，不设时自动选 |
+| `JADE_MAX_TOKENS` | `.env` | 每次回复的输出上限，可写 `32000` / `64K` / `1M` |
+| `JADE_EFFORT` | `.env` | 思考力度（Claude：`low`–`max`；OpenAI：`minimal`–`high`） |
+| `JADE_CONTEXT_WINDOW` | `.env` | 模型上下文窗口，不设时按模型名推断 |
+| `JADE_RPM` | `.env` | 每分钟最多发几个模型请求，不设时不主动限速 |
+| `JADE_SEARCH` | `.env` | 搜索服务顺序，逗号分隔 |
+| `JADE_SEARCH_RESULTS` | `.env` | 每次搜索返回条数，默认 10 |
+| `JADE_SHELL` | shell | shell 工具用的 shell，默认 bash（Windows 上是 Git Bash） |
+| `JADE_BROWSER` | shell | screenshot 工具用的浏览器（Chrome / Edge / Chromium） |
+| `JADE_AUTO_UPDATE` | shell | 设为 `off` 关闭后台自动升级 |
+| `JADE_UPDATE_CHECK` | shell | 设为 `off` 不检查更新 |
+| `HTTPS_PROXY` / `HTTP_PROXY` | shell | 模型和 web 请求走代理（Node.js 版本太旧、不支持时启动时会提示；Bun 都支持） |
+
+权限模式和压缩阈值是插件配置，写在 `$JADE_HOME/config.json`，例如 `{"jade/approval": {"mode": "auto"}, "jade/compact": {"thresholdTokens": "120k"}}`。会话里用 Shift+Tab 或 `/mode` 选的模式记在 `mode.json`，比配置优先（见上文"权限"）。
+
+网络搜索可选配置多家服务的 key（`TAVILY_API_KEY`、`JINA_API_KEY`、`EXA_API_KEY` 等），配了 key 的服务按顺序试；一个 key 都不设时只有 `web_fetch`，没有 `web_search`。完整列表见 [.env.example](https://github.com/MochiNek0/uncarved/blob/main/.env.example)。
 
 ## 目录布局
 

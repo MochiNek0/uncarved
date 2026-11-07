@@ -6,7 +6,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { Block, Tool, ToolContext } from "uncarved";
-import { fsTools, nearMiss } from "../plugins/fs/fs.ts";
+import { applyEditsToText, fsTools, nearMiss } from "../plugins/fs/fs.ts";
 
 // ---------- 辅助 ----------
 
@@ -256,6 +256,22 @@ describe("edit hints and multi_edit", () => {
     expect(nearMiss(text, "function f() {\n    return 1;\n}")).toContain("lines 1-3 if whitespace is ignored");
     expect(nearMiss(text, "function f() {\n  return 2;\n}")).toContain('first line "function f() {" appears at line 1');
     expect(nearMiss(text, "something else")).toBe("");
+  });
+
+  test("nearMiss recognizes read_file's line-number prefixes copied into old_string", () => {
+    const text = "function f() {\n\treturn 1;\n}\n";
+    expect(nearMiss(text, "1\tfunction f() {\n2\t\treturn 1;")).toContain("line-number prefixes");
+    // 只有部分行像行号时不算
+    expect(nearMiss(text, "1\tfunction f() {\nreturn 1;")).not.toContain("line-number prefixes");
+  });
+
+  test("a non-unique old_string reports where it occurs", () => {
+    const text = "a\nx = 1\nb\nx = 1\nc\nx = 1\n";
+    expect(applyEditsToText(text, [{ old_string: "x = 1", new_string: "x = 2" }], "f.ts")).toBe(
+      "old_string occurs 3 times in f.ts (lines 2, 4, 6); add context to make it unique or set replace_all",
+    );
+    const many = "y\n".repeat(7);
+    expect(applyEditsToText(many, [{ old_string: "y", new_string: "z" }], "f.ts")).toContain("(lines 1, 2, 3, 4, 5, …)");
   });
 
   test("edit_file explains a near miss", async () => {

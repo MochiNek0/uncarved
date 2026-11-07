@@ -197,6 +197,10 @@ test("SDK 的错误转成 ProviderError；取消照原样抛出", async () => {
 
   expect(await fail(new Anthropic.APIError(400, {}, "bad", new Headers()))).toMatchObject({ retryable: false, status: 400 });
   expect(await fail(new Anthropic.APIConnectionError({ message: "reset" }))).toMatchObject({ retryable: true, status: undefined });
+  // 连不上时说出连的是哪里
+  const where = Object.assign(fakeClient(() => { throw new Anthropic.APIConnectionError({ message: "Connection error." }); }).client, { baseURL: "http://127.0.0.1:9" });
+  const unreachable = await anthropicProvider({ client: where }).complete(hi, { signal }).catch((e) => e);
+  expect(unreachable.message).toBe("anthropic could not reach http://127.0.0.1:9: Connection error.");
   expect(await fail(new Anthropic.APIUserAbortError())).not.toBeInstanceOf(ProviderError);
 });
 

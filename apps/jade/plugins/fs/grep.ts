@@ -231,6 +231,33 @@ async function ripgrep(rg: string, s: Search): Promise<Found | undefined | "miss
 
 // ---------- JS ----------
 
+/** 同时读几个文件。逐个等 stat、readFile 时，几万个文件的仓库要好几秒（多数时间花在等 IO 上） */
+const READ_AHEAD = 16;
+
+/** 读出可以搜的文本；不存在（git 列出的文件可能已在工作区删除）、太大、二进制的返回 undefined */
+async function readSearchable(file: string): Promise<Buffer | undefined> {
+  const info = await statOrUndefined(file);
+  if (!info?.isFile() || info.size > MAX_FILE_BYTES) return undefined;
+  const buf = await readFile(file).catch(() => undefined);
+  return buf && !buf.includes(0) ? buf : undefined;
+}
+
+/** 按 items 的顺序产出 fn 的结果，最多 n 个同时进行；调用方提前停止时，已经开始的读取随它结束 */
+async function* ordered<T, R>(items: Iterable<T> | AsyncIterable<T>, n: number, fn: (item: T) => Promise<R>): AsyncGenerator<[T, R]> {
+  const pending: { item: T; result: Promise<R> }[] = [];
+  for await (const item of items) {
+    const result = fn(item);
+    // 先挂上处理，免得提前停止时没人等的 Promise 报 unhandled rejection
+    result.catch(() => {});
+    pending.push({ item, result });
+    if (pending.length >= n) {
+      const head = pending.shift()!;
+      yield [head.item, await head.result];
+    }
+  }
+  for (const p of pending) yield [p.item, await p.result];
+}
+
 async function jsGrep(s: Search): Promise<Found> {
   // 和 ripgrep 的 --glob 一致：不含 / 的模式（"*.ts"）匹配任意深度的文件名
   const filter = s.include ? globMatcher(s.include.includes("/") ? s.include : `**/${s.include}`) : undefined;
@@ -239,14 +266,15 @@ async function jsGrep(s: Search): Promise<Found> {
   const single = (await stat(s.root)).isFile();
   const candidates = single ? [s.root] : await listFiles(s.root, s.signal);
   const sorted = Array.isArray(candidates) ? [...candidates].sort() : candidates;
-  for await (const file of sorted) {
+  const wanted = async function* () {
+    for await (const file of sorted) {
+      if (filter && !single && !filter(path.relative(s.root, file).split(path.sep).join("/"))) continue;
+      yield file;
+    }
+  };
+  for await (const [file, buf] of ordered(wanted(), READ_AHEAD, readSearchable)) {
     s.signal.throwIfAborted();
-    if (filter && !single && !filter(path.relative(s.root, file).split(path.sep).join("/"))) continue;
-    // git 列出的文件可能已在工作区删除
-    const info = await statOrUndefined(file);
-    if (!info?.isFile() || info.size > MAX_FILE_BYTES) continue;
-    const buf = await readFile(file);
-    if (buf.includes(0)) continue; // 二进制文件
+    if (!buf) continue;
     const all = buf.toString("utf8").split(/\r?\n/);
     if (all.at(-1) === "") all.pop();
     const hits: FileHits = { file, count: 0, lines: [] };

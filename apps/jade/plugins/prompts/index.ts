@@ -1,10 +1,12 @@
 // jade/prompts：在 context.build 里生成系统提示词。其他插件经 prompts@1 往里加段落。
+// 也负责内核不写的、给模型看的说明：内容为空的错误工具结果在投影里补一句原因（results.ts）。
 
 import path from "node:path";
-import type { ContentSource, SystemSegment } from "uncarved";
+import type { ContentSource, LogEvent, SystemSegment } from "uncarved";
 import { definePlugin, type UI } from "../../src/api.ts";
 import type { Models } from "../models/index.ts";
 import { allInstructions, environment, mainPrompt, realPath } from "./prompts.ts";
+import { explainEmptyResults, whyEmpty, type Reasons, type Why } from "./results.ts";
 
 /** prompts@1 */
 export interface Prompts {
@@ -62,6 +64,32 @@ export default definePlugin({
     const fixed = [segment(env), ...instructions.map((i) => segment(i.text, i.trust, "stable", ID, i.source))];
     // 告诉用户读了哪些指令文件，否则看不出它们生效了
     if (instructions.length > 0) ctx.service<UI>("ui@1")?.notify(`loaded instructions: ${instructions.map((i) => display(realPath(ctx.cwd), i.file)).join(", ")}`);
+
+    // 内容为空的错误工具结果补上说明（results.ts）。原因记在 derived 里；同一批里可能有几个，
+    // observe 并发执行、拿到的 derived 快照可能是旧的，所以在这里累积，每次记完整的一份。
+    // 运行时不等 observe：紧接着的模型调用投影时记录可能还没落盘，所以投影也看这份累积的。
+    // observe 在事件写入时就（以微任务）开始执行，早于之后的投影；下一轮之前记录一定已落盘，恢复会话时从 derived 读，
+    // 所以投影只取决于日志，每次相同
+    const reasonsKey = `${ID}/empty-results`;
+    let reasons: Record<string, Why> | undefined;
+    ctx.kernel.hook({
+      kind: "observe",
+      point: "event",
+      fn: async (e: LogEvent, hook) => {
+        const found = whyEmpty(e);
+        if (!found) return;
+        reasons ??= { ...((hook.derived[reasonsKey] as Reasons | undefined) ?? {}) };
+        reasons[found.toolUseId] = found.why;
+        await hook.record(reasonsKey, { ...reasons });
+      },
+    });
+    ctx.kernel.hook({
+      kind: "transform",
+      point: "context.project",
+      // 出错时跳过（不补说明），不让这一轮失败
+      optional: true,
+      fn: (messages, hook) => explainEmptyResults(messages, { ...(hook.derived[reasonsKey] as Reasons | undefined), ...reasons }, ID),
+    });
 
     ctx.kernel.hook({
       kind: "transform",

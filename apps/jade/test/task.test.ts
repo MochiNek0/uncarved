@@ -4,11 +4,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { RuntimeNotice } from "uncarved";
+import { ProviderError, type Block, type RuntimeNotice } from "uncarved";
 import { say, cleanup, scriptedHost, textOf, use } from "./scripted-ui.ts";
 
 afterEach(cleanup);
-import { WRAP_UP } from "../plugins/task/subagent.ts";
+import { OMITTED, taskTool, WRAP_UP } from "../plugins/task/subagent.ts";
 import { SEARCH_PROVIDERS } from "../plugins/web/web.ts";
 
 const SEARCH_KEYS = SEARCH_PROVIDERS.map((p) => p.env);
@@ -79,6 +79,71 @@ describe("jade/task", () => {
     const result = shared.requests[5]!.messages.at(-1)!.content[0]!;
     expect(result.kind === "tool_result" && result.isError).toBe(false);
     expect(textOf([result])).toBe("report: nothing found");
+  });
+
+  test("a sub-agent that hits an error (e.g. the context window) still reports, with older tool output left out", async () => {
+    const { cwd, host, shared, send } = await scriptedHost();
+    // 窗口很小：报告请求里工具输出最多约 2000 个字符
+    shared.current = { ...shared.current!, contextWindow: 1000 };
+    await writeFile(path.join(cwd, "big.txt"), "x".repeat(5000));
+    shared.script.push(
+      use("u1", "task", { description: "read", prompt: "read big.txt" }),
+      use("c1", "read_file", { path: "big.txt" }),
+      { error: "prompt is too long: 250000 tokens > 200000 maximum" } as never,
+      say("report: big.txt is all x"),
+      say("done"),
+    );
+    const s = await host.sessions.open();
+    await send(s, "go");
+    expect(shared.requests).toHaveLength(5);
+    const wrap = shared.requests[3]!;
+    expect(textOf(wrap.messages.at(-1)!.content)).toBe(WRAP_UP);
+    const old = wrap.messages.flatMap((m) => m.content).find((b) => b.kind === "tool_result")!;
+    expect(textOf((old as { content: Block[] }).content)).toBe(OMITTED);
+    const result = shared.requests[4]!.messages.at(-1)!.content[0]!;
+    expect(result.kind === "tool_result" && result.isError).toBe(false);
+    expect(textOf([result])).toContain("The sub-agent stopped on an error: prompt is too long");
+    expect(textOf([result])).toContain("report: big.txt is all x");
+  });
+
+  test("after an error whose retries are used up, the sub-agent is not asked for a report again", async () => {
+    let calls = 0;
+    const tool = taskTool({
+      cwd: process.cwd(),
+      provider: {
+        id: "p",
+        async complete() {
+          calls++;
+          // 跨插件时宿主的膜把它包成 PluginError，原来的在 cause 里
+          throw Object.assign(new Error("plugin m (models@1.complete): overloaded", { cause: new ProviderError("overloaded", { retryable: true, status: 529 }) }), { name: "PluginError" });
+        },
+      },
+      tools: () => [],
+      maxSteps: 5,
+      id: "jade/task",
+    });
+    const ctx = { sessionId: "s", toolUseId: "t", signal: new AbortController().signal, parent: { sessionId: "s", eventId: "e" }, progress() {} };
+    const r = await tool.execute({ description: "x", prompt: "y" }, ctx);
+    expect(calls).toBe(1);
+    expect(r.isError).toBe(true);
+  });
+
+  test("a sub-agent whose history nears the context window stops and reports", async () => {
+    const { cwd, host, shared, send } = await scriptedHost();
+    shared.current = { ...shared.current!, contextWindow: 1000 };
+    await writeFile(path.join(cwd, "a.txt"), "x");
+    shared.script.push(
+      use("u1", "task", { description: "read", prompt: "read a.txt" }),
+      // 输入加输出 810 个 token，到了窗口的 70%
+      { ...use("c1", "read_file", { path: "a.txt" }), usage: { inputTokens: 800, outputTokens: 10 } },
+      say("report: a.txt is x"),
+      say("done"),
+    );
+    const s = await host.sessions.open();
+    await send(s, "go");
+    expect(shared.requests).toHaveLength(4);
+    expect(textOf(shared.requests[2]!.messages.at(-1)!.content)).toBe(WRAP_UP);
+    expect(textOf([shared.requests[3]!.messages.at(-1)!.content[0]!])).toBe("report: a.txt is x");
   });
 
   test("the sub-agent gets web_fetch, and web_search only while a search service is configured", async () => {

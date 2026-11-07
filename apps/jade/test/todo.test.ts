@@ -20,6 +20,8 @@ describe("todo_write", () => {
     expect(r.content).toBe("Todo list updated:\n[x] read\n[~] edit\n[~] test\n[ ] ship\nNote: keep only one item in_progress at a time.");
     expect(renderTodos([])).toBe("(empty)");
     expect(todoTool().effect).toBe("read");
+    // 和同一批的读并发，不把它们拖成串行
+    expect(todoTool().concurrency).toBe("safe");
   });
 
   test("latestTodos finds the last list in the history", () => {

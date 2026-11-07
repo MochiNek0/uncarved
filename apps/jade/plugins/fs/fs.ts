@@ -366,7 +366,9 @@ function replaceIn(text: string, { old_string, new_string, replace_all }: Edit, 
   const pattern = new RegExp(old_string.split(/\r?\n/).map(escapeRegExp).join("\\r?\\n"), "g");
   const count = text.match(pattern)?.length ?? 0;
   if (count === 0) return `old_string not found in ${shown}${nearMiss(text, old_string)}`;
-  if (count > 1 && !replace_all) return `old_string occurs ${count} times in ${shown}; add context to make it unique or set replace_all`;
+  if (count > 1 && !replace_all) {
+    return `old_string occurs ${count} times in ${shown} (${linesOf(text, pattern, 5)}); add context to make it unique or set replace_all`;
+  }
   // new_string 的换行沿用被替换那段的；那段只有一行时沿用整个文件的，单行改成多行也不会混进 LF
   const fileEol = eolOf(text, "\n");
   const to = (matched: string) => (new_string.includes("\r\n") ? new_string : new_string.replaceAll("\n", eolOf(matched, fileEol)));
@@ -374,11 +376,30 @@ function replaceIn(text: string, { old_string, new_string, replace_all }: Edit, 
   return { text: text.replace(replace_all ? pattern : new RegExp(pattern.source), to), count: replace_all ? count : 1 };
 }
 
+/** pattern 前 max 处匹配所在的行号，例如 "lines 3, 17, 40" */
+function linesOf(text: string, pattern: RegExp, max: number): string {
+  const found: number[] = [];
+  let line = 1;
+  let from = 0;
+  for (const m of text.matchAll(new RegExp(pattern.source, "g"))) {
+    for (let i = from; i < m.index; i++) if (text.charCodeAt(i) === 10) line++;
+    from = m.index;
+    found.push(line);
+    if (found.length === max) break;
+  }
+  return `line${found.length > 1 ? "s" : ""} ${found.join(", ")}${found.length === max ? ", …" : ""}`;
+}
+
 /**
  * old_string 找不到时帮模型定位：忽略空白后能匹配到哪几行，或者第一行出现在哪里。
  * 只给提示，不自动按模糊匹配修改：那样可能改错地方
  */
 export function nearMiss(text: string, needle: string): string {
+  // 最常见的一种：把 read_file 每行开头的行号和制表符一起抄进来了
+  const raw = needle.split(/\r?\n/).filter((l) => l.trim() !== "");
+  if (raw.length > 0 && raw.every((l) => /^\s*\d+\t/.test(l))) {
+    return ". It seems to include read_file's line-number prefixes (the number and tab at the start of each line); they are not part of the file. Remove them and keep the rest exactly";
+  }
   const norm = (l: string) => l.trim().replace(/\s+/g, " ");
   const lines = text.split(/\r?\n/).map(norm);
   const want = needle.split(/\r?\n/).map(norm);

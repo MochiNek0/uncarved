@@ -41,7 +41,7 @@
     "access": "public"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json && node scripts/build-plugins.mjs",
+    "build": "node scripts/clean-dist.mjs && tsc -p tsconfig.build.json && node scripts/build-plugins.mjs",
     "prepublishOnly": "node ../../scripts/require-bun-publish.mjs && bun run build"
   },
   "dependencies": {
