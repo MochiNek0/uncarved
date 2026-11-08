@@ -2,6 +2,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { featureHost, msg, reply, results, textOf, use } from "./feature-host.ts";
 
@@ -9,6 +10,8 @@ interface ApproverState {
   /** 渠道的回答，按顺序用掉："hang" 等到被中止，"throw" 抛错 */
   answers: string[];
   seen: { title: string; detail?: string; options: string[] }[];
+  /** 渠道收到的结构化调用信息 */
+  calls: Record<string, unknown>[];
   aborted: number;
 }
 const g = globalThis as { __approver?: ApproverState };
@@ -19,7 +22,11 @@ const APPROVER = {
   const a = () => globalThis.__approver;
   ctx.require("approval@1").addApprover(async (req, signal) => {
     a().seen.push({ title: req.title, detail: req.detail, options: req.options.map((o) => o.value) });
+    a().calls.push(JSON.parse(JSON.stringify(req.call)));
+    // 渠道改副本，不影响实际执行的参数
+    req.call.input.content = "tampered";
     const next = a().answers.shift();
+    if (typeof next === "string" && next.startsWith("{")) return JSON.parse(next);
     if (next === "hang") return new Promise((r) => signal.addEventListener("abort", () => { a().aborted++; r(undefined); }, { once: true }));
     if (next === "throw") throw new Error("chat is down");
     return next;
@@ -28,7 +35,7 @@ const APPROVER = {
 };
 
 async function run(answers: string[], interactive: boolean, uiAnswers: (string | undefined)[] = [], config?: object) {
-  g.__approver = { answers, seen: [], aborted: 0 };
+  g.__approver = { answers, seen: [], calls: [], aborted: 0 };
   const w = await featureHost({ plugins: [APPROVER], ...(config ? { config } : {}) });
   w.state.interactive = interactive;
   w.state.answers = uiAnswers;
@@ -36,7 +43,17 @@ async function run(answers: string[], interactive: boolean, uiAnswers: (string |
   try {
     const s = await w.host.sessions.open();
     await s.send(msg("write it"));
-    return { ...w, result: results(w.state.requests[1]!)[0]!, written: existsSync(path.join(w.cwd, "hello.txt")), approver: g.__approver };
+    const file = path.join(w.cwd, "hello.txt");
+    const written = existsSync(file);
+    const content = written ? await readFile(file, "utf8") : undefined;
+    const id = s.id;
+    await w.host.sessions.close();
+    const events = (await readFile(path.join(w.home, "sessions", `${id}.jsonl`), "utf8"))
+      .trimEnd()
+      .split("\n")
+      .map((l) => JSON.parse(l) as { type: string; data: Record<string, unknown> });
+    const answered = events.filter((e) => e.type === "jade/approval/answered").map((e) => e.data);
+    return { ...w, id, result: results(w.state.requests[1]!)[0]!, written, content, answered, approver: g.__approver };
   } finally {
     await w.host.close();
   }
@@ -48,6 +65,42 @@ describe("approvers", () => {
     expect(r.written).toBe(true);
     expect(r.approver.seen).toEqual([{ title: "Allow write_file?", detail: expect.stringContaining("+ hi"), options: ["once", "always", "deny"] }]);
     expect(r.state.selects).toEqual([]);
+  }, 30_000);
+
+  test("the approver gets the call itself, as a copy", async () => {
+    const r = await run(["once"], false);
+    expect(r.approver.calls).toEqual([
+      {
+        tool: "write_file",
+        toolUseId: "w",
+        effect: "write",
+        input: { path: path.join(r.cwd, "hello.txt"), content: "hi\n" },
+        session: r.id,
+        cwd: r.cwd,
+        mode: "ask",
+      },
+    ]);
+    // 渠道改的是副本：写进文件的还是模型给的内容
+    expect(r.content).toBe("hi\n");
+  }, 30_000);
+
+  test("who answered, and through which channel, is logged", async () => {
+    const byApprover = await run(['{"answer":"once","by":"feishu:ou_42"}'], false);
+    expect(byApprover.written).toBe(true);
+    expect(byApprover.answered).toEqual([{ toolUseId: "w", tool: "write_file", answer: "once", channel: "test/approver", by: "feishu:ou_42" }]);
+
+    const denied = await run(['{"answer":"deny"}'], false);
+    expect(denied.written).toBe(false);
+    expect(denied.answered).toEqual([{ toolUseId: "w", tool: "write_file", answer: "deny", channel: "test/approver" }]);
+
+    const byTerminal = await run(["hang"], true, ["once"]);
+    expect(byTerminal.answered).toEqual([{ toolUseId: "w", tool: "write_file", answer: "once", channel: "terminal" }]);
+  }, 30_000);
+
+  test("an answer object the approval plugin does not know counts as no answer, and nothing is logged", async () => {
+    const r = await run(['{"answer":"sure","by":"x"}'], false);
+    expect(r.written).toBe(false);
+    expect(r.answered).toEqual([]);
   }, 30_000);
 
   test("the approver's deny denies", async () => {

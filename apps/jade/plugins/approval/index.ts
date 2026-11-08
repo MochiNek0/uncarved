@@ -24,7 +24,8 @@ export interface Approval {
    * 登记一个审批渠道（例如聊天机器人）：要问用户时，问题同时交给终端和所有渠道，先回答的算数，
    * 其余的经 signal 收到中止。渠道返回 undefined、不认识的值或出错，算它不回答，不算拒绝；
    * 终端里取消照旧算拒绝。有渠道时，不能提问的前端（-p）也会问。返回撤销函数，调用方的作用域关闭时自动撤销。
-   * 项目层插件不能用
+   * 渠道除了终端看到的问题，还拿到结构化的调用信息（request.call，副本）；回答可以带 by 说明是谁回答的，
+   * 和渠道（登记它的插件 id）一起记进 `jade/approval/answered` 事件。项目层插件不能用
    */
   addApprover(approver: Approver): () => void;
   /**
@@ -36,8 +37,54 @@ export interface Approval {
 
 /** 审批的回答：允许一次、本会话里总是允许、拒绝 */
 export type Answer = "once" | "always" | "deny";
-export type Approver = (request: SelectRequest<Answer>, signal: AbortSignal) => Promise<Answer | undefined>;
+
+/** 要审批的调用，给审批渠道做卡片、做记录用。是副本：渠道改了它也不影响实际执行的参数 */
+export interface ApprovalCall {
+  /** 工具名 */
+  tool: string;
+  toolUseId: string;
+  effect: "read" | "write" | "external";
+  /** 实际要执行的参数（路径已统一成绝对路径） */
+  input: unknown;
+  /** 会话 id */
+  session: string;
+  /** 会话的工作目录 */
+  cwd: string;
+  /** 当前的审批模式 */
+  mode: Mode;
+  /** auto 模式下模型审查转给人的理由 */
+  review?: string;
+}
+
+/** 交给审批渠道的问题：终端看到的那份，加上结构化的调用信息 */
+export interface ApprovalRequest extends SelectRequest<Answer> {
+  call: ApprovalCall;
+}
+
+/** 渠道的回答。带 by（例如 "feishu:ou_123"）时记进日志，说明是谁批准或拒绝的 */
+export type ApproverAnswer = Answer | { answer: Answer; by?: string };
+export type Approver = (request: ApprovalRequest, signal: AbortSignal) => Promise<ApproverAnswer | undefined>;
 const ANSWERS: readonly string[] = ["once", "always", "deny"] satisfies Answer[];
+
+/**
+ * 每个人工回答记成一个 `jade/approval/answered` 事件（审计用）：哪个调用、回答了什么、经哪个渠道
+ * （"terminal" 或登记渠道的插件 id）、渠道说是谁。没人回答（超时、都不回答）时不记，tool.decided 里是拒绝
+ */
+export interface AnsweredEvent {
+  toolUseId: string;
+  tool: string;
+  answer: Answer;
+  channel: string;
+  by?: string;
+}
+
+/** ask 的结果：回答和它来自哪里 */
+interface Answered {
+  answer: Answer;
+  channel: string;
+  by?: string;
+}
+const MAX_BY_CHARS = 200;
 
 /** derived 里保存"总是允许"规则的键 */
 const RULES_KEY = "jade/approval/rules";
@@ -70,7 +117,7 @@ const readRoots: string[] = [];
 /** 经 allowWrite 登记的目录；policy 每次判断时读它 */
 const writeRoots: string[] = [];
 /** 经 addApprover 登记的审批渠道 */
-const approvers = new Set<Approver>();
+const approvers = new Map<Approver, string>();
 /** 打开着的会话：会话 id → 判断只读调用能不能不问就执行（allows） */
 const sessionChecks = new Map<string, (call: GatedToolCall) => boolean>();
 
@@ -95,7 +142,7 @@ export default definePlugin({
       addApprover(approver: Approver) {
         if (caller.layer === "project") throw new Error("approval.addApprover: project plugins cannot answer approvals");
         if (typeof approver !== "function") throw new Error("approval.addApprover: approver must be a function");
-        approvers.add(approver);
+        approvers.set(approver, caller.plugin);
         const remove = () => void approvers.delete(approver);
         caller.onDispose(remove);
         return remove;
@@ -198,7 +245,7 @@ export default definePlugin({
           if (again.decision !== "ask") return again;
           const rule = rules.ruleFor(call);
           const shown = (await preview(renderers, call)) ?? detail(call);
-          const answer = await ask(
+          const answered = await ask(
             ui,
             {
               title: `Allow ${call.name}?`,
@@ -210,8 +257,23 @@ export default definePlugin({
                 { label: "Deny", value: "deny" },
               ],
             },
+            {
+              tool: call.name,
+              toolUseId: call.toolUseId,
+              effect: call.tool.effect,
+              input: call.input,
+              session: id,
+              cwd: ctx.cwd,
+              mode,
+              ...(why ? { review: why } : {}),
+            },
             hook.signal,
           );
+          if (answered) {
+            const event: AnsweredEvent = { toolUseId: call.toolUseId, tool: call.name, ...answered };
+            await hook.emit("answered", event);
+          }
+          const answer = answered?.answer;
           if (answer === "always") {
             added.push(rule);
             await hook.record(RULES_KEY, saved());
@@ -243,22 +305,27 @@ function allow(caller: Caller, name: string, roots: string[], dir: string): () =
 
 /**
  * 把问题同时交给终端（能提问时）和所有审批渠道，返回先到的回答，然后中止其余的。
- * 终端里取消（undefined）算拒绝；渠道返回 undefined、不认识的值或出错算它不回答。都不回答时返回 undefined（拒绝）
+ * 终端里取消（undefined）算拒绝；渠道返回 undefined、不认识的值或出错算它不回答。都不回答时返回 undefined（拒绝）。
+ * 回答带着来源：终端是 "terminal"，渠道是登记它的插件 id
  */
-async function ask(ui: UI | undefined, request: SelectRequest<Answer>, signal: AbortSignal): Promise<Answer | undefined> {
+async function ask(ui: UI | undefined, request: SelectRequest<Answer>, call: ApprovalCall, signal: AbortSignal): Promise<Answered | undefined> {
   const done = new AbortController();
   const stop = () => done.abort(signal.reason);
   signal.addEventListener("abort", stop, { once: true });
   try {
-    return await new Promise<Answer | undefined>((resolve, reject) => {
-      const channels: Promise<Answer | undefined | typeof NONE>[] = [];
-      if (ui?.interactive) channels.push(ui.select(request, done.signal).then((a) => (a !== undefined && ANSWERS.includes(a) ? a : "deny")));
-      for (const approver of approvers) {
+    return await new Promise<Answered | undefined>((resolve, reject) => {
+      const channels: Promise<Answered | typeof NONE>[] = [];
+      if (ui?.interactive) {
+        // 终端里取消算拒绝
+        channels.push(ui.select(request, done.signal).then((a) => ({ answer: a !== undefined && ANSWERS.includes(a) ? a : "deny", channel: "terminal" })));
+      }
+      for (const [approver, plugin] of approvers) {
         channels.push(
           Promise.resolve()
-            .then(() => approver(request, done.signal))
+            // 每个渠道一份副本：渠道改了参数也影响不到实际执行的调用和别的渠道
+            .then(() => approver({ ...request, options: request.options.map((o) => ({ ...o })), call: structuredClone(call) }, done.signal))
             .then(
-              (a) => (typeof a === "string" && ANSWERS.includes(a) ? (a as Answer) : NONE),
+              (a) => fromApprover(a, plugin),
               () => NONE,
             ),
         );
@@ -278,6 +345,15 @@ async function ask(ui: UI | undefined, request: SelectRequest<Answer>, signal: A
   }
 }
 const NONE = Symbol("no answer");
+
+/** 渠道的回答：认识的回答带上渠道；by 只收短字符串。看不懂的算不回答 */
+function fromApprover(a: unknown, channel: string): Answered | typeof NONE {
+  if (typeof a === "string") return ANSWERS.includes(a) ? { answer: a as Answer, channel } : NONE;
+  if (typeof a !== "object" || a === null) return NONE;
+  const { answer, by } = a as { answer?: unknown; by?: unknown };
+  if (typeof answer !== "string" || !ANSWERS.includes(answer)) return NONE;
+  return { answer: answer as Answer, channel, ...(typeof by === "string" && by !== "" ? { by: by.slice(0, MAX_BY_CHARS) } : {}) };
+}
 
 /**
  * 工具自己登记的审批预览（例如文件修改的 diff）。没有登记、返回的不是文字、或者出错时返回 undefined，
