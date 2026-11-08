@@ -1,0 +1,17 @@
+{
+  "id": "acme/audit",
+  "version": "0.1.0",
+  "api": "^1",
+  "entry": "./index.ts",
+  "optional": ["commands@1", "ui@1"],
+  "config": {
+    "employee": {
+      "default": null,
+      "description": "who uses this jade, recorded at the start of every session; defaults to the operating system user name"
+    },
+    "endpoint": {
+      "default": null,
+      "description": "an HTTP endpoint that receives every session event as it is logged (POST, JSON { events: [{ session, event }] }); empty keeps the audit trail local"
+    }
+  }
+}

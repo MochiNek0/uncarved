@@ -197,6 +197,54 @@ describe("关卡与变换", () => {
     expect(result.kind === "tool_result" && result.content[0]).toMatchObject({ kind: "text", text: "not today" });
   });
 
+  test("一个关卡拒绝后，还在等的关卡收到中止，结果是先拒绝的那个；等它们结束后才继续", async () => {
+    const echo = recordingTool("echo");
+    const store = new MemoryLogStore();
+    const { provider, requests } = scripted([
+      { content: [toolUse("t1", "echo", {})], stopReason: "tool_use" },
+      { content: [text("ok")], stopReason: "end" },
+    ]);
+    const events: string[] = [];
+    const rt = await Runtime.create({
+      store,
+      provider,
+      plugins: [
+        // 排在前面、一直等人回答的关卡：只有中止才会结束
+        plugin("asker", {
+          tools: [echo.tool],
+          hooks: [
+            {
+              kind: "gate",
+              point: "tool.gate",
+              timeoutMs: 60_000,
+              fn: (_c, hook) =>
+                new Promise((resolve) =>
+                  hook.signal.addEventListener("abort", () => {
+                    events.push("asker aborted");
+                    // 被中止后拖一会儿才结束：内核要等它
+                    setTimeout(() => {
+                      events.push("asker done");
+                      resolve({ decision: "deny", reason: "the user did not answer" });
+                    }, 20);
+                  }),
+                ),
+            },
+          ],
+        }),
+        plugin("policy", { hooks: [{ kind: "gate", point: "tool.gate", fn: () => ({ decision: "deny", reason: "against policy" }) }] }),
+      ],
+    });
+    await rt.send(say("hi"));
+
+    expect(echo.calls).toEqual([]);
+    expect(events).toEqual(["asker aborted", "asker done"]);
+    const result = requests[1]!.messages.at(-1)!.content[0]!;
+    expect(result).toMatchObject({ kind: "tool_result", isError: true, origin: { by: "plugin", id: "policy" } });
+    expect(result.kind === "tool_result" && result.content[0]).toMatchObject({ kind: "text", text: "against policy" });
+    const decided = (await readAll(store, rt.state.sessionId)).find((e) => e.type === "tool.decided");
+    expect(decided?.data).toMatchObject({ decision: "deny", decidedBy: "policy" });
+  });
+
   test("未知工具由运行时拒绝，结果的来源是 runtime（I-8）", async () => {
     const { provider, requests } = scripted([
       { content: [toolUse("t1", "nope", {})], stopReason: "tool_use" },

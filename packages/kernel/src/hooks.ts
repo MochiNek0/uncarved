@@ -195,19 +195,36 @@ export class HookBus {
     ctx: HookContextFor,
   ): Promise<GateResult & { by?: string }> {
     const hooks = this.ordered(point).filter((h) => h.spec.kind === "gate");
+    // 一个 gate 拒绝之后，结果已经定了：中止其余还在等的 gate（例如正在问人的审批），不让人去回答一个注定被拒绝的问题。
+    // 仍然等它们全部结束（I-9 要求它们及时响应中止），"所有 hook 结束"即"不会再有插件写入"的保证不变。
+    // 结果是最先拒绝的那个：被中止的 gate 返回什么都不算，它们因中止而出的错也不报告
+    const stop = new AbortController();
+    let denied: (GateResult & { by: string }) | undefined;
     const results = await Promise.all(
       hooks.map(async (h) => {
+        const base = ctx(h.plugin);
+        const hctx: HookContext = { ...base, signal: AbortSignal.any([base.signal, stop.signal]) };
         try {
           // 每个 gate 一份拷贝：并发执行时，一个 gate 改了 payload 不能影响其他 gate 看到的内容
-          const r = (await invoke(h.spec.fn as AnyFn, structuredClone(payload), ctx(h.plugin), h.spec.timeoutMs)) as GateResult;
+          const r = (await invoke(h.spec.fn as AnyFn, structuredClone(payload), hctx, h.spec.timeoutMs)) as GateResult;
           if (!r || !Object.hasOwn(GATE_RANK, r.decision)) throw new Error(`invalid gate result ${JSON.stringify(r)}`);
-          return { ...r, by: h.plugin };
+          const result = { ...r, by: h.plugin };
+          if (result.decision === "deny" && !denied) {
+            denied = result;
+            stop.abort(new Error(`denied by ${h.plugin}`));
+          }
+          return result;
         } catch (error) {
-          this.#onError({ plugin: h.plugin, point, error });
+          if (!denied) {
+            this.#onError({ plugin: h.plugin, point, error });
+            denied = { decision: "deny", by: h.plugin };
+            stop.abort(new Error(`${h.plugin} failed`));
+          }
           return { decision: "deny" as const, by: h.plugin };
         }
       }),
     );
+    if (denied) return denied;
     let best: GateResult & { by?: string } = { decision: "abstain" };
     for (const r of results) if (GATE_RANK[r.decision] > GATE_RANK[best.decision]) best = r;
     return best;

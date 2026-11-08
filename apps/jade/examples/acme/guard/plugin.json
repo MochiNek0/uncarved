@@ -1,0 +1,25 @@
+{
+  "id": "acme/guard",
+  "version": "0.1.0",
+  "api": "^1",
+  "entry": "./index.ts",
+  "optional": ["commands@1", "ui@1"],
+  "config": {
+    "denyCommands": {
+      "default": null,
+      "description": "extra shell commands to block: { \"<rule name>\": \"<regular expression>\" }, added to the built-in rules; set a built-in rule's name to null to turn it off"
+    },
+    "allowedHosts": {
+      "default": [],
+      "description": "hosts the agent may send requests to (a host also allows its subdomains); empty means any host"
+    },
+    "confineWrites": {
+      "default": true,
+      "description": "file tools may only change files inside the working directory and the system temp directory"
+    },
+    "secretFiles": {
+      "default": ["^\\.env(\\.(?!example$|sample$|template$).+)?$", "\\.pem$", "\\.key$", "^id_(rsa|ecdsa|ed25519)$", "^\\.npmrc$", "^credentials(\\.json)?$"],
+      "description": "file names (regular expressions) that no tool may read or change, so they never reach the model"
+    }
+  }
+}
