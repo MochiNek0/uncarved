@@ -275,6 +275,7 @@ export function providerInfo(env: Env = process.env): ProviderInfo {
  * JADE_RPM 是每分钟最多发几个请求，见 rpmFromEnv（限速在 withRetry 的 gate 里做）
  * JADE_IDLE_TIMEOUT 是等模型服务回数据的时限，见 idleTimeoutFromEnv
  * JADE_VISION 是模型能不能看图片，见 visionFromEnv
+ * JADE_MODEL_HEADERS 是加在每次请求上的请求头，见 headersFromEnv
  * 只导入用到的那个服务的包：Anthropic 的 SDK 加载要一百多毫秒，拖慢启动
  */
 export async function providerFromEnv(env: Env = process.env): Promise<Provider> {
@@ -286,6 +287,7 @@ export async function providerFromEnv(env: Env = process.env): Promise<Provider>
   rpmFromEnv(env);
   const idleTimeoutMs = idleTimeoutFromEnv(env);
   const toolResultImages = visionFromEnv(env);
+  const headers = headersFromEnv(env);
   if (kind === "openai") {
     if (!env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is required for the openai provider");
     const { openaiResponsesProvider } = await import("@uncarved/provider-openai-responses");
@@ -299,6 +301,7 @@ export async function providerFromEnv(env: Env = process.env): Promise<Provider>
       reasoning: effort ? { effort: effort as "minimal" | "low" | "medium" | "high", summary: "auto" } : undefined,
       idleTimeoutMs,
       toolResultImages,
+      headers,
     });
   }
   if (kind === "openai-compat") {
@@ -313,6 +316,7 @@ export async function providerFromEnv(env: Env = process.env): Promise<Provider>
       extraBody: env.OPENAI_COMPAT_EXTRA_BODY ? jsonObject("OPENAI_COMPAT_EXTRA_BODY", env.OPENAI_COMPAT_EXTRA_BODY) : undefined,
       idleTimeoutMs,
       toolResultImages,
+      headers,
     });
   }
   const { anthropicProvider } = await import("@uncarved/provider-anthropic");
@@ -323,6 +327,7 @@ export async function providerFromEnv(env: Env = process.env): Promise<Provider>
     model: env.ANTHROPIC_MODEL,
     effort: (effort ?? "high") as "low" | "medium" | "high" | "xhigh" | "max",
     maxTokens,
+    headers,
   });
 }
 
@@ -339,6 +344,7 @@ export async function listModels(env: Env = process.env, fetchImpl: typeof fetch
         ? { authorization: `Bearer ${kind === "openai" ? env.OPENAI_API_KEY : env.OPENAI_COMPAT_API_KEY}` }
         : {};
   try {
+    Object.assign(headers, headersFromEnv(env));
     const res = await fetchImpl(kind === "anthropic" ? `${base}/v1/models?limit=100` : `${base}/models`, {
       headers,
       signal: AbortSignal.timeout(10_000),
@@ -349,6 +355,29 @@ export async function listModels(env: Env = process.env, fetchImpl: typeof fetch
   } catch {
     return [];
   }
+}
+
+/** 请求头名字：HTTP 的 token 字符 */
+const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+
+/**
+ * JADE_MODEL_HEADERS：JSON 对象，加在每次模型请求（和列出模型）上的请求头，例如公司网关要的员工身份
+ * {"x-employee-id":"e123"}。和服务的地址、密钥一起保存，换服务时不带过去，免得把网关的凭据发给别的服务。
+ * 同名时盖过 provider 自己的请求头（包括 authorization），网关用自己的认证时有用。不设时为 undefined
+ */
+export function headersFromEnv(env: Env = process.env): Record<string, string> | undefined {
+  const text = env.JADE_MODEL_HEADERS?.trim();
+  if (!text) return undefined;
+  const value = jsonObject("JADE_MODEL_HEADERS", text);
+  const out: Record<string, string> = {};
+  for (const [name, v] of Object.entries(value)) {
+    if (!HEADER_NAME.test(name)) throw new Error(`JADE_MODEL_HEADERS: ${JSON.stringify(name)} is not a valid header name`);
+    if (typeof v !== "string") throw new Error(`JADE_MODEL_HEADERS: the value of ${JSON.stringify(name)} must be a string`);
+    // 换行会把一个请求头拆成两个
+    if (/[\r\n\0]/.test(v)) throw new Error(`JADE_MODEL_HEADERS: the value of ${JSON.stringify(name)} must not contain line breaks`);
+    out[name] = v;
+  }
+  return out;
 }
 
 function jsonObject(name: string, text: string): Record<string, unknown> {

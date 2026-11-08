@@ -31,6 +31,7 @@ const ENV_KEYS = [
   "OPENAI_COMPAT_MODEL",
   "OPENAI_COMPAT_API_KEY",
   "OPENAI_COMPAT_EXTRA_BODY",
+  "JADE_MODEL_HEADERS",
   "JADE_MAX_TOKENS",
   "JADE_EFFORT",
   "JADE_CONTEXT_WINDOW",
@@ -170,6 +171,21 @@ describe("/model", () => {
       await command.run("m1", ctx);
       expect(models.current()!.model).toBe("m1");
       expect(await readEnvFile(home)).not.toContain("JADE_MAX_TOKENS");
+    } finally {
+      await host.close();
+    }
+  });
+
+  test("JADE_MODEL_HEADERS stay with their service: not sent to another one, back when switching back", async () => {
+    const { home, host, ctx, command, models } = await setup(`${ENV_A}JADE_MODEL_HEADERS={"x-employee-id":"e123"}\n`);
+    try {
+      await command.run("m2", ctx);
+      expect(models.current()!.model).toBe("m2");
+      expect(await readEnvFile(home)).not.toContain("JADE_MODEL_HEADERS");
+
+      await command.run("m1", ctx);
+      expect(models.current()!.model).toBe("m1");
+      expect(parseEnv(await readEnvFile(home)).JADE_MODEL_HEADERS).toBe(`{"x-employee-id":"e123"}`);
     } finally {
       await host.close();
     }

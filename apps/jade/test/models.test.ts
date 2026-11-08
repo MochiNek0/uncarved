@@ -9,7 +9,9 @@ import { ProviderError, type Delta, type Provider } from "uncarved";
 import { envWithFile, hasProvider, parseEnv, parseTokens } from "../plugins/models/config.ts";
 import {
   effortFromEnv,
+  headersFromEnv,
   isConcurrencyLimit,
+  listModels,
   isRateLimit,
   providerFromEnv,
   providerInfo,
@@ -228,6 +230,47 @@ describe("model configuration", () => {
     expect((await providerFromEnv({ ...env, OPENAI_COMPAT_EXTRA_BODY: '{"enable_thinking":true}' })).id).toBe("openai-compat");
     await expect(providerFromEnv({ ...env, OPENAI_COMPAT_EXTRA_BODY: "enable_thinking" })).rejects.toThrow("must be a JSON object");
     await expect(providerFromEnv({ ...env, OPENAI_COMPAT_EXTRA_BODY: "[1]" })).rejects.toThrow("must be a JSON object");
+  });
+
+  test("JADE_MODEL_HEADERS go on every model request, for every provider, and on listing models", async () => {
+    const seen: { url: string; headers: Headers }[] = [];
+    const real = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : String(input);
+      seen.push({ url, headers: new Headers(input instanceof Request ? input.headers : init?.headers) });
+      return new Response("bad request", { status: 400 });
+    }) as unknown as typeof fetch;
+    const headers = '{"x-employee-id":"e123","authorization":"Bearer gateway-token"}';
+    try {
+      for (const env of [
+        { OPENAI_API_KEY: "k", OPENAI_BASE_URL: "http://gw.test/v1" },
+        { OPENAI_COMPAT_BASE_URL: "http://gw.test/v1", OPENAI_COMPAT_MODEL: "m", OPENAI_COMPAT_API_KEY: "k" },
+        { ANTHROPIC_API_KEY: "k", ANTHROPIC_BASE_URL: "http://gw.test" },
+      ]) {
+        const provider = await providerFromEnv({ ...env, JADE_MODEL_HEADERS: headers });
+        await provider.complete(request, { signal: new AbortController().signal }).catch(() => {});
+      }
+      await listModels({ OPENAI_COMPAT_BASE_URL: "http://gw.test/v1", OPENAI_COMPAT_MODEL: "m", OPENAI_COMPAT_API_KEY: "k", JADE_MODEL_HEADERS: headers });
+    } finally {
+      globalThis.fetch = real;
+    }
+    expect(seen.length).toBeGreaterThanOrEqual(4);
+    for (const s of seen) {
+      expect(s.url).toStartWith("http://gw.test");
+      expect(s.headers.get("x-employee-id")).toBe("e123");
+      // 同名的盖过 provider 自己的认证：网关用自己的凭据
+      expect(s.headers.get("authorization")).toBe("Bearer gateway-token");
+    }
+  });
+
+  test("JADE_MODEL_HEADERS must be a JSON object of single-line strings", () => {
+    expect(headersFromEnv({})).toBeUndefined();
+    expect(headersFromEnv({ JADE_MODEL_HEADERS: " " })).toBeUndefined();
+    expect(headersFromEnv({ JADE_MODEL_HEADERS: '{"x-a":"1"}' })).toEqual({ "x-a": "1" });
+    expect(() => headersFromEnv({ JADE_MODEL_HEADERS: "x-a: 1" })).toThrow("must be a JSON object");
+    expect(() => headersFromEnv({ JADE_MODEL_HEADERS: '{"x-a":1}' })).toThrow("must be a string");
+    expect(() => headersFromEnv({ JADE_MODEL_HEADERS: '{"x a":"1"}' })).toThrow("not a valid header name");
+    expect(() => headersFromEnv({ JADE_MODEL_HEADERS: JSON.stringify({ "x-a": "1\r\nx-b: 2" }) })).toThrow("line breaks");
   });
 
   test("token counts accept K and M", () => {

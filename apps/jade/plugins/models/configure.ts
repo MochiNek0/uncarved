@@ -56,7 +56,7 @@ function visionHint(env: Env, kind: string): string {
 }
 
 /** 一个服务包含的变量（不含模型名） */
-const serviceKeys = (kind: ProviderKind) => ["JADE_PROVIDER", URL_KEY[kind], KEY_KEY[kind], ...(kind === "openai-compat" ? ["OPENAI_COMPAT_EXTRA_BODY"] : [])];
+const serviceKeys = (kind: ProviderKind) => ["JADE_PROVIDER", URL_KEY[kind], KEY_KEY[kind], "JADE_MODEL_HEADERS", ...(kind === "openai-compat" ? ["OPENAI_COMPAT_EXTRA_BODY"] : [])];
 
 const pick = (env: Env, keys: string[]) => {
   const out: Record<string, string> = {};
@@ -266,11 +266,11 @@ export function configurator(opts: ConfigureOptions): Configure {
     const key = answer || known;
 
     const serviceEnv: Env = { JADE_PROVIDER: kind, [URL_KEY[kind]]: baseURL, [KEY_KEY[kind]]: key };
-    if (kind === "openai-compat") {
-      // 额外的请求参数跟着服务走：同一个服务保留，换了服务用保存过的那份
-      const saved = services.find((s) => serviceId(s.env) === serviceId(serviceEnv));
-      serviceEnv.OPENAI_COMPAT_EXTRA_BODY = saved ? saved.env.OPENAI_COMPAT_EXTRA_BODY : sameAddress(env) ? env.OPENAI_COMPAT_EXTRA_BODY : undefined;
-    }
+    // 额外的请求头和请求参数跟着服务走：同一个服务保留，换了服务用保存过的那份
+    const savedService = services.find((s) => serviceId(s.env) === serviceId(serviceEnv));
+    const carried = (k: string) => (savedService ? savedService.env[k] : sameAddress(env) ? env[k] : undefined);
+    serviceEnv.JADE_MODEL_HEADERS = carried("JADE_MODEL_HEADERS");
+    if (kind === "openai-compat") serviceEnv.OPENAI_COMPAT_EXTRA_BODY = carried("OPENAI_COMPAT_EXTRA_BODY");
     const target = services.find((s) => serviceId(s.env) === serviceId(serviceEnv));
     const model = await chooseModel({ ...env, ...serviceEnv }, same ? current?.model : undefined, target?.models.map((m) => m.name));
     if (!model) return false;
