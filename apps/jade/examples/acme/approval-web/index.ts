@@ -217,57 +217,98 @@ const PAGE = `<!doctype html>
 <body>
 <main>
   <h1>jade approvals</h1>
-  <label class="who">Your name <input id="name" autocomplete="name" placeholder="recorded in the audit log"></label>
+  <label class="who">Your name <input id="name" autocomplete="name" placeholder="e.g. li.si (recorded in the audit log)"></label>
   <div id="list"><div class="empty">Loading…</div></div>
 </main>
 <script>
-  const token = new URLSearchParams(location.search).get("token") || "";
-  const nameInput = document.getElementById("name");
-  try { nameInput.value = localStorage.getItem("jade-approver-name") || ""; } catch {}
-  nameInput.addEventListener("input", () => { try { localStorage.setItem("jade-approver-name", nameInput.value); } catch {} });
-  const list = document.getElementById("list");
-  const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; };
-  let shown = "";
+  // 只用老浏览器也有的写法（ES5、XMLHttpRequest、appendChild）：手机上常用微信、QQ 等 App 里的内置浏览器打开，
+  // 它们的内核可能很旧，用了新 API 页面会停在 Loading。脚本出错时把原因显示在页面上，而不是卡住
+  var list = document.getElementById("list");
+  var nameInput = document.getElementById("name");
+  var shown = "";
 
-  async function refresh() {
-    let items;
-    try {
-      const res = await fetch("/api/pending", { headers: { "x-token": token } });
-      if (!res.ok) throw new Error(await res.text());
-      items = await res.json();
-    } catch (e) {
-      list.replaceChildren(el("div", "empty", "Cannot reach jade: " + e.message));
-      shown = "";
-      return;
-    }
-    const key = items.map((i) => i.id).join(",");
-    if (key === shown) return;
-    shown = key;
-    if (items.length === 0) { list.replaceChildren(el("div", "empty", "Nothing waiting for approval.")); return; }
-    list.replaceChildren(...items.map(card));
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+  function show(nodes) {
+    while (list.firstChild) list.removeChild(list.firstChild);
+    for (var i = 0; i < nodes.length; i++) list.appendChild(nodes[i]);
+  }
+  window.onerror = function (message) {
+    show([el("div", "empty", "Page error: " + message)]);
+    shown = "";
+  };
+
+  var match = /[?&]token=([^&]*)/.exec(location.search);
+  var token = match ? decodeURIComponent(match[1]) : "";
+  try { nameInput.value = window.localStorage.getItem("jade-approver-name") || ""; } catch (e) {}
+  nameInput.addEventListener("input", function () {
+    try { window.localStorage.setItem("jade-approver-name", nameInput.value); } catch (e) {}
+  });
+
+  function request(method, path, body, done) {
+    var xhr = new XMLHttpRequest();
+    xhr.open(method, path);
+    xhr.setRequestHeader("x-token", token);
+    if (body) xhr.setRequestHeader("content-type", "application/json");
+    xhr.timeout = 10000;
+    xhr.onload = function () {
+      var data;
+      try { data = JSON.parse(xhr.responseText); } catch (e) { data = undefined; }
+      done(xhr.status, data, xhr.responseText);
+    };
+    xhr.onerror = xhr.ontimeout = function () { done(0, undefined, "network error"); };
+    xhr.send(body ? JSON.stringify(body) : null);
+  }
+
+  function refresh() {
+    request("GET", "/api/pending", null, function (status, items, text) {
+      if (status !== 200 || !items) {
+        show([el("div", "empty", "Cannot reach jade: " + (status ? status + " " : "") + text)]);
+        shown = "";
+        return;
+      }
+      var key = items.map(function (i) { return i.id; }).join(",");
+      if (key === shown) return;
+      shown = key;
+      if (items.length === 0) {
+        show([el("div", "empty", "Connected. Nothing is waiting for approval: when jade asks before running something, it shows up here.")]);
+        return;
+      }
+      show(items.map(card));
+    });
   }
 
   function card(item) {
-    const c = el("div", "card");
-    c.append(el("div", "title", item.title));
-    c.append(el("div", "meta", item.call.cwd + " · " + item.call.effect + " · mode " + item.call.mode + " · " + new Date(item.since).toLocaleTimeString()));
-    if (item.call.review) c.append(el("div", "review", "Model review: " + item.call.review));
-    c.append(el("pre", "", item.detail || JSON.stringify(item.call.input, null, 2)));
-    const buttons = el("div", "buttons");
-    const error = el("div", "error");
-    for (const o of item.options) {
-      const b = el("button", o.value, o.label);
-      b.addEventListener("click", async () => {
-        const name = nameInput.value.trim();
+    var c = el("div", "card");
+    c.appendChild(el("div", "title", item.title));
+    c.appendChild(el("div", "meta", item.call.cwd + " · " + item.call.effect + " · mode " + item.call.mode + " · " + new Date(item.since).toLocaleTimeString()));
+    if (item.call.review) c.appendChild(el("div", "review", "Model review: " + item.call.review));
+    c.appendChild(el("pre", "", item.detail || JSON.stringify(item.call.input, null, 2)));
+    var buttons = el("div", "buttons");
+    var error = el("div", "error");
+    var all = [];
+    function disable(off) { for (var i = 0; i < all.length; i++) all[i].disabled = off; }
+    item.options.forEach(function (o) {
+      var b = el("button", o.value, o.label);
+      all.push(b);
+      b.addEventListener("click", function () {
+        var name = nameInput.value.replace(/^\\s+|\\s+$/g, "");
         if (!name) { error.textContent = "Fill in your name first."; nameInput.focus(); return; }
-        for (const x of buttons.children) x.disabled = true;
-        const res = await fetch("/api/answer", { method: "POST", headers: { "content-type": "application/json", "x-token": token }, body: JSON.stringify({ id: item.id, answer: o.value, name }) });
-        if (!res.ok) { error.textContent = (await res.json().catch(() => ({}))).error || "Failed"; for (const x of buttons.children) x.disabled = false; }
-        shown = ""; refresh();
+        disable(true);
+        request("POST", "/api/answer", { id: item.id, answer: o.value, name: name }, function (status, data) {
+          if (status !== 200) { error.textContent = (data && data.error) || "Failed"; disable(false); }
+          shown = "";
+          refresh();
+        });
       });
-      buttons.append(b);
-    }
-    c.append(buttons, error);
+      buttons.appendChild(b);
+    });
+    c.appendChild(buttons);
+    c.appendChild(error);
     return c;
   }
 
