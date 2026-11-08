@@ -152,6 +152,82 @@ describe("acme/guard in a session", () => {
   }, 30_000);
 });
 
+describe("acme/approval-web", () => {
+  /** 装上网页审批（端口随机），发一条要审批的消息，不等它结束 */
+  async function start(opts: { interactive?: boolean } = {}) {
+    const home = await tempDir("jade-acme-web-");
+    await cp(path.join(EXAMPLES, "approval-web"), path.join(home, "plugins", "acme-approval-web"), { recursive: true });
+    await cp(path.join(EXAMPLES, "audit"), path.join(home, "plugins", "acme-audit"), { recursive: true });
+    const w = await featureHost({ home, config: { "acme/approval-web": { port: 0 } } });
+    w.state.interactive = opts.interactive ?? false;
+    w.state.script.push({ content: [use("w", "write_file", { path: "hello.txt", content: "hi\n" })], stopReason: "tool_use" }, reply("done"));
+    const commands = w.host.service<Commands>("commands@1")!;
+    const shown = (await commands.get("approvals")!.command.run("", { signal: new AbortController().signal, ui: undefined as never, sessions: w.host.sessions, print: () => {} })) as string;
+    const link = new URL(/http:\/\/\S+/.exec(shown)![0]);
+    const token = link.searchParams.get("token")!;
+    const api = (p: string, init?: RequestInit) => fetch(new URL(p, link), { ...init, headers: { "content-type": "application/json", "x-token": token, ...init?.headers } });
+    const pending = async () => (await (await api("/api/pending")).json()) as { id: string; title: string; call: { tool: string; input: { path: string } } }[];
+    const s = await w.host.sessions.open();
+    const sent = s.send(msg("write it"));
+    // 测试失败、提前关闭宿主时不要变成未处理的拒绝
+    sent.catch(() => {});
+    return { ...w, link, token, api, pending, session: s, sent };
+  }
+
+  const waitFor = async <T>(fn: () => Promise<T | undefined>): Promise<T> => {
+    for (let i = 0; i < 200; i++) {
+      const v = await fn();
+      if (v !== undefined) return v;
+      await Bun.sleep(25);
+    }
+    throw new Error("timed out");
+  };
+
+  test("a person approves on the page; the audit report says who", async () => {
+    const w = await start();
+    try {
+      // 页面本身要 token
+      expect((await fetch(w.link)).status).toBe(200);
+      expect((await fetch(new URL("/", w.link.origin))).status).toBe(403);
+      expect((await fetch(new URL("/api/pending", w.link.origin))).status).toBe(403);
+
+      const item = await waitFor(async () => (await w.pending())[0]);
+      expect(item.title).toBe("Allow write_file?");
+      expect(item.call.tool).toBe("write_file");
+      expect(item.call.input.path).toBe(path.join(w.cwd, "hello.txt"));
+
+      // 没填名字不算数
+      expect((await w.api("/api/answer", { method: "POST", body: JSON.stringify({ id: item.id, answer: "once", name: " " }) })).status).toBe(400);
+      expect((await w.api("/api/answer", { method: "POST", body: JSON.stringify({ id: item.id, answer: "once", name: "li.si" }) })).status).toBe(200);
+      // 答过的不能再答
+      expect((await w.api("/api/answer", { method: "POST", body: JSON.stringify({ id: item.id, answer: "deny", name: "li.si" }) })).status).toBe(404);
+      await w.sent;
+
+      expect(existsSync(path.join(w.cwd, "hello.txt"))).toBe(true);
+      expect(await w.pending()).toEqual([]);
+      const events = await w.session.history();
+      expect(ofType(events, "jade/approval/answered")).toEqual([{ toolUseId: "w", tool: "write_file", answer: "once", channel: "acme/approval-web", by: "web:li.si" }]);
+      const commands = w.host.service<Commands>("commands@1")!;
+      await commands.get("audit")!.command.run("", { signal: new AbortController().signal, ui: undefined as never, sessions: w.host.sessions, print: () => {} });
+      expect(await readFile(path.join(w.home, "audit", `${w.session.id}.md`), "utf8")).toContain("allowed once by **web:li.si via acme/approval-web**");
+    } finally {
+      await w.host.close();
+    }
+  }, 30_000);
+
+  test("answered in the terminal first: the page's question is withdrawn", async () => {
+    const w = await start({ interactive: true });
+    try {
+      await w.sent;
+      expect(existsSync(path.join(w.cwd, "hello.txt"))).toBe(true);
+      expect(await w.pending()).toEqual([]);
+      expect(ofType(await w.session.history(), "jade/approval/answered")).toEqual([expect.objectContaining({ channel: "terminal" })]);
+    } finally {
+      await w.host.close();
+    }
+  }, 30_000);
+});
+
 describe("acme/audit", () => {
   test("the report says who did what, and how each call was allowed or blocked", async () => {
     const w = await run({

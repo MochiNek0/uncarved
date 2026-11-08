@@ -1,0 +1,22 @@
+{
+  "id": "acme/approval-web",
+  "version": "0.1.0",
+  "api": "^1",
+  "entry": "./index.ts",
+  "requires": ["approval@1"],
+  "optional": ["commands@1", "ui@1"],
+  "config": {
+    "host": {
+      "default": "127.0.0.1",
+      "description": "address the approval page listens on; 0.0.0.0 lets a phone on the same network open it"
+    },
+    "port": {
+      "default": 7788,
+      "description": "port of the approval page; 0 picks a free one"
+    },
+    "token": {
+      "default": null,
+      "description": "the secret in the page's link; empty makes a new one at every start"
+    }
+  }
+}
