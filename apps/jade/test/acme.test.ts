@@ -7,6 +7,8 @@ import path from "node:path";
 import type { LogEvent } from "uncarved";
 import type { Commands } from "../plugins/commands/index.ts";
 import { check, rulesFrom } from "../examples/acme/guard/index.ts";
+import { readUsage, startGateway, type GatewayOptions, type GatewayRecord } from "../examples/acme/gateway/gateway.ts";
+import { providerFromEnv } from "../plugins/models/provider.ts";
 import { featureHost, msg, reply, results, tempDir, textOf, use, type Step } from "./feature-host.ts";
 
 const EXAMPLES = path.resolve(import.meta.dir, "../examples/acme");
@@ -226,6 +228,98 @@ describe("acme/approval-web", () => {
       await w.host.close();
     }
   }, 30_000);
+});
+
+describe("acme gateway", () => {
+  /** 假的上游：OpenAI 兼容的流式回复，最后一块带用量；记下收到的请求头 */
+  function upstream() {
+    const seen: { path: string; headers: Headers; body: Record<string, unknown> }[] = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        seen.push({ path: new URL(req.url).pathname, headers: req.headers, body: (await req.json()) as Record<string, unknown> });
+        const chunks = [
+          { choices: [{ index: 0, delta: { role: "assistant", content: "hello from upstream" } }] },
+          { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+          { choices: [], usage: { prompt_tokens: 1200, completion_tokens: 34 } },
+        ];
+        const sse = chunks.map((c) => `data: ${JSON.stringify(c)}\n\n`).join("") + "data: [DONE]\n\n";
+        return new Response(sse, { headers: { "content-type": "text/event-stream" } });
+      },
+    });
+    return { server, seen, url: `http://127.0.0.1:${server.port}/v1` };
+  }
+
+  async function gateway(extra: Partial<GatewayOptions> = {}) {
+    const up = upstream();
+    const records: GatewayRecord[] = [];
+    const logFile = path.join(await tempDir("jade-acme-gw-"), "gateway-log.jsonl");
+    const gw = await startGateway({ upstream: up.url, upstreamKey: "real-model-key", token: "acme-gw-token", port: 0, logFile, onRecord: (r) => records.push(r), ...extra });
+    const env = (headers?: object) => ({
+      JADE_PROVIDER: "openai-compat",
+      OPENAI_COMPAT_BASE_URL: gw.url,
+      OPENAI_COMPAT_MODEL: "deepseek-chat",
+      OPENAI_COMPAT_API_KEY: "acme-gw-token",
+      ...(headers ? { JADE_MODEL_HEADERS: JSON.stringify(headers) } : {}),
+    });
+    const ask = async (e: Record<string, string>) => {
+      const provider = await providerFromEnv(e);
+      return provider.complete({ system: [], messages: [msg("hi")], tools: [] } as never, { signal: new AbortController().signal });
+    };
+    return { up, gw, records, logFile, env, ask, close: async () => (await gw.close(), up.server.stop(true)) };
+  }
+
+  test("jade talks to the model through the gateway, which holds the real key and counts tokens per employee", async () => {
+    const g = await gateway();
+    try {
+      const res = await g.ask(g.env({ "x-employee-id": "zhang.san" }));
+      expect(textOf(res.content)).toBe("hello from upstream");
+
+      // 上游收到的是网关的密钥，没有员工的网关令牌，也没有身份头
+      expect(g.up.seen).toHaveLength(1);
+      expect(g.up.seen[0]!.path).toBe("/v1/chat/completions");
+      expect(g.up.seen[0]!.headers.get("authorization")).toBe("Bearer real-model-key");
+      expect(g.up.seen[0]!.headers.get("x-employee-id")).toBeNull();
+      expect(g.up.seen[0]!.body.model).toBe("deepseek-chat");
+
+      expect(g.records).toEqual([expect.objectContaining({ employee: "zhang.san", path: "/chat/completions", model: "deepseek-chat", status: 200, inputTokens: 1200, outputTokens: 34 })]);
+      expect(g.gw.totals.get("zhang.san")).toEqual({ requests: 1, inputTokens: 1200, outputTokens: 34 });
+      expect(JSON.parse((await readFile(g.logFile, "utf8")).trim())).toMatchObject({ employee: "zhang.san", inputTokens: 1200 });
+    } finally {
+      await g.close();
+    }
+  });
+
+  test("no employee, a wrong gateway token, or a model the company has not approved: refused, and jade shows why", async () => {
+    const g = await gateway({ models: ["deepseek-chat"] });
+    try {
+      await expect(g.ask(g.env())).rejects.toThrow("requests must say which employee sends them");
+      await expect(g.ask({ ...g.env({ "x-employee-id": "zhang.san" }), OPENAI_COMPAT_API_KEY: "guess" })).rejects.toThrow("invalid gateway token");
+      await expect(g.ask({ ...g.env({ "x-employee-id": "zhang.san" }), OPENAI_COMPAT_MODEL: "gpt-5" })).rejects.toThrow("model gpt-5 is not approved");
+      expect(g.up.seen).toEqual([]);
+      expect(g.records.map((r) => [r.status, r.employee])).toEqual([
+        [401, undefined],
+        [401, "zhang.san"],
+        [403, "zhang.san"],
+      ]);
+    } finally {
+      await g.close();
+    }
+  });
+
+  test("usage is read from all three formats", () => {
+    const read = (...lines: string[]) => {
+      const u: { inputTokens?: number; outputTokens?: number } = {};
+      for (const l of lines) readUsage(l, u);
+      return u;
+    };
+    expect(read('data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2}}')).toEqual({ inputTokens: 10, outputTokens: 2 });
+    expect(read('data: {"type":"response.completed","response":{"usage":{"input_tokens":7,"output_tokens":3}}}')).toEqual({ inputTokens: 7, outputTokens: 3 });
+    expect(
+      read('data: {"type":"message_start","message":{"usage":{"input_tokens":50,"output_tokens":1}}}', 'data: {"type":"message_delta","usage":{"output_tokens":40}}'),
+    ).toEqual({ inputTokens: 50, outputTokens: 40 });
+    expect(read("data: [DONE]", "event: ping", '{"usage":{"prompt_tokens":5}}')).toEqual({ inputTokens: 5 });
+  });
 });
 
 describe("acme/audit", () => {

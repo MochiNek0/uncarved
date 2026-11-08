@@ -8,6 +8,8 @@
 | [`acme/audit`](./audit) | 审计：记下谁在哪台机器上用；可以把每个事件实时发到公司的审计服务；`/audit` 生成审计报告 |
 | [`acme/approval-web`](./approval-web) | 网页审批渠道：要问人时，问题同时出现在终端和一个网页上（手机也能开），先回答的算数，回答的人记进日志。换成飞书、钉钉机器人是同一个接口 |
 
+另外有一个不是插件的 [`gateway/gateway.ts`](./gateway/gateway.ts)：模拟公司的模型网关，见下面"模拟网关"。
+
 ## 安装
 
 ```sh
@@ -75,13 +77,57 @@ jade plugins add ./apps/jade/examples/acme/approval-web --link
 
 名字是页面上自己填的，拿到链接的人填什么都行：演示够用，正式用要换成有身份认证的渠道（公司 IM 机器人、审批系统），`by` 由它们给出。
 
+## 模拟网关
+
+真实环境里网关是公司的服务，员工电脑上只有网关的地址和令牌，真正的模型密钥在网关上。`gateway.ts` 在本机模拟它：
+
+- 没带员工身份（`x-employee-id`）、网关令牌不对、用了公司没批准的模型：拒绝，jade 里看得到原因。
+- 每个请求打印一行：谁、什么模型、多少 token、多久，以及这个员工累计用了多少；同时写进 `gateway-log.jsonl`。
+- 员工的身份头和网关令牌不转发给上游，上游只看到网关的密钥。
+- OpenAI 兼容、OpenAI Responses、Claude 三种格式都能转发。
+
+启动网关（换成你自己的上游和密钥）：
+
+```sh
+cd apps/jade/examples/acme/gateway
+export GATEWAY_UPSTREAM=https://api.deepseek.com/v1
+export GATEWAY_UPSTREAM_KEY=sk-真正的模型密钥
+export GATEWAY_TOKEN=acme-gw-token
+export GATEWAY_MODELS=deepseek-chat
+bun gateway.ts    # 或 node gateway.ts
+```
+
+| 变量 | 说明 |
+|---|---|
+| `GATEWAY_UPSTREAM` | 上游地址（必填）。客户端请求的路径接在它后面：OpenAI 兼容服务写到 `/v1`，Claude 写 `https://api.anthropic.com` |
+| `GATEWAY_UPSTREAM_KEY` | 上游密钥，只在网关上。不设时转发客户端自己的认证头 |
+| `GATEWAY_TOKEN` | 员工连网关的令牌；不设时不检查 |
+| `GATEWAY_MODELS` | 允许的模型，逗号分隔；不设时不限 |
+| `GATEWAY_PORT`、`GATEWAY_HOST` | 默认 `127.0.0.1:8787` |
+| `GATEWAY_LOG` | 请求日志，默认 `gateway-log.jsonl` |
+
+员工这边的 `$JADE_HOME/.env`：
+
+```sh
+JADE_PROVIDER=openai-compat
+OPENAI_COMPAT_BASE_URL=http://127.0.0.1:8787
+OPENAI_COMPAT_API_KEY=acme-gw-token
+OPENAI_COMPAT_MODEL=deepseek-chat
+JADE_MODEL_HEADERS={"x-employee-id":"zhang.san"}
+```
+
+上游是 Claude 时，换成 `JADE_PROVIDER=anthropic`、`ANTHROPIC_BASE_URL=http://127.0.0.1:8787`、`ANTHROPIC_API_KEY=acme-gw-token`。
+
 ## 演示脚本
+
+0. 一个终端开着网关，jade 的 `.env` 指向它。
 
 1. 装上三个插件，`/guard` 看规则，`/approvals` 拿到链接，用手机打开。
 2. 让 jade 改个 bug、提交并推送。要审批的调用同时出现在终端和手机上，在手机上点"允许"，终端的问题自动消失。
 3. 让它 `git push --force`，或者读 `.env`。直接被拒，模型收到原因，不会弹审批框。
 4. Shift+Tab 切到 yolo 再试一次：照样被拒。
-5. `/audit`：每一步是谁、在哪个渠道批准的，哪条红线拦下了什么。
+5. `/audit`：每一步是谁、在哪个渠道批准的，哪条红线拦下了什么。旁边网关的终端里，同一段时间每个模型请求都带着员工身份和 token 用量。
+6. 把 `.env` 里的 `JADE_MODEL_HEADERS` 删掉再启动 jade：网关拒绝，jade 显示原因。
 
 ## 局限
 
