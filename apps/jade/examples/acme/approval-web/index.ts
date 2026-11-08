@@ -32,13 +32,14 @@ interface Pending {
 
 /** 本进程里页面的链接；监听失败时是 failure。第一个会话打开时告诉用户一次（announced） */
 let url: string | undefined;
-let lanUrl: string | undefined;
+let lanUrls: string[] = [];
 let failure: string | undefined;
 let announced = false;
 
 export default {
   async process(ctx) {
-    url = lanUrl = failure = undefined;
+    url = failure = undefined;
+    lanUrls = [];
     announced = false;
     const pending = new Map<string, { item: Pending; answer: (a: { answer: Answer; by: string }) => void }>();
     const token = typeof ctx.config.token === "string" && ctx.config.token ? ctx.config.token : randomBytes(18).toString("base64url");
@@ -89,8 +90,7 @@ export default {
     });
     const actual = (server.address() as { port: number }).port;
     url = `http://127.0.0.1:${actual}/?token=${token}`;
-    const lan = host === "0.0.0.0" || host === "::" ? lanAddress() : undefined;
-    lanUrl = lan ? `http://${lan}:${actual}/?token=${token}` : undefined;
+    lanUrls = host === "0.0.0.0" || host === "::" ? lanAddresses().map((ip) => `http://${ip}:${actual}/?token=${token}`) : [];
 
     ctx.require<Approval>("approval@1").addApprover((request: ApprovalRequest, signal) => {
       const id = String(++next);
@@ -131,14 +131,38 @@ export default {
 
 function links(): string {
   if (failure) return `acme/approval-web: ${failure}`;
-  return [`Approvals can also be answered at ${url}`, ...(lanUrl ? [`  from a phone on this network: ${lanUrl}`] : [])].join("\n");
+  const [lan, ...others] = lanUrls;
+  return [
+    `Approvals can also be answered at ${url}`,
+    ...(lan ? [`  from a phone on this network: ${lan}`] : []),
+    ...(others.length > 0 ? [`  other addresses: ${others.map((u) => new URL(u).hostname).join(", ")}`] : []),
+  ].join("\n");
 }
 
-function lanAddress(): string | undefined {
-  for (const list of Object.values(os.networkInterfaces())) {
-    for (const a of list ?? []) if (a.family === "IPv4" && !a.internal) return a.address;
+/**
+ * 手机能连上的地址，最可能的排前面：家里和公司的局域网（192.168、10、172.16–31），然后是 Tailscale 这类 100.64/10。
+ * 198.18/15 是代理软件（Clash 等 TUN 模式）的虚拟网卡、169.254 是没拿到地址的网卡，手机连不上，不要
+ */
+export function lanAddresses(nets: ReturnType<typeof os.networkInterfaces> = os.networkInterfaces()): string[] {
+  const rank = (ip: string): number | undefined => {
+    const [a = 0, b = 0] = ip.split(".").map(Number);
+    if (a === 198 && (b === 18 || b === 19)) return undefined;
+    if (a === 169 && b === 254) return undefined;
+    if (a === 192 && b === 168) return 0;
+    if (a === 10) return 1;
+    if (a === 172 && b >= 16 && b <= 31) return 2;
+    if (a === 100 && b >= 64 && b <= 127) return 3;
+    return 4;
+  };
+  const found: { ip: string; rank: number }[] = [];
+  for (const list of Object.values(nets)) {
+    for (const a of list ?? []) {
+      if (a.family !== "IPv4" || a.internal) continue;
+      const r = rank(a.address);
+      if (r !== undefined) found.push({ ip: a.address, rank: r });
+    }
   }
-  return undefined;
+  return found.sort((x, y) => x.rank - y.rank).map((f) => f.ip);
 }
 
 function send(res: ServerResponse, status: number, type: string, body: string) {

@@ -7,6 +7,7 @@ import path from "node:path";
 import type { LogEvent } from "uncarved";
 import type { Commands } from "../plugins/commands/index.ts";
 import { check, rulesFrom } from "../examples/acme/guard/index.ts";
+import { lanAddresses } from "../examples/acme/approval-web/index.ts";
 import { readUsage, startGateway, type GatewayOptions, type GatewayRecord } from "../examples/acme/gateway/gateway.ts";
 import { providerFromEnv } from "../plugins/models/provider.ts";
 import { featureHost, msg, reply, results, tempDir, textOf, use, type Step } from "./feature-host.ts";
@@ -216,6 +217,21 @@ describe("acme/approval-web", () => {
       await w.host.close();
     }
   }, 30_000);
+
+  test("the phone link uses the LAN address, not a proxy's virtual adapter", () => {
+    const nic = (address: string, internal = false) => ({ address, family: "IPv4" as const, internal, netmask: "255.255.255.0", mac: "00:00:00:00:00:00", cidr: null });
+    // 这台开发机的真实情况：FlClash 的虚拟网卡排在最前面
+    const nets = {
+      FlClash: [nic("198.18.0.1")],
+      Tailscale: [nic("100.75.146.62")],
+      "vEthernet (Default Switch)": [nic("172.17.32.1")],
+      WLAN: [nic("192.168.1.12")],
+      "Loopback Pseudo-Interface 1": [nic("127.0.0.1", true)],
+      Unplugged: [nic("169.254.3.4")],
+    };
+    expect(lanAddresses(nets)).toEqual(["192.168.1.12", "172.17.32.1", "100.75.146.62"]);
+    expect(lanAddresses({ only: [nic("10.0.0.5")] })).toEqual(["10.0.0.5"]);
+  });
 
   test("answered in the terminal first: the page's question is withdrawn", async () => {
     const w = await start({ interactive: true });
