@@ -7,6 +7,7 @@ import path from "node:path";
 import type { Tool, ToolResult } from "uncarved";
 import { findBrowser, screenshotTool } from "../plugins/screenshot/tool.ts";
 import type { Proc } from "../plugins/screenshot/sys.ts";
+import { cleanup, say, scriptedHost } from "./scripted-ui.ts";
 
 /** 1x1 的 PNG */
 const PNG = Buffer.from(
@@ -16,6 +17,7 @@ const PNG = Buffer.from(
 
 let tmp: string[] = [];
 afterEach(async () => {
+  await cleanup();
   for (const d of tmp.splice(0)) await rm(d, { recursive: true, force: true });
 });
 
@@ -102,5 +104,34 @@ describe("screenshot tool", () => {
     expect(screenshotTool({ cwd: os.tmpdir(), browser: undefined, env: { JADE_BROWSER: path.join(os.tmpdir(), "nope", "nope") } })).toBeUndefined();
     // JADE_BROWSER 指向一个存在的文件时就用它
     expect(findBrowser({ JADE_BROWSER: process.execPath })).toBe(process.execPath);
+  });
+});
+
+describe("screenshot in requests", () => {
+  const saved = process.env.JADE_BROWSER;
+  afterEach(() => {
+    if (saved === undefined) delete process.env.JADE_BROWSER;
+    else process.env.JADE_BROWSER = saved;
+  });
+
+  test("a model that cannot see images is offered neither the tool nor the note; switching models brings them back", async () => {
+    // 会话开始时要找得到浏览器，工具才会注册；随便指向一个存在的可执行文件
+    process.env.JADE_BROWSER = process.execPath;
+    const { host, shared, send } = await scriptedHost();
+    shared.current = { ...shared.current!, vision: false };
+    shared.script.push(say("one"), say("two"));
+    const s = await host.sessions.open();
+    const system = (i: number) => shared.requests[i]!.system.map((x) => x.text).join("\n");
+    const tools = (i: number) => shared.requests[i]!.tools.map((t) => t.name);
+
+    await send(s, "look at the page");
+    expect(tools(0)).not.toContain("screenshot");
+    expect(system(0)).not.toContain("take a screenshot");
+
+    // 换成能看图的模型（/model），下一次请求就有
+    shared.current = { ...shared.current!, vision: true };
+    await send(s, "again");
+    expect(tools(1)).toContain("screenshot");
+    expect(system(1)).toContain("take a screenshot");
   });
 });
