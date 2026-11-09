@@ -403,15 +403,16 @@ const CURSOR_RESET = "\x1b[0 q";
 
 /** 工作超过这么久后结束，或者这时弹出要用户选择的对话框，用户多半去做别的了：提醒一下 */
 const NOTIFY_AFTER = 10_000;
-/** 支持 OSC 9 桌面通知的终端；其他终端只响铃（不认识的 OSC 9 在有的终端里会弹别的东西） */
+/** 支持 OSC 9 桌面通知的终端；其他终端什么都不发（不认识的 OSC 9 在有的终端里会弹别的东西） */
 const OSC9_TERMINALS = new Set(["iTerm.app", "WezTerm", "ghostty"]);
 
-/** 响铃，支持的终端再发一条桌面通知。JADE_NOTIFY=off 关闭 */
+/**
+ * 支持的终端发一条桌面通知。不响铃：铃声在很多终端里（例如 Windows Terminal）是系统的错误提示音，听起来像出错了。
+ * JADE_NOTIFY=off 关闭
+ */
 function notifier(stdout: NodeJS.WriteStream, env = process.env): (message: string) => void {
-  if (env.JADE_NOTIFY === "off") return () => {};
-  const osc9 = OSC9_TERMINALS.has(env.TERM_PROGRAM ?? "");
-  return (message) =>
-    stdout.write(osc9 ? `\x1b]9;jade: ${message.replace(/[\x00-\x1f\x7f]/g, " ")}\x07` : "\x07");
+  if (env.JADE_NOTIFY === "off" || !OSC9_TERMINALS.has(env.TERM_PROGRAM ?? "")) return () => {};
+  return (message) => stdout.write(`\x1b]9;jade: ${message.replace(/[\x00-\x1f\x7f]/g, " ")}\x07`);
 }
 
 export function tuiScreen(opts: TuiOptions): Screen {
