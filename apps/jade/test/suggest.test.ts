@@ -95,15 +95,18 @@ describe("jade/suggest", () => {
 
     // 下次启动时 state/suggest.json 盖过 config.json
     const next = await scriptedHost({ config: { "jade/suggest": { enabled: false, model: "big" } }, files: { "state/suggest.json": JSON.stringify({ enabled: true, model: "small" }) } });
-    expect(await suggestCommand(next.host).run("", ctxFor(next.host))).toContain("suggestions are on, predicted by the saved model small");
+    expect(await suggestCommand(next.host).run("", ctxFor(next.host))).toContain("suggestions are on, predicted by the model small");
   });
 
-  test("/suggest model checks the name against the saved models, and the picker can go back to the session's model", async () => {
+  test("/suggest model checks the name against the saved and listed models, and the picker can go back to the session's model", async () => {
     const { host, shared, send } = await scriptedHost({ config: { "jade/suggest": { enabled: true } } });
     shared.saved = ["small", "big"];
+    shared.listed = ["big", "listed"];
     const run = (args: string) => suggestCommand(host).run(args, ctxFor(host));
-    expect(await run("model tiny")).toBe("tiny is not a model saved by /model. Saved: small, big.");
-    expect(await run("model small")).toBe("suggestions are on, predicted by the saved model small.");
+    expect(await run("model tiny")).toBe("tiny is not a model saved by /model or offered by the current service. Available: small, big, listed.");
+    // 服务提供的模型不用先在 /model 里保存
+    expect(await run("model listed")).toBe("suggestions are on, predicted by the model listed.");
+    expect(await run("model small")).toBe("suggestions are on, predicted by the model small.");
     shared.script.push(say("done"), say("thanks"));
     const s = await host.sessions.open();
     await send(s, "fix it");

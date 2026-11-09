@@ -1,6 +1,6 @@
 // jade/suggest：每一轮正常结束后，预测用户下一条想发的消息，灰色显示在输入框里，Tab 或 → 接受。默认关着（enabled）。
 //
-// 模型经 models@1：配置 model 是 /model 保存过的模型名，不设时用会话的模型。
+// 模型经 models@1：配置 model 是 /model 保存过的模型名或当前服务上的模型名，不设时用会话的模型。
 // /suggest 在 TUI 里开关、选模型，马上生效，记在 $JADE_HOME/state/suggest.json，盖过 config.json 里的 enabled 和 model。
 // 对话从 context.project（每次请求模型前的消息）和 model.after（这一轮最后的回复）取，轮次结束从 turn.ended 事件知道。
 // 从旧 jade 的 examples/plugins/suggest 移植；提示词、对话的整理和截取、回复的清理参考 dsh-ghost-prompt。
@@ -139,7 +139,7 @@ export default definePlugin({
       ...(await readState(file)),
     };
     const models = ctx.require<Models>("models@1");
-    const describe = () => `suggestions are ${settings.enabled ? "on" : "off"}, predicted by ${settings.model ? `the saved model ${settings.model}` : "the session's model"}`;
+    const describe = () => `suggestions are ${settings.enabled ? "on" : "off"}, predicted by ${settings.model ? `the model ${settings.model}` : "the session's model"}`;
     const update = async (next: Partial<Settings>) => {
       settings = { ...settings, ...next };
       for (const fn of changed) fn();
@@ -157,7 +157,9 @@ export default definePlugin({
         const [sub = "", ...rest] = args.trim().split(/\s+/);
         if (sub === "on" || sub === "off") return update({ enabled: sub === "on" });
         if (sub === "model") {
-          const saved = (await models.saved?.()) ?? [];
+          // 能选的：/model 保存过的，加上当前服务提供的（不用先在 /model 里保存）
+          const [saved, listed] = await Promise.all([models.saved?.() ?? ([] as string[]), models.list().catch((): string[] => [])]);
+          const names = [...new Set([...saved, ...listed])];
           let name: string | undefined = rest.join(" ");
           if (!name) {
             const SESSION = "\0session";
@@ -166,15 +168,15 @@ export default definePlugin({
                 title: "Which model predicts your next message?",
                 options: [
                   { label: "The session's model", value: SESSION },
-                  ...saved.map((m) => ({ label: m, value: m, ...(m === settings.model ? { hint: "current" } : {}) })),
+                  ...names.map((m) => ({ label: m, value: m, ...(m === settings.model ? { hint: "current" } : saved.includes(m) ? { hint: "saved" } : {}) })),
                 ],
               },
               c.signal,
             );
             if (picked === undefined) return;
             name = picked === SESSION ? undefined : picked;
-          } else if (models.saved && !saved.includes(name)) {
-            return `${name} is not a model saved by /model. ${saved.length ? `Saved: ${saved.join(", ")}.` : "Add one with /model first."}`;
+          } else if (models.saved && !names.includes(name)) {
+            return `${name} is not a model saved by /model or offered by the current service. ${names.length ? `Available: ${names.join(", ")}.` : "Add one with /model first."}`;
           }
           return update({ model: name });
         }

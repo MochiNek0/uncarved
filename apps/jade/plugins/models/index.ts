@@ -12,7 +12,7 @@ import { contextWindow } from "./context.ts";
 import { envWithFile, hasProvider, parseTokens } from "./config.ts";
 import { configurator } from "./configure.ts";
 import { isBuiltinKind, listModels, MODEL_KEY, providerFromEnv, providerInfo, providerKind, RateGate, rpmFromEnv, visionFromEnv, withRetry } from "./provider.ts";
-import { readSavedServices, type Env } from "./saved.ts";
+import { MODEL_SETTINGS, readSavedServices, type Env } from "./saved.ts";
 
 /** models@1 */
 export interface Models {
@@ -30,7 +30,8 @@ export interface Models {
   } | undefined;
   /**
    * 完成一次请求，带重试和限速。默认用当前配置的模型（限速和会话共用）；
-   * model 是 /model 保存过的模型名（$JADE_HOME/models.json），用它和它自己的设置，找不到时报错
+   * model 是 /model 保存过的模型名（$JADE_HOME/models.json），用它和它自己的设置；
+   * 没保存过时当作当前服务上的模型名（list() 里的那些），用这个服务的默认设置
    */
   complete(request: ModelRequest, options: { signal: AbortSignal; onDelta?: (delta: import("uncarved").Delta) => void; model?: string }): Promise<ModelResponse>;
   /** 服务提供的模型列表；不支持或出错时为空 */
@@ -95,24 +96,32 @@ export default definePlugin({
 
     /** 保存过的模型的 provider，按配置缓存：models.json 里的密钥或设置改了就另建一份 */
     const savedProviders = new Map<string, Promise<Provider>>();
+    const cachedBuild = (snapshot: Env): Promise<Provider> => {
+      const key = JSON.stringify(snapshot);
+      const cached = savedProviders.get(key);
+      if (cached) return cached;
+      const p = build(snapshot);
+      savedProviders.set(key, p);
+      // 创建失败时下次重试
+      p.catch(() => savedProviders.delete(key));
+      return p;
+    };
     const saved = async (name: string): Promise<Provider> => {
       for (const s of await readSavedServices(modelsFile)) {
         const m = s.models.find((x) => x.name === name);
         const kind = providerKind(s.env);
         if (!m || !isBuiltinKind(kind)) continue;
-        const snapshot: Env = { ...s.env, ...m.settings, JADE_PROVIDER: kind, [MODEL_KEY[kind]]: m.name };
-        const key = JSON.stringify(snapshot);
-        const cached = savedProviders.get(key);
-        if (cached) return cached;
-        const p = build(snapshot);
-        savedProviders.set(key, p);
-        // 创建失败时下次重试
-        p.catch(() => savedProviders.delete(key));
-        return p;
+        return cachedBuild({ ...s.env, ...m.settings, JADE_PROVIDER: kind, [MODEL_KEY[kind]]: m.name });
       }
+      if (!hasProvider(env)) throw notConfigured();
       // 只写在 .env 里、没保存过的当前模型
-      if (hasProvider(env) && providerInfo(env).model === name) return provider();
-      throw new Error(`model ${JSON.stringify(name)} is not one of the models saved by /model (${modelsFile})`);
+      if (providerInfo(env).model === name) return provider();
+      // 当前服务上的另一个模型（没保存过）：用这个服务的地址和密钥，不带当前模型自己的设置，用服务的默认值
+      const kind = providerKind(env);
+      if (!isBuiltinKind(kind)) throw new Error(`model ${JSON.stringify(name)} is not one of the models saved by /model (${modelsFile})`);
+      const snapshot: Env = { ...env, JADE_PROVIDER: kind, [MODEL_KEY[kind]]: name };
+      for (const k of MODEL_SETTINGS) delete snapshot[k];
+      return cachedBuild(snapshot);
     };
 
     const current: Provider["complete"] = (request, options) => provider().then((p) => p.complete(request, options));

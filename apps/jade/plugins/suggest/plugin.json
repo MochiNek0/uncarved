@@ -12,7 +12,7 @@
     },
     "model": {
       "default": "",
-      "description": "the model that predicts, by a name saved with /model; empty uses the session's model; /suggest model overrides it"
+      "description": "the model that predicts: a name saved with /model or a model of the current service; empty uses the session's model; /suggest model overrides it"
     }
   }
 }

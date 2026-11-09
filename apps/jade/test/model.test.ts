@@ -200,7 +200,7 @@ describe("/model", () => {
     }
   });
 
-  test("complete with a model name uses that saved model and its settings, without switching", async () => {
+  test("complete with a model name uses that saved model and its settings, or another model on the current service, without switching", async () => {
     const { host, models } = await setup();
     respond = () =>
       new Response([`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: "ok" } }] })}\n\n`, "data: [DONE]\n\n"].join(""), {
@@ -219,7 +219,12 @@ describe("/model", () => {
       expect(urls.at(-1)).toContain("a.example/v1");
       expect((bodies.at(-1) as { model?: string }).model).toBe("m1");
 
-      await expect(models.complete(request, { signal, model: "nope" })).rejects.toThrow('model "nope" is not one of the models saved by /model');
+      // 没保存过的名字：当前服务上的模型，不带 m2 的设置
+      await models.complete(request, { signal, model: "m3" });
+      expect(urls.at(-1)).toContain("a.example/v1");
+      expect((bodies.at(-1) as { model?: string }).model).toBe("m3");
+      expect(bodies.at(-1)).not.toMatchObject({ max_tokens: 64000 });
+      expect(models.current()!.model).toBe("m1");
     } finally {
       await host.close();
     }

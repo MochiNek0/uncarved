@@ -42,7 +42,7 @@ export const userText = (text: string): Block[] => [{ kind: "text", text, origin
 export interface Shared {
   script: Step[];
   requests: ModelRequest[];
-  current: { kind: string; model: string; via: string; contextWindow: number } | undefined;
+  current: { kind: string; model: string; via: string; contextWindow: number; vision?: boolean } | undefined;
   /** select 依次给出的回答；用完后选第一项 */
   answers: (string | undefined)[];
   asked: string[];
@@ -56,6 +56,8 @@ export interface Shared {
   hints: (string | undefined)[];
   /** models@1.saved 返回的模型名 */
   saved: string[];
+  /** models@1.list 返回的模型名 */
+  listed: string[];
 }
 
 const FAKE_MODEL = `export default { process(ctx) {
@@ -75,7 +77,7 @@ const FAKE_MODEL = `export default { process(ctx) {
     for (const b of res.content) if (b.kind === "text") opts.onDelta?.({ kind: "text", text: b.text });
     if (opts.signal?.aborted) throw new Error("aborted");
     return res;
-  }, list: async () => [], saved: async () => g().saved });
+  }, list: async () => g().listed, saved: async () => g().saved });
 } };`;
 
 const FAKE_FRONTEND = `export default { process(ctx) {
@@ -112,6 +114,7 @@ export async function scriptedHost(opts: { config?: Record<string, Record<string
     modelOptions: [],
     hints: [],
     saved: [],
+    listed: [],
   };
   (globalThis as { __jadeScriptedUi?: Shared }).__jadeScriptedUi = shared;
   const plugin = async (name: string, manifest: object, code: string) => {
