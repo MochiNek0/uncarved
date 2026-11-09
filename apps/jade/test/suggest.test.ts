@@ -186,6 +186,8 @@ describe("jade/suggest helpers", () => {
     expect(tidy("NONE")).toBeUndefined();
     expect(tidy("none.")).toBeUndefined();
     expect(tidy("   ")).toBeUndefined();
+    expect(tidy("需要我把改动追加提交吗？")).toBeUndefined();
+    expect(tidy("should I run the tests?")).toBeUndefined();
     expect(tidy("x".repeat(400))).toBe(`${"x".repeat(299)}…`);
   });
 });

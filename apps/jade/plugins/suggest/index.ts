@@ -21,6 +21,9 @@ export const SYSTEM = [
   "- Match the language and tone the user has been writing in. If the user writes Chinese, answer in Chinese.",
   "- Keep it short: one sentence, at most about 20 words or 40 CJK characters.",
   "- Prefer the obvious next step: answering a question the assistant just asked, approving a proposed plan, verifying or continuing the work.",
+  "- The user gives instructions; write an instruction or a short answer, not a question.",
+  '- Never summarize or describe the work that was done (wrong: "the Title weights are fixed now"). That is the assistant\'s job, not the user\'s.',
+  '- Never speak as the assistant: no offers or plans like "want me to...", "I will...", "需要我…吗", "我会…". When the assistant offered something, the user accepts or declines it (assistant: "I can commit this if you want" -> user: "commit it").',
   "- Never repeat a request the user already made, and never invent facts, file names or numbers not in the conversation.",
   "- If no next message is reasonably predictable, output exactly: NONE",
   'Output only the message text on one line. No quotes, no prefix like "User:", no explanation, no Markdown.',
@@ -84,11 +87,12 @@ const LEADING_PREFIX = /^(?:user|用户)\s*[:：]\s*/i;
 const LEADING_QUOTES = /^["'“”‘’`「『]+/;
 const TRAILING_QUOTES = /["'“”‘’`」』]+$/;
 
-/** 模型回复的第一行整理成建议：去掉 "User:" 前缀和包着的引号；NONE 或空的时候 undefined */
+/** 模型回复的第一行整理成建议：去掉 "User:" 前缀和包着的引号；NONE、空或问句的时候 undefined */
 export function tidy(reply: string): string | undefined {
   let line = reply.trimStart().split(/\r?\n/)[0]!.trim().replace(LEADING_PREFIX, "");
   if (LEADING_QUOTES.test(line)) line = line.replace(LEADING_QUOTES, "").replace(TRAILING_QUOTES, "").trim();
-  if (!line || /^none\.?$/i.test(line)) return undefined;
+  // 问句多半是模型把助手的"要不要我…？"当成了用户的话，猜中用户真要问什么的少，不显示
+  if (!line || /^none\.?$/i.test(line) || /[?？]$/.test(line)) return undefined;
   return line.length > 300 ? `${line.slice(0, 299)}…` : line;
 }
 
