@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/logo.svg" alt="jade" width="160"></p>
+
 # jade
 
 > 基于 [uncarved](../../README.md) 内核的编程 Agent 发行版。

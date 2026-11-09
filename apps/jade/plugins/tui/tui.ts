@@ -29,6 +29,7 @@ import wrapAnsi from "wrap-ansi";
 import { mentionAt, mentionText, rankPaths } from "./mentions.ts";
 import { charWidth, edit, empty, layout, moveRow, offsetAt, type EditState } from "./editor.ts";
 import { expandTabs, markdownStream, type MdLine } from "./markdown.ts";
+import { cells, FRAME_MS, Mascot, moodOf, nextChange, title } from "./mascot.ts";
 import {
   dim,
   type Choice,
@@ -101,6 +102,8 @@ interface UiState {
   /** 对话区离底部滚上去了多少行；0 表示跟着最新的输出 */
   scroll: number;
   busy?: { label: string; since: number };
+  /** 上一次正常做完（不是中断）的时间，吉祥物据此笑一会儿 */
+  doneAt?: number;
   /** 正在运行的工具最新的一行进度，显示在对话的最后，工具结束时去掉 */
   progress: { id: string; line: string }[];
   queued: string[];
@@ -415,6 +418,42 @@ function notifier(stdout: NodeJS.WriteStream, env = process.env): (message: stri
   return (message) => stdout.write(`\x1b]9;jade: ${message.replace(/[\x00-\x1f\x7f]/g, " ")}\x07`);
 }
 
+/** 终端标题里的控制字符换成空格，免得提前结束转义序列 */
+const osc0 = (text: string) => `\x1b]0;${text.replace(/[\x00-\x1f\x7f]/g, " ")}\x07`;
+/** 先把终端原来的标题存进标题栈（xterm 的 CSI 22 t），退出时取回；不支持的终端（如 Windows Terminal）退出时清空标题，回到默认 */
+const TITLE_PUSH = "\x1b[22;0t";
+const TITLE_POP = `${osc0("")}\x1b[23;0t`;
+
+/**
+ * 让终端标签页标题跟着 jade 的状态走（见 mascot.ts 的 title）：空闲时显示标志，运行中转圈，等用户时加感叹号。
+ * JADE_TITLE=off 关闭。返回关闭函数，会把标题还原
+ */
+function titleBar(stdout: NodeJS.WriteStream, store: Store, env = process.env): () => void {
+  if (env.JADE_TITLE === "off") return () => {};
+  let shown = "";
+  const update = () => {
+    const s = store.state;
+    const now = Date.now();
+    const mood = moodOf({ busy: s.busy?.label, asking: s.dialogs.length > 0, doneAt: s.doneAt }, now);
+    const dir = s.status.cwd.split(/[\\/]/).filter(Boolean).at(-1) ?? s.status.cwd;
+    const text = title(mood, dir, now);
+    if (text === shown) return;
+    shown = text;
+    stdout.write(osc0(text));
+  };
+  stdout.write(TITLE_PUSH);
+  update();
+  const off = store.subscribe(update);
+  // 运行中转圈：状态不变时也要按时间换一帧
+  const timer = setInterval(() => store.state.busy && update(), 250);
+  timer.unref?.();
+  return () => {
+    off();
+    clearInterval(timer);
+    stdout.write(TITLE_POP);
+  };
+}
+
 export function tuiScreen(opts: TuiOptions): Screen {
   const stdout = opts.io?.stdout ?? process.stdout;
   const store = new Store(opts.status);
@@ -518,10 +557,11 @@ export function tuiScreen(opts: TuiOptions): Screen {
     },
   );
   stdout.write(MOUSE_ON + CURSOR_BLINK);
+  const closeTitle = titleBar(stdout, store);
   // 没走 close 就退出（process.exit）时也要把终端还原，否则会留在备用屏幕、鼠标上报也开着
   const restore = () => {
     try {
-      writeSync(1, `${MOUSE_OFF}${CURSOR_RESET}\x1b[?1049l\x1b[?25h`);
+      writeSync(1, `${MOUSE_OFF}${CURSOR_RESET}${TITLE_POP}\x1b[?1049l\x1b[?25h`);
     } catch {}
   };
   if (!opts.io) process.on("exit", restore);
@@ -590,7 +630,10 @@ export function tuiScreen(opts: TuiOptions): Screen {
       if (label === undefined) {
         // 稍等一下再提醒：排队的消息接着开始时（马上又 busy）不算结束
         if (longBusy()) doneTimer ??= setTimeout(() => notify("done"), 300);
-        store.update({ busy: undefined });
+        store.update({
+          busy: undefined,
+          ...(current && current.label !== "Interrupting" ? { doneAt: Date.now() } : {}),
+        });
         return;
       }
       clearTimeout(doneTimer);
@@ -647,6 +690,7 @@ export function tuiScreen(opts: TuiOptions): Screen {
       store.update({ live: undefined, busy: undefined, progress: [] }, true);
       // 等最后一帧画完再卸载；卸载时 Ink 退出备用屏幕
       await new Promise((r) => setTimeout(r, 50));
+      closeTitle();
       stdout.write(MOUSE_OFF + CURSOR_RESET);
       instance.unmount();
       await instance.waitUntilExit();
@@ -788,16 +832,30 @@ function App({
 }) {
   const state = useSyncExternalStore(store.subscribe, store.get);
   const dialog = state.dialogs[0];
-  // 运行中每 100ms 整体重画一次，推动转圈动画。不能让 Spinner 自己重画：
+  const { columns, rows } = useScreenSize();
+  const compact = rows < COMPACT_ROWS;
+  // 运行中每一帧（FRAME_MS）整体重画一次，推动转圈和吉祥物的动画。不能让 Spinner、吉祥物自己重画：
   // Ink 只在输入框也跟着提交的那一帧保留光标，否则把光标藏起来，运行中光标就不见了
-  const [, tick] = useReducer((n: number) => n + 1, 0);
+  const [ticks, tick] = useReducer((n: number) => n + 1, 0);
   const busy = state.busy !== undefined;
   useEffect(() => {
     if (!busy) return;
-    const t = setInterval(tick, 100);
+    const t = setInterval(tick, FRAME_MS);
     return () => clearInterval(t);
   }, [busy]);
-  const { columns, rows } = useScreenSize();
+  const now = Date.now();
+  const mood = moodOf({ busy: state.busy?.label, asking: dialog !== undefined, doneAt: state.doneAt }, now);
+  const mascot = useRef<Mascot>(undefined);
+  mascot.current ??= new Mascot();
+  const showBot = !compact && columns >= 50;
+  const bot = showBot ? mascot.current.frame(mood, now) : undefined;
+  // 不在运行时吉祥物也会眨眼、瞟一眼、从上一个表情缓过来：只在它要动的时候按帧重画，其余时间不画
+  const moving = showBot && mascot.current.moving(mood, now);
+  useEffect(() => {
+    if (busy || !showBot) return;
+    const t = setTimeout(tick, nextChange(mood, Date.now(), state.doneAt, moving));
+    return () => clearTimeout(t);
+  }, [busy, showBot, ticks, mood, moving, state.doneAt]);
 
   // 对话区占掉标题和底部之外的全部高度，只画能看见的那几行
   const ref = useRef<DOMElement>(null);
@@ -940,7 +998,7 @@ function App({
       h(
         Box,
         { flexDirection: "column", flexGrow: 1, overflowY: "hidden" },
-        h(Header, { status: state.status, version, compact: rows < COMPACT_ROWS }),
+        h(Header, { status: state.status, version, compact, bot }),
         h(
           Box,
           {
@@ -998,20 +1056,20 @@ function App({
   );
 }
 
-const JADE = "#00a86b";
-const SHINE = "#b6f2d4";
-
 /**
- * 标题左边的吉祥物：一个玉做的团子，用半格字符画的像素图，三行高，正好和右边三行文字并排。
- * 每个字符上下两个像素；眼睛是玉上挖空的两格，左上角一点高光让它看起来像玉
+ * 标题左边的吉祥物（见 mascot.ts）：玉做的团子，按 mood 换表情和动画，三行高，正好和右边三行文字并排
  */
-function Bot() {
+function Bot({ pixels }: { pixels: (string | undefined)[][] }) {
   return h(
     Box,
-    { flexDirection: "column", flexShrink: 0, marginRight: 2 },
-    h(Text, { color: JADE }, " ▄", h(Text, { color: SHINE, backgroundColor: JADE }, "▄"), "████▄"),
-    h(Text, { color: JADE }, "██ ███ ██"),
-    h(Text, { color: JADE }, "▀███████▀"),
+    { flexDirection: "column", flexShrink: 0, marginRight: 1 },
+    ...cells(pixels).map((row, i) =>
+      h(
+        Text,
+        { key: i },
+        ...row.map((r, j) => h(Text, { key: j, color: r.fg, backgroundColor: r.bg }, r.text)),
+      ),
+    ),
   );
 }
 
@@ -1019,13 +1077,15 @@ function Header({
   status,
   version,
   compact,
+  bot,
 }: {
   status: StatusInfo;
   version: string;
+  /** 吉祥物这一帧的像素（见 mascot.ts）；放不下时 undefined */
+  bot?: (string | undefined)[][];
   /** 终端很矮时只占一行，把高度留给对话和输入框 */
   compact: boolean;
 }) {
-  const { columns } = useScreenSize();
   // 模型 · 目录 (分支)
   const where = [
     h(Text, { key: "model", color: "cyan" }, status.model),
@@ -1043,7 +1103,7 @@ function Header({
   return h(
     Box,
     { flexShrink: 0, borderStyle: "round", borderColor: "cyan", paddingX: 1 },
-    columns >= 50 ? h(Bot) : null,
+    bot ? h(Bot, { pixels: bot }) : null,
     h(
       Box,
       { flexDirection: "column", flexGrow: 1, flexShrink: 1 },

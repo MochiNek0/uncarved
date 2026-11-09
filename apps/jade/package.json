@@ -27,6 +27,7 @@
     "jade": "./bin/jade.js"
   },
   "files": [
+    "assets",
     "bin",
     "dist",
     "src",

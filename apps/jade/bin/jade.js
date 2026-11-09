@@ -7,6 +7,10 @@ if (!process.versions.bun && (major < 22 || (major === 22 && minor < 18))) {
   process.exit(1);
 }
 
+// 进程列表（ps、top、活动监视器）里显示成 jade 而不是 node / bun。
+// Windows 上 process.title 改的是控制台标题，退出后还会留着；终端界面自己会设置、还原标题（见 tui 插件），这里就不改了
+if (process.platform !== "win32") process.title = "jade";
+
 // 加载 .ts 插件时，部分 Node 版本会打印 type stripping 的 ExperimentalWarning。只去掉这一条
 if (!process.versions.bun) {
   process.removeAllListeners("warning");
