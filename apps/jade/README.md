@@ -99,6 +99,23 @@ jade plugins disable <id>
 
 `<来源>` 支持：本地目录、npm 包（`name@版本`、`@scope/name`、`npm:<spec>`、`.tgz`）、git 仓库（`https://…`、`git@…`、`github:user/repo`、`user/repo`，可带 `#分支/tag/提交`）。`--project` 装进仓库的 `.jade/plugins`（随代码分发，首次加载需确认）；`--link` 把本地目录链接进来，开发插件用。
 
+### 安装 skill 和 MCP 服务
+
+```sh
+jade skills add <来源> [--path <子目录>] [--project] [--force]   # 来源的写法同上
+jade skills update [名字…] [--project] [--force]
+jade skills remove <名字> [--project]
+jade skills                                                      # 列出找到的 skill
+
+jade mcp add <名字> [--env KEY=VALUE]… [--project] [--force] [--] <命令> [参数…]
+jade mcp add <名字> --url <地址> [--header "Name: value"]… [--project] [--force]
+jade mcp remove <名字> [--project]
+```
+
+不加 `--project` 装到 `$JADE_HOME`（`$JADE_HOME/skills/<名字>`、`$JADE_HOME/mcp.json`），加了装到当前工作目录（`.jade/skills/<名字>`、`.jade/mcp.json`）。一个仓库里有多个 skill 时（例如 `anthropics/skills`），不加 `--path` 会列出它们，用 `--path skills/pdf` 选一个。`jade skills update` 不覆盖装好后手动改过的 skill，除非加 `--force`。新装的 skill 马上生效，运行中的 jade 从下一步起就能用，不用 `/clear` 或重启；新加的 MCP 服务重启 jade 后生效，项目层的服务第一次启动前仍然要你确认。会话里同样可以用 `/skills add …`、`/mcp add …`。
+
+这两条命令由 `jade/skills`、`jade/mcp` 插件经核心的 `cli@1` 注册，核心并不认识 skill 和 MCP。
+
 安装不执行插件代码（npm 依赖用 `--ignore-scripts`），失败不会留下装了一半的插件。连续 3 次启动都在激活阶段失败的插件会被自动停用。
 
 ### 写一个插件

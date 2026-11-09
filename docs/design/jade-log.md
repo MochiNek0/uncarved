@@ -22,4 +22,5 @@ C 的证据。"多亏是插件才能这样做"是架构对的证据，"架构挡
 
 ### 架构挡了路
 
+- 2026-11-09 想让用户在终端里一条命令装网上的 skill 和 MCP 服务（`jade skills add`、`jade mcp add`）→ 插件没法加 `jade <子命令>`，直接写进 `main.ts` 又要让核心认识 skill 和 MCP → 给核心加了 `cli@1`（核心只查名字、转交参数），安装逻辑留在 `jade/skills`、`jade/mcp`。见 [jade.md](./jade.md) 3.4。
 - 2026-11-05 移植 memory、undo → 没有"给模型留一句说明"的接口，两个插件各自往 `context.project` 里附说明（`/undo` 的已撤销记录另存在 `$JADE_HOME/checkpoints`）→ 绕过去了。两个插件绕同一条路，说明插件接口缺这一项。见 [jade.md](./jade.md) 第 11 节第 7 步。

@@ -186,6 +186,26 @@ export interface Frontend {
 }
 
 /**
+ * cli@1：插件注册的 `jade <子命令>`，由核心提供（不是插件，见 3.4）。
+ * 命令行的第一个参数是注册过的名字时，核心启动宿主后把剩下的参数交给它，不进前端。
+ * 核心自己的子命令（plugins、update、help……）不能注册
+ */
+export interface Cli {
+  /** 注册一条子命令，返回撤销函数。名字已被占用或保留时抛错 */
+  register(command: CliCommand): () => void;
+}
+
+export interface CliCommand {
+  /** jade <name> …：小写字母、数字和 - */
+  name: string;
+  /**
+   * argv 是 name 之后的参数。返回的文字打印到 stdout，退出码 0；
+   * 用法错误或失败时抛错，核心把消息打印到 stderr，退出码 2。log 写到 stderr（进度之类）
+   */
+  run(argv: readonly string[], ctx: { log(text: string): void; signal: AbortSignal }): string | void | Promise<string | void>;
+}
+
+/**
  * jade@1：核心自己的诊断信息，由核心提供（不是插件，见 3.4）。只读；`/plugins` 用它，
  * 和救援 CLI `jade plugins list` 看的是同一份状态
  */

@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import type { Block } from "uncarved";
 import type { CommandContext, Commands } from "../plugins/commands/index.ts";
+import { manageMcp } from "../plugins/mcp/install.ts";
 import { expandEnv, loadMcpConfig, McpClient, mcpToolName, mcpTools, type McpServerEntry } from "../plugins/mcp/mcp.ts";
 import type { SessionManager, UI } from "../src/index.ts";
 import { featureHost, msg, reply, results, tempDir, textOf, use } from "./feature-host.ts";
@@ -220,6 +221,9 @@ describe("jade/mcp plugin", () => {
       expect(listed).toContain("fake");
       expect(listed).toContain("connected");
       expect(listed).toContain("echo");
+      // 每个服务、合计都估算了每次请求占多少 token
+      expect(listed).toMatch(/fake .*≈\d+ tokens/);
+      expect(listed).toMatch(/≈\d+ tokens in every request/);
     } finally {
       await host.close();
     }
@@ -335,4 +339,57 @@ describe("jade/mcp plugin", () => {
       await w.host.close();
     }
   }, 60_000);
+});
+
+describe("/mcp add and remove", () => {
+  test("write $JADE_HOME/mcp.json, or <cwd>/.jade/mcp.json with --project; other content is kept; loadMcpConfig reads them", async () => {
+    const home = await tempDir("jade-mcp-home-");
+    const cwd = await tempDir("jade-mcp-cwd-");
+    await writeFile(path.join(home, "mcp.json"), JSON.stringify({ note: "keep", mcpServers: { old: { command: "x" } } }));
+
+    expect(await manageMcp(["add", "fs", "--env", "TOKEN=${MY_TOKEN}", "npx", "-y", "@scope/server", "--root", "."], { home, cwd, cmd: "/mcp" })).toContain("restart jade");
+    expect(await manageMcp(["add", "web", "--project", "--url", "https://example.com/mcp", "--header", "Authorization: Bearer ${K}"], { home, cwd, cmd: "/mcp" })).toContain("confirm");
+    const user = JSON.parse(await readFile(path.join(home, "mcp.json"), "utf8"));
+    expect(user.note).toBe("keep");
+    expect(user.mcpServers.fs).toEqual({ command: "npx", args: ["-y", "@scope/server", "--root", "."], env: { TOKEN: "${MY_TOKEN}" } });
+    const project = JSON.parse(await readFile(path.join(cwd, ".jade", "mcp.json"), "utf8"));
+    expect(project.mcpServers.web).toEqual({ type: "http", url: "https://example.com/mcp", headers: { Authorization: "Bearer ${K}" } });
+
+    const { servers } = await loadMcpConfig({ home, root: cwd, cwd, env: { MY_TOKEN: "t", K: "k" } });
+    expect(servers.map((s) => [s.name, s.layer])).toEqual([["old", "user"], ["fs", "user"], ["web", "project"]]);
+
+    await expect(manageMcp(["add", "fs", "--", "other"], { home, cwd, cmd: "/mcp" })).rejects.toThrow("already has");
+    await manageMcp(["add", "fs", "--force", "--", "other", "--flag"], { home, cwd, cmd: "/mcp" });
+    expect(JSON.parse(await readFile(path.join(home, "mcp.json"), "utf8")).mcpServers.fs).toEqual({ command: "other", args: ["--flag"] });
+
+    expect(await manageMcp(["remove", "web", "--project"], { home, cwd, cmd: "/mcp" })).toContain("removed");
+    expect(JSON.parse(await readFile(path.join(cwd, ".jade", "mcp.json"), "utf8")).mcpServers).toEqual({});
+    await expect(manageMcp(["remove", "web"], { home, cwd, cmd: "/mcp" })).rejects.toThrow("no MCP server named web");
+  });
+
+  test("bad arguments and a broken config file are reported, and the file is left alone", async () => {
+    const home = await tempDir("jade-mcp-home-");
+    const env = { home, cwd: home, cmd: "/mcp" };
+    await expect(manageMcp(["add", "x"], env)).rejects.toThrow("give a command or --url");
+    await expect(manageMcp(["add", "x", "--url", "ftp://h"], env)).rejects.toThrow("http");
+    await expect(manageMcp(["add", "x", "--url", "https://h", "cmd"], env)).rejects.toThrow("not both");
+    await expect(manageMcp(["add", "bad name!", "cmd"], env)).rejects.toThrow("the name may only contain");
+    await expect(manageMcp(["add", "x", "--env", "NOEQUALS", "cmd"], env)).rejects.toThrow("KEY=VALUE");
+    await writeFile(path.join(home, "mcp.json"), "{ broken");
+    await expect(manageMcp(["add", "x", "cmd"], env)).rejects.toThrow("fix it by hand");
+    expect(await readFile(path.join(home, "mcp.json"), "utf8")).toBe("{ broken");
+  });
+
+  test("/mcp add through the plugin does not need the servers to connect", async () => {
+    const home = await tempDir("jade-mcp-home-");
+    const { host } = await featureHost({ home });
+    try {
+      const run = (args: string) => host.service<Commands>("commands@1")!.get("mcp")!.command.run(args, ctxFor(host.sessions));
+      expect(String(await run(`add fake "${process.execPath}" "${SERVER}"`))).toContain("added MCP server fake");
+      expect(JSON.parse(await readFile(path.join(home, "mcp.json"), "utf8")).mcpServers.fake).toEqual({ command: process.execPath, args: [SERVER] });
+      expect(String(await run("add"))).toContain("usage: /mcp add");
+    } finally {
+      await host.close();
+    }
+  }, 30_000);
 });

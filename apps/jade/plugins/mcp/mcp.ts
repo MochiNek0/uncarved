@@ -135,7 +135,8 @@ export async function loadMcpConfig(opts: {
 
 const SERVER_NAME = /^[A-Za-z0-9_.-]+$/;
 
-function checkConfig(name: string, raw: unknown): string | undefined {
+/** 一条服务配置的问题；没问题时为 undefined。/mcp add 写入前也用它检查 */
+export function checkConfig(name: string, raw: unknown): string | undefined {
   if (!SERVER_NAME.test(name)) return "the name may only contain letters, digits, '.', '_' and '-'";
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return "must be an object";
   const c = raw as McpServerConfig;

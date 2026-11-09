@@ -3,5 +3,5 @@
   "version": "0.2.0",
   "api": "^1",
   "entry": "./index.ts",
-  "optional": ["ui@1", "commands@1", "prompts@1", "task@1"]
+  "optional": ["ui@1", "commands@1", "prompts@1", "task@1", "cli@1"]
 }

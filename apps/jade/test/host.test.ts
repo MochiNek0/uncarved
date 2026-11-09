@@ -177,6 +177,36 @@ describe("isolation", () => {
   });
 });
 
+describe("cli@1", () => {
+  test("plugins register jade <subcommand>; jade's own words and taken names are refused; a quarantined plugin's subcommands go away", async () => {
+    const w = await world();
+    await w.plugin("user", { id: "a", optional: ["cli@1"] }, `export default { process(ctx) {
+      const cli = ctx.service("cli@1");
+      cli.register({ name: "hello", run: (argv) => "hi " + argv.join(" ") });
+      globalThis.__cliErrors = [];
+      for (const name of ["plugins", "update", "Bad Name", "hello"]) {
+        try { cli.register({ name, run: () => {} }); } catch (e) { globalThis.__cliErrors.push(e.message); }
+      }
+    } };`);
+    const host = await w.start();
+    const g = globalThis as { __cliErrors?: string[] };
+    // 核心服务抛出的错误和插件提供的服务一样，带着 "plugin jade (cli@1.register)" 的前缀
+    expect(g.__cliErrors!.map((m) => m.replace(/^plugin jade \(cli@1\.register\): /, ""))).toEqual([
+      '"jade plugins" belongs to jade itself',
+      '"jade update" belongs to jade itself',
+      'invalid jade subcommand name "Bad Name"',
+      '"jade hello" is already registered by a',
+    ]);
+    delete g.__cliErrors;
+    const hello = host.cliCommand("hello")!;
+    expect(hello.plugin).toBe("a");
+    expect(await hello.command.run(["there"], { log: () => {}, signal: new AbortController().signal })).toBe("hi there");
+    await host.quarantine("a", "test");
+    expect(host.cliCommand("hello")).toBeUndefined();
+    await host.close();
+  });
+});
+
 describe("crash loops", () => {
   test(`a plugin that faults in ${FAULT_LIMIT} launches in a row is disabled until enabled again`, async () => {
     const w = await world();

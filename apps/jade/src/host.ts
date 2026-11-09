@@ -9,6 +9,8 @@ import {
   ServiceUnavailable,
   StaleContext,
   type Caller,
+  type Cli,
+  type CliCommand,
   type Disposer,
   type Jade,
   type PluginLayer,
@@ -59,6 +61,13 @@ const CORE_ID = "jade";
 
 /** 核心自己提供的诊断服务（3.4），名字要和 api.ts 的 Jade 一致 */
 export const JADE_SERVICE = "jade@1";
+/** 核心自己提供的 jade <子命令> 注册表（3.4），名字要和 api.ts 的 Cli 一致 */
+export const CLI_SERVICE = "cli@1";
+const CORE_SERVICES = [JADE_SERVICE, CLI_SERVICE];
+
+/** main.ts 在启动宿主之前自己处理的第一个参数：插件注册了也轮不到，所以不让注册 */
+const CORE_WORDS: ReadonlySet<string> = new Set(["plugins", "update", "upgrade", "help", "list", "ls", "add", "install", "remove", "rm", "uninstall", "enable", "disable"]);
+const CLI_NAME = /^[a-z0-9][a-z0-9-]*$/;
 
 interface Active {
   source: PluginSource;
@@ -75,7 +84,7 @@ interface Active {
 export async function planPlugins(opts: Pick<HostOptions, "roots" | "home" | "flags" | "safe">): Promise<{ plan: Plan; broken: BrokenSource[]; faults: Faults }> {
   const [{ sources, broken }, config, faults] = await Promise.all([discover(opts.roots), readPluginsConfig(opts.home), readFaults(opts.home)]);
   const disabled = new Set([...config.disabled, ...faults.autoDisabled]);
-  const plan = resolve(sources, { apiVersion: API_VERSION, disabled, safe: opts.safe, flags: opts.flags, coreServices: [JADE_SERVICE] });
+  const plan = resolve(sources, { apiVersion: API_VERSION, disabled, safe: opts.safe, flags: opts.flags, coreServices: CORE_SERVICES });
   // 区分"用户停用"和"连续崩溃后自动停用"
   for (const e of plan.entries) {
     if (e.state === "disabled" && e.reason !== "safe mode" && !config.disabled.includes(e.source.manifest.id)) {
@@ -102,6 +111,7 @@ export class PluginHost {
   readonly #secrets: SecretsStore;
   #config: { user: ConfigFile; project: ConfigFile } = { user: {}, project: {} };
   readonly #pluginConfigs = new Map<string, Readonly<Record<string, unknown>>>();
+  readonly #cli = new Map<string, { command: CliCommand; plugin: string }>();
   #sessions: Sessions | undefined;
   #writing: Promise<void> = Promise.resolve();
 
@@ -120,6 +130,32 @@ export class PluginHost {
       } satisfies Jade,
       provider: this.#core,
     });
+    // jade <子命令> 的注册表：每个调用方一个实例，调用方关闭（停用、被隔离）时撤销它注册的
+    this.#services.set(CLI_SERVICE, {
+      impl: (caller: Caller): Cli => ({
+        register: (command) => {
+          const name = command?.name;
+          if (typeof name !== "string" || !CLI_NAME.test(name)) throw new Error(`invalid jade subcommand name ${JSON.stringify(name)}`);
+          if (CORE_WORDS.has(name)) throw new Error(`"jade ${name}" belongs to jade itself`);
+          if (typeof command.run !== "function") throw new Error(`jade ${name} has no run function`);
+          const taken = this.#cli.get(name);
+          if (taken) throw new Error(`"jade ${name}" is already registered by ${taken.plugin}`);
+          const entry = { command, plugin: caller.plugin };
+          this.#cli.set(name, entry);
+          const revoke = () => {
+            if (this.#cli.get(name) === entry) this.#cli.delete(name);
+          };
+          caller.onDispose(revoke);
+          return revoke;
+        },
+      }),
+      provider: this.#core,
+    });
+  }
+
+  /** 插件注册的 jade <子命令>；main.ts 在交给前端之前查它 */
+  cliCommand(name: string): { command: CliCommand; plugin: string } | undefined {
+    return this.#cli.get(name);
   }
 
   /** 解析并按顺序激活全部插件。单个插件失败不影响其他插件，不抛出 */

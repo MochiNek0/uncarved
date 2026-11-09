@@ -31,27 +31,29 @@ export async function fetchPlugin(
   subdir?: string,
   log?: (text: string) => void,
 ): Promise<Fetched> {
-  await mkdir(staging, { recursive: true });
-  let root: string;
-  let commit: string | undefined;
-  if (source.kind === "git") {
-    ({ root, commit } = await fetchGit(source, staging, log));
-  } else if (source.kind === "npm") {
-    root = await fetchNpm(source.location, staging, log);
-  } else {
-    root = path.join(staging, "local");
-    log?.(`copying ${source.location}`);
-    await cp(source.location, root, {
-      recursive: true,
-      filter: (src) => !/[\\/](node_modules|\.git)$/.test(src),
-    });
-  }
-
+  const { root, commit } = await fetchSource(source, staging, log);
   const dir = subdir ? inSubdir(root, subdir) : root;
   const manifest = await readPluginManifest(dir);
   const hash = await treeHash(dir);
   await installDependencies(dir, log);
   return { dir, commit, manifest, hash };
+}
+
+/**
+ * 只下载来源，不检查 plugin.json、不装依赖：jade/skills 安装 skill 也用它。
+ * 返回 staging 里来源的根目录；git 来源同时返回提交
+ */
+export async function fetchSource(source: PluginSourceSpec, staging: string, log?: (text: string) => void): Promise<{ root: string; commit?: string }> {
+  await mkdir(staging, { recursive: true });
+  if (source.kind === "git") return fetchGit(source, staging, log);
+  if (source.kind === "npm") return { root: await fetchNpm(source.location, staging, log) };
+  const root = path.join(staging, "local");
+  log?.(`copying ${source.location}`);
+  await cp(source.location, root, {
+    recursive: true,
+    filter: (src) => !/[\\/](node_modules|\.git)$/.test(src),
+  });
+  return { root };
 }
 
 /** 读一个插件目录的 plugin.json；不是插件时给出能看懂的错误 */

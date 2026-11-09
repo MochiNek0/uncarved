@@ -1,5 +1,6 @@
 // jade 命令行入口：解析核心自己的参数，启动插件宿主，把控制权交给前端插件（3.4）。
-// 核心自己只处理 jade plugins …、jade update、--safe、--version（以及把 jade remove x 这类漏了 plugins 的写法挡下来）；其余参数原样交给前端。
+// 核心自己只处理 jade plugins …、jade update、--safe、--version（以及把 jade remove x 这类漏了 plugins 的写法挡下来）；
+// 第一个参数是插件注册的子命令（cli@1）时交给那个插件；其余参数原样交给前端。
 
 import { existsSync, readFileSync } from "node:fs";
 import os from "node:os";
@@ -7,7 +8,7 @@ import path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import type { TrustOptions } from "uncarved";
-import type { Frontend, UI } from "./api.ts";
+import { PluginError, type Frontend, type UI } from "./api.ts";
 import { PluginHost, type HostOptions } from "./host.ts";
 import type { LayerRoot } from "./manifest.ts";
 import { pluginsCommand } from "./rescue.ts";
@@ -20,6 +21,7 @@ const DOUBLE_SIGINT_MS = 2000;
 const USAGE = `usage: jade [--safe] [frontend options…]
        jade plugins [list | add <source> | update [id…] | remove <id> | enable <id> | disable <id>] [options]
        jade update [--check]   upgrade jade itself to the latest version on npm
+       jade <subcommand> …     a subcommand added by a plugin; "jade <subcommand> --help" shows its options
 
   --safe        load only the plugins that come with jade
   -v, --version print the version
@@ -97,9 +99,11 @@ export async function main(argv: readonly string[]): Promise<number> {
 
   // 前端起来之前，消息打到 stderr；之后交给 ui@1
   let host: PluginHost | undefined;
+  /** 跑的是插件的子命令：前端不会起来，消息一直打到 stderr */
+  let cliMode = false;
   const report = (message: string) => {
     try {
-      const ui = host?.service<UI>("ui@1");
+      const ui = cliMode ? undefined : host?.service<UI>("ui@1");
       if (ui) return ui.notify(message, "warning");
     } catch {
       // ui@1 的提供者坏了：退回 stderr
@@ -141,8 +145,22 @@ export async function main(argv: readonly string[]): Promise<number> {
 
   let code = 1;
   try {
-    const frontend = host.service<Frontend>("frontend@1");
-    if (!frontend) {
+    // 插件注册的 jade <子命令>（cli@1）：交给它，不进前端
+    const sub = rest[0] !== undefined && !rest[0].startsWith("-") ? host.cliCommand(rest[0]) : undefined;
+    const frontend = sub ? undefined : host.service<Frontend>("frontend@1");
+    if (sub) {
+      cliMode = true;
+      try {
+        const out = await sub.command.run(rest.slice(1), { log: (text) => console.error(text), signal: ac.signal });
+        if (out) console.log(out);
+        code = 0;
+      } catch (e) {
+        // 插件抛出的错误经服务层包成 PluginError（带 "plugin <id> (…)" 前缀）；用法错误只给用户看插件自己的消息
+        const cause = e instanceof PluginError ? e.cause : e;
+        console.error(cause instanceof Error ? cause.message : String(cause));
+        code = 2;
+      }
+    } else if (!frontend) {
       console.error(noFrontend(host, safe));
     } else {
       code = (await frontend.run({ argv: rest, sessions: host.sessions, signal: ac.signal })) ?? 0;

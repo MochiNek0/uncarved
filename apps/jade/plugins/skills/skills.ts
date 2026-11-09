@@ -29,7 +29,7 @@ export interface Skill {
   overrides?: string;
 }
 
-const NAME = /^[a-z0-9][a-z0-9_-]*$/i;
+export const NAME = /^[a-z0-9][a-z0-9_-]*$/i;
 /** 系统提示词里每个描述的上限 */
 const MAX_DESCRIPTION = 400;
 /** skill 工具列出的目录内文件数上限 */
@@ -120,6 +120,9 @@ export function parseSkill(text: string): { meta: Record<string, string>; body: 
   return { meta, body: body.trim() };
 }
 
+/** 系统提示词的 skill 列表里这个 skill 的一行（/skills 按它估算占用） */
+export const skillLine = (s: Skill) => `- ${s.name}: ${s.description.replace(/\s+/g, " ")}`;
+
 /** 系统提示词里的 skill 列表；没有 skill 时为 undefined */
 export function skillsPrompt(skills: Skill[]): string | undefined {
   if (skills.length === 0) return undefined;
@@ -129,20 +132,29 @@ export function skillsPrompt(skills: Skill[]): string | undefined {
       "When a task matches a skill's description, call the skill tool with its name before starting, then follow the instructions it returns. " +
       "Files a skill refers to are relative to its directory, which the skill tool tells you.",
     "",
-    ...skills.map((s) => `- ${s.name}: ${s.description.replace(/\s+/g, " ")}`),
+    ...skills.map(skillLine),
   ].join("\n");
 }
 
-/** skill 工具：读入某个 skill 的正文，以及它目录里的文件 */
-export function skillTool(skills: Skill[]): Tool {
-  const byName = new Map(skills.map((s) => [s.name.toLowerCase(), s]));
+/**
+ * skill 工具：读入某个 skill 的正文，以及它目录里的文件。
+ * 会话里的工具列表在会话创建时就定了，所以不管有没有 skill 都注册它，名字也不写成 enum：
+ * 会话中途装的 skill 用 current() 取最新的列表，找不到时先 refresh() 重新查找一次。
+ * 说明里告诉模型怎么装 skill（装到 install 给的目录），否则它会照别的工具的习惯放进 .claude/skills
+ */
+export function skillTool(current: () => Skill[], refresh: () => Promise<void>, install: { user: string; project: string }): Tool {
+  const lookup = (name: string) => current().find((s) => s.name.toLowerCase() === name.toLowerCase());
   return {
     name: "skill",
     description:
-      "Load the instructions of a skill listed in the system prompt. Call it when a task matches the skill's description, then follow the instructions.",
+      'Load the instructions of a skill listed in the system prompt under "# Skills". Call it when a task matches the skill\'s description, then follow the instructions. ' +
+      "To install a new skill, run `jade skills add <source>` in the shell (<source>: a git repository such as user/repo or a URL, an npm package, or a local directory; " +
+      "add `--path <dir>` for one skill inside a repository with several). It installs into " +
+      `${install.user}; add \`--project\` to install into ${install.project} for this project only. ` +
+      "Do not copy skills into .claude/skills. A newly installed skill can be used right away.",
     inputSchema: {
       type: "object",
-      properties: { name: { type: "string", enum: skills.map((s) => s.name), description: "the skill's name" } },
+      properties: { name: { type: "string", description: "the skill's name" } },
       required: ["name"],
       additionalProperties: false,
     },
@@ -151,8 +163,15 @@ export function skillTool(skills: Skill[]): Tool {
     idempotent: true,
     async execute(input) {
       const name = String((input as { name?: unknown }).name ?? "");
-      const skill = byName.get(name.toLowerCase());
-      if (!skill) return { content: `There is no skill named ${JSON.stringify(name)}. Available: ${skills.map((s) => s.name).join(", ")}.`, isError: true };
+      let skill = lookup(name);
+      if (!skill) {
+        await refresh();
+        skill = lookup(name);
+      }
+      if (!skill) {
+        const names = current().map((s) => s.name);
+        return { content: `There is no skill named ${JSON.stringify(name)}. ${names.length ? `Available: ${names.join(", ")}.` : "No skills are installed."}`, isError: true };
+      }
       let text: string;
       try {
         text = await readFile(path.join(skill.dir, "SKILL.md"), "utf8");

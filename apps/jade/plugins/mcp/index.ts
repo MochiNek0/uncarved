@@ -1,4 +1,5 @@
-// jade/mcp：配置的 MCP 服务的工具交给模型（声明只读的也经 task@1 交给子 Agent）；/mcp 查看状态、重连。
+// jade/mcp：配置的 MCP 服务的工具交给模型（声明只读的也经 task@1 交给子 Agent）；/mcp 查看状态、重连，
+// /mcp add、/mcp remove 改配置文件（见 install.ts；终端里是 jade mcp add|remove）。
 //
 // 服务是进程级的资源：第一个会话打开时读配置、确认项目层的服务、连接，之后各会话共用；进程退出时（进程作用域关闭）全部关掉。
 // 一个会话里的工具列表不变（否则提示缓存失效）：第一个会话最多等 STARTUP_WAIT_MS，没连上的在后台接着连，
@@ -6,12 +7,13 @@
 // 服务进程退出后，下一次调用它的工具时重新连接一次。
 
 import path from "node:path";
-import { definePlugin, type ProcessContext, type UI } from "../../src/api.ts";
+import { definePlugin, type Cli, type ProcessContext, type UI } from "../../src/api.ts";
 import type { Commands } from "../commands/index.ts";
 import type { Prompts } from "../prompts/index.ts";
 import type { Task } from "../task/index.ts";
 import { describeServer, loadMcpConfig, McpClient, mcpTools, mcpTrustHash } from "./mcp.ts";
-import { bold, clip, dim, display, green, realPath, red, repoRoot, TrustFile, yellow } from "./project.ts";
+import { manageMcp, manageUsage } from "./install.ts";
+import { bold, clip, dim, display, estimateTokens, green, realPath, red, repoRoot, splitArgs, TrustFile, yellow } from "./project.ts";
 
 const ID = "jade/mcp";
 /** 第一个会话最多等 MCP 服务连接这么久（能交互时），没连上的在后台接着连 */
@@ -130,6 +132,12 @@ function instructions(clients: McpClient[]): string[] {
 ${c.instructions}`);
 }
 
+/** 一个服务每次请求都带着的大约多少 token：发给模型的工具定义，加上它的使用说明。没连上时为 0 */
+function serverTokens(c: McpClient): number {
+  const tools = mcpTools([c]).reduce((n, t) => n + estimateTokens(JSON.stringify({ name: t.name, description: t.description, input_schema: t.inputSchema })), 0);
+  return tools + instructions([c]).reduce((n, text) => n + estimateTokens(text), 0);
+}
+
 /** 当前进程的服务；process() 里创建，session() 里用 */
 let current: Servers | undefined;
 
@@ -142,13 +150,26 @@ export default definePlugin({
 
     ctx.service<Commands>("commands@1")?.register({
       name: "mcp",
-      args: "[reconnect <name>]",
-      description: "MCP servers: status and tools",
+      args: "[reconnect <name> | add <name> … | remove <name>] [--project]",
+      description: "MCP servers: status and tools; add or remove one",
       instant: true,
       async run(args) {
+        let words: string[];
+        try {
+          words = splitArgs(args);
+        } catch (e) {
+          return red(errorText(e));
+        }
+        // 只改配置文件，不用先连接
+        if (words[0] === "add" || words[0] === "remove" || words[0] === "rm") {
+          try {
+            return await manageMcp(words, { home: ctx.home, cwd: ctx.cwd, cmd: "/mcp" });
+          } catch (e) {
+            return red(errorText(e));
+          }
+        }
         await servers.start();
         const clients = servers.clients;
-        const words = args.trim().split(/\s+/).filter(Boolean);
         if (words[0] === "reconnect") {
           const c = clients.find((x) => x.name === words[1]);
           if (!c) return red(`usage: /mcp reconnect <name>; servers: ${clients.map((x) => x.name).join(", ") || "(none)"}`);
@@ -160,21 +181,30 @@ export default definePlugin({
             return red(`${c.name}: ${errorText(err)}`);
           }
         }
-        if (words.length > 0) return red("usage: /mcp [reconnect <name>]");
+        if (words.length > 0) return red(`usage: /mcp [reconnect <name>]\n${manageUsage("/mcp")}`);
         if (clients.length === 0) {
-          return dim(`(no MCP servers) configure them in ${display(ctx.cwd, path.join(ctx.home, "mcp.json"))}, .mcp.json or .jade/mcp.json`);
+          return dim(`(no MCP servers) add one with /mcp add, or configure them in ${display(ctx.cwd, path.join(ctx.home, "mcp.json"))}, .mcp.json or .jade/mcp.json`);
         }
         const lines: string[] = [];
+        let total = 0;
         for (const c of clients) {
           const state = c.status === "connected" ? green("connected") : c.status === "failed" ? red("failed") : yellow(c.status);
           const info = c.serverInfo?.name ? ` · ${c.serverInfo.name}${c.serverInfo.version ? ` ${c.serverInfo.version}` : ""}` : "";
-          lines.push(`${bold(c.name)} ${state} ${dim(`${c.entry.layer} · ${display(ctx.cwd, c.entry.file)} · ${describeServer(c.entry.config)}${info}`)}`);
+          const tokens = serverTokens(c);
+          total += tokens;
+          lines.push(`${bold(c.name)} ${state} ${dim(`${c.entry.layer} · ${display(ctx.cwd, c.entry.file)} · ${describeServer(c.entry.config)}${info}${tokens ? ` · ≈${tokens} tokens` : ""}`)}`);
           if (c.error) lines.push(red(`  ${c.error}`));
           if (c.tools.length) lines.push(`  tools  ${c.tools.map((t) => `${t.name}${t.annotations?.readOnlyHint ? dim(" (read)") : ""}`).join(", ")}`);
           if (c.status === "failed" && c.stderr.length) lines.push(dim(c.stderr.map((l) => `  │ ${clip(l, 200)}`).join("\n")));
         }
+        if (total) lines.push(dim(`≈${total} tokens in every request (tool definitions and server instructions); remove or disable servers you do not use to save them`));
         return lines.join("\n");
       },
+    });
+    // 终端里加、删服务：jade mcp add|remove …（cli@1，核心提供）。查看状态要连接服务，只在 /mcp 里有
+    ctx.service<Cli>("cli@1")?.register({
+      name: "mcp",
+      run: (argv) => manageMcp(argv, { home: ctx.home, cwd: ctx.cwd, cmd: "jade mcp" }),
     });
   },
 

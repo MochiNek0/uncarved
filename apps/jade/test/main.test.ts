@@ -2,7 +2,8 @@
 // 不能当成第一条消息发给模型。
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { main } from "../src/main.ts";
@@ -64,4 +65,54 @@ test("a broken plugins.json is reported with its path instead of crashing", asyn
   await writeFile(path.join(home, "plugins.json"), '{"disabled": [],}');
   expect(await main(["--safe", "-p", "hi"])).toBe(1);
   expect(errors.join("\n")).toContain("plugins.json");
+});
+
+describe("subcommands added by plugins (cli@1)", () => {
+  let out: string[] = [];
+  let cwd = "";
+  const saved = process.cwd();
+  beforeEach(async () => {
+    out = [];
+    cwd = await mkdtemp(path.join(os.tmpdir(), "jade-main-cwd-"));
+    process.chdir(cwd);
+  });
+  afterEach(async () => {
+    process.chdir(saved);
+    await rm(cwd, { recursive: true, force: true });
+  });
+  const run = async (argv: string[]) => {
+    const log = spyOn(console, "log").mockImplementation((...args: unknown[]) => void out.push(args.join(" ")));
+    try {
+      return await main(argv);
+    } finally {
+      log.mockRestore();
+    }
+  };
+
+  test("jade mcp add writes $JADE_HOME/mcp.json without starting a frontend; --project writes <cwd>/.jade/mcp.json", async () => {
+    expect(await run(["mcp", "add", "fs", "npx", "-y", "@scope/server"])).toBe(0);
+    expect(out.join("\n")).toContain("added MCP server fs");
+    expect(JSON.parse(await readFile(path.join(home, "mcp.json"), "utf8")).mcpServers.fs).toEqual({ command: "npx", args: ["-y", "@scope/server"] });
+    expect(await run(["mcp", "add", "web", "--url", "https://example.com/mcp", "--project"])).toBe(0);
+    expect(JSON.parse(await readFile(path.join(cwd, ".jade", "mcp.json"), "utf8")).mcpServers.web.url).toBe("https://example.com/mcp");
+  }, 30_000);
+
+  test("jade skills add installs into $JADE_HOME/skills, or <cwd>/.jade/skills with --project", async () => {
+    const src = path.join(cwd, "src", "notes");
+    await mkdir(src, { recursive: true });
+    await writeFile(path.join(src, "SKILL.md"), "---\ndescription: take notes\n---\nsteps");
+    expect(await run(["skills", "add", src])).toBe(0);
+    expect(existsSync(path.join(home, "skills", "notes", "SKILL.md"))).toBe(true);
+    expect(await run(["skills", "add", src, "--project"])).toBe(0);
+    expect(existsSync(path.join(cwd, ".jade", "skills", "notes", "SKILL.md"))).toBe(true);
+    expect(await run(["skills"])).toBe(0);
+    expect(out.join("\n")).toContain("notes");
+  }, 30_000);
+
+  test("a usage error exits with 2 and prints the plugin's usage to stderr", async () => {
+    expect(await run(["mcp", "add"])).toBe(2);
+    expect(errors.join("\n")).toContain("usage: jade mcp add");
+    expect(await run(["skills", "--help"])).toBe(0);
+    expect(out.join("\n")).toContain("usage: jade skills");
+  }, 30_000);
 });

@@ -106,8 +106,9 @@
 | `provider@1` | 新建或恢复会话时取一个 uncarved `Provider` | `jade/models` |
 | `store@1`（可选） | 会话日志存储；没有提供者时用核心自带的 jsonl | — |
 | `jade@1` | 核心自己提供（不是插件）：每个插件的状态和原因、服务的提供者。`/plugins` 用它；插件可以在 `requires` 里写，但没有插件能提供它 | 核心 |
+| `cli@1` | 核心自己提供（不是插件）：插件注册的 `jade <子命令>`。命令行的第一个参数是注册过的名字时，核心启动宿主后把剩下的参数交给它，不进前端 | 核心 |
 
-`jade@1` 是唯一由核心提供、给插件用的服务：核心知道自己加载了哪些插件，第三方插件拿不到这份信息，而"哪个插件坏了、为什么"是用户该看到的。它只读，没有副作用。
+`jade@1` 和 `cli@1` 是仅有的由核心提供、给插件用的服务。`jade@1`：核心知道自己加载了哪些插件，第三方插件拿不到这份信息，而"哪个插件坏了、为什么"是用户该看到的；它只读，没有副作用。`cli@1`：命令行由核心解析，插件要加 `jade <子命令>` 只能经核心；核心只查名字、转交参数，不认识子命令做什么（`jade skills`、`jade mcp` 分别来自 `jade/skills`、`jade/mcp`）。核心自己的词（`plugins`、`update`、`help`，以及 `jade plugins` 的子命令名）不能注册：它们在宿主启动之前就被核心处理了。和救援 CLI 不同，插件的子命令要启动宿主，插件坏了时不保证能用。
 
 前端的选择：清单里 `"frontend": { "name": "tui", "default": true }` 或 `{ "name": "print", "flag": "-p" }`。核心按命令行选定一个前端，只激活被选中的那个前端插件提供的 `frontend@1`。
 
@@ -118,7 +119,7 @@
 - `UI.session({ session, plugin })`（可选）：一个插件在一个会话里的界面——状态栏上它的一段（`status(text)`，一行，undefined 去掉）和输入框（`draft`：读、插入、整段替换、灰色提示）。核心为每个加入会话的插件调用一次，插件的作用域关闭时调用返回值的 `dispose()` 收掉它的段落。前端没有这些东西时返回 `undefined`，插件的 `ctx.status`、`ctx.input` 也就是 `undefined`。`jade/tui` 提供它；`jade/print` 没有。
 - `Session.history()` 返回会话日志里的全部事件：前端恢复会话时用它重新显示对话（日志存储归核心，前端拿不到）。
 
-命令行入口（`src/main.ts`）只做：处理 `jade plugins …`、`--safe`、`--version`；把以 `-` 开头的参数作为选前端的开关；项目层插件存在且在终端里运行时提供确认方式（记录在 `$JADE_HOME/state/trust.json`）；前端起来之前的消息打到 stderr，之后交给 `ui@1`；连续两次 Ctrl+C 直接退出。
+命令行入口（`src/main.ts`）只做：处理 `jade plugins …`、`--safe`、`--version`；第一个参数是插件经 `cli@1` 注册的子命令时交给它；把以 `-` 开头的参数作为选前端的开关；项目层插件存在且在终端里运行时提供确认方式（记录在 `$JADE_HOME/state/trust.json`）；前端起来之前的消息打到 stderr，之后交给 `ui@1`；连续两次 Ctrl+C 直接退出。
 
 ### 3.5 插件 API 包
 
@@ -305,8 +306,8 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 | `jade/todo`、`jade/ask` | 工具 | `ask` 需要 `ui@1`，不能提问时不注册工具 | `tools/todo.ts`、`tools/ask.ts` |
 | `jade/task` | `task` 工具、`task@1`（`tool(tool, { when })`：其他插件给子 Agent 登记只读工具，`when` 每次启动子 Agent 时决定给不给） | `models@1` | `tools/task.ts`。子 Agent 是嵌套的 `Runtime`，日志在内存里，不关联到父会话 |
 | `jade/compact` | `context.project` 里清理旧输出、总结；`/compact`；上下文溢出后压缩并经 `afterTurn` 重试 | `models@1` | `plugins/compact.ts` |
-| `jade/mcp` | MCP 服务的工具、`/mcp`；项目层服务启动前确认（`$JADE_HOME/trust.jsonl`） | 可选 `ui@1`、`commands@1`、`prompts@1`、`task@1` | `mcp.ts`。插件自带的 MCP 配置（旧的 PluginBundle）没有了 |
-| `jade/skills` | `skill` 工具、`/skills`、`/<skill 名>`；skill 目录经 `approval@1.allowRead` 可直接读 | 可选 | `skills.ts` |
+| `jade/mcp` | MCP 服务的工具、`/mcp`；`/mcp add\|remove` 和 `jade mcp add\|remove` 改配置文件；项目层服务启动前确认（`$JADE_HOME/trust.jsonl`） | 可选 `ui@1`、`commands@1`、`prompts@1`、`task@1`、`cli@1` | `mcp.ts`。插件自带的 MCP 配置（旧的 PluginBundle）没有了 |
+| `jade/skills` | `skill` 工具、`/skills`、`/<skill 名>`；`/skills add\|update\|remove` 和 `jade skills …` 从 git、npm 或本地目录安装（下载复用核心的 `source.ts`、`fetch.ts`）；每次调用模型前重新查找 skill，会话中途装的马上能用（`skill` 工具因此总是注册、名字不写成 enum，列表变了才改提示词）；工具说明告诉模型用 `jade skills add` 装到 `.jade`；skill 目录经 `approval@1.allowRead` 可直接读 | 可选 | `skills.ts` |
 | `jade/scratch` | 每个会话一个临时目录（系统临时目录下的 `jade-scratch/<会话 id>`，恢复会话时还是同一个，不主动删除），经 `prompts@1` 告诉模型临时文件放这里，经 `approval@1.allowWrite` 和工作目录同样对待 | 可选 `approval@1`、`prompts@1` | 新功能，参考 Claude Code 的 scratchpad（`test/scratch.test.ts`） |
 | `jade/checks` | 改文件后在 `context.project` 里跑项目检查、`/checks`；命令第一次运行前确认 | `shell@1`（运行检查）；可选 `ui@1`、`approval@1`、`renderers@1`、`commands@1` | `plugins/checks.ts` |
 | `jade/memory`、`jade/undo` | `memory` 工具和 `/memory`；`/undo`（`tool.before`/`tool.after` 记快照） | 可选 | `memory.ts`、`tools/checkpoint.ts` |
