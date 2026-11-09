@@ -844,8 +844,10 @@ function App({
   const [copied, setCopied] = useState<string>();
   const copiedTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
   useEffect(() => () => clearTimeout(copiedTimer.current), []);
-  const copySelection = (s: Selection) => {
-    const text = selectedText(s, rowAt);
+  /** 输入框文字在屏幕上的位置（Prompt 里的 EditableText 每次渲染时写入） */
+  const inputPlace = useRef<Placement>(undefined);
+  const copySelection = (s: Selection) => copyText(selectedText(s, rowAt));
+  const copyText = (text: string) => {
     copy(text);
     clearTimeout(copiedTimer.current);
     setCopied(`Copied ${[...text].length} characters to the clipboard`);
@@ -885,6 +887,10 @@ function App({
         if (!clamp && (i < 0 || i >= shown.length)) return undefined;
         return { row: start + Math.min(Math.max(i, 0), shown.length - 1), col: Math.max(0, mouse.x - 1) };
       };
+      // 滚轮在放不下全部文字的输入框上（含上下边框）时由输入框自己翻
+      const input = inputPlace.current;
+      const overInput = input && input.total > input.rows && mouse.y >= input.y - 1 && mouse.y <= input.y + input.rows;
+      if ((mouse.button === 64 || mouse.button === 65) && overInput) return;
       if (mouse.button === 64) store.scrollBy(WHEEL_LINES, max);
       else if (mouse.button === 65) store.scrollBy(-WHEEL_LINES, max);
       else if (mouse.button === 0 && mouse.press) {
@@ -982,6 +988,8 @@ function App({
             active: !dialog,
             onSubmit: () => store.scrollBy(-max, max),
             flash: copied,
+            place: inputPlace,
+            onCopy: copyText,
           }),
           h(StatusBar, { status: state.status, width: Math.max(10, columns - 2) }),
         ),
@@ -1255,8 +1263,19 @@ function editKey(s: EditState, input: string, key: Key): EditState | undefined {
   return text ? edit.insert(s, text) : undefined;
 }
 
-/** 可编辑文本在屏幕上的位置：第一个字符的列 x、第一行可见行的行 y、可见的是折行后的第 first 行起的 rows 行 */
-type Placement = { x: number; y: number; first: number; rows: number } | undefined;
+/**
+ * 可编辑文本在屏幕上的位置：第一个字符的列 x、第一行可见行的行 y、可见的是折行后的第 first 行起的 rows 行，
+ * 折行后一共 total 行
+ */
+type Placement = { x: number; y: number; first: number; rows: number; total: number } | undefined;
+
+/** 一行文字里下标 [from, to)（相对这一行）反色显示，和对话区的选中一样 */
+function inverseRange(row: string, from: number, to: number): string {
+  from = Math.max(0, Math.min(row.length, from));
+  to = Math.max(from, Math.min(row.length, to));
+  if (from === to) return row;
+  return `${row.slice(0, from)}${INVERSE}${row.slice(from, to)}${INVERSE_OFF}${row.slice(to)}`;
+}
 
 /** 渲染可编辑文本并把终端光标放到输入位置（输入法的候选框跟着它） */
 function EditableText({
@@ -1268,9 +1287,15 @@ function EditableText({
   active,
   maxRows = Infinity,
   place,
+  top,
+  selected,
 }: {
   /** 每次渲染时写入文字的位置，点击换算光标用 */
   place?: { current: Placement };
+  /** 用滚轮翻到的第一行可见行；undefined 时跟着光标 */
+  top?: number;
+  /** 选中的文字：value 里的下标 [from, to) */
+  selected?: [number, number];
   state: EditState;
   width: number;
   prefix: string;
@@ -1289,13 +1314,15 @@ function EditableText({
     : state.cursor;
   const all = layout(shown, cursor, width - prefix.length);
   const { col } = all;
-  // 行数超过 maxRows 时滚动，光标所在的行总在可见范围里
-  const first = Math.max(
-    0,
-    Math.min(all.row - maxRows + 1, all.rows.length - maxRows),
-  );
+  // 行数超过 maxRows 时滚动：平时光标所在的行总在可见范围里，用滚轮翻过时停在翻到的地方（光标可能不在里面）
+  const last = Math.max(0, all.rows.length - maxRows);
+  const first =
+    top === undefined
+      ? Math.max(0, Math.min(all.row - maxRows + 1, last))
+      : Math.max(0, Math.min(top, last));
   const rows = all.rows.slice(first, first + maxRows);
   const row = all.row - first;
+  const cursorShown = row >= 0 && row < rows.length;
 
   // 光标位置要在渲染时设：useCursor 在这次提交时交给 Ink，跟这一帧一起画出来。
   // 放在 useEffect 里会晚一帧，光标总是停在上一次按键的位置（只移动光标时最明显）。
@@ -1307,8 +1334,8 @@ function EditableText({
     active && metrics.hasMeasured && ref.current
       ? origin(ref.current)
       : undefined;
-  const position = at && { x: at.x + prefix.length + col, y: at.y + row };
-  if (place) place.current = at && { x: at.x + prefix.length, y: at.y, first, rows: rows.length };
+  const position = at && cursorShown ? { x: at.x + prefix.length + col, y: at.y + row } : undefined;
+  if (place) place.current = at && { x: at.x + prefix.length, y: at.y, first, rows: rows.length, total: all.rows.length };
   const [, recheck] = useReducer((n: number) => n + 1, 0);
   useEffect(() => {
     if (!at || !ref.current) return;
@@ -1329,9 +1356,15 @@ function EditableText({
             h(
               Text,
               { color: "cyan" },
-              first + i === 0 ? prefix : i === 0 ? "↑".padEnd(prefix.length) : " ".repeat(prefix.length),
+              first + i === 0
+                ? prefix
+                : i === 0
+                  ? "↑".padEnd(prefix.length)
+                  : i === rows.length - 1 && first + rows.length < all.rows.length
+                    ? "↓".padEnd(prefix.length)
+                    : " ".repeat(prefix.length),
             ),
-            r,
+            selected && !mask ? inverseRange(r, selected[0] - all.starts[first + i]!, selected[1] - all.starts[first + i]!) : r,
           ),
         ),
   );
@@ -1370,7 +1403,13 @@ function Prompt({
   active,
   onSubmit,
   flash,
+  place,
+  onCopy,
 }: {
+  /** 输入框文字在屏幕上的位置（见 EditableText 的 place）；App 用它判断滚轮是不是在输入框上 */
+  place: { current: Placement };
+  /** 在输入框里拖动选中了文字：复制它 */
+  onCopy(text: string): void;
   /** 当前的命令（随会话的插件增减），每次算菜单时取 */
   commands: () => CommandInfo[];
   handlers: TuiHandlers;
@@ -1400,8 +1439,12 @@ function Prompt({
   const draft = useRef("");
   const lastCtrlC = useRef(0);
   const lastEsc = useRef(0);
-  /** 输入框文字在屏幕上的位置，点击时换算光标位置用（见 EditableText 的 place） */
-  const place = useRef<Placement>(undefined);
+  /**
+   * 用滚轮翻过输入框时翻到的第一行可见行。只对翻的时候的那份文字和光标有效：打字、移动光标后又跟着光标
+   */
+  const scrolled = useRef<{ top: number; value: string; cursor: number }>(undefined);
+  /** 在输入框里按住左键拖动选中的文字：anchor 是按下的位置，focus 是拖到的位置（value 里的下标）；文字改了就作废 */
+  const [getDrag, setDrag] = useLive<{ anchor: number; focus: number; value: string } | undefined>(undefined);
   const { columns, rows } = useScreenSize();
   /** 输入框里文字的宽度：边框、内边距和前面的 "› " 之外 */
   const textWidth = Math.max(10, columns - 5) - 2;
@@ -1600,6 +1643,49 @@ function Prompt({
       const search = getSearch();
       if (search) return searchKey(search, input, key);
       const state = current();
+      // 输入框里的鼠标：点击移动光标，按住拖动选中、松开时复制，滚轮翻看放不下的文字
+      const mouse = mouseEvent(input);
+      if (mouse) {
+        const at = place.current;
+        if (!at) return;
+        const row = mouse.y - at.y;
+        // 拖出输入框时停在第一行或最后一行
+        const offset = (r: number) => offsetAt(state.value, textWidth, at.first + Math.max(0, Math.min(at.rows - 1, r)), mouse.x - at.x);
+        // 滚轮：上下边框也算在输入框上
+        if ((mouse.button === 64 || mouse.button === 65) && row >= -1 && row <= at.rows && at.total > at.rows) {
+          const top = Math.max(0, Math.min(at.total - at.rows, at.first + (mouse.button === 64 ? -WHEEL_LINES : WHEEL_LINES)));
+          scrolled.current = { top, value: state.value, cursor: state.cursor };
+          return setState({ ...state });
+        }
+        if (mouse.button === 0 && mouse.press) {
+          if (row < 0 || row >= at.rows) return setDrag(undefined);
+          const cursor = offset(row);
+          if (cursor === undefined) return;
+          setDrag({ anchor: cursor, focus: cursor, value: state.value });
+          // 点在翻过的地方时保持翻到的位置
+          if (scrolled.current) scrolled.current = { ...scrolled.current, cursor };
+          return setState({ ...state, cursor });
+        }
+        const drag = getDrag();
+        if (!drag || drag.value !== state.value) return;
+        if (mouse.button === DRAG) {
+          const focus = offset(row);
+          if (focus === undefined) return;
+          setDrag({ ...drag, focus });
+          if (scrolled.current) scrolled.current = { ...scrolled.current, cursor: focus };
+          return setState({ ...state, cursor: focus });
+        }
+        if (mouse.button === 0 && !mouse.press && drag.anchor !== drag.focus) {
+          onCopy(state.value.slice(Math.min(drag.anchor, drag.focus), Math.max(drag.anchor, drag.focus)));
+        }
+        return;
+      }
+      // 别的键取消输入框里的选中；Ctrl+C 只取消选中（已经在松开时复制过了）
+      const drag = getDrag();
+      if (drag) {
+        setDrag(undefined);
+        if (key.ctrl && input === "c" && drag.anchor !== drag.focus && drag.value === state.value) return;
+      }
       if (key.ctrl && input === "r")
         return history.current.length
           ? setSearch({ query: "", index: 0 })
@@ -1618,17 +1704,6 @@ function Prompt({
         if (Date.now() - lastEsc.current < 1500) return discard();
         setNotice("Press Esc again to clear the input");
         lastEsc.current = Date.now();
-        return;
-      }
-      // 点击输入框里的文字：光标移到点的位置
-      const mouse = mouseEvent(input);
-      if (mouse) {
-        const at = place.current;
-        if (!at || mouse.button !== 0 || !mouse.press) return;
-        const row = mouse.y - at.y;
-        if (row < 0 || row >= at.rows) return;
-        const cursor = offsetAt(state.value, textWidth, at.first + row, mouse.x - at.x);
-        if (cursor !== undefined) setState({ ...state, cursor });
         return;
       }
       // 文字和回车在同一块里到达（输入很快时终端可能合并）：插入文字后发送
@@ -1701,6 +1776,14 @@ function Prompt({
     { isActive: active },
   );
 
+  const view = scrolled.current;
+  const viewTop = view && view.value === state.value && view.cursor === state.cursor ? view.top : undefined;
+  const drag = getDrag();
+  const dragged: [number, number] | undefined =
+    drag && drag.value === state.value && drag.anchor !== drag.focus
+      ? [Math.min(drag.anchor, drag.focus), Math.max(drag.anchor, drag.focus)]
+      : undefined;
+
   // 对话框打开时隐藏但不卸载，输入到一半的内容和历史都保留
   return h(
     Box,
@@ -1733,6 +1816,8 @@ function Prompt({
             active,
             maxRows: inputRows,
             place,
+            top: viewTop,
+            selected: dragged,
           }),
     ),
     search

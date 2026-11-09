@@ -63,20 +63,23 @@ describe("editor", () => {
     // 中文占两列
     expect(layout("中文abc", 2, 4)).toEqual({
       rows: ["中文", "abc"],
+      starts: [0, 2],
       row: 1,
       col: 0,
     });
     expect(layout("ab\ncd", 5, 10)).toEqual({
       rows: ["ab", "cd"],
+      starts: [0, 3],
       row: 1,
       col: 2,
     });
     expect(layout("abcd", 4, 4)).toEqual({
       rows: ["abcd", ""],
+      starts: [0, 4],
       row: 1,
       col: 0,
     });
-    expect(layout("", 0, 4)).toEqual({ rows: [""], row: 0, col: 0 });
+    expect(layout("", 0, 4)).toEqual({ rows: [""], starts: [0], row: 0, col: 0 });
   });
 
   test("up and down move by wrapped screen rows and keep the display column", () => {
@@ -733,6 +736,44 @@ describe("terminal UI", () => {
     await type("X");
     await type("\r");
     expect(calls.submit).toEqual(["heXllo world"]);
+  });
+
+  test("dragging in the input selects text without shift and copies it; the cursor stays where the drag ended", async () => {
+    const { type, raw, calls } = setup();
+    await type("hello world");
+    const copied = () => [...raw().matchAll(/\x1b\]52;c;([A-Za-z0-9+/=]*)\x07/g)].map((m) => Buffer.from(m[1]!, "base64").toString("utf8"));
+    // 文字从第 5 列开始：从第 1 个字符前拖到第 6 个字符前
+    await type("\x1b[<0;5;37M");
+    await type("\x1b[<32;8;37M");
+    await type("\x1b[<32;10;37M");
+    expect(raw()).toContain("\x1b[7m");
+    await type("\x1b[<0;10;37m");
+    expect(copied()).toEqual(["hello"]);
+    expect(raw()).toContain("Copied 5 characters to the clipboard");
+    // 有选中时 Ctrl+C 只取消选中，不清空输入
+    await type("\x03");
+    await type("!");
+    await type("\r");
+    expect(calls.submit).toEqual(["hello! world"]);
+  });
+
+  test("the mouse wheel scrolls a long input instead of the conversation; typing goes back to the cursor", async () => {
+    const { screen, type, output, clear } = setup();
+    screen.log("conversation-line");
+    await sleep(80);
+    // 100×40 时输入框最多 10 行
+    await type(`\x1b[200~${Array.from({ length: 20 }, (_, i) => `row-${i}`).join("\n")}\x1b[201~`);
+    expect(output()).toContain("row-19");
+    expect(output()).not.toContain("row-5\n");
+    clear();
+    // 输入框文字占第 28 到 37 行
+    await type("\x1b[<64;10;30M");
+    await type("\x1b[<64;10;30M");
+    expect(output()).toContain("row-4");
+    expect(output()).not.toContain("more lines");
+    clear();
+    await type("X");
+    expect(output()).toContain("row-19X");
   });
 
   test("ctrl+o expands and collapses the latest foldable item", async () => {

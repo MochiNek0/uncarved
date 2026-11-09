@@ -80,6 +80,8 @@ export const edit = {
 
 export interface Layout {
   rows: string[];
+  /** 每一行第一个字符在 value 中的下标 */
+  starts: number[];
   /** 光标所在的行和列（列按显示宽度，中文占两列） */
   row: number;
   col: number;
@@ -148,6 +150,7 @@ export function moveRow(s: EditState, width: number, by: -1 | 1): EditState | un
 export function layout(value: string, cursor: number, width: number): Layout {
   width = Math.max(2, width);
   const rows: string[] = [];
+  const starts = [0];
   let row = 0;
   let col = 0;
   let current = "";
@@ -161,12 +164,14 @@ export function layout(value: string, cursor: number, width: number): Layout {
     if (i === cursor) place();
     if (ch === "\n") {
       rows.push(current);
+      starts.push(i + 1);
       current = "";
       currentWidth = 0;
     } else {
       const w = charWidth(ch);
       if (currentWidth + w > width) {
         rows.push(current);
+        starts.push(i);
         current = "";
         currentWidth = 0;
         if (i === cursor) place();
@@ -182,7 +187,10 @@ export function layout(value: string, cursor: number, width: number): Layout {
   if (col >= width) {
     row++;
     col = 0;
-    if (row >= rows.length) rows.push("");
+    if (row >= rows.length) {
+      rows.push("");
+      starts.push(value.length);
+    }
   }
-  return { rows, row, col };
+  return { rows, starts, row, col };
 }
