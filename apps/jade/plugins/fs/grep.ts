@@ -72,7 +72,8 @@ export function grepTool(cwd: string, opts: GrepOptions = {}): Tool {
         path: { type: "string" },
         include: { type: "string" },
         ignore_case: { type: "boolean" },
-        output_mode: { type: "string", enum: ["content", "files", "count"] },
+        // files_with_matches 是 ripgrep / Claude Code 的叫法，很多模型会这样传，当作 files
+        output_mode: { type: "string", enum: ["content", "files", "count", "files_with_matches"] },
         context: { type: "integer" },
       },
       required: ["pattern"],
@@ -87,9 +88,10 @@ export function grepTool(cwd: string, opts: GrepOptions = {}): Tool {
         path?: string;
         include?: string;
         ignore_case?: boolean;
-        output_mode?: Mode;
+        output_mode?: Mode | "files_with_matches";
         context?: number;
       };
+      const mode: Mode = output_mode === "files_with_matches" ? "files" : output_mode;
       let re: RegExp;
       try {
         re = new RegExp(pattern, ignore_case ? "i" : "");
@@ -102,8 +104,8 @@ export function grepTool(cwd: string, opts: GrepOptions = {}): Tool {
         pattern,
         ignoreCase: ignore_case,
         include,
-        context: output_mode === "content" ? Math.min(Math.max(context, 0), MAX_CONTEXT) : 0,
-        mode: output_mode,
+        context: mode === "content" ? Math.min(Math.max(context, 0), MAX_CONTEXT) : 0,
+        mode,
         signal,
       };
       let found: Found | undefined;
