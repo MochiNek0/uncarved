@@ -64,6 +64,9 @@ describe("parseProblems", () => {
     expect(out[1]!.text).toContain("# example.com/pkg");
     expect(out[2]!.text).toContain("Found 3 errors.");
     expect(parseProblems("error TS5083: Cannot read file 'x'.", cwd)).toEqual([{ text: "error TS5083: Cannot read file 'x'." }]);
+    // Next.js 的路由组：路径里带括号
+    const [group] = parseProblems("app/(normal)/list/page.tsx(240,10): error TS2304: Cannot find name 'x'.\r\n", cwd);
+    expect(group!.file).toBe(path.resolve(cwd, "app/(normal)/list/page.tsx"));
   });
 });
 

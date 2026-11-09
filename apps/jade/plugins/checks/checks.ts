@@ -142,7 +142,8 @@ export interface Problem {
  * 后面认不出路径的行（多行说明、代码片段）归到它下面；第一个问题之前的行单独算一个没有文件的问题
  */
 export function parseProblems(output: string, cwd: string): Problem[] {
-  const START = /^\s*((?:[A-Za-z]:[\\/])?[^\s:()][^:()]*?)(?:\(\d+,\d+\)|:\d+(?::\d+)?)(?=[:\s]|$)/;
+  // 路径里可以有括号（Next.js 的 app/(group)/page.tsx），只是不能以括号开头
+  const START = /^\s*((?:[A-Za-z]:[\\/])?[^\s:()][^:]*?)(?:\(\d+,\d+\)|:\d+(?::\d+)?)(?=[:\s]|$)/;
   const out: Problem[] = [];
   let cur: Problem | undefined;
   for (const line of output.split(/\r?\n/)) {
