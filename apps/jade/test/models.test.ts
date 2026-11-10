@@ -19,6 +19,7 @@ import {
   rpmFromEnv,
   visionFromEnv,
   withRetry,
+  type RetriedResponse,
 } from "../plugins/models/provider.ts";
 
 let tmp: string[] = [];
@@ -44,6 +45,30 @@ describe("withRetry", () => {
     const res = await withRetry(inner, { delaysMs: [1] }).complete(request, { signal: new AbortController().signal });
     expect(calls).toBe(2);
     expect(res.provider).toBe("inner");
+  });
+
+  test("a response after retries carries the failed attempts; a first-try response carries none", async () => {
+    let calls = 0;
+    const inner: Provider = {
+      id: "inner",
+      async complete(_req, { onDelta }) {
+        calls++;
+        if (calls === 1) throw new ProviderError("HTTP 503", { retryable: true, status: 503 });
+        if (calls === 2) {
+          onDelta?.({ kind: "text", text: "hal" });
+          throw new ProviderError("stream failed", { retryable: true });
+        }
+        return { model: "m", content: [], stopReason: "end" };
+      },
+    };
+    const p = withRetry(inner, { delaysMs: [1, 2], random: () => 1 });
+    const res = (await p.complete(request, { signal: new AbortController().signal })) as RetriedResponse;
+    expect(res.retries).toEqual([
+      { attempt: 1, delayMs: 1, error: "HTTP 503", status: 503 },
+      { attempt: 2, delayMs: 2, error: "stream failed", discarded: true },
+    ]);
+    const again = (await p.complete(request, { signal: new AbortController().signal })) as RetriedResponse;
+    expect(again.retries).toBeUndefined();
   });
 
   test("discards streamed deltas of a failed attempt before retrying", async () => {

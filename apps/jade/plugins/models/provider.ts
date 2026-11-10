@@ -1,6 +1,6 @@
 // Provider：按环境变量选择，外面包一层重试（4.7：重试是包装 Provider 的事）。
 
-import { ProviderError, type Provider } from "uncarved";
+import { ProviderError, type ModelResponse, type Provider } from "uncarved";
 import { parseTokens } from "./config.ts";
 
 /** 默认的重试等待：一次比一次久，最长 3 分钟 */
@@ -33,6 +33,22 @@ export const isRateLimit = (err: ProviderError) => err.status === 429 || /\b429\
  */
 export const isConcurrencyLimit = (err: ProviderError) => /concurren/i.test(err.message);
 
+/** 重试过的请求里每次失败的记录 */
+export interface RetryRecord {
+  attempt: number;
+  delayMs: number;
+  error: string;
+  status?: number;
+  /** 失败前已经输出了一部分（界面上标了作废） */
+  discarded?: true;
+}
+
+/**
+ * withRetry 的回复：重试过时带上失败的记录。核心写日志时只取回复的 content、stopReason、usage，
+ * 这一项进不了上下文；jade/models 在 model.after 里把它写成插件事件
+ */
+export type RetriedResponse = ModelResponse & { retries?: RetryRecord[] };
+
 export function withRetry(inner: Provider, opts: RetryOptions = {}): Provider {
   const delays = opts.delaysMs ?? RETRY_DELAYS_MS;
   const retries = opts.retries ?? delays.length;
@@ -40,7 +56,8 @@ export function withRetry(inner: Provider, opts: RetryOptions = {}): Provider {
   const random = opts.random ?? Math.random;
   return {
     id: `retry(${inner.id})`,
-    async complete(request, options) {
+    async complete(request, options): Promise<RetriedResponse> {
+      const failures: RetryRecord[] = [];
       for (let attempt = 1; ; attempt++) {
         let streamed = false;
         await opts.gate?.acquire(options.signal);
@@ -54,7 +71,7 @@ export function withRetry(inner: Provider, opts: RetryOptions = {}): Provider {
             },
           });
           // 实际回复的是被包装者（4.7 第 3 款）
-          return { ...res, provider: res.provider ?? inner.id };
+          return { ...res, provider: res.provider ?? inner.id, ...(failures.length > 0 ? { retries: failures } : {}) };
         } catch (err) {
           if (!(err instanceof ProviderError) || !err.retryable || attempt > retries || options.signal.aborted) throw err;
           // 在计划的时间上随机缩短最多 20%，并行的子 Agent 同时遇到 429 时不会同时重试。
@@ -66,6 +83,7 @@ export function withRetry(inner: Provider, opts: RetryOptions = {}): Provider {
           if (isRateLimit(err)) opts.gate?.limited(delayMs, { learn: !isConcurrencyLimit(err) });
           // 失败的这次已经推送过增量的，先让订阅者作废它们（4.7）
           if (streamed) options.onDelta?.({ kind: "reset" });
+          failures.push({ attempt, delayMs, error: err.message, ...(err.status !== undefined ? { status: err.status } : {}), ...(streamed ? { discarded: true as const } : {}) });
           opts.onRetry?.({ attempt, retries, delayMs, error: err });
           await sleep(delayMs, options.signal);
         }

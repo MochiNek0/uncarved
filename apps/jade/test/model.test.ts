@@ -345,3 +345,36 @@ describe(".env values", () => {
     expect(parseEnv(await readFile(file, "utf8"))).toEqual(values);
   });
 });
+
+describe("retries", () => {
+  test("a retried model request is written to the session log as a plugin event, not into the context", async () => {
+    const { host } = await setup();
+    const ok = () =>
+      new Response(
+        [
+          `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: "ok" } }] })}\n\n`,
+          `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`,
+          "data: [DONE]\n\n",
+        ].join(""),
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    let calls = 0;
+    respond = (url) => (url.endsWith("/chat/completions") && ++calls === 1 ? new Response("busy", { status: 503 }) : ok());
+    try {
+      const s = await host.sessions.open();
+      await s.send({ kind: "message", content: [{ kind: "text", text: "hi", origin: { by: "user" }, trust: "trusted" }] });
+      const events = await s.history();
+      const retried = events.filter((e) => e.type === "jade/models/retried");
+      expect(retried).toHaveLength(1);
+      const [record] = (retried[0]!.data as { retries: { attempt: number; status?: number; error: string }[] }).retries;
+      expect(record).toMatchObject({ attempt: 1, status: 503 });
+      expect(record!.error).toContain("503");
+      // 记在回复之后；回复照常进上下文，重试记录不进
+      const types = events.map((e) => e.type);
+      expect(types.indexOf("jade/models/retried")).toBeGreaterThan(types.indexOf("model.responded"));
+      expect(JSON.stringify(s.state.messages)).not.toContain("503");
+    } finally {
+      await host.close();
+    }
+  }, 10_000);
+});

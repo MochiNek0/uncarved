@@ -11,7 +11,7 @@ import type { Commands } from "../commands/index.ts";
 import { contextWindow } from "./context.ts";
 import { envWithFile, hasProvider, parseTokens } from "./config.ts";
 import { configurator } from "./configure.ts";
-import { isBuiltinKind, listModels, MODEL_KEY, providerFromEnv, providerInfo, providerKind, RateGate, rpmFromEnv, visionFromEnv, withRetry } from "./provider.ts";
+import { isBuiltinKind, listModels, MODEL_KEY, providerFromEnv, providerInfo, providerKind, RateGate, rpmFromEnv, visionFromEnv, withRetry, type RetriedResponse } from "./provider.ts";
 import { MODEL_SETTINGS, readSavedServices, type Env } from "./saved.ts";
 
 /** models@1 */
@@ -201,6 +201,18 @@ export default definePlugin({
           signal: c.signal,
         });
         await configure.model(args.trim() || undefined);
+      },
+    });
+  },
+
+  session(ctx) {
+    // 重试过的请求：把每次失败写进会话日志，事后能查到为什么慢、为什么重新输出（插件事件，不进上下文）
+    ctx.kernel.hook({
+      kind: "observe",
+      point: "model.after",
+      fn: async (res, hook) => {
+        const retries = (res as RetriedResponse).retries;
+        if (retries?.length) await hook.emit("retried", { retries });
       },
     });
   },
