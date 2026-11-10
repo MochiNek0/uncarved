@@ -1383,6 +1383,78 @@ describe("中断与进度", () => {
     expect(ended.data).toEqual({ reason: "aborted", error: "user pressed Ctrl+C" });
   });
 
+  test("endTurn() 结束等待人工审批的一轮：记为 aborted，不再请求模型，之后可以发新消息", async () => {
+    const write = recordingTool("write", { effect: "write", idempotent: false });
+    const store = new MemoryLogStore();
+    const { provider, requests } = scripted([
+      { content: [toolUse("t1", "write", {})], stopReason: "tool_use" },
+      { content: [text("ok")], stopReason: "end" },
+    ]);
+    const ask = { kind: "gate" as const, point: "tool.gate" as const, fn: () => ({ decision: "ask" as const }) };
+    const rt = await Runtime.create({ store, provider, plugins: [plugin("p", { tools: [write.tool], hooks: [ask] })] });
+    await rt.send(say("go"));
+    expect(rt.state.phase).toBe("awaiting");
+    // abort() 只发信号：没有在驱动时结束不了这一轮
+    rt.abort("user pressed Ctrl+C");
+    expect(rt.state.phase).toBe("awaiting");
+
+    await rt.endTurn("user pressed Ctrl+C");
+    const events = await readAll(store, rt.state.sessionId);
+    expect(events.at(-1)!.type).toBe("turn.ended");
+    expect(events.at(-1)!.data).toEqual({ reason: "aborted", error: "user pressed Ctrl+C" });
+    expect(rt.state.phase).toBe("idle");
+    expect(write.calls).toEqual([]);
+    expect(requests.length).toBe(1);
+    // 没有结果的调用补上错误结果，历史仍然合法
+    expect(rt.state.messages.at(-1)!.content.map((b) => b.kind === "tool_result" && [b.toolUseId, b.isError])).toEqual([["t1", true]]);
+    // 状态只凭日志就能重建（I-5）
+    expect(rebuild(rt.state.sessionId, events)).toEqual(rt.state);
+
+    await rt.send(say("something else"));
+    expect(rt.state.phase).toBe("idle");
+    expect(requests.length).toBe(2);
+  });
+
+  test("endTurn() 在没有未完成的一轮时什么都不做；恢复后可以用它放弃没做完的一轮", async () => {
+    const store = new MemoryLogStore();
+    const { provider } = scripted([{ content: [text("hi")], stopReason: "end" }]);
+    const rt = await Runtime.create({ store, provider, plugins: [] });
+    await rt.endTurn();
+    await rt.send(say("hi"));
+    const before = (await readAll(store, rt.state.sessionId)).length;
+    await rt.endTurn();
+    expect((await readAll(store, rt.state.sessionId)).length).toBe(before);
+
+    // 模型请求发出后进程退出：恢复后不 recover()，直接放弃这一轮
+    const crashed = new MemoryLogStore();
+    const failing: Provider = { id: "down", complete: () => new Promise(() => {}) };
+    const rt1 = await Runtime.create({ store: crashed, provider: failing, plugins: [] });
+    void rt1.send(say("hi")).catch(() => {});
+    await Bun.sleep(0);
+    const rt2 = await Runtime.resume({ store: crashed, provider, sessionId: rt1.state.sessionId });
+    expect(rt2.state.phase).toBe("model");
+    await rt2.endTurn();
+    expect(rt2.state.phase).toBe("idle");
+    expect((await readAll(crashed, rt2.state.sessionId)).at(-1)!.data).toEqual({ reason: "aborted" });
+  });
+
+  test("endTurn() 在插件变化未被接受时拒绝（4.6）", async () => {
+    const echo = recordingTool("echo");
+    const store = new MemoryLogStore();
+    const ask = { kind: "gate" as const, point: "tool.gate" as const, fn: () => ({ decision: "ask" as const }) };
+    const first = scripted([{ content: [toolUse("t1", "echo", {})], stopReason: "tool_use" }]);
+    const rt1 = await Runtime.create({ store, provider: first.provider, plugins: [plugin("p", { tools: [echo.tool], hooks: [ask] })] });
+    await rt1.send(say("hi"));
+    const rt2 = await Runtime.resume({
+      store,
+      provider: scripted([]).provider,
+      sessionId: rt1.state.sessionId,
+      plugins: [plugin("p", { version: "2.0.0", tools: [echo.tool], hooks: [ask] })],
+    });
+    await expect(rt2.endTurn()).rejects.toBeInstanceOf(PluginsHeld);
+    expect(rt2.state.phase).toBe("awaiting");
+  });
+
   test("provider 不理会中断信号：宽限期过后不再等它，本轮记为 aborted", async () => {
     const store = new MemoryLogStore();
     let rt!: Runtime;

@@ -62,6 +62,7 @@ await rt.send({
 | `rt.send(input)` | 发送用户输入，跑完这一轮后 resolve |
 | `rt.subscribe(fn)` | 订阅通知：`event`、`delta`、`tool-progress`、`awaiting`、`warning`、`hook-error`。返回取消订阅函数 |
 | `rt.abort(reason?)` | 中断当前操作 |
+| `rt.endTurn(reason?)` | 结束没有在驱动的那一轮（等待人工审批的，或恢复后不打算 `recover()` 的），记为 `aborted`；没有未完成的一轮时什么都不做 |
 | `rt.recover()` | 崩溃或重启后，继续执行日志里尚未完成的工作 |
 | `rt.close()` | 结束会话，之后日志不再接受事件 |
 | `rt.detach()` | 宿主离开会话，会话保持可恢复，之后本实例不再可用 |

@@ -294,6 +294,24 @@ export class Runtime {
   }
 
   /**
+   * 结束没有在驱动的那一轮：等待人工审批的，或者恢复后不打算 recover() 的。写入 turn.ended（aborted），
+   * 没有结果的工具调用记为错误。正在驱动时用 abort()；没有未完成的一轮时什么都不做（4.4）
+   */
+  async endTurn(reason?: unknown): Promise<void> {
+    this.#enter();
+    try {
+      this.#queue.length = 0;
+      const phase = this.#state.phase;
+      if (phase === "new" || phase === "idle" || phase === "ended") return;
+      const error = reason instanceof Error ? reason.message : reason === undefined ? undefined : String(reason);
+      await this.#commit("turn.ended", { reason: "aborted", error }, RUNTIME);
+    } finally {
+      await this.#settle();
+      this.#busy = false;
+    }
+  }
+
+  /**
    * 结束会话。session.end 的 observe 在 session.ended 之前执行并等待完成，
    * 因此仍可写入；session.ended 之后日志不再接受任何事件（5.1）
    */
