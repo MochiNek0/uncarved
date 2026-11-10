@@ -1,6 +1,6 @@
 {
   "name": "uncarved",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "A minimal, fully customizable agent harness kernel",
   "license": "MIT",
   "repository": {

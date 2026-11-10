@@ -576,9 +576,9 @@ describe("等待、恢复与兼容", () => {
   });
 
   test("内核版本按 semver 的 ^ 范围匹配，0.x 时小版本不兼容", () => {
-    expect(KERNEL_VERSION).toBe("0.1.5");
-    for (const kernel of ["^0.1", "^0.1.0", "^0.1.1", "^0.1.2", "^0.1.3", "^0.1.4", "^0.1.5", "^0"]) expect(() => checkCompat(plugin("ok", { kernel }))).not.toThrow();
-    for (const kernel of ["^0.2", "^0.1.6", "^0.0", "^0.0.1", "^1", "1", "~0.1", ">=0.1", "^0.1.x"]) {
+    expect(KERNEL_VERSION).toBe("0.1.6");
+    for (const kernel of ["^0.1", "^0.1.0", "^0.1.1", "^0.1.2", "^0.1.3", "^0.1.4", "^0.1.5", "^0.1.6", "^0"]) expect(() => checkCompat(plugin("ok", { kernel }))).not.toThrow();
+    for (const kernel of ["^0.2", "^0.1.7", "^0.0", "^0.0.1", "^1", "1", "~0.1", ">=0.1", "^0.1.x"]) {
       expect(() => checkCompat(plugin("bad", { kernel }))).toThrow(PluginIncompatible);
     }
   });
