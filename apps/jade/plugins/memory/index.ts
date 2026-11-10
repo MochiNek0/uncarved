@@ -2,7 +2,7 @@
 // 会话开始时经 prompts@1 把记忆放进系统提示词（会话中途的改动下一个会话才进提示词，这样提示缓存不失效；
 // 用户在 /memory 里改了，下一次请求时附一条说明告诉模型）。
 
-import { definePlugin } from "../../src/api.ts";
+import { definePlugin } from "@uncarved/jade-api";
 import type { Commands } from "../commands/index.ts";
 import type { Prompts } from "../prompts/index.ts";
 import type { Renderers } from "../renderers/index.ts";

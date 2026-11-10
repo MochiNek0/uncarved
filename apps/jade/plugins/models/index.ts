@@ -6,7 +6,7 @@
 
 import path from "node:path";
 import type { ModelRequest, ModelResponse, Provider } from "uncarved";
-import { definePlugin, type UI } from "../../src/api.ts";
+import { definePlugin, type UI } from "@uncarved/jade-api";
 import type { Commands } from "../commands/index.ts";
 import { contextWindow } from "./context.ts";
 import { envWithFile, hasProvider, parseTokens } from "./config.ts";

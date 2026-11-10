@@ -1,7 +1,7 @@
 // jade/commands：斜杠命令的注册表。只登记，不执行：前端解析输入、带着自己的上下文调用 run。
 // 每个调用方一个实例，调用方关闭（停用、被隔离、换会话时的会话作用域）时它注册的命令自动撤销。
 
-import { definePlugin, type SessionManager, type UI } from "../../src/api.ts";
+import { definePlugin, type SessionManager, type UI } from "@uncarved/jade-api";
 
 export interface Command {
   /** 不带斜杠，字母、数字、- 和 _ */

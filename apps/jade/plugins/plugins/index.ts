@@ -1,7 +1,7 @@
 // jade/plugins：/plugins 命令。列出这次启动里每个插件的状态和原因（failed、skipped、conflicted……），
 // 以及每个服务由谁提供。数据来自核心自己的 jade@1 服务，和救援 CLI `jade plugins list` 是同一份状态。
 
-import { definePlugin, type Jade } from "../../src/api.ts";
+import { definePlugin, type Jade } from "@uncarved/jade-api";
 import type { Commands } from "../commands/index.ts";
 
 export default definePlugin({

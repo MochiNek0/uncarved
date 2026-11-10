@@ -1,6 +1,6 @@
 // 把内置插件编译成 plugins-dist/：Node 不给 node_modules 里的 .ts 去类型，npm 装的 jade 要靠编译好的 .js。
-// plugins-dist 和 plugins 在包里同一层，插件里的 ../../package.json、../其他插件/ 照样成立；
-// ../../src/ 改指 ../../dist/，让插件和宿主（dist）用同一份模块
+// plugins-dist 和 plugins 在包里同一层，插件里的 ../../package.json、../其他插件/ 照样成立。
+// 插件不 import 宿主的模块（只从 @uncarved/jade-api 拿类型和 definePlugin），所以路径不用改写
 import { execFileSync } from "node:child_process";
 import { cp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -25,10 +25,7 @@ for (const entry of await readdir(out, { recursive: true, withFileTypes: true })
   if (!entry.isFile()) continue;
   const file = path.join(entry.parentPath, entry.name);
   if (entry.name === "vendor.js") vendors.push(file);
-  if (entry.name.endsWith(".js")) {
-    const src = await readFile(file, "utf8");
-    await writeFile(file, src.replace(/(["'])\.\.\/\.\.\/src\//g, "$1../../dist/"));
-  } else if (entry.name === "plugin.json") {
+  if (entry.name === "plugin.json") {
     const manifest = JSON.parse(await readFile(file, "utf8"));
     if (typeof manifest.entry === "string") manifest.entry = manifest.entry.replace(/\.ts$/, ".js");
     await writeFile(file, JSON.stringify(manifest, null, 2) + "\n");

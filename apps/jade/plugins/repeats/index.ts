@@ -15,7 +15,7 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
 import type { Block, GateResult, LocalHookSpec, LogEvent } from "uncarved";
-import { definePlugin } from "../../src/api.ts";
+import { definePlugin } from "@uncarved/jade-api";
 
 const ID = "jade/repeats";
 /** jade/compact 记录压缩结果用的派生数据键（旧 jade 的约定）：记一次就说明历史被压缩过 */

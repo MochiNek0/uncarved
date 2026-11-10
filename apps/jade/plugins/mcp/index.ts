@@ -7,7 +7,7 @@
 // 服务进程退出后，下一次调用它的工具时重新连接一次。
 
 import path from "node:path";
-import { definePlugin, type Cli, type ProcessContext, type UI } from "../../src/api.ts";
+import { definePlugin, type Cli, type ProcessContext, type UI } from "@uncarved/jade-api";
 import type { Commands } from "../commands/index.ts";
 import type { Prompts } from "../prompts/index.ts";
 import type { Task } from "../task/index.ts";

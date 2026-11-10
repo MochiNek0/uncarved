@@ -22,6 +22,7 @@
         "jade": "./bin/jade.js",
       },
       "dependencies": {
+        "@uncarved/jade-api": "workspace:*",
         "@uncarved/provider-anthropic": "workspace:*",
         "@uncarved/provider-openai-compat": "workspace:*",
         "@uncarved/provider-openai-responses": "workspace:*",
@@ -37,6 +38,13 @@
       "devDependencies": {
         "@types/picomatch": "^4.0.2",
         "@types/react": "^19.2.0",
+      },
+    },
+    "packages/jade-api": {
+      "name": "@uncarved/jade-api",
+      "version": "1.0.0",
+      "peerDependencies": {
+        "uncarved": "workspace:^",
       },
     },
     "packages/kernel": {
@@ -142,6 +150,8 @@
     "@typescript/typescript-win32-x64": ["@typescript/typescript-win32-x64@7.0.2", "https://registry.npmmirror.com/@typescript/typescript-win32-x64/-/typescript-win32-x64-7.0.2.tgz", { "os": "win32", "cpu": "x64" }, "sha512-0BQ3HkAHHlKLSp1qRvf3SUhGpGsDuhB/jgFw75guyqbxJqEaS0Cw/VFO8i2nHglJUzQCRtMMR/IBAKE3ETMC4g=="],
 
     "@uncarved/jade": ["@uncarved/jade@workspace:apps/jade"],
+
+    "@uncarved/jade-api": ["@uncarved/jade-api@workspace:packages/jade-api"],
 
     "@uncarved/plugin-stdio": ["@uncarved/plugin-stdio@workspace:packages/plugin-stdio"],
 

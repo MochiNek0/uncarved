@@ -6,7 +6,7 @@
 
 import path from "node:path";
 import type { GatedToolCall, Message } from "uncarved";
-import { definePlugin, type Caller, type SelectRequest, type UI } from "../../src/api.ts";
+import { definePlugin, type Caller, type SelectRequest, type UI } from "@uncarved/jade-api";
 import type { Models } from "../models/index.ts";
 import type { Renderers } from "../renderers/index.ts";
 import { describeRule, MODES, policy, type AllowRule, type Mode } from "./policy.ts";

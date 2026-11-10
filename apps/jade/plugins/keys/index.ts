@@ -1,6 +1,6 @@
 // jade/keys：快捷键的注册表。前端在输入框有焦点时按下自己不用的键，查这里找到插件的处理函数。
 
-import { definePlugin } from "../../src/api.ts";
+import { definePlugin } from "@uncarved/jade-api";
 
 /** "ctrl+<字母>"、"alt+<字母或数字>" 或 "shift+tab" */
 export const KEY_SPEC = /^(ctrl\+[a-z]|alt\+[a-z0-9]|shift\+tab)$/;

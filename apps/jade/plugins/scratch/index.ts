@@ -5,7 +5,7 @@ import { realpathSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { definePlugin } from "../../src/api.ts";
+import { definePlugin } from "@uncarved/jade-api";
 import type { Approval } from "../approval/index.ts";
 import type { Prompts } from "../prompts/index.ts";
 

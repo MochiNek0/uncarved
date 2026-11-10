@@ -4,7 +4,7 @@
 // 压缩插件可以从历史里找最后一份清单（latestTodos）写进摘要。从旧 jade 的 tools/todo.ts 移植。
 
 import type { Message, Tool } from "uncarved";
-import { definePlugin } from "../../src/api.ts";
+import { definePlugin } from "@uncarved/jade-api";
 import type { Renderers, ToolRenderer } from "../renderers/index.ts";
 
 export type TodoStatus = "pending" | "in_progress" | "completed";

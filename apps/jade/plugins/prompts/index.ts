@@ -4,7 +4,7 @@
 
 import path from "node:path";
 import type { ContentSource, LogEvent, SystemSegment } from "uncarved";
-import { definePlugin, type UI } from "../../src/api.ts";
+import { definePlugin, type UI } from "@uncarved/jade-api";
 import type { Models } from "../models/index.ts";
 import { Notes } from "./notes.ts";
 import { allInstructions, environment, mainPrompt, realPath } from "./prompts.ts";

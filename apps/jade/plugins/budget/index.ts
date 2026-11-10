@@ -2,7 +2,7 @@
 // 从旧 jade 的 plugins/budget.ts 移植；上限来自配置 maxSteps。
 
 import type { State } from "uncarved";
-import { definePlugin, type UI } from "../../src/api.ts";
+import { definePlugin, type UI } from "@uncarved/jade-api";
 
 const DEFAULT_STEPS = 100;
 

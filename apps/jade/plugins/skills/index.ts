@@ -5,7 +5,7 @@
 // 它只是给模型看的文字，不执行代码；和旧 jade 一样，列表里有项目层的 skill 时整段标为不可信。
 
 import path from "node:path";
-import { definePlugin, type Cli, type Sources, type UI } from "../../src/api.ts";
+import { definePlugin, type Cli, type Sources, type UI } from "@uncarved/jade-api";
 import type { Approval } from "../approval/index.ts";
 import type { Commands } from "../commands/index.ts";
 import type { Prompts } from "../prompts/index.ts";

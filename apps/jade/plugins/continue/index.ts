@@ -6,7 +6,7 @@
 // 旧 jade 的"上下文溢出后压缩重试"不在这里：不压缩就重试只会再溢出一次，整件事归 jade/compact。
 
 import type { Block, UserInput } from "uncarved";
-import { definePlugin, type UI } from "../../src/api.ts";
+import { definePlugin, type UI } from "@uncarved/jade-api";
 
 export const DEFAULT_CONTINUES = 3;
 export const CONTINUE_NOTE =

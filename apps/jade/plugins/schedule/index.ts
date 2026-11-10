@@ -5,7 +5,7 @@
 
 import path from "node:path";
 import type { Tool, UserInput } from "uncarved";
-import { definePlugin, type UI } from "../../src/api.ts";
+import { definePlugin, type UI } from "@uncarved/jade-api";
 import type { Commands } from "../commands/index.ts";
 import { parseCron } from "./cron.ts";
 import { claimDue, nextAt, sameDir, ScheduleStore, type Task } from "./store.ts";

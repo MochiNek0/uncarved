@@ -2,7 +2,7 @@
 // 模型能不能看图片由 jade/models 的 models@1 给出（JADE_VISION）：不能看时请求里没有这个工具和提示，调用了也不截图。
 // 访问网络的 URL 由 jade/approval 的关卡决定要不要问用户（effect 是 read，路径之外的 URL 会问）。
 
-import { definePlugin } from "../../src/api.ts";
+import { definePlugin } from "@uncarved/jade-api";
 import type { Models } from "../models/index.ts";
 import type { Prompts } from "../prompts/index.ts";
 import type { Renderers } from "../renderers/index.ts";

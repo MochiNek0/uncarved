@@ -9,7 +9,7 @@ import { randomBytes } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Delta, Message, ModelRequest } from "uncarved";
-import { definePlugin, type UI } from "../../src/api.ts";
+import { definePlugin, type UI } from "@uncarved/jade-api";
 import type { Commands } from "../commands/index.ts";
 import type { Models } from "../models/index.ts";
 

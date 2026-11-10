@@ -1,6 +1,6 @@
 // jade/shell：bash 工具，以及后台命令的 bash_output、kill_shell；shell@1 给其他插件执行命令。
 
-import { definePlugin, type UI } from "../../src/api.ts";
+import { definePlugin, type UI } from "@uncarved/jade-api";
 import type { Prompts } from "../prompts/index.ts";
 import type { Renderers } from "../renderers/index.ts";
 import { shellRenderers } from "./renderers.ts";

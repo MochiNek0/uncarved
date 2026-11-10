@@ -1,6 +1,6 @@
 // jade/tui：终端界面，默认的前端。提供 frontend@1 和 ui@1；命令、快捷键、显示方式都来自注册表插件。
 
-import { definePlugin } from "../../src/api.ts";
+import { definePlugin } from "@uncarved/jade-api";
 import type { Commands } from "../commands/index.ts";
 import type { Compact } from "../compact/index.ts";
 import type { Keys } from "../keys/index.ts";

@@ -9,7 +9,7 @@ import { readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Block } from "uncarved";
-import type { Frontend, OpenOptions, Session, SessionManager, SessionUI, UI } from "../../src/api.ts";
+import type { Frontend, OpenOptions, Session, SessionManager, SessionUI, UI } from "@uncarved/jade-api";
 import type { CommandContext, Commands } from "../commands/index.ts";
 import type { Keys } from "../keys/index.ts";
 import type { Compact } from "../compact/index.ts";

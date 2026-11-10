@@ -2,7 +2,7 @@
 // 请求因为超出上下文窗口失败时，压缩后用 { kind: "retry" } 重试一次（session.afterTurn，设计 4.3）。
 
 import type { LogEvent } from "uncarved";
-import { definePlugin, type UI } from "../../src/api.ts";
+import { definePlugin, type UI } from "@uncarved/jade-api";
 import type { Commands } from "../commands/index.ts";
 import type { Models } from "../models/index.ts";
 import type { Renderers } from "../renderers/index.ts";

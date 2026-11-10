@@ -10,7 +10,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type { Tool } from "uncarved";
-import { definePlugin, type UI } from "../../src/api.ts";
+import { definePlugin, type UI } from "@uncarved/jade-api";
 import type { Approval } from "../approval/index.ts";
 import type { Commands } from "../commands/index.ts";
 import type { Keys } from "../keys/index.ts";

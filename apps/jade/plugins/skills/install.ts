@@ -9,7 +9,7 @@
 import { randomBytes } from "node:crypto";
 import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { PluginSourceSpec, Sources } from "../../src/api.ts";
+import type { PluginSourceSpec, Sources } from "@uncarved/jade-api";
 import { NAME, parseSkill } from "./skills.ts";
 
 export interface SkillRecord {

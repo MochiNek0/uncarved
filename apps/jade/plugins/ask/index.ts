@@ -5,7 +5,7 @@
 // 从旧 jade 的 tools/ask.ts 和 main.ts 的 askUser 移植。
 
 import type { Tool } from "uncarved";
-import { definePlugin, type UI } from "../../src/api.ts";
+import { definePlugin, type UI } from "@uncarved/jade-api";
 import type { Renderers, ToolRenderer } from "../renderers/index.ts";
 
 export interface Question {

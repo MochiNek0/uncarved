@@ -1,7 +1,7 @@
 // jade/renderers：工具调用和插件事件在对话里怎么显示的注册表。前端查这里；没有登记的用前端的默认显示。
 // 显示的文字可以带 ANSI 颜色，前端负责过滤掉颜色之外的控制序列。
 
-import { definePlugin } from "../../src/api.ts";
+import { definePlugin } from "@uncarved/jade-api";
 
 export interface ToolRenderer {
   tool: string;

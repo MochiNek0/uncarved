@@ -11,6 +11,7 @@ Uncarved 是一个极简、完全可定制的 Agent 内核。它只提供**一�
 | 包 | 说明 |
 |---|---|
 | [`uncarved`](./packages/kernel) | 内核：Runtime、事件日志、插件与 hook、信任模型 |
+| [`@uncarved/jade-api`](./packages/jade-api) | 写 jade 插件用的类型和 `definePlugin`，没有运行时依赖 |
 | [`@uncarved/store-jsonl`](./packages/store-jsonl) | 基于 JSONL 文件的日志存储和信任存储，带文件锁 |
 | [`@uncarved/plugin-stdio`](./packages/plugin-stdio) | 进程外插件：通过 stdio（JSON-RPC 2.0）运行任意语言写的插件 |
 | [`@uncarved/provider-anthropic`](./packages/provider-anthropic) | Claude Messages API |

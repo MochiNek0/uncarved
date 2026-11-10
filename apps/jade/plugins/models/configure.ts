@@ -9,7 +9,7 @@ import { hasProvider, parseTokens } from "./config.ts";
 import { contextWindow } from "./context.ts";
 import { EFFORTS, isBuiltinKind, jsonObject, KEY_KEY, listModels, MODEL_KEY, providerInfo, providerKind, rpmFromEnv, URL_KEY, visionFromEnv, type ProviderKind } from "./provider.ts";
 import { MODEL_SETTINGS, readSavedServices, updateEnvFile, writeSavedServices, type Env, type SavedModel, type SavedService } from "./saved.ts";
-import type { UI } from "../../src/api.ts";
+import type { UI } from "@uncarved/jade-api";
 
 export interface ConfigureOptions {
   envFile: string;

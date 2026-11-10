@@ -10,7 +10,7 @@
 
 import { createHash } from "node:crypto";
 import path from "node:path";
-import { definePlugin, type SessionContext, type UI } from "../../src/api.ts";
+import { definePlugin, type SessionContext, type UI } from "@uncarved/jade-api";
 import type { Approval } from "../approval/index.ts";
 import type { Commands } from "../commands/index.ts";
 import type { EventRenderer, Renderers } from "../renderers/index.ts";

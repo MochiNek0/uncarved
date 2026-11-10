@@ -5,7 +5,7 @@
 import { appendFile, mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import type { UserInput } from "uncarved";
-import { definePlugin } from "../../src/api.ts";
+import { definePlugin } from "@uncarved/jade-api";
 import type { Commands } from "../commands/index.ts";
 
 export interface SessionSummary {

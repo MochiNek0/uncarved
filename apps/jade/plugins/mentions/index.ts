@@ -8,7 +8,7 @@
 // 输入框里 @ 的补全不在这里，在 jade/tui。
 
 import type { Block, Message } from "uncarved";
-import { definePlugin } from "../../src/api.ts";
+import { definePlugin } from "@uncarved/jade-api";
 import type { Renderers } from "../renderers/index.ts";
 import { attachMentions } from "./attach.ts";
 import { clip, dim, yellow } from "./style.ts";

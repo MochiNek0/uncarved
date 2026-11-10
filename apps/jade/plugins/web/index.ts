@@ -5,7 +5,7 @@
 // 不用重开会话；会话的工具清单在创建时就定了。
 
 import path from "node:path";
-import { definePlugin, type ScopeContext, type UI } from "../../src/api.ts";
+import { definePlugin, type ScopeContext, type UI } from "@uncarved/jade-api";
 import type { Commands } from "../commands/index.ts";
 import type { Prompts } from "../prompts/index.ts";
 import type { Renderers } from "../renderers/index.ts";

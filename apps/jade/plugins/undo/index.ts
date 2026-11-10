@@ -7,7 +7,7 @@
 import { readFile } from "node:fs/promises";
 import { realpathSync } from "node:fs";
 import path from "node:path";
-import { definePlugin } from "../../src/api.ts";
+import { definePlugin } from "@uncarved/jade-api";
 import type { Commands } from "../commands/index.ts";
 import type { Prompts } from "../prompts/index.ts";
 import { Checkpoints, lastTurnChanges, sha256, turnToolNames, type Checkpoint } from "./checkpoint.ts";

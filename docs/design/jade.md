@@ -129,9 +129,9 @@
 
 ### 3.5 插件 API 包
 
-- 新包 `@uncarved/jade-api`：只有类型和 `definePlugin`，没有运行时依赖。（第 1–3 步先放在 `apps/jade/src/api.ts`，第 4 步出现第一个仓库外插件之前拆成独立的包。）插件 `api` 字段按 `^` 规则匹配，不接受 `>=` 这类开放范围（dsh 的 `engines.dsh: ">=0.2.0"` 永远拒绝不了未来的破坏性版本）。
+- 包 `@uncarved/jade-api`（`packages/jade-api`，2026-11-10 从 `apps/jade/src/api.ts` 拆出）：只有类型和 `definePlugin`，没有运行时依赖，版本就是插件 API 的版本。内置插件也只从它 import，不 import 核心的模块（`test/boundaries.test.ts` 守着）。核心的 `src/api.ts` 把它原样转出，另加只有核心用得到值的东西：`API_VERSION`、层级顺序、错误类。错误类不在包里：插件自己装的那份和核心的不是同一个模块，`instanceof` 不成立，插件按 `error.name` 判断。插件 `api` 字段按 `^` 规则匹配，不接受 `>=` 这类开放范围（dsh 的 `engines.dsh: ">=0.2.0"` 永远拒绝不了未来的破坏性版本）。
 - 插件运行时用到的一切都从 `ctx` 拿，不从宿主的包里 import 值，避免两份模块副本造成单例错乱（pi #4748、#8620）。
-- 各插件提供的服务类型由提供者自己导出，例如 `@uncarved/jade-tui` 导出 `UI`。
+- 各插件提供的服务类型由提供者自己导出（`plugins/<名字>/index.ts`）。内置插件之间按相对路径 `import type`；这些类型还没有单独发布，第三方插件暂时拿不到（要用就照着写一份接口）。`ui@1`、`frontend@1` 的形状由 jade 定义，在 `@uncarved/jade-api` 里。
 
 ## 4. 作用域与生命周期
 

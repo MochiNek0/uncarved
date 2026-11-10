@@ -2,7 +2,7 @@
 // 配置 auto 为 false 或 JADE_AUTO_UPDATE=off 时只提示。仓库里的开发版和 npm link 既不提示也不升级。
 // 查询和升级经核心的 update@1 服务，和 jade update 是同一套；不想要它就 jade plugins disable jade/update。
 
-import { definePlugin, type UI, type Updater } from "../../src/api.ts";
+import { definePlugin, type UI, type Updater } from "@uncarved/jade-api";
 
 export interface CheckOptions {
   /** 核心的 update@1 */

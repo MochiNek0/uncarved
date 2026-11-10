@@ -137,7 +137,7 @@ jade mcp remove <名字> [--project]
 ```
 
 ```ts
-import { definePlugin } from "@uncarved/jade";
+import { definePlugin } from "@uncarved/jade-api";
 
 export default definePlugin({
   process(ctx) {

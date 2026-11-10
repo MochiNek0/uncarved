@@ -4,7 +4,7 @@
 // 登记随登记者的作用域撤销。主会话里的工具对象是各插件私有的，子 Agent 拿到的是登记者另给的一份。
 
 import type { Tool, Usage } from "uncarved";
-import { definePlugin, type UI } from "../../src/api.ts";
+import { definePlugin, type UI } from "@uncarved/jade-api";
 import type { Approval } from "../approval/index.ts";
 import type { Models } from "../models/index.ts";
 import type { Renderers } from "../renderers/index.ts";

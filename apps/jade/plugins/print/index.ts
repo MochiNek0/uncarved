@@ -2,7 +2,7 @@
 // 不能向用户提问：ui@1 的 select 总是返回 undefined，要审批的调用由审批插件拒绝。
 
 import type { Block, LogEvent, RuntimeNotice } from "uncarved";
-import { definePlugin, type Frontend, type UI } from "../../src/api.ts";
+import { definePlugin, type Frontend, type UI } from "@uncarved/jade-api";
 
 const USAGE = `usage: jade -p <prompt> [--resume <session id>]
        echo <prompt> | jade -p
