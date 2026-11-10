@@ -110,7 +110,10 @@ export interface SessionControl {
   afterTurn(fn: () => void | Promise<void>): void;
   /**
    * 发起一轮。正在跑时排到当前这一轮之后，这一轮跑完时 resolve。
-   * 不要在 hook 或工具里 await 它：它要等当前这一轮结束，而当前这一轮在等你。项目层插件不能用（第 7 节）
+   * 不要在 hook 或工具里 await 它：它要等当前这一轮结束，而当前这一轮在等你。项目层插件不能用（第 7 节）。
+   *
+   * `kind: "approval"` 是对等待人工审批的调用的回答，属于正在跑的这一轮，不排队：内核停下来等审批时交给它，
+   * 内核接着跑到再次停下（下一个审批，或这一轮结束）时 resolve。没有在跑的一轮、或没有这个待批的调用时 reject
    */
   send(input: UserInput): Promise<void>;
   /** 中止正在跑的这一轮（例如用户在别处喊停）；空闲时什么都不做。项目层插件不能用 */
@@ -152,12 +155,16 @@ export interface Draft {
 export interface Session {
   readonly id: string;
   readonly state: State;
-  /** 发一条输入；正在跑时排队。这一轮跑完时 resolve（之后的 afterTurn 不等） */
+  /**
+   * 发一条输入；正在跑时排队。这一轮跑完时 resolve（之后的 afterTurn 不等）。内核停下来等人工审批时这一轮还没完。
+   * `kind: "approval"`（审批的回答）不排队，交给正在等的这一轮
+   */
   send(input: UserInput): Promise<void>;
   /** 排队的输入和 afterTurn 全部处理完时 resolve */
   idle(): Promise<void>;
   /** 继续日志里没做完的工作（崩溃、重启后） */
   recover(): Promise<void>;
+  /** 中止正在跑的这一轮，包括停下来等人工审批的时候 */
   abort(reason?: unknown): void;
   subscribe(fn: (n: RuntimeNotice) => void): () => void;
   /** 日志里的全部事件（恢复会话时前端用它重新显示对话） */

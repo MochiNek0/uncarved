@@ -1,6 +1,6 @@
 {
   "id": "jade/approval",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "api": "^1",
   "entry": "./index.ts",
   "provides": ["approval@1"],

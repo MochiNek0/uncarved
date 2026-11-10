@@ -148,6 +148,21 @@ test("a long or multi-line command is shown in full when its call is expanded", 
   expect(lines.get("b2")!.details).toBe("    a\n    b");
 });
 
+test("a call that waited for approval shows when the answer arrives: the call line if approved, the reason if denied", () => {
+  const { event, lines } = recording();
+  const ask = (id: string) => {
+    event("model.responded", { content: [{ kind: "tool_use", id, name: "bash", input: { command: "ls" } }], usage: {} });
+    event("tool.decided", { toolUseId: id, input: { command: "ls" }, decision: "ask", decidedBy: "jade/approval" });
+  };
+  ask("b1");
+  expect(lines.has("b1")).toBe(false);
+  event("input.received", { kind: "approval", toolUseId: "b1", approved: true });
+  expect(lines.get("b1")!.text).toBe("● bash(ls)");
+  ask("b2");
+  event("input.received", { kind: "approval", toolUseId: "b2", approved: false, reason: "The user denied this tool call." });
+  expect(lines.get("b2")!.text).toBe("✗ bash(ls) — The user denied this tool call.");
+});
+
 test("a renderer's call replaces the call line and shows the rest unfolded; a null result hides the result, errors still show", () => {
   const { event, use, lines, logged } = recording();
   use("w1", "todo_write", { todos: [{ content: "read", status: "completed" }, { content: "edit", status: "in_progress" }] });

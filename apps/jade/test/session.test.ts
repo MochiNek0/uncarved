@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { Block, ModelResponse, State } from "uncarved";
-import { NO_APPROVAL_REASON, ServiceUnavailable, StaleContext } from "../src/index.ts";
+import { NO_APPROVAL_REASON, NO_APPROVER_ERROR, ServiceUnavailable, StaleContext } from "../src/index.ts";
 import { info, world } from "./helpers.ts";
 
 type Step = Omit<ModelResponse, "model">;
@@ -213,6 +213,94 @@ describe("afterTurn and send", () => {
     const second = s.send(msg("second"));
     await Promise.all([first, recovered, second]);
     expect(s.state.messages.length).toBe(4);
+    await host.close();
+  });
+});
+
+describe("waiting for approval", () => {
+  // 审批插件：写操作要问（ask），自己不回答；测试经它的 ctx 交回答
+  const ASK = `export default { process(ctx) { ctx.provide("approval@1", {}); }, session(ctx) {
+    globalThis.__ctx = ctx;
+    ctx.kernel.hook({ kind: "gate", point: "tool.gate", fn: (call) => ({ decision: call.tool.effect === "read" ? "allow" : "ask" }) });
+    ctx.kernel.hook({ kind: "observe", point: "event", fn: (e) => { if (e.type === "turn.ended") ctx.session.afterTurn(() => { globalThis.__log.push("after"); }); } });
+  } };`;
+  const approval = (w: Awaited<ReturnType<typeof world>>) => w.plugin("bundled", { id: "approval", provides: ["approval@1"] }, ASK);
+  const waiting = async (s: { state: State }) => {
+    while (s.state.phase !== "awaiting") await Bun.sleep(1);
+  };
+  const ended = async (s: { history(): Promise<{ type: string; data: unknown }[]> }) =>
+    (await s.history()).filter((e) => e.type === "turn.ended").map((e) => e.data as { reason: string; error?: string });
+
+  test("the turn is not over while it waits: send resolves and afterTurn runs once the approval has let it finish", async () => {
+    const { host } = await setup(approval);
+    g.__script!.push(call(use("t1", "poke")), say("done"));
+    const s = await host.sessions.open();
+    let resolved = false;
+    const turn = s.send(msg("go")).then(() => (resolved = true));
+    await waiting(s);
+    await Bun.sleep(5);
+    expect(resolved).toBe(false);
+    expect(g.__log).toEqual([]);
+    await g.__ctx!.session.send({ kind: "approval", toolUseId: "t1", approved: true });
+    await turn;
+    await s.idle();
+    expect(results(s.state)).toEqual({ t1: [false, "poke ok"] });
+    expect(g.__log).toEqual(["ran poke", "after"]);
+    await host.close();
+  });
+
+  test("an approval for a call that is not waiting is rejected, and the turn keeps waiting", async () => {
+    const { host } = await setup(approval);
+    g.__script!.push(call(use("t1", "poke")), say("done"));
+    const s = await host.sessions.open();
+    const turn = s.send(msg("go"));
+    await waiting(s);
+    await expect(g.__ctx!.session.send({ kind: "approval", toolUseId: "nope", approved: true })).rejects.toThrow("no pending approval");
+    expect(s.state.phase).toBe("awaiting");
+    await g.__ctx!.session.send({ kind: "approval", toolUseId: "t1", approved: false, reason: "no" });
+    await turn;
+    expect(results(s.state)).toEqual({ t1: [true, "no"] });
+    // 没有在跑的一轮时，审批的回答直接拒绝
+    await expect(s.send({ kind: "approval", toolUseId: "t1", approved: true })).rejects.toThrow("no turn is waiting");
+    await host.close();
+  });
+
+  test("aborting a turn that waits for approval ends it, and the next message runs", async () => {
+    const { host } = await setup(approval);
+    g.__script!.push(call(use("t1", "poke")), say("fine"));
+    const s = await host.sessions.open();
+    const turn = s.send(msg("go"));
+    await waiting(s);
+    s.abort(new Error("interrupted by user"));
+    await expect(turn).rejects.toThrow("interrupted by user");
+    expect(await ended(s)).toEqual([{ reason: "aborted", error: "interrupted by user" }]);
+    expect(g.__log).not.toContain("ran poke");
+    await s.send(msg("something else"));
+    expect(s.state.phase).toBe("idle");
+    expect(g.__script).toEqual([]);
+    await host.close();
+  });
+
+  test("leaving a session that waits for approval ends the turn", async () => {
+    const { host } = await setup(approval);
+    g.__script!.push(call(use("t1", "poke")));
+    const s = await host.sessions.open();
+    const turn = s.send(msg("go")).catch((e: Error) => e.message);
+    await waiting(s);
+    await host.sessions.close();
+    expect(await turn).toContain("was closed");
+    expect((await ended(s)).map((e) => e.reason)).toEqual(["aborted"]);
+    await host.close();
+  });
+
+  test("when a plugin asks but no approval plugin guards the session, the turn ends instead of waiting forever", async () => {
+    const ASK_READS = `export default { session(ctx) { ctx.kernel.hook({ kind: "gate", point: "tool.gate", fn: () => ({ decision: "ask" }) }); } };`;
+    const { host } = await setup((w) => w.plugin("bundled", { id: "careful" }, ASK_READS));
+    g.__script!.push(call(use("t1", "peek")), say("never reached"));
+    const s = await host.sessions.open();
+    await expect(s.send(msg("go"))).rejects.toThrow(NO_APPROVER_ERROR);
+    expect(await ended(s)).toEqual([{ reason: "aborted", error: NO_APPROVER_ERROR }]);
+    expect(g.__log).toEqual([]);
     await host.close();
   });
 });

@@ -18,6 +18,6 @@ export {
 } from "./install.ts";
 export { parseSource, type PluginSourceSpec, type SourceKind } from "./source.ts";
 export { treeHash } from "./hash.ts";
-export { CORE_PLUGIN_ID, NO_APPROVAL_REASON, Sessions } from "./session.ts";
+export { CORE_PLUGIN_ID, NO_APPROVAL_REASON, NO_APPROVER_ERROR, Sessions } from "./session.ts";
 export { pluginConfig, readConfigFile, type ConfigFile } from "./config.ts";
 export { FAULT_LIMIT } from "./state.ts";

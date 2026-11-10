@@ -161,6 +161,8 @@ export function transcript(opts: TranscriptOptions): Transcript {
   };
   /** 有 result renderer 的调用的参数，结果出来时交给它 */
   const inputs = new Map<string, unknown>();
+  /** 等人工审批的调用的参数，回答（input.received）来了按它显示 */
+  const asks = new Map<string, unknown>();
 
   /** 出过错的 renderer（插件 + 工具），只提示一次 */
   const failed = new Set<string>();
@@ -223,6 +225,7 @@ export function transcript(opts: TranscriptOptions): Transcript {
       calls.clear();
       befores.clear();
       inputs.clear();
+      asks.clear();
       self.lastEnd = undefined;
     },
   };
@@ -314,7 +317,10 @@ export function transcript(opts: TranscriptOptions): Transcript {
         const full = details(name, d.input);
         if (full) calls.set(d.toolUseId, full);
         if (opts.renderer?.(name)?.renderer.result) inputs.set(d.toolUseId, d.input);
-        if (d.decision === "ask") return;
+        if (d.decision === "ask") {
+          asks.set(d.toolUseId, d.input);
+          return;
+        }
         // 执行前交给 renderer 的 before（例如按文件当时的内容算 diff）；重新显示历史时文件已经变了，不调用
         if (d.decision === "allow" && !replaying) {
           const before = customSync(name, (r) => r.before?.(d.input));
@@ -339,6 +345,15 @@ export function transcript(opts: TranscriptOptions): Transcript {
           }
         }
         return;
+      }
+      case "input.received": {
+        // 对等待审批的调用的回答：和关卡直接决定的一样显示
+        const d = e.data as EventDataMap["input.received"];
+        if (d.kind !== "approval") return;
+        const input = asks.get(d.toolUseId);
+        asks.delete(d.toolUseId);
+        const decided: EventDataMap["tool.decided"] = { toolUseId: d.toolUseId, decision: d.approved ? "allow" : "deny", input, ...(d.approved ? {} : { reason: d.reason }) };
+        return renderEvent({ ...e, type: "tool.decided", data: decided });
       }
       case "tool.completed": {
         const d = e.data as EventDataMap["tool.completed"];

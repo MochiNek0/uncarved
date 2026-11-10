@@ -1,11 +1,13 @@
-// jade/approval：审批。tool.before 把路径统一成绝对路径，tool.gate 按模式和规则决定，要问时经 ui@1 问用户。
+// jade/approval：审批。tool.before 把路径统一成绝对路径，tool.gate 按模式和规则决定：允许、拒绝，或者要问用户（ask）。
+// 关卡不等用户：所有关卡合并的结果是 ask 时（日志里的 tool.decided），内核停下来等人工审批，这里才经 ui@1 问用户，
+// 把回答作为 approval 输入交给会话。别的插件的关卡要问时也由这里问。谁回答的、选了什么记成 jade/approval/answered 事件。
 // auto 模式下规则判断不了、本来要问的调用先让模型审一次（review.ts）：它只能放行或转给用户，不能替用户拒绝。
 //
 // 没有这个插件（停用、坏掉、被隔离）时，核心的兜底关卡拒绝所有非只读工具（第 7 节），所以这里出错不会放行。
 // 用户选的"总是允许"记进日志（derived），恢复会话后仍然有效；模式是进程级的，来自配置，可以经 approval@1 改。
 
 import path from "node:path";
-import type { GatedToolCall, Message } from "uncarved";
+import type { EventDataMap, GatedToolCall, Message } from "uncarved";
 import { definePlugin, type Caller, type SelectRequest, type UI } from "@uncarved/jade-api";
 import type { Models } from "../models/index.ts";
 import type { Renderers } from "../renderers/index.ts";
@@ -41,10 +43,12 @@ const ANSWERS: readonly string[] = ["once", "always", "deny"] satisfies Answer[]
 
 /** derived 里保存"总是允许"规则的键 */
 const RULES_KEY = "jade/approval/rules";
-/** 等用户回答的默认时限：内核要求 hook 有有限的超时，超时按拒绝处理。配置 askTimeoutMinutes 可以改 */
+/** 等用户回答的默认时限，过了按拒绝处理。配置 askTimeoutMinutes 可以改 */
 const ASK_TIMEOUT_MS = 24 * 60 * 60 * 1000;
-/** askTimeoutMinutes 的上限：内核的定时器最长约 24.8 天 */
+/** askTimeoutMinutes 的上限：定时器最长约 24.8 天 */
 const MAX_ASK_TIMEOUT_MINUTES = 7 * 24 * 60;
+/** 关卡的时限：auto 模式的审查最长一分钟（review.ts），比 hook 默认的 30 秒长 */
+const GATE_TIMEOUT_MS = 2 * 60_000;
 const MAX_DETAIL_CHARS = 2000;
 /** 等工具的审批预览的时限，过了就用默认的 detail */
 const PREVIEW_TIMEOUT_MS = 5000;
@@ -69,8 +73,8 @@ let badTimeout: string | undefined;
 const readRoots: string[] = [];
 /** 经 allowWrite 登记的目录；policy 每次判断时读它 */
 const writeRoots: string[] = [];
-/** 经 addApprover 登记的审批渠道 */
-const approvers = new Set<Approver>();
+/** 经 addApprover 登记的审批渠道 → 登记它的插件 */
+const approvers = new Map<Approver, string>();
 /** 打开着的会话：会话 id → 判断只读调用能不能不问就执行（allows） */
 const sessionChecks = new Map<string, (call: GatedToolCall) => boolean>();
 
@@ -95,7 +99,7 @@ export default definePlugin({
       addApprover(approver: Approver) {
         if (caller.layer === "project") throw new Error("approval.addApprover: project plugins cannot answer approvals");
         if (typeof approver !== "function") throw new Error("approval.addApprover: approver must be a function");
-        approvers.add(approver);
+        approvers.set(approver, caller.plugin);
         const remove = () => void approvers.delete(approver);
         caller.onDispose(remove);
         return remove;
@@ -135,12 +139,23 @@ export default definePlugin({
     /** 本会话里审查过一次、放行了的调用 */
     const reviewedCalls = new Set<string>();
     let warned = false;
-    /** 本进程里刚选的"总是允许"：并发的关卡拿到的 derived 是各自开始时的快照，可能还没有它 */
+    /** 本进程里刚选的"总是允许"：记进日志之前（要等看到那条 approval 输入）就要生效 */
     const added: AllowRule[] = [];
     /** 一次只问一个问题；排在后面的问之前重新判断，前面刚选的"总是允许"可能已经覆盖它 */
     let asking: Promise<unknown> = Promise.resolve();
     /** 日志里记下的"总是允许"规则，每次调用工具前取一次：子 Agent 在工具执行期间经 allows 用它 */
     let logged: AllowRule[] = [];
+    const merged = (from: readonly AllowRule[]) => [...from, ...added.filter((r) => !from.some((l) => JSON.stringify(l) === JSON.stringify(r)))];
+    const saved = () => merged(logged);
+    /** 这一轮里关卡看过、还没有决定的调用 */
+    const seen = new Map<string, Asked>();
+    /** 已经交给会话的回答：在日志里看到那条 approval 输入时记一条 answered 事件 */
+    const answered = new Map<string, { answer: string; by: string }>();
+    /** 这一轮结束（包括被中断）时中止还开着的问题 */
+    let turn = new AbortController();
+    const canAsk = () => ui?.interactive === true || approvers.size > 0;
+    const nobody = (name: string) => `${name} needs the user's approval, but nobody can approve it in this non-interactive run. Do not retry it; tell the user what you wanted to do.`;
+
     const id = ctx.session.id;
     const check = (call: GatedToolCall) =>
       rules.decide(call, { mode: mode === "yolo" ? "yolo" : "readonly", rules: [...logged, ...added] }).decision === "allow";
@@ -160,12 +175,9 @@ export default definePlugin({
     ctx.kernel.hook({
       kind: "gate",
       point: "tool.gate",
-      timeoutMs: askTimeoutMs,
+      timeoutMs: GATE_TIMEOUT_MS,
       fn: async (call, hook) => {
-        const saved = () => {
-          const logged = (hook.derived[RULES_KEY] as AllowRule[] | undefined) ?? [];
-          return [...logged, ...added.filter((r) => !logged.some((l) => JSON.stringify(l) === JSON.stringify(r)))];
-        };
+        seen.set(call.toolUseId, { call, mine: false });
         const result = rules.decide(call, { mode, rules: saved() });
         if (result.decision !== "ask") return result;
         // auto 模式：规则判断不了、本来要问的调用先让模型审一次。审查只能放行或转给用户，不会替用户拒绝
@@ -182,7 +194,7 @@ export default definePlugin({
           }
           why = verdict.reason;
         }
-        if (!ui?.interactive && approvers.size === 0) {
+        if (!canAsk()) {
           if (!warned) {
             warned = true;
             ui?.notify(
@@ -191,41 +203,121 @@ export default definePlugin({
               "warning",
             );
           }
-          return { decision: "deny", reason: `${call.name} needs the user's approval, but nobody can approve it in this non-interactive run. Do not retry it; tell the user what you wanted to do.` };
+          return { decision: "deny", reason: nobody(call.name) };
         }
-        const turn = asking.then(async () => {
-          const again = rules.decide(call, { mode, rules: saved() });
-          if (again.decision !== "ask") return again;
-          const rule = rules.ruleFor(call);
-          const shown = (await preview(renderers, call)) ?? detail(call);
-          const answer = await ask(
-            ui,
-            {
-              title: `Allow ${call.name}?`,
-              // 审查转给用户的：先说为什么
-              detail: why ? `${why}\n\n${shown}` : shown,
-              options: [
-                { label: "Allow once", value: "once" },
-                { label: `Always allow ${describeRule(rule)} in this session`, value: "always" },
-                { label: "Deny", value: "deny" },
-              ],
-            },
-            hook.signal,
-          );
-          if (answer === "always") {
-            added.push(rule);
-            await hook.record(RULES_KEY, saved());
-            return { decision: "allow" as const };
-          }
-          if (answer === "once") return { decision: "allow" as const };
-          return { decision: "deny" as const, reason: "The user denied this tool call. Do not retry it unchanged: adjust, or ask what to do instead." };
-        });
-        asking = turn.catch(() => {});
-        return turn;
+        seen.set(call.toolUseId, { call, mine: true, ...(why ? { why } : {}) });
+        return { decision: "ask" };
+      },
+    });
+
+    /** 问用户（或按刚加的规则直接决定），返回交给内核的回答 */
+    const decide = async (asked: Asked, signal: AbortSignal): Promise<Verdict> => {
+      const { call } = asked;
+      if (asked.mine) {
+        const again = rules.decide(call, { mode, rules: saved() });
+        if (again.decision === "allow") return { approved: true, answer: "allow", by: "rule" };
+        if (again.decision === "deny") return { approved: false, answer: "deny", by: "rule", reason: again.reason };
+      }
+      if (!canAsk()) return { approved: false, answer: "deny", by: "nobody", reason: nobody(call.name) };
+      const rule = rules.ruleFor(call);
+      const shown = (await preview(renderers, call)) ?? detail(call);
+      const expired = new AbortController();
+      const timer = setTimeout(() => expired.abort(), askTimeoutMs);
+      let got: { answer: Answer; by: string } | undefined;
+      try {
+        got = await ask(
+          ui,
+          {
+            title: `Allow ${call.name}?`,
+            // 审查转给用户的：先说为什么
+            detail: asked.why ? `${asked.why}\n\n${shown}` : shown,
+            options: [
+              { label: "Allow once", value: "once" },
+              // 别的插件要问的调用不能"总是允许"：这里的规则管不到它的关卡
+              ...(asked.mine ? [{ label: `Always allow ${describeRule(rule)} in this session`, value: "always" as const }] : []),
+              { label: "Deny", value: "deny" },
+            ],
+          },
+          AbortSignal.any([signal, expired.signal, ctx.signal]),
+        );
+      } finally {
+        clearTimeout(timer);
+      }
+      if (expired.signal.aborted) {
+        return { approved: false, answer: "deny", by: "timeout", reason: `Nobody answered the approval request for ${call.name} in time. Do not retry it; tell the user what you wanted to do.` };
+      }
+      if (got?.answer === "always" && asked.mine) {
+        added.push(rule);
+        return { approved: true, answer: "always", by: got.by };
+      }
+      if (got?.answer === "once" || got?.answer === "always") return { approved: true, answer: "once", by: got.by };
+      return { approved: false, answer: "deny", by: got?.by ?? "nobody", reason: "The user denied this tool call. Do not retry it unchanged: adjust, or ask what to do instead." };
+    };
+
+    /** 一个要问的调用：得出回答，交给会话。出错也要回答（拒绝），否则这一轮一直等着 */
+    const settle = async (asked: Asked, signal: AbortSignal) => {
+      const toolUseId = asked.call.toolUseId;
+      let verdict: Verdict;
+      try {
+        verdict = await decide(asked, signal);
+      } catch (e) {
+        verdict = { approved: false, answer: "deny", by: "error", reason: `Asking for approval failed: ${e instanceof Error ? e.message : String(e)}` };
+      }
+      // 这一轮已经结束（被中断）：回答作废
+      if (signal.aborted) return;
+      answered.set(toolUseId, { answer: verdict.answer, by: verdict.by });
+      // 不等它：它要到内核再次停下才 resolve，后面排着的问题可能就是内核在等的
+      void Promise.resolve()
+        .then(() => ctx.session.send({ kind: "approval", toolUseId, approved: verdict.approved, ...(verdict.reason ? { reason: verdict.reason } : {}) }))
+        .catch(() => void answered.delete(toolUseId));
+    };
+
+    ctx.kernel.hook({
+      kind: "observe",
+      point: "event",
+      fn: async (e, hook) => {
+        if (e.type === "tool.decided") {
+          const d = e.data as EventDataMap["tool.decided"];
+          const asked = seen.get(d.toolUseId);
+          seen.delete(d.toolUseId);
+          if (d.decision !== "ask" || !asked) return;
+          // 不在这里等回答：observe 要马上返回，内核才能停下来等
+          const signal = turn.signal;
+          asking = asking.then(() => settle(asked, signal));
+        } else if (e.type === "input.received") {
+          const d = e.data as EventDataMap["input.received"];
+          if (d.kind !== "approval") return;
+          const a = answered.get(d.toolUseId);
+          if (!a) return;
+          answered.delete(d.toolUseId);
+          // 内核只记同意或拒绝：选了什么、谁回答的（终端、哪个渠道、规则、超时）记在这里
+          await hook.emit("answered", { toolUseId: d.toolUseId, ...a });
+          if (a.answer === "always") await hook.record(RULES_KEY, merged((hook.derived[RULES_KEY] as AllowRule[] | undefined) ?? []));
+        } else if (e.type === "turn.ended") {
+          turn.abort(new Error("the turn ended"));
+          turn = new AbortController();
+          seen.clear();
+          answered.clear();
+        }
       },
     });
   },
 });
+
+/** 关卡看过的一个调用。mine：是这里的规则要问的（否则是别的插件的关卡要问）；why：auto 模式的审查转给用户时的理由 */
+interface Asked {
+  call: GatedToolCall;
+  mine: boolean;
+  why?: string;
+}
+
+/** 交给内核的回答，和记进 answered 事件的部分（answer、by） */
+interface Verdict {
+  approved: boolean;
+  answer: "allow" | Answer;
+  by: string;
+  reason?: string;
+}
 
 /** allowRead、allowWrite：把目录登记进 roots，调用方的作用域关闭时撤销 */
 function allow(caller: Caller, name: string, roots: string[], dir: string): () => void {
@@ -242,23 +334,25 @@ function allow(caller: Caller, name: string, roots: string[], dir: string): () =
 }
 
 /**
- * 把问题同时交给终端（能提问时）和所有审批渠道，返回先到的回答，然后中止其余的。
+ * 把问题同时交给终端（能提问时）和所有审批渠道，返回先到的回答和回答的人（"terminal" 或渠道的插件 id），然后中止其余的。
  * 终端里取消（undefined）算拒绝；渠道返回 undefined、不认识的值或出错算它不回答。都不回答时返回 undefined（拒绝）
  */
-async function ask(ui: UI | undefined, request: SelectRequest<Answer>, signal: AbortSignal): Promise<Answer | undefined> {
+async function ask(ui: UI | undefined, request: SelectRequest<Answer>, signal: AbortSignal): Promise<{ answer: Answer; by: string } | undefined> {
   const done = new AbortController();
   const stop = () => done.abort(signal.reason);
   signal.addEventListener("abort", stop, { once: true });
   try {
-    return await new Promise<Answer | undefined>((resolve, reject) => {
-      const channels: Promise<Answer | undefined | typeof NONE>[] = [];
-      if (ui?.interactive) channels.push(ui.select(request, done.signal).then((a) => (a !== undefined && ANSWERS.includes(a) ? a : "deny")));
-      for (const approver of approvers) {
+    return await new Promise<{ answer: Answer; by: string } | undefined>((resolve, reject) => {
+      const channels: Promise<{ answer: Answer; by: string } | typeof NONE>[] = [];
+      if (ui?.interactive) {
+        channels.push(ui.select(request, done.signal).then((a): { answer: Answer; by: string } => ({ answer: a !== undefined && ANSWERS.includes(a) ? a : "deny", by: "terminal" })));
+      }
+      for (const [approver, by] of approvers) {
         channels.push(
           Promise.resolve()
             .then(() => approver(request, done.signal))
             .then(
-              (a) => (typeof a === "string" && ANSWERS.includes(a) ? (a as Answer) : NONE),
+              (a) => (typeof a === "string" && ANSWERS.includes(a) ? { answer: a as Answer, by } : NONE),
               () => NONE,
             ),
         );

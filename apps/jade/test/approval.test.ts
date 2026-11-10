@@ -1,4 +1,5 @@
 // jade/approval 的审批渠道（approval@1 的 addApprover）：问题同时交给终端和渠道，先回答的算数，其余的被中止。
+// 以及审批走内核的 ask：关卡不等用户，内核停下来等人工审批时才问，回答作为 approval 输入记进日志。
 
 import { describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
@@ -86,5 +87,140 @@ describe("approvers", () => {
     const r = await run(["once"], false, [], { "jade/approval": { askTimeoutMinutes: "soon" } });
     expect(r.written).toBe(true);
     expect(r.state.notes.join(" ")).toContain('askTimeoutMinutes must be a number of minutes between 0 and 10080, got "soon"; using 24 hours');
+  }, 30_000);
+});
+
+describe("asking through the kernel", () => {
+  const write = (id: string, file: string) => use(id, "write_file", { path: file, content: "hi\n" });
+  /** 日志里和审批有关的事件 */
+  const trail = (events: { type: string; data: unknown }[]) =>
+    events.flatMap((e) => {
+      const d = e.data as Record<string, unknown>;
+      if (e.type === "tool.decided") return [`decided ${d.toolUseId} ${d.decision} by ${d.decidedBy}`];
+      if (e.type === "input.received" && d.kind === "approval") return [`approval ${d.toolUseId} ${d.approved}`];
+      if (e.type === "jade/approval/answered") return [`answered ${d.toolUseId} ${d.answer} by ${d.by}`];
+      if (e.type === "derived.recorded" && d.key === "jade/approval/rules") return ["rules recorded"];
+      if (e.type === "turn.ended") return [`ended ${d.reason}`];
+      return [];
+    });
+
+  async function world(plugins: { manifest: { id: string } & Record<string, unknown>; code: string }[] = []) {
+    g.__approver = { answers: [], seen: [], aborted: 0 };
+    return featureHost({ plugins });
+  }
+
+  test("the log shows the gate asking, the answer as the user's input, and who gave it", async () => {
+    const w = await world();
+    w.state.answers = ["once"];
+    w.state.script.push({ content: [write("w", "hello.txt")], stopReason: "tool_use" }, reply("done"));
+    try {
+      const s = await w.host.sessions.open();
+      await s.send(msg("write it"));
+      expect(existsSync(path.join(w.cwd, "hello.txt"))).toBe(true);
+      expect(trail(await s.history())).toEqual(["decided w ask by jade/approval", "approval w true", "answered w once by terminal", "ended end"]);
+    } finally {
+      await w.host.close();
+    }
+  }, 30_000);
+
+  test("an approver's answer is recorded under its plugin", async () => {
+    const w = await world([APPROVER]);
+    g.__approver!.answers = ["deny"];
+    w.state.interactive = false;
+    w.state.script.push({ content: [write("w", "hello.txt")], stopReason: "tool_use" }, reply("done"));
+    try {
+      const s = await w.host.sessions.open();
+      await s.send(msg("write it"));
+      expect(trail(await s.history())).toEqual(["decided w ask by jade/approval", "approval w false", "answered w deny by test/approver", "ended end"]);
+    } finally {
+      await w.host.close();
+    }
+  }, 30_000);
+
+  test("when another plugin's gate denies the call, the user is not asked", async () => {
+    const DENY = { manifest: { id: "test/deny" }, code: `export default { session(ctx) {
+      ctx.kernel.hook({ kind: "gate", point: "tool.gate", fn: (call) => call.name === "write_file" ? { decision: "deny", reason: "not today" } : { decision: "abstain" } });
+    } };` };
+    const w = await world([DENY]);
+    w.state.script.push({ content: [write("w", "hello.txt")], stopReason: "tool_use" }, reply("done"));
+    try {
+      const s = await w.host.sessions.open();
+      await s.send(msg("write it"));
+      expect(w.state.selects).toEqual([]);
+      expect(textOf(results(w.state.requests[1]!)[0]!.content)).toBe("not today");
+    } finally {
+      await w.host.close();
+    }
+  }, 30_000);
+
+  test("always allow covers the rest of the batch and later turns, and is recorded in the log", async () => {
+    const w = await world();
+    w.state.answers = ["always"];
+    w.state.script.push({ content: [write("a", "one.txt"), write("b", "two.txt")], stopReason: "tool_use" }, reply("done"));
+    w.state.script.push({ content: [write("c", "three.txt")], stopReason: "tool_use" }, reply("done again"));
+    try {
+      const s = await w.host.sessions.open();
+      await s.send(msg("write them"));
+      await s.send(msg("one more"));
+      expect(w.state.selects).toHaveLength(1);
+      for (const f of ["one.txt", "two.txt", "three.txt"]) expect(existsSync(path.join(w.cwd, f))).toBe(true);
+      expect(trail(await s.history())).toEqual([
+        "decided a ask by jade/approval",
+        "decided b ask by jade/approval",
+        "approval a true",
+        "answered a always by terminal",
+        "rules recorded",
+        "approval b true",
+        "answered b allow by rule",
+        "ended end",
+        "decided c allow by jade/approval",
+        "ended end",
+      ]);
+    } finally {
+      await w.host.close();
+    }
+  }, 30_000);
+
+  test("a call another plugin's gate wants asked is asked here, without the always option", async () => {
+    const CAREFUL = { manifest: { id: "test/careful" }, code: `export default { session(ctx) {
+      ctx.kernel.hook({ kind: "gate", point: "tool.gate", fn: (call) => ({ decision: call.name === "read_file" ? "ask" : "abstain" }) });
+    } };` };
+    const w = await world([APPROVER, CAREFUL]);
+    g.__approver!.answers = ["once"];
+    w.state.interactive = false;
+    await Bun.write(path.join(w.cwd, "notes.txt"), "hello\n");
+    w.state.script.push({ content: [use("r", "read_file", { path: "notes.txt" })], stopReason: "tool_use" }, reply("done"));
+    try {
+      const s = await w.host.sessions.open();
+      await s.send(msg("read it"));
+      expect(g.__approver!.seen.map((q) => [q.title, q.options])).toEqual([["Allow read_file?", ["once", "deny"]]]);
+      expect(results(w.state.requests[1]!)[0]!.isError).toBe(false);
+      expect(trail(await s.history())).toEqual(["decided r ask by test/careful", "approval r true", "answered r once by test/approver", "ended end"]);
+    } finally {
+      await w.host.close();
+    }
+  }, 30_000);
+
+  test("interrupting while the question is open closes it and ends the turn; the next message runs", async () => {
+    const w = await world([APPROVER]);
+    g.__approver!.answers = ["hang"];
+    w.state.interactive = false;
+    w.state.script.push({ content: [write("w", "hello.txt")], stopReason: "tool_use" }, reply("fine"));
+    try {
+      const s = await w.host.sessions.open();
+      const turn = s.send(msg("write it")).catch((e: Error) => e.message);
+      while (g.__approver!.seen.length === 0) await Bun.sleep(1);
+      s.abort(new Error("interrupted by user"));
+      expect(await turn).toBe("interrupted by user");
+      await s.idle();
+      expect(g.__approver!.aborted).toBe(1);
+      expect(existsSync(path.join(w.cwd, "hello.txt"))).toBe(false);
+      expect(trail(await s.history())).toEqual(["decided w ask by jade/approval", "ended aborted"]);
+      await s.send(msg("never mind"));
+      expect(s.state.phase).toBe("idle");
+      expect(w.state.script).toEqual([]);
+    } finally {
+      await w.host.close();
+    }
   }, 30_000);
 });

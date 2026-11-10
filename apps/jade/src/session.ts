@@ -6,6 +6,7 @@ import {
   checkCompat,
   readAll,
   definePlugin as kernelPlugin,
+  InvalidTransition,
   Runtime,
   type GateResult,
   type Layer,
@@ -45,6 +46,9 @@ export const CORE_PLUGIN_ID = "jade/core";
 export const NO_APPROVAL_REASON =
   "No permission plugin is active in this session, so only read-only tools may run. Ask the user to enable an approval plugin.";
 
+/** 有插件要人工审批、但没有审批插件来问时，这一轮结束的原因 */
+export const NO_APPROVER_ERROR = "A plugin asked for the user's approval, but no approval plugin is active in this session to ask.";
+
 /** 会话管理器向宿主要的东西 */
 export interface SessionHost {
   home: string;
@@ -75,6 +79,11 @@ interface Part {
   kernel: Plugin;
 }
 
+interface Turn {
+  stop?: { reason: unknown };
+  wake?: () => void;
+}
+
 class LiveSession implements Session {
   readonly id: string;
   readonly parts: Part[] = [];
@@ -86,13 +95,20 @@ class LiveSession implements Session {
   /** 离开时的原因；有了以后不再接受输入 */
   #left: Error | undefined;
   #report: (m: string) => void;
+  /** 正在跑的这一轮（包括停下来等人工审批的时候）：stop 是要它结束的原因，wake 叫醒等审批的循环 */
+  #turn: Turn | undefined;
+  /** 交进来、还没交给内核的审批回答 */
+  #answers: { input: UserInput; resolve: () => void; reject: (e: unknown) => void }[] = [];
+  /** 审批插件是不是守着这个会话（第 7 节）：不是的话没有人会回答审批 */
+  #attended: () => boolean;
 
   readonly #store: LogStore;
 
-  constructor(id: string, store: LogStore, report: (m: string) => void) {
+  constructor(id: string, store: LogStore, report: (m: string) => void, attended: () => boolean) {
     this.id = id;
     this.#store = store;
     this.#report = report;
+    this.#attended = attended;
   }
 
   history(): Promise<LogEvent[]> {
@@ -104,7 +120,58 @@ class LiveSession implements Session {
   }
 
   send(input: UserInput): Promise<void> {
-    return this.#enqueue(() => this.rt.send(input));
+    // 对插件变化的确认不开始一轮（内核只记录结果）
+    if (input.kind === "plugins") return this.#enqueue(() => this.rt.send(input));
+    if (input.kind !== "approval") return this.#enqueue(() => this.#drive(() => this.rt.send(input)));
+    // 审批的回答属于正在跑的这一轮，不排到它后面
+    if (this.#left) return Promise.reject(this.#left);
+    const turn = this.#turn;
+    if (!turn) return Promise.reject(new Error(`session ${this.id}: no turn is waiting for approval`));
+    return new Promise((resolve, reject) => {
+      this.#answers.push({ input, resolve, reject });
+      turn.wake?.();
+    });
+  }
+
+  /**
+   * 跑完一轮。内核停在等待人工审批（awaiting）时这一轮还没完：在这里等审批的回答交给内核，直到这一轮结束。
+   * 等的时候被中止，或者没有审批插件来问，就结束这一轮（内核的 endTurn）
+   */
+  async #drive(start: () => Promise<void>): Promise<void> {
+    const turn: Turn = {};
+    this.#turn = turn;
+    try {
+      await start();
+      while (this.rt.phase === "awaiting") {
+        const stop = turn.stop ?? (this.#attended() ? undefined : { reason: new Error(NO_APPROVER_ERROR) });
+        if (stop) {
+          const reason = stop.reason ?? new Error("aborted");
+          await this.rt.endTurn(reason);
+          throw reason;
+        }
+        const next = this.#answers.shift();
+        if (!next) {
+          await new Promise<void>((wake) => (turn.wake = wake));
+          turn.wake = undefined;
+          continue;
+        }
+        try {
+          await this.rt.send(next.input);
+          next.resolve();
+        } catch (e) {
+          // 内核不认的回答（没有这个待批的调用）：只是这个回答作废，这一轮照常等
+          if (e instanceof InvalidTransition && this.rt.phase === "awaiting") {
+            next.reject(e);
+            continue;
+          }
+          next.resolve();
+          throw e;
+        }
+      }
+    } finally {
+      this.#turn = undefined;
+      for (const a of this.#answers.splice(0)) a.reject(new Error(`session ${this.id}: the turn ended before this approval was used`));
+    }
   }
 
   #enqueue(run: () => Promise<void>): Promise<void> {
@@ -126,7 +193,7 @@ class LiveSession implements Session {
     this.#left ??= new Error(`session ${this.id} was closed before this input ran`);
     for (const job of this.#queue.splice(0)) job.reject(this.#left);
     this.#after.length = 0;
-    this.rt.abort(this.#left);
+    this.abort(this.#left);
   }
 
   async idle(): Promise<void> {
@@ -135,11 +202,20 @@ class LiveSession implements Session {
 
   /** 和输入排同一个队：恢复可能要跑完一整轮，这期间插件发来的输入排在它后面，而不是撞上 RuntimeBusy */
   recover(): Promise<void> {
-    return this.#enqueue(() => this.rt.recover());
+    return this.#enqueue(() => {
+      // 上次退出时停在等待人工审批：问过的对话框已经不在了，这一轮到此为止
+      if (this.rt.phase === "awaiting" && !this.rt.state.held) return this.rt.endTurn(new Error("jade exited while this turn was waiting for approval"));
+      return this.#drive(() => this.rt.recover());
+    });
   }
 
   abort(reason?: unknown): void {
     this.rt.abort(reason);
+    // 停在等待人工审批时内核没有在跑，信号结束不了这一轮
+    if (this.#turn) {
+      this.#turn.stop = { reason };
+      this.#turn.wake?.();
+    }
   }
 
   subscribe(fn: (n: RuntimeNotice) => void): () => void {
@@ -225,7 +301,7 @@ export class Sessions implements SessionManager {
     if (!provider) throw new ServiceUnavailable("provider@1", "(none): no active plugin provides a model");
     const store = host.service<LogStore>("store@1", host.core) ?? (this.#store ??= new JsonlLogStore(path.join(host.home, "sessions")));
 
-    const s = new LiveSession(opts.resume ?? crypto.randomUUID(), store, host.report);
+    const s: LiveSession = new LiveSession(opts.resume ?? crypto.randomUUID(), store, host.report, () => this.#guarded(s));
     try {
       for (const p of host.active()) if (p.module.session) await this.#join(s, p);
       const plugins = [this.#corePlugin(s), ...s.parts.map((p) => p.kernel)];
@@ -400,14 +476,15 @@ export class Sessions implements SessionManager {
    * 项目层的提供者也不算：克隆的仓库不能放宽审批
    */
   #corePlugin(s: LiveSession): Plugin {
-    const gate = (call: { tool: { effect: string } }): GateResult => {
-      const approval = this.#host.provider("approval@1");
-      const guarded = s.parts.some(
-        (p) => p.gates > 0 && !p.owner.scope.closed && p.source.manifest.id === approval && p.source.layer !== "project",
-      );
-      return guarded || call.tool.effect === "read" ? { decision: "abstain" } : { decision: "deny", reason: NO_APPROVAL_REASON };
-    };
+    const gate = (call: { tool: { effect: string } }): GateResult =>
+      this.#guarded(s) || call.tool.effect === "read" ? { decision: "abstain" } : { decision: "deny", reason: NO_APPROVAL_REASON };
     return kernelPlugin({ id: CORE_PLUGIN_ID, version: API_VERSION, layer: "distro", hooks: [{ kind: "gate", point: "tool.gate", fn: gate }] });
+  }
+
+  /** approval@1 的提供者（不能是项目层插件）在这个会话里有仍然有效的 tool.gate */
+  #guarded(s: LiveSession): boolean {
+    const approval = this.#host.provider("approval@1");
+    return s.parts.some((p) => p.gates > 0 && !p.owner.scope.closed && p.source.manifest.id === approval && p.source.layer !== "project");
   }
 
   /** 离开会话：中止正在跑的工作，等它停下，detach，关闭插件的会话作用域 */
