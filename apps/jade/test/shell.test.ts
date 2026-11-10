@@ -190,9 +190,10 @@ describe("jade/shell in a session", () => {
     const c: CommandContext = { signal: new AbortController().signal, ui: w.host.service<UI>("ui@1")!, sessions: w.host.sessions, print: () => {} };
     expect(await shells.run("", c)).toBe("bg1  exited with code 3  exit 3");
     expect(await shells.run("kill bg7", c)).toBe("There is no background command bg7.");
-    // 模型下一次请求时看到说明
+    // 模型下一次请求时看到说明。命令可能在第一轮的第二次请求前就结束了（macOS 上常见），那时说明附在工具结果那条消息后面，
+    // 所以在整段对话里找，而不只看最后一条
     w.shared.script.push(say("ok"));
     await w.send(s, "and now?");
-    expect(textOf(w.shared.requests.at(-1)!.messages.at(-1)!.content)).toContain("[Note from jade] Background shell bg1 (exit 3) exited with code 3. Read its remaining output with bash_output.");
+    expect(w.shared.requests.at(-1)!.messages.map((m) => textOf(m.content)).join("\n")).toContain("[Note from jade] Background shell bg1 (exit 3) exited with code 3. Read its remaining output with bash_output.");
   }, 30_000);
 });
