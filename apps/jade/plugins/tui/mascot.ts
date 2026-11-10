@@ -262,9 +262,11 @@ function eyeAt(p: Pose, px: number, py: number): number {
     // 笑分两步：先是下眼皮往上推，眼睛压成上面一格的一条线（连续的）；
     // 推到头之后一下子变成 ^（像素画按帧换形状，滑过去的中间几帧是糊的）
     const smile = happy > 0.6;
-    // 变成 ^ 时两只眼睛各往外一格：^ 有三格宽，不挪开的话两只里边的眼角只隔一格，连成一排锯齿
+    // 两只都变成 ^ 时各往外一格：^ 有三格宽，不挪开的话两只里边的眼角只隔一格，连成一排锯齿；
+    // 只眨一只眼时另一只是普通的眼睛，不会连起来，^ 留在原位
     // ^ 对齐整格：从别的表情缓过来时视线还没回正，不对齐的话 ^ 是糊的
-    const ex = smile ? Math.round(bx + p.gx - 0.5) + 0.5 + (i === 0 ? -1 : 1) : bx + p.gx;
+    const out = p.happy > 0.6 ? (i === 0 ? -1 : 1) : 0;
+    const ex = smile ? Math.round(bx + p.gx - 0.5) + 0.5 + out : bx + p.gx;
     const bottom = smile ? Math.round(EYE_BOTTOM + p.gy) : EYE_BOTTOM + p.gy;
     if (Math.abs(px - ex) < 0.5) {
       // 闭眼是上眼皮往下：下沿不动，高度变小，最少留 1 像素的一条线

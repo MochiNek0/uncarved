@@ -130,9 +130,9 @@ test("after landing it watches a ✓ draw itself on the right, then winks", () =
   expect(tick(watching.grid)).toEqual(CHECK);
   // 画的时候眼睛看着右边
   expect(watching.m.pose.gx).toBeGreaterThan(0.9);
-  // 眨眼：左眼 ^，右眼照常睁着，没有嘴和脸红
+  // 眨眼：左眼 ^ 留在原位（不像 ^ ^ 那样往外挪），右眼照常睁着，没有嘴和脸红
   const { dark, grid } = doneAfter(2500);
-  expect([dark(1, 2), dark(0, 3), dark(2, 3), dark(1, 3)]).toEqual([true, true, true, false]);
+  expect([dark(2, 2), dark(1, 3), dark(3, 3), dark(2, 3), dark(0, 3)]).toEqual([true, true, true, false, false]);
   expect([dark(6, 2), dark(6, 3), dark(7, 2)]).toEqual([true, true, false]);
   for (const y of [4, 5]) for (let x = 2; x <= 6; x++) expect(dark(x, y)).toBe(false);
   for (const row of grid) for (const c of row.slice(0, 9)) if (c) expect(parseInt(c.slice(1, 3), 16)).toBeLessThan(parseInt(c.slice(3, 5), 16));
