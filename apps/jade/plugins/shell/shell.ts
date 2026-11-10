@@ -18,6 +18,8 @@ export interface ShellOptions {
   cwd: string;
   /** 默认 JADE_SHELL 环境变量，否则 bash（Windows 上是 Git Bash） */
   shell?: string;
+  /** 后台命令自己结束时调用（被 kill_shell、shutdown 停掉的不算） */
+  onExit?(bg: { id: string; command: string; exitCode: number | null }): void;
 }
 
 export interface ShellTools {
@@ -29,6 +31,10 @@ export interface ShellTools {
   unavailable?: string;
   /** 杀掉所有还在运行的后台进程 */
   shutdown(): void;
+  /** 本会话启动过的后台命令 */
+  list(): { id: string; command: string; status: string }[];
+  /** 停掉一个后台命令（连同它启动的进程）；没有这个编号时返回 false */
+  kill(id: string): Promise<boolean>;
   /** 宿主和插件自己执行一条命令（不经过模型和审批），找不到 shell 时为 undefined */
   run?: RunCommand;
 }
@@ -59,6 +65,8 @@ interface Background {
   /** 因超出缓存而丢弃的字符数，下次读取时告诉模型 */
   dropped: number;
   exitCode?: number | null;
+  /** 是被停掉的（kill_shell、shutdown），不是自己结束的 */
+  killed?: boolean;
 }
 
 export function shellTools(opts: ShellOptions): ShellTools {
@@ -67,7 +75,7 @@ export function shellTools(opts: ShellOptions): ShellTools {
   // 找不到 shell 时不提供这几个工具：否则模型每次调用都要用户先批准，执行时才失败，模型还会反复重试
   if (!found) {
     const hint = process.platform === "win32" ? "install Git for Windows, or set JADE_SHELL to the path of a bash executable" : "set JADE_SHELL to the path of a shell";
-    return { tools: [], unavailable: `${shell} was not found, so the bash tool is disabled; ${hint}`, shutdown() {} };
+    return { tools: [], unavailable: `${shell} was not found, so the bash tool is disabled; ${hint}`, shutdown() {}, list: () => [], kill: async () => false };
   }
   const executable = found;
   const env = shellEnv(executable);
@@ -96,12 +104,20 @@ export function shellTools(opts: ShellOptions): ShellTools {
     void Promise.all([collect(bg.proc.stdout, append, false), collect(bg.proc.stderr, append, false)]).catch(() => {});
     void bg.proc.exited.then((code) => {
       bg.exitCode = code;
+      if (!bg.killed) opts.onExit?.({ id, command, exitCode: code });
     });
     background.set(id, bg);
     return id;
   }
 
   const status = (bg: Background) => (bg.exitCode === undefined ? "running" : `exited with code ${bg.exitCode}`);
+  /** 停掉一个还在运行的后台命令，等它退出 */
+  const stop = async (bg: Background) => {
+    if (bg.exitCode !== undefined) return;
+    bg.killed = true;
+    killTree(executable, env, bg.proc.pid);
+    await bg.proc.exited;
+  };
 
   const bash: Tool = {
     name: "bash",
@@ -206,10 +222,7 @@ export function shellTools(opts: ShellOptions): ShellTools {
       const { id } = input as { id: string };
       const bg = find(id);
       if (!bg) return unknown(id);
-      if (bg.exitCode === undefined) {
-        killTree(executable, env, bg.proc.pid);
-        await bg.proc.exited;
-      }
+      await stop(bg);
       return { content: `${id} stopped (${status(bg)})` };
     },
   };
@@ -221,7 +234,18 @@ export function shellTools(opts: ShellOptions): ShellTools {
     executable,
     run,
     shutdown() {
-      for (const bg of background.values()) if (bg.exitCode === undefined) killTree(executable, env, bg.proc.pid);
+      for (const bg of background.values()) {
+        if (bg.exitCode !== undefined) continue;
+        bg.killed = true;
+        killTree(executable, env, bg.proc.pid);
+      }
+    },
+    list: () => [...background.values()].map((bg) => ({ id: bg.id, command: bg.command, status: status(bg) })),
+    async kill(id) {
+      const bg = background.get(id);
+      if (!bg) return false;
+      await stop(bg);
+      return true;
     },
   };
 }

@@ -357,6 +357,29 @@ describe("edit hints and multi_edit", () => {
   });
 });
 
+describe("files that are not UTF-8", () => {
+  // "中文" 加一个换行的 GBK 编码
+  const gbk = Buffer.from([0xd6, 0xd0, 0xce, 0xc4, 0x0a]);
+
+  test("read_file shows them decoded but edit_file and write_file leave the bytes alone", async () => {
+    const cwd = await workspace();
+    const file = path.join(cwd, "a.txt");
+    await writeFile(file, gbk);
+    const tools = fsTools(cwd);
+    const read = await run(tools, "read_file", { path: "a.txt" });
+    expect(read.isError).toBe(false);
+    expect(read.text).toStartWith("1\t中文\n");
+    expect(read.text).toContain("not valid UTF-8");
+    const edit = await run(tools, "edit_file", { path: "a.txt", old_string: "中文", new_string: "x" });
+    expect(edit.isError).toBe(true);
+    expect(edit.text).toContain("not valid UTF-8");
+    const write = await run(tools, "write_file", { path: "a.txt", content: "x\n" });
+    expect(write.isError).toBe(true);
+    expect(write.text).toContain("not valid UTF-8");
+    expect(await readFile(file)).toEqual(gbk);
+  });
+});
+
 describe("line endings and large files", () => {
   test("write_file keeps CRLF and BOM of the file it overwrites", async () => {
     const cwd = await workspace();

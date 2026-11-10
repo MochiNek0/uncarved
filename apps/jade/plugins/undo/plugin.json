@@ -3,5 +3,11 @@
   "version": "0.3.0",
   "api": "^1",
   "entry": "./index.ts",
-  "optional": ["commands@1", "prompts@1"]
+  "optional": ["commands@1", "prompts@1"],
+  "config": {
+    "shell": {
+      "default": true,
+      "description": "in a git repository, snapshot the working tree before the first shell command of each turn so that /undo also restores what the commands changed; false turns this off"
+    }
+  }
 }

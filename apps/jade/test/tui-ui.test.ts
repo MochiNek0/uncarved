@@ -420,6 +420,39 @@ describe("terminal UI", () => {
     expect(output()).toContain("•••••••••");
   });
 
+  test("ctrl+j starts a new line; enter sends", async () => {
+    const { calls, type } = setup();
+    await type("one");
+    await type("\n"); // ctrl+j（Windows Terminal 里 ctrl+enter 发的也是它）
+    await type("two");
+    expect(calls.submit).toEqual([]);
+    // 终端单独报上来的 Shift+Enter（kitty 键盘协议的写法）
+    await type("\x1b[13;2u");
+    await type("three");
+    await type("\r");
+    expect(calls.submit).toEqual(["one\ntwo\nthree"]);
+  });
+
+  test("a dialog that pops up while the user is typing ignores the keys typed through it", async () => {
+    const { screen, type, output } = setup();
+    await type("fix 2 thin");
+    let answer: string | undefined = "pending";
+    void screen.select("Allow bash(rm x)?", [
+      { label: "Yes", value: "yes" },
+      { label: "No", value: "no" },
+    ]).then((v) => (answer = v));
+    await sleep(80);
+    expect(output()).toContain("Allow bash(rm x)?");
+    // 接着打出来的数字和回车不算回答
+    await type("2");
+    await type("\r");
+    expect(answer).toBe("pending");
+    // 停一下之后才算
+    await sleep(700);
+    await type("\r");
+    expect(answer).toBe("yes");
+  });
+
   test("aborting a dialog's signal closes it and returns undefined", async () => {
     const { screen, type, output } = setup();
     const ac = new AbortController();
@@ -722,7 +755,10 @@ describe("terminal UI", () => {
     );
     await until(output, "enter confirm");
     expect(output()).toContain("3. No");
-    expect(output()).toContain("more lines");
+    expect(output()).toContain("more lines · PgDn/PgUp to scroll");
+    // PgDn 翻到预览的末尾，批准之前能看完
+    for (let i = 0; i < 20 && !output().includes("end of"); i++) await type("\x1b[6~");
+    expect(output()).toContain("PgUp to scroll back");
     await type("\r");
     expect(await picked).toBe(1);
   });

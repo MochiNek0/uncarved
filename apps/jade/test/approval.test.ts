@@ -47,7 +47,7 @@ describe("approvers", () => {
   test("a front end that cannot ask still asks the approver, and its answer counts", async () => {
     const r = await run(["once"], false);
     expect(r.written).toBe(true);
-    expect(r.approver.seen).toEqual([{ title: "Allow write_file?", detail: expect.stringContaining("+ hi"), options: ["once", "always", "deny"] }]);
+    expect(r.approver.seen).toEqual([{ title: "Allow write_file?", detail: expect.stringContaining("+ hi"), options: ["once", "always", "forever", "deny"] }]);
     expect(r.state.selects).toEqual([]);
   }, 30_000);
 
@@ -176,6 +176,53 @@ describe("asking through the kernel", () => {
         "decided c allow by jade/approval",
         "ended end",
       ]);
+    } finally {
+      await w.host.close();
+    }
+  }, 30_000);
+
+  test("always allow in this directory is saved under $JADE_HOME and covers new sessions and new processes", async () => {
+    const w = await world();
+    w.state.answers = ["forever"];
+    w.state.script.push({ content: [write("a", "one.txt")], stopReason: "tool_use" }, reply("done"));
+    w.state.script.push({ content: [write("b", "two.txt")], stopReason: "tool_use" }, reply("done again"));
+    try {
+      const s = await w.host.sessions.open();
+      await s.send(msg("write it"));
+      expect(trail(await s.history())).toEqual(["decided a ask by jade/approval", "approval a true", "answered a forever by terminal", "ended end"]);
+      const next = await w.host.sessions.open();
+      await next.send(msg("one more"));
+      expect(w.state.selects).toHaveLength(1);
+      expect(existsSync(path.join(w.cwd, "two.txt"))).toBe(true);
+    } finally {
+      await w.host.close();
+    }
+    expect(JSON.parse(await Bun.file(path.join(w.home, "state", "approvals.json")).text())).toEqual({ [w.cwd]: [{ tool: "write_file" }] });
+    // 另一个进程、同一个目录：不再问；别的目录照旧问
+    for (const [cwd, asked] of [[w.cwd, 0], [undefined, 1]] as const) {
+      const again = await featureHost({ home: w.home, ...(cwd ? { cwd } : {}) });
+      again.state.answers = ["deny"];
+      again.state.script.push({ content: [write("c", "three.txt")], stopReason: "tool_use" }, reply("done"));
+      try {
+        await (await again.host.sessions.open()).send(msg("write it"));
+        expect(again.state.selects).toHaveLength(asked);
+      } finally {
+        await again.host.close();
+      }
+    }
+  }, 30_000);
+
+  test("deny with an explanation passes what the user typed to the model", async () => {
+    const w = await world();
+    w.state.answers = ["explain"];
+    w.state.inputs = ["use two.txt instead"];
+    w.state.script.push({ content: [write("a", "one.txt")], stopReason: "tool_use" }, reply("ok"));
+    try {
+      const s = await w.host.sessions.open();
+      await s.send(msg("write it"));
+      expect(existsSync(path.join(w.cwd, "one.txt"))).toBe(false);
+      expect(textOf(results(w.state.requests[1]!)[0]!.content)).toBe("The user denied this tool call and said: use two.txt instead");
+      expect(trail(await s.history())).toEqual(["decided a ask by jade/approval", "approval a false", "answered a deny by terminal", "ended end"]);
     } finally {
       await w.host.close();
     }

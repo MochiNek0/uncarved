@@ -39,13 +39,23 @@ npm install -g @uncarved/jade
 jade                       # 启动终端界面（默认前端），交互式对话
 jade -p "把 README 翻成英文"   # 非交互：把消息发给模型后打印结果退出
 cat err.log | jade -p - "解释这个错误"   # "-"：把 stdin 接在消息后面（不写 "-" 时，有消息就不读 stdin）
+jade -p -c "接着做"          # 非交互，接着这个目录里最近一次会话
+jade -p --json "..."       # 结束时在 stdout 输出一个 JSON：session、result（最后的回复）、reason、usage
 jade -c                    # 继续最近一次会话
 jade --resume <id>         # 恢复指定会话
 jade --safe                # 只加载自带的插件（排查故障用）
 jade -v                    # 打印版本
 ```
 
-会话里的斜杠命令（由对应插件提供）：`/clear` `/resume` `/retry` `/mode` `/model` `/plugins` `/mcp` `/skills` `/memory` `/undo` `/search` `/compact` `/schedule` `/suggest` `/checks` `/help` `/exit`。
+会话里的斜杠命令（由对应插件提供）：`/clear` `/resume` `/retry` `/mode` `/model` `/plugins` `/mcp` `/skills` `/memory` `/undo` `/search` `/compact` `/schedule` `/suggest` `/checks` `/copy` `/shells` `/cost` `/help` `/exit`。
+
+- `/copy` 把最后一条回复的原文放进剪贴板（`/copy code` 只要其中最后一个代码块），没有折行和排版符号。
+- `/undo` 撤销上一轮改过的文件；在 git 仓库里，这一轮 shell 命令改动、新建、删除的文件也一起恢复（被 `.gitignore` 忽略的除外）。
+- `/compact 要留意的事`：压缩历史时让总结特别留意后面写的内容。
+- `/shells` 列出 agent 启动的后台命令，`/shells kill <编号>` 停掉一个；后台命令自己结束时会提示。
+- 自定义命令：把提示词写进 `$JADE_HOME/commands/<名字>.md`（或仓库里的 `.jade/commands/`），之后用 `/<名字> [参数]` 发送；正文里的 `$ARGUMENTS` 换成参数。
+
+输入框里回车发送；换行用 Ctrl+J（Windows Terminal 里 Ctrl+Enter 也行）、Alt+Enter，或行尾写 `\` 再回车。终端单独上报 Shift+Enter 时它也换行。
 
 连续两次 Ctrl+C（2 秒内）直接退出，不经过任何插件——插件出问题时你一定能停下来。
 
@@ -60,6 +70,8 @@ jade 默认在改动前问你。模式由 `jade/approval` 插件提供，用 Shi
 | `plan` | 不改任何东西，只给出计划 |
 | `readonly` | 不改任何东西 |
 | `yolo` | 从不询问 |
+
+审批对话框里除了"允许一次"和"本会话里总是允许"，还可以选"在这个目录里总是允许"：规则记在 `$JADE_HOME/state/approvals.json`（按工作目录），以后在这个目录里开的会话都不再问，删掉文件里对应的条目就恢复询问。也可以选"拒绝并说明"，写一句话告诉 agent 该怎么做。预览放不下时用 PgUp/PgDn 翻看。
 
 安全性靠三条：**拒绝优先**（任何一个插件的拒绝都不能被推翻）、**兜底关卡**（审批插件不在场时核心拒绝所有写操作，而不是放行）、**层级**（项目层插件换不掉你的审批、模型配置和前端）。审批插件坏掉的结果是"什么都改不了"，不是"什么都放行"。
 
@@ -85,6 +97,9 @@ jade 自带的功能全是 `apps/jade/plugins/` 下的普通插件，和第三�
 | `jade/skills`、`jade/memory` | 技能目录、长期记忆 |
 | `jade/schedule` | 定时任务（cron，重启后仍生效） |
 | `jade/screenshot` | 无头浏览器截图交给模型看 |
+| `jade/custom-commands` | 把 Markdown 文件变成斜杠命令 |
+| `jade/hooks` | 在配置里写 shell 命令，工具调用前后、一轮结束时运行 |
+| `jade/cost` | 按配置的单价把 token 用量换算成钱，`/cost` |
 
 完整清单见 [docs/design/jade.md](../../docs/design/jade.md) 第 9 节。
 
@@ -193,6 +208,27 @@ plugin.run()
 
 权限模式和压缩阈值是插件配置，写在 `$JADE_HOME/config.json`，例如 `{"jade/approval": {"mode": "auto"}, "jade/compact": {"thresholdTokens": "120k"}}`。会话里用 Shift+Tab 或 `/mode` 选的模式记在 `mode.json`，比配置优先（见上文"权限"）。等审批回答的时限默认 24 小时，过了按拒绝处理，可用 `{"jade/approval": {"askTimeoutMinutes": 30}}` 改短（最长一周）。
 
+其他插件配置（都写在 `$JADE_HOME/config.json`）：
+
+```jsonc
+{
+  // 子 Agent 用另一个（更便宜、更快的）模型：/model 保存过的名字，或当前服务上的模型名
+  "jade/task": { "model": "claude-haiku-5-5" },
+  // 单价，每百万 token（这里的数字只是示例，按你用的服务填）；键是模型名或它的前缀。配了之后状态栏显示会话花了多少钱
+  "jade/cost": { "prices": { "claude-opus": { "input": 15, "output": 75, "cacheRead": 1.5, "cacheWrite": 18.75 } } },
+  // hook：before 的命令退出码不是 0 时拒绝这次调用；after 失败时告诉 agent；turn 在一轮结束时运行。
+  // 命令里可以用 $JADE_TOOL、$JADE_TOOL_INPUT（参数的 JSON 文件）、$JADE_TOOL_PATH
+  "jade/hooks": { "hooks": [
+    { "on": "after", "tool": "edit_file", "command": "bunx prettier --write \"$JADE_TOOL_PATH\"" },
+    { "on": "turn", "command": "echo done" }
+  ] },
+  // 不读 ~/.claude/CLAUDE.md（默认在 $JADE_HOME 里没有 AGENTS.md / CLAUDE.md 时用它作用户指令）
+  "jade/prompts": { "claudeInstructions": false },
+  // 不在 shell 命令之前给工作区拍快照（/undo 就撤销不了命令的改动）
+  "jade/undo": { "shell": false }
+}
+```
+
 网络搜索可选配置多家服务的 key（`TAVILY_API_KEY`、`JINA_API_KEY`、`EXA_API_KEY` 等），配了 key 的服务按顺序试；一个 key 都不设时只有 `web_fetch`，没有 `web_search`。完整列表见 [.env.example](https://github.com/MochiNek0/uncarved/blob/main/.env.example)。
 
 ## 目录布局
@@ -203,7 +239,10 @@ plugin.run()
   config.json                  # 用户层插件配置
   mode.json                    # 当前权限模式
   plugins/                     # 用户层插件
+  commands/                    # 自定义斜杠命令（<名字>.md）
+  checkpoints/                 # /undo 的文件快照和工作区快照（按会话）
   state/
+    approvals.json             # "在这个目录里总是允许"的规则（按工作目录）
     sessions.jsonl             # 会话索引
     trust.json                 # 项目层插件的确认记录（按内容哈希）
     secrets/<id>.json          # 各插件的密钥，0600

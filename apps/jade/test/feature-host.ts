@@ -29,6 +29,8 @@ export interface TestState {
   /** select 的回答，按顺序用掉；用完之后选第一项 */
   answers: (string | undefined)[];
   selects: { title: string; detail?: string }[];
+  /** input 的回答，按顺序用掉；用完之后 undefined（取消） */
+  inputs?: (string | undefined)[];
   notes: string[];
 }
 
@@ -54,7 +56,7 @@ const FAKE_UI = `export default { process(ctx) {
       if (!t().interactive) return undefined;
       return t().answers.length ? t().answers.shift() : r.options[0]?.value;
     },
-    input: async () => undefined,
+    input: async () => t().inputs?.shift(),
   });
 } };`;
 
@@ -93,7 +95,8 @@ export async function featureHost(opts: { home?: string; cwd?: string; config?: 
     }
   }
   await writeFile(path.join(home, "plugins.json"), JSON.stringify({ disabled }));
-  if (opts.config) await writeFile(path.join(home, "config.json"), JSON.stringify(opts.config));
+  // 不读这台机器上的 ~/.claude/CLAUDE.md：测试结果不能取决于谁在跑
+  await writeFile(path.join(home, "config.json"), JSON.stringify({ "jade/prompts": { claudeInstructions: false }, ...opts.config }));
 
   const state: TestState = { script: [], requests: [], interactive: true, answers: [], selects: [], notes: [] };
   (globalThis as { __jadeTest?: TestState }).__jadeTest = state;

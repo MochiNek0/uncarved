@@ -101,7 +101,7 @@ const UNDONE = "undone.json";
  * 最近一轮还有没撤销的修改的快照（最新的在前）。一轮从一条用户自己写的消息开始；
  * 只有工具结果、或者只有插件、宿主加的说明（例如自动续写的提示）的消息不算新的一轮。没有可撤销的返回空数组
  */
-export function lastTurnChanges(messages: readonly Message[], checkpoints: readonly Checkpoint[], undone: ReadonlySet<string>): Checkpoint[] {
+export function lastTurnChanges<T extends { toolUseId: string }>(messages: readonly Message[], checkpoints: readonly T[], undone: ReadonlySet<string>): T[] {
   const pending = checkpoints.filter((c) => !undone.has(c.toolUseId));
   if (pending.length === 0) return [];
   let ids = new Set<string>();
@@ -146,4 +146,4 @@ export function turnToolNames(messages: readonly Message[], toolUseId?: string):
 }
 
 /** 会话和工具调用的 id 用作文件名 */
-const safe = (id: string) => id.replace(/[^A-Za-z0-9_.-]/g, "_");
+export const safe = (id: string) => id.replace(/[^A-Za-z0-9_.-]/g, "_");

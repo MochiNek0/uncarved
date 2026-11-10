@@ -172,8 +172,11 @@ export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
       if (buf.subarray(0, 8000).includes(0)) {
         return { content: `${display(cwd, full)} is a binary file (${buf.length} bytes) and cannot be shown as text`, isError: true };
       }
-      const text = buf.toString("utf8");
-      remember(full, info, opts.responses?.calls ?? -1, ctx?.toolUseId);
+      // 不是 UTF-8 的文件（多半是 GBK）照样给模型看，但不算读过：改它会把原来的字节写坏
+      const strict = utf8(buf);
+      const text = strict ?? legacyText(buf);
+      const note = strict === undefined ? `\n(${notUtf8(display(cwd, full))})` : "";
+      if (strict !== undefined) remember(full, info, opts.responses?.calls ?? -1, ctx?.toolUseId);
       if (text.length === 0) return { content: "(empty file)" };
       const lines = text.split(/\r?\n/);
       if (lines.at(-1) === "") lines.pop();
@@ -192,9 +195,9 @@ export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
       const body = out.join("\n");
       const end = start + out.length - 1;
       if (out.length < slice.length) {
-        return { content: `${body}\n(output capped at about ${MAX_READ_CHARS} characters: showing lines ${start}-${end} of ${lines.length}; continue with offset ${end + 1})` };
+        return { content: `${body}\n(output capped at about ${MAX_READ_CHARS} characters: showing lines ${start}-${end} of ${lines.length}; continue with offset ${end + 1})${note}` };
       }
-      return { content: end < lines.length ? `${body}\n(showing lines ${start}-${end} of ${lines.length})` : body };
+      return { content: (end < lines.length ? `${body}\n(showing lines ${start}-${end} of ${lines.length})` : body) + note };
     },
   };
 
@@ -219,7 +222,8 @@ export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
       const info = await statOrUndefined(full);
       if (info?.isDirectory()) return { content: `${display(cwd, full)} is a directory`, isError: true };
       // 同样内容重复写入（崩溃后重跑）不算覆盖别人的修改
-      const before = info ? await readFile(full, "utf8") : null;
+      const before = info ? utf8(await readFile(full)) ?? undefined : null;
+      if (before === undefined) return { content: notUtf8(display(cwd, full)), isError: true };
       // read_file 不显示换行风格和 BOM：覆盖已有文件时沿用原来的，否则整个文件每一行都算改了
       const content = before === null ? given : keepStyle(before, given);
       const problem = info && before !== null && before !== content ? staleness(full, info) : undefined;
@@ -241,7 +245,8 @@ export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
     if (!info) {
       return { content: seen.has(full) ? `${shown} no longer exists` : `${shown} does not exist; use write_file to create it`, isError: true };
     }
-    const text = await readFile(full, "utf8");
+    const text = utf8(await readFile(full));
+    if (text === undefined) return { content: notUtf8(shown), isError: true };
     const problem = staleness(full, info);
     if (problem) return { content: problem, isError: true };
     let next = text;
@@ -385,6 +390,28 @@ export function applyEditsToText(text: string, edits: Edit[], shown: string): st
   }
   return { text: next };
 }
+
+/** 按 UTF-8 解码（BOM 留着）；不是合法的 UTF-8 时 undefined */
+export function utf8(buf: Uint8Array): string | undefined {
+  try {
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(buf);
+  } catch {
+    return undefined;
+  }
+}
+
+/** 不是 UTF-8 的文本只用来显示：按 GB18030（含 GBK）解码，运行时不支持时按 UTF-8 解码、坏的字节显示成 U+FFFD */
+function legacyText(buf: Buffer): string {
+  try {
+    return new TextDecoder("gb18030").decode(buf);
+  } catch {
+    return buf.toString("utf8");
+  }
+}
+
+const notUtf8 = (shown: string) =>
+  `${shown} is not valid UTF-8 (read_file shows it decoded as GB18030). write_file and edit_file only handle UTF-8 and would corrupt it, so they refuse it: ` +
+  "change it with a command that keeps its encoding, or ask the user before converting it to UTF-8.";
 
 /** text 里多数换行是 CRLF 时返回 "\r\n"，多数是 LF 时返回 "\n"，一样多或没有换行时返回 fallback */
 function eolOf(text: string, fallback: string): string {

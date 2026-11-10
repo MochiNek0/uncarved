@@ -321,6 +321,20 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 | `jade/suggest` | 一轮正常结束后预测用户的下一条消息，经 `ctx.input.hint` 灰色显示在输入框里，Tab 或 → 接受；下一次请求模型时作废。默认关着（`enabled`），`model` 选 `/model` 保存过的模型或当前服务提供的模型（不用先保存），不设时用会话的模型。`/suggest on|off`、`/suggest model [name]`（不带名字时弹出选择，列出保存过的和服务提供的模型）马上生效，记在 `$JADE_HOME/state/suggest.json`，盖过 `config.json` | `models@1`；可选 `ui@1`、`commands@1` | 旧 jade 的 `examples/plugins/suggest`；提示词、对话的整理和截取（只算用户自己打的字、工具调用只留名字、从最新的往前取 8000 字）、回复的清理（`NONE`、前缀和引号）、第一行完整就停参考 dsh-ghost-prompt（`test/suggest.test.ts`）。服务和密钥不再由插件自己存 |
 | `jade/update` | 经核心的 `update@1`：启动时查 npm 上有没有更新的 jade（每天最多一次，缓存在 `$JADE_HOME/update-check.json`），有就在后台升级、下次启动生效；配置 `auto: false` 或 `JADE_AUTO_UPDATE=off` 时只提示，`JADE_UPDATE_CHECK=off` 不查。开发版和不能提问的前端（`-p`）既不提示也不升级 | `update@1`；可选 `ui@1` | `update.ts` 的 `checkForUpdate`（`test/update.test.ts`） |
 | `jade/schedule` | 定时任务：五字段 cron（本机时区），存在 `$JADE_HOME/state/schedules.json`，重启后还在。到点时投到创建它的目录里正在运行的 jade 的当前会话（正在跑就排在本轮之后）；没有 jade 开着就等，下次打开时错过的几次只补一次；`jade -p` 不投递。同一台机器开着几个 jade 时，所有读写经一把目录锁，到点的任务只由一个进程认领、只投递一次；上一次还没跑完的不再认领。`/schedule`（list、add、once、pause、resume、rm、run）和模型工具 `schedule_create`、`schedule_list`、`schedule_edit` 共用这份存储；创建和修改的 effect 是 `external`，auto 模式下也要审 | 可选 `commands@1`、`ui@1` | 新功能，参考 dsh 的 `dsh-schedule`（`test/schedule.test.ts`）。任务的 `target` 现在只有 `cwd` 一种；一个进程能同时挂多个会话之后，再加"后台另开会话"（dsh 的 `new`） |
+| `jade/custom-commands` | `$JADE_HOME/commands/<名字>.md`、`<工作目录>/.jade/commands/<名字>.md` 变成 `/<名字> [参数]`：文件内容作为用户消息发出去，`$ARGUMENTS` 换成参数；启动时登记，内容每次执行时重新读；名字被占用的不登记 | `commands@1`；可选 `ui@1` | 新功能（`test/custom-commands.test.ts`） |
+| `jade/hooks` | 配置 `hooks` 里的 shell 命令：`before`（`tool.gate`，退出码非 0 时拒绝，输出作理由）、`after`（`tool.after`，失败时经 `prompts@1.note` 告诉模型）、`turn`（一轮结束后）。配置键没有标 `project`，仓库设不了 | `shell@1`；可选 `ui@1`、`prompts@1` | 新功能（`test/hooks.test.ts`） |
+| `jade/cost` | 按配置的单价（每百万 token，按模型名前缀）把日志里的用量换算成钱：状态栏一段（`ctx.status`，合计每轮记进 `derived`）、`/cost` | 可选 `commands@1`、`models@1` | 新功能（`test/cost.test.ts`） |
+
+2026-11-10 之后的补充（都在插件里，核心没有改）：
+
+- `jade/fs`：不是合法 UTF-8 的文件（多半是 GBK）只读不改，`read_file` 按 GB18030 解码给模型看，`write_file`、`edit_file` 拒绝，免得把原来的字节写坏。
+- `jade/approval`：回答多了"在这个目录里总是允许"（`forever`，记在 `$JADE_HOME/state/approvals.json`，按工作目录；不进日志）；终端里多了"拒绝并说明"，说的话作为拒绝的理由交给模型。`allows` 对不是只读的工具只按只读模式判断（yolo 和"总是允许"都不放宽）。
+- `jade/task`：`task@1.tool` 也收不是只读的工具，但只执行 `approval@1.allows` 认定为只读的调用，所以子 Agent 仍然不改任何东西；`jade/shell` 据此给子 Agent 一个不能在后台跑的 `bash`。配置 `model` 让子 Agent 用另一个模型。
+- `jade/undo`：在 git 仓库里，每轮第一次 `bash` 之前把工作区拍进 `$JADE_HOME/checkpoints/<会话>/shadow` 里的影子 git 仓库（tree 对象，对象库借用项目的，不做换行转换和 filter），`/undo` 时把之后变了的文件恢复回去；项目自己的 `.git` 不碰。被忽略的文件不在快照里。
+- `jade/shell`：后台命令自己结束时提示用户并经 `prompts@1.note` 告诉模型；`/shells`。
+- `jade/prompts`：`$JADE_HOME` 里没有指令文件时用 `~/.claude/CLAUDE.md`（配置 `claudeInstructions: false` 关掉）。
+- `jade/tui`：对话框弹出时用户正在打字，接着打出来的回车和数字不当成回答；审批预览用 PgUp/PgDn 翻看；第一个词里还有 `/` 的输入（路径）当普通消息；`/copy`；Ctrl+J、单独上报的 Shift+Enter 换行。
+- `jade/print`：`-c/--continue`（经 `sessions@1`）、`--json`。`jade/compact`：`/compact <要留意的事>`。
 
 几条值得注意的变化：
 

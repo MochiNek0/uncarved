@@ -39,8 +39,8 @@ export interface Compactor {
   project(messages: Message[], ctx: HookContext): Promise<Message[]>;
   /** event 的 observe：记下真实用量 */
   observe(e: LogEvent): void;
-  /** 下一次请求前无论是否超过阈值都总结一次 */
-  request(): void;
+  /** 下一次请求前无论是否超过阈值都总结一次；focus 是用户要总结特别留意的事（/compact 后面写的） */
+  request(focus?: string): void;
 }
 
 const SUMMARY_SYSTEM =
@@ -125,6 +125,7 @@ const total = (u: Usage | undefined) => (u?.inputTokens === undefined ? undefine
 export function compactor(opts: CompactorOptions): Compactor {
   const id = opts.id ?? "jade/compact";
   let forced = false;
+  let focus: string | undefined;
   /** 最近一次投影：它对应的消息条数和压缩状态；收到回复后补上真实用量 */
   let last: { length: number; state: string; tokens?: number } | undefined;
   let pending: { length: number; state: string } | undefined;
@@ -189,6 +190,8 @@ export function compactor(opts: CompactorOptions): Compactor {
       }
     }
     forced = false;
+    const asked = focus;
+    focus = undefined;
 
     const res = await opts.complete(
       {
@@ -205,6 +208,7 @@ export function compactor(opts: CompactorOptions): Compactor {
                 origin: { by: "plugin", id },
                 trust: "untrusted",
               },
+              ...(asked ? [{ kind: "text" as const, text: `The user asked that the summary pay particular attention to: ${asked}`, origin: { by: "plugin" as const, id }, trust: "trusted" as const }] : []),
             ],
           },
         ],
@@ -235,8 +239,9 @@ export function compactor(opts: CompactorOptions): Compactor {
       last = { ...pending, tokens: total((e as LogEvent<"model.responded">).data.usage) };
       pending = undefined;
     },
-    request() {
+    request(what) {
       forced = true;
+      focus = what;
     },
   };
 }

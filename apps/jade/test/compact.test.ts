@@ -100,12 +100,14 @@ describe("jade/compact in a session", () => {
 
     const compact = host.service<Commands>("commands@1")!.get("compact")!.command;
     const c: CommandContext = { signal: new AbortController().signal, ui: host.service<UI>("ui@1")!, sessions: host.sessions, print: () => {} };
-    expect(await compact.run("", c)).toContain("will be compacted");
+    expect(await compact.run("keep the API decisions", c)).toContain("will be compacted");
     shared.script.push(say("SUMMARY"), say("C"));
     await send(s, "third");
 
     const summarizer = shared.requests[2]!;
     expect(summarizer.tools).toEqual([]);
+    // 命令后面写的话交给总结
+    expect(textOf(summarizer.messages[0]!.content)).toContain("pay particular attention to: keep the API decisions");
     expect(textOf(summarizer.messages[0]!.content)).toContain("<transcript>");
     const main = shared.requests[3]!;
     expect(textOf(main.messages[0]!.content)).toContain("SUMMARY");

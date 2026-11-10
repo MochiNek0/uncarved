@@ -71,6 +71,8 @@ export interface Screen {
   input(title: string, opts?: { initial?: string; mask?: boolean; placeholder?: string; signal?: AbortSignal }): Promise<string | undefined>;
   /** 输入框里还没提交的文字和灰色提示（插件的 ctx.input 用）；只有终端界面有 */
   readonly draft?: { text(): string; insert(text: string): void; set(text: string): void; hint(text: string | undefined): void };
+  /** 把文字放进系统剪贴板（OSC 52）；只有终端界面有 */
+  copy?(text: string): void;
   /** 清空已经显示的对话（开始新会话时） */
   clear(): void;
   close(): Promise<void>;
@@ -169,6 +171,7 @@ export function safeScreen(screen: Screen): Screen {
       set: (t) => screen.draft!.set(plain(lf(t))),
       hint: (t) => screen.draft!.hint(t === undefined ? undefined : plain(lf(t))),
     },
+    ...(screen.copy ? { copy: (t: string) => screen.copy!(t) } : {}),
     clear: () => screen.clear(),
     close: () => screen.close(),
   };

@@ -2,6 +2,7 @@
 // 也负责内核不写的、给模型看的说明：内容为空的错误工具结果在投影里补一句原因（results.ts）；
 // 其他插件经 prompts@1 的 note 给模型留一句说明（notes.ts）。
 
+import os from "node:os";
 import path from "node:path";
 import type { ContentSource, LogEvent, SystemSegment } from "uncarved";
 import { definePlugin, type UI } from "@uncarved/jade-api";
@@ -76,7 +77,7 @@ export default definePlugin({
 
   async session(ctx) {
     const models = ctx.service<Models>("models@1");
-    const [env, instructions] = await Promise.all([environment(ctx.cwd), allInstructions(ctx.home, ctx.cwd)]);
+    const [env, instructions] = await Promise.all([environment(ctx.cwd), allInstructions(ctx.home, ctx.cwd, ctx.config.claudeInstructions === false ? null : os.homedir())]);
     const fixed = [segment(env), ...instructions.map((i) => segment(i.text, i.trust, "stable", ID, i.source))];
     // 告诉用户读了哪些指令文件，否则看不出它们生效了
     if (instructions.length > 0) ctx.service<UI>("ui@1")?.notify(`loaded instructions: ${instructions.map((i) => display(realPath(ctx.cwd), i.file)).join(", ")}`);

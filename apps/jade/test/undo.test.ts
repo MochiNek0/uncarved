@@ -131,6 +131,45 @@ describe("jade/undo in a session", () => {
     expect(plain(await run())).toContain("This turn also ran shell commands; what they changed is not undone.");
   });
 
+  test("in a git repository /undo also restores what the turn's shell commands changed, and leaves the project's own git alone", async () => {
+    const { cwd, host, shared, send, run } = await setup();
+    const git = (...args: string[]) => Bun.spawnSync(["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "core.autocrlf=false", ...args], { cwd }).stdout.toString();
+    git("init", "-q");
+    await writeFile(path.join(cwd, ".gitignore"), "ignored.txt\n");
+    await writeFile(path.join(cwd, "kept.txt"), "original\r\nline\n");
+    await writeFile(path.join(cwd, "removed.txt"), "will be removed\n");
+    git("add", "-A");
+    git("commit", "-q", "-m", "init");
+    const status = git("status", "--porcelain");
+    shared.script.push(
+      // 命令之前文件工具建的文件，命令之后又被命令改了
+      use("u1", "write_file", { path: "made.txt", content: "by tool\n" }),
+      use("u2", "bash", { command: "printf 'changed\\n' > kept.txt && rm removed.txt && printf 'new\\n' > added.txt && printf 'x\\n' >> made.txt && printf 'i\\n' > ignored.txt" }),
+      say("done"),
+    );
+    const s = await host.sessions.open();
+    await send(s, "do it");
+    expect(await readFile(path.join(cwd, "kept.txt"), "utf8")).toBe("changed\n");
+    expect(existsSync(path.join(cwd, "removed.txt"))).toBe(false);
+
+    shared.answers.push("yes");
+    const out = plain(await run());
+    expect(shared.asked.at(-1)).toContain("It ran shell commands");
+    expect(out).toContain("Undid the last turn (4 files):");
+    expect(out).not.toContain("is not undone");
+    // 原样恢复，换行也不变
+    expect(await readFile(path.join(cwd, "kept.txt"), "utf8")).toBe("original\r\nline\n");
+    expect(await readFile(path.join(cwd, "removed.txt"), "utf8")).toBe("will be removed\n");
+    expect(existsSync(path.join(cwd, "added.txt"))).toBe(false);
+    // 文件工具在命令之前建的文件也撤销了
+    expect(existsSync(path.join(cwd, "made.txt"))).toBe(false);
+    // 被忽略的文件不在快照里
+    expect(existsSync(path.join(cwd, "ignored.txt"))).toBe(true);
+    // 项目自己的 git 没动过：暂存区和提交都是原样
+    expect(git("status", "--porcelain")).toBe(status);
+    expect(plain(await run())).toBe("Nothing to undo.");
+  }, 30_000);
+
   test("failed and denied writes leave nothing to undo", async () => {
     const { host, shared, send, run } = await setup();
     // a.txt 不存在：edit_file 失败

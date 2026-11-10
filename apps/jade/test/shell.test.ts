@@ -7,6 +7,9 @@ import path from "node:path";
 import type { ToolContext } from "uncarved";
 import { shellService } from "../plugins/shell/service.ts";
 import { shellTool, shellTools } from "../plugins/shell/shell.ts";
+import type { UI } from "../src/index.ts";
+import type { CommandContext, Commands } from "../plugins/commands/index.ts";
+import { cleanup, say, scriptedHost, textOf, use } from "./scripted-ui.ts";
 
 let tmp: string[] = [];
 afterEach(async () => {
@@ -111,6 +114,28 @@ describe("bash", () => {
       shell.shutdown();
     }
   }, 20_000);
+
+  test("a background shell that ends by itself is reported once; one stopped with kill is not", async () => {
+    const cwd = await workspace();
+    const exits: string[] = [];
+    const shell = shellTools({ cwd, onExit: (bg) => void exits.push(`${bg.id} ${bg.command} -> ${bg.exitCode}`) });
+    const bash = shell.tools.find((t) => t.name === "bash")!;
+    try {
+      await bash.execute({ command: "exit 3", run_in_background: true }, ctx());
+      await bash.execute({ command: "sleep 30", run_in_background: true }, ctx());
+      for (let i = 0; i < 50 && exits.length === 0; i++) await Bun.sleep(100);
+      expect(shell.list()).toEqual([
+        { id: "bg1", command: "exit 3", status: "exited with code 3" },
+        { id: "bg2", command: "sleep 30", status: "running" },
+      ]);
+      expect(await shell.kill("bg2")).toBe(true);
+      expect(await shell.kill("bg9")).toBe(false);
+      await Bun.sleep(200);
+      expect(exits).toEqual(["bg1 exit 3 -> 3"]);
+    } finally {
+      shell.shutdown();
+    }
+  }, 20_000);
 });
 
 // shell@1：其他插件执行命令的入口（jade/checks 用它跑项目的检查）
@@ -149,4 +174,25 @@ describe("shell@1", () => {
     // which 不依赖 shell 在不在
     expect(typeof service.which("no-such-program-for-jade")).toBe("undefined");
   });
+});
+
+describe("jade/shell in a session", () => {
+  afterEach(cleanup);
+
+  test("a background command that ends is announced to the user and noted for the model; /shells lists it", async () => {
+    const w = await scriptedHost();
+    w.shared.script.push(use("u1", "bash", { command: "exit 3", run_in_background: true }), say("started"));
+    const s = await w.host.sessions.open();
+    await w.send(s, "start it");
+    for (let i = 0; i < 50 && !w.shared.notes.some((n) => n.includes("bg1")); i++) await Bun.sleep(100);
+    expect(w.shared.notes).toContain("Background shell bg1 (exit 3) exited with code 3");
+    const shells = w.host.service<Commands>("commands@1")!.get("shells")!.command;
+    const c: CommandContext = { signal: new AbortController().signal, ui: w.host.service<UI>("ui@1")!, sessions: w.host.sessions, print: () => {} };
+    expect(await shells.run("", c)).toBe("bg1  exited with code 3  exit 3");
+    expect(await shells.run("kill bg7", c)).toBe("There is no background command bg7.");
+    // 模型下一次请求时看到说明
+    w.shared.script.push(say("ok"));
+    await w.send(s, "and now?");
+    expect(textOf(w.shared.requests.at(-1)!.messages.at(-1)!.content)).toContain("[Note from jade] Background shell bg1 (exit 3) exited with code 3. Read its remaining output with bash_output.");
+  }, 30_000);
 });

@@ -3,7 +3,8 @@
 // 主体和环境信息都是 stable：环境信息在会话开始时取一次，不在每次请求时更新，
 // 否则它一变，排在后面的整段历史都无法命中提示缓存。
 // 指令文件兼容 AGENTS.md 和 CLAUDE.md，同一目录两者都有时只读 AGENTS.md。
-// 用户层（$JADE_HOME 里）的是 trusted；项目层（随仓库分发）的是 untrusted，并记下出处（宪法 7.2）。
+// 用户层的先找 $JADE_HOME，没有时用 ~/.claude 里的（和 jade/skills 读 ~/.claude/skills 一样，已有的全局指令不用再抄一份）。
+// 用户层的是 trusted；项目层（随仓库分发）的是 untrusted，并记下出处（宪法 7.2）。
 // 项目层从仓库根目录到工作目录逐级查找，上级的在前，离工作目录近的在后。
 
 import { createHash } from "node:crypto";
@@ -110,10 +111,10 @@ export interface Instructions {
   file: string;
 }
 
-/** 用户层（home 里）和项目层（仓库根目录到 cwd 逐级）的指令文件，按顺序 */
-export async function allInstructions(home: string, cwd: string): Promise<Instructions[]> {
+/** 用户层（home 里，没有时 userHome/.claude 里；userHome 给 null 时不找）和项目层（仓库根目录到 cwd 逐级）的指令文件，按顺序 */
+export async function allInstructions(home: string, cwd: string, userHome: string | null = os.homedir()): Promise<Instructions[]> {
   const out: Instructions[] = [];
-  const user = await instructions(home, home, "user");
+  const user = (await instructions(home, home, "user")) ?? (userHome === null ? undefined : await instructions(userHome, path.join(userHome, ".claude"), "user"));
   if (user) out.push({ text: `# User instructions (${user.source.path})\n\n${user.text}`, trust: "trusted", source: user.source, file: user.file });
   const root = realPath(await repoRoot(cwd));
   for (const dir of ancestry(root, realPath(cwd))) {

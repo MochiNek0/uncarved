@@ -22,7 +22,12 @@ C 的证据。"多亏是插件才能这样做"是架构对的证据，"架构挡
 
 - 2026-11-10 摆正两处插件直接 import 核心模块的地方（`jade/update` 用 `src/update.ts`，`jade/skills` 用 `src/fetch.ts` 等）→ 改成核心服务 `update@1`、`sources@1` 之后，两个插件的清单写明了依赖，第三方插件也能装东西、查版本；核心一行功能代码都没加，只是把已有的函数挂成服务。
 
+- 2026-11-10 一次加了一批日常功能（按目录记住的审批规则、`/undo` 撤销 shell 改动、后台命令结束提示、子 Agent 的只读 bash、自定义命令、用户 hook、费用显示、`-p --json`）→ 全部落在插件里，三个是新插件（`jade/custom-commands`、`jade/hooks`、`jade/cost`），`src/` 一行没动。用到的都是已有的接口：`commands@1`、`shell@1`、`prompts@1.note`、`ctx.status`、`derived`、内核 hook。注意：这一批是读代码找出来的，不是用出来的，哪些真的有用要等日常使用来验证。
+
 ### 架构挡了路
+
+- 2026-11-10 想做"用 `$EDITOR` 编辑输入"和通用的"复制到剪贴板"→ `ui@1` 没有暂停/恢复终端的方法，也没有剪贴板方法，插件做不了终端编辑器；`/copy` 因此只能放在 `jade/tui` 里。没改，等真的需要时给 `ui@1` 加方法。
+- 2026-11-10 想让会话里的插件读自己会话的日志（`jade/cost` 恢复会话后接着算）→ `ctx.session` 没有 `history()`（命令里的 `sessions.current` 有）→ 绕过去了：合计每轮记进 `derived`。
 
 - 2026-11-09 想让用户在终端里一条命令装网上的 skill 和 MCP 服务（`jade skills add`、`jade mcp add`）→ 插件没法加 `jade <子命令>`，直接写进 `main.ts` 又要让核心认识 skill 和 MCP → 给核心加了 `cli@1`（核心只查名字、转交参数），安装逻辑留在 `jade/skills`、`jade/mcp`。见 [jade.md](./jade.md) 3.4。
 - 2026-11-05 移植 memory、undo → 没有"给模型留一句说明"的接口，两个插件各自往 `context.project` 里附说明（`/undo` 的已撤销记录另存在 `$JADE_HOME/checkpoints`）→ 绕过去了。两个插件绕同一条路，说明插件接口缺这一项。见 [jade.md](./jade.md) 第 11 节第 7 步。2026-11-10 补上：`prompts@1.note`，两份 `notes.ts` 删掉。

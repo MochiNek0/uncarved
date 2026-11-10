@@ -1,0 +1,13 @@
+{
+  "id": "jade/cost",
+  "version": "0.1.0",
+  "api": "^1",
+  "entry": "./index.ts",
+  "optional": ["commands@1", "models@1"],
+  "config": {
+    "prices": {
+      "default": {},
+      "description": "prices in $ per million tokens, by model name or name prefix: { \"<model>\": { \"input\": 3, \"output\": 15, \"cacheRead\": 0.3, \"cacheWrite\": 3.75 } }; models without a price are counted in tokens only"
+    }
+  }
+}

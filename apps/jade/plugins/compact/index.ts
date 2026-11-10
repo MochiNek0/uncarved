@@ -34,8 +34,8 @@ function thresholdFor(config: Record<string, unknown>, models: Models): () => nu
   };
 }
 
-/** /compact 请求过的会话：下一次投影时无论是否超过阈值都总结一次 */
-const requested = new Set<string>();
+/** /compact 请求过的会话：下一次投影时无论是否超过阈值都总结一次。值是命令后面写的、要总结特别留意的事 */
+const requested = new Map<string, string>();
 
 export default definePlugin({
   process(ctx) {
@@ -43,11 +43,12 @@ export default definePlugin({
     const commands = ctx.service<Commands>("commands@1");
     commands?.register({
       name: "compact",
-      description: "compact the history before the next request",
-      run(_args, c) {
+      args: "[what to keep]",
+      description: "compact the history before the next request; text after the command tells the summary what to pay attention to",
+      run(args, c) {
         const s = c.sessions.current;
         if (!s) return "No session is open.";
-        requested.add(s.id);
+        requested.set(s.id, args.trim());
         return dim("History will be compacted before the next request.");
       },
     });
@@ -79,7 +80,11 @@ export default definePlugin({
       order: 100,
       timeoutMs: SUMMARY_TIMEOUT_MS,
       fn: (messages, hook) => {
-        if (requested.delete(id)) c.request();
+        const focus = requested.get(id);
+        if (focus !== undefined) {
+          requested.delete(id);
+          c.request(focus || undefined);
+        }
         return c.project(messages, hook);
       },
     });

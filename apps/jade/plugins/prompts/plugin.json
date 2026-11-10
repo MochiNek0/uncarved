@@ -4,5 +4,11 @@
   "api": "^1",
   "entry": "./index.ts",
   "provides": ["prompts@1"],
-  "optional": ["models@1", "ui@1"]
+  "optional": ["models@1", "ui@1"],
+  "config": {
+    "claudeInstructions": {
+      "default": true,
+      "description": "when $JADE_HOME has no AGENTS.md or CLAUDE.md, use ~/.claude/CLAUDE.md as the user instructions; false turns this off"
+    }
+  }
 }

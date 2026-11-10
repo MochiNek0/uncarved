@@ -10,6 +10,9 @@
     "maxSteps": {
       "default": 40,
       "description": "how many responses a sub-agent may make before it is asked for its report"
+    },
+    "model": {
+      "description": "the model sub-agents use: a model saved by /model, or another model of the current service (for example a cheaper, faster one); default: the session's model"
     }
   }
 }

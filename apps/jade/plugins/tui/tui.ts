@@ -655,6 +655,7 @@ export function tuiScreen(opts: TuiOptions): Screen {
       },
       hint: (text) => store.update({ hint: text ? text.replace(/\r\n?/g, "\n") : undefined }),
     },
+    copy: (text) => void stdout.write(osc52(text)),
     select: <T>(title: string, choices: Choice<T>[], o?: { body?: string; signal?: AbortSignal }) => {
       if (longBusy()) notify(title);
       return ask<T | undefined>(
@@ -789,7 +790,8 @@ function selectedText(s: Selection, row: (i: number) => string | undefined): str
     const [from, to] = selectedCols(s, r)!;
     let text = "";
     walk(row(r) ?? "", from, to, (ch, inside) => void (inside && (text += ch)));
-    lines.push(text.trimEnd());
+    // 代码块左边的竖线是排版加的，不是代码的一部分
+    lines.push(text.trimEnd().replace(/^┃ ?/, ""));
   }
   return lines.join("\n");
 }
@@ -1621,6 +1623,8 @@ function Prompt({
     if (!text.trim()) return;
     remember(text);
     set(empty);
+    // 发出去之后弹出的对话框是用户自己要的（/mode、/model），马上就能回答
+    typedAt = 0;
     onSubmit();
     handlers.submit(text);
   };
@@ -1776,8 +1780,9 @@ function Prompt({
         return submit(edit.insert(state, input.slice(0, -1)).value.trim());
       }
       if (key.return) {
-        // 行尾的 \ 加回车换行；Alt+Enter 也换行
-        if (key.meta) return set(edit.insert(state, "\n"));
+        // 行尾的 \ 加回车换行；Alt+Enter 也换行；终端把 Shift+Enter 单独报上来时（kitty 键盘协议、modifyOtherKeys）也换行。
+        // Ctrl+J（Windows Terminal 里 Ctrl+Enter 也是它）发的是 LF，不算回车，在 editKey 里当普通换行插入
+        if (key.meta || key.shift) return set(edit.insert(state, "\n"));
         if (state.value.slice(0, state.cursor).endsWith("\\"))
           return set(edit.insert(edit.backspace(state), "\n"));
         const { pick, file } = derive();
@@ -1831,7 +1836,10 @@ function Prompt({
       const spec = keySpec(input, key);
       if (spec && handlers.key?.(spec)) return;
       const next = editKey(state, input, key);
-      if (next) set(next);
+      if (next) {
+        if (next.value !== state.value) typedAt = Date.now();
+        set(next);
+      }
     },
     { isActive: active },
   );
@@ -1965,6 +1973,25 @@ function around(selected: number, total: number, size: number): number {
   return Math.max(0, Math.min(selected - Math.floor(size / 2), total - size));
 }
 
+/** 用户上一次在输入框里打字的时间；发送之后清零 */
+let typedAt = 0;
+/** 打字停下这么久之后，对话框才把回车和字符当成回答 */
+const TYPING_GRACE = 500;
+
+/**
+ * 对话框弹出时用户正在输入框里打字（例如在排下一条消息时弹出审批）：接着打出来的回车、数字不能当成回答。
+ * 返回 true 表示这个键要丢掉。方向键、Esc 说明用户已经看到对话框了，不再拦
+ */
+function typedThrough(input: string, key: Key): boolean {
+  if (Date.now() - typedAt >= TYPING_GRACE) return false;
+  if (key.escape || key.upArrow || key.downArrow || key.pageUp || key.pageDown || (key.ctrl && input === "c") || MOUSE.test(input)) {
+    typedAt = 0;
+    return false;
+  }
+  typedAt = Date.now();
+  return true;
+}
+
 /** 选择框一次最多显示几项 */
 const VISIBLE = 10;
 /** 选项多于这么多时可以打字筛选（这时 j/k 和数字键不再是快捷键） */
@@ -1978,6 +2005,9 @@ function SelectDialog({
   const selection = useContext(SelectionContext);
   const [getSelected, setSelected] = useLive(0);
   const [getQuery, setQuery] = useLive("");
+  /** 预览从第几行开始显示，以及它能翻到哪里、一页几行（放得下时 maxTop 是 0） */
+  const [getTop, setTop] = useLive(0);
+  const scrolling = useRef({ maxTop: 0, page: 1 });
   const { rows, columns } = useScreenSize();
   const filtering = dialog.choices.length > FILTER_FROM;
   const query = getQuery();
@@ -1997,12 +2027,25 @@ function SelectDialog({
   // 按折行后的屏幕行数截断（一行长代码会占好几行），每一行单独显示、不再折行
   const lines = !dialog.body ? [] : wrap(dialog.body, Math.max(1, columns - 4));
   const room = Math.max(3, rows - Math.min(n, visible) - 16);
+  // 放不下时 PgUp/PgDn 翻看预览（批准之前要能看完整个 diff），最后一行说明还有多少
+  const page = room - 1;
+  const maxTop = Math.max(0, lines.length - page);
+  const top = Math.min(getTop(), maxTop);
+  scrolling.current = { maxTop, page };
   const body =
     lines.length > room
-      ? [...lines.slice(0, room - 1), dim(`… ${lines.length - room + 1} more lines`)]
+      ? [
+          ...lines.slice(top, top + page),
+          dim(
+            top < maxTop
+              ? `… ${lines.length - top - page} more lines · PgDn/PgUp to scroll`
+              : `end of ${lines.length} lines · PgUp to scroll back`,
+          ),
+        ]
       : lines;
   useInput((input, key) => {
     if (key.ctrl && input === "c" && selection.active()) return selection.clear();
+    if (typedThrough(input, key)) return;
     const items = filtered();
     const n = items.length;
     const selected = Math.min(getSelected(), Math.max(0, n - 1));
@@ -2020,6 +2063,11 @@ function SelectDialog({
     }
     if (key.escape || (key.ctrl && input === "c"))
       return dialog.resolve(undefined);
+    // 预览放不下时翻预览，否则翻选项
+    const { maxTop, page } = scrolling.current;
+    if (maxTop > 0 && (key.pageDown || key.pageUp)) {
+      return setTop(Math.max(0, Math.min(maxTop, Math.min(getTop(), maxTop) + (key.pageDown ? page : -page))));
+    }
     if (key.pageDown) return setSelected(Math.min(n - 1, selected + visible));
     if (key.pageUp) return setSelected(Math.max(0, selected - visible));
     if (filtering) {
@@ -2097,6 +2145,7 @@ function InputDialog({
   );
   useInput((input, key) => {
     if (key.ctrl && input === "c" && selection.active()) return selection.clear();
+    if (typedThrough(input, key)) return;
     const state = current();
     if (key.return) return dialog.resolve(state.value.trim());
     if (key.escape || (key.ctrl && input === "c"))

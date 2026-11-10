@@ -77,6 +77,17 @@ describe("jade -p", () => {
     expect(await text(2)).toBe("just stdin");
   });
 
+  test("--json prints one JSON object; -c continues the latest session in this directory", async () => {
+    const w = await setup([say("first answer"), say("second answer")]);
+    const first = w.run("-p", "--json", "hello");
+    expect(first.code).toBe(0);
+    const a = JSON.parse(first.stdout) as { session: string; result: string; reason: string };
+    expect(a).toMatchObject({ result: "first answer", reason: "end" });
+    const second = w.run("-p", "-c", "--json", "again");
+    expect(second.code).toBe(0);
+    expect(JSON.parse(second.stdout)).toMatchObject({ session: a.session, result: "second answer" });
+  }, 60_000);
+
   test("writes a file when the approval mode allows changes in the working directory", async () => {
     const w = await setup([use("write_file", { path: "hello.txt", content: "hi\n" }), say("Created hello.txt.")], { "jade/approval": { mode: "auto" } });
     const r = w.run("-p", "create hello.txt");

@@ -1,9 +1,10 @@
 // jade/prompts：指令文件进系统提示词，并告诉用户读了哪些。
 
 import { describe, expect, test } from "bun:test";
-import { writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Block, LogEvent, Message, Origin } from "uncarved";
+import { allInstructions } from "../plugins/prompts/prompts.ts";
 import { explainEmptyResults, whyEmpty } from "../plugins/prompts/results.ts";
 import { featureHost, msg, reply, results, tempDir, textOf, use } from "./feature-host.ts";
 
@@ -35,6 +36,19 @@ test("no notice without instruction files", async () => {
   } finally {
     await host.close();
   }
+});
+
+test("user instructions fall back to ~/.claude/CLAUDE.md when $JADE_HOME has none", async () => {
+  const home = await tempDir("jade-prompts-home-");
+  const cwd = await tempDir("jade-prompts-cwd-");
+  const userHome = await tempDir("jade-prompts-user-");
+  await mkdir(path.join(userHome, ".claude"));
+  await writeFile(path.join(userHome, ".claude", "CLAUDE.md"), "claude rule");
+  expect((await allInstructions(home, cwd, userHome)).map((i) => [i.source.path, i.trust, i.text.includes("claude rule")])).toEqual([[".claude/CLAUDE.md", "trusted", true]]);
+  // $JADE_HOME 里有的优先；关掉（null）时不找
+  expect(await allInstructions(home, cwd, null)).toEqual([]);
+  await writeFile(path.join(home, "AGENTS.md"), "jade rule");
+  expect((await allInstructions(home, cwd, userHome)).map((i) => i.source.path)).toEqual(["AGENTS.md"]);
 });
 
 test("an empty error result says why: a tool that does not exist", async () => {

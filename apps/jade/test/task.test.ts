@@ -2,6 +2,7 @@
 // 子 Agent 的工具来自 task@1 的登记（jade/fs 登记它的只读工具），模型经 models@1。
 
 import { afterEach, describe, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
 import { symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { ProviderError, type Block, type RuntimeNotice } from "uncarved";
@@ -226,6 +227,35 @@ describe("jade/task", () => {
     await send(s, "go");
     expect(shared.asked).toEqual([]);
     expect(textOf(shared.requests[2]!.messages.at(-1)!.content)).toContain("the notes");
+  });
+
+  test("the sub-agent can run read-only shell commands, and nothing else, even in yolo mode", async () => {
+    const { cwd, host, shared, send } = await scriptedHost();
+    await writeFile(path.join(cwd, "a.txt"), "hello\n");
+    shared.script.push(
+      use("u1", "task", { description: "look", prompt: "look around" }),
+      use("c1", "bash", { command: "cat a.txt" }),
+      use("c2", "bash", { command: "rm a.txt" }),
+      say("report"),
+      say("done"),
+    );
+    const s = await host.sessions.open();
+    await send(s, "go");
+    const sub = shared.requests[1]!;
+    expect(sub.tools.map((t) => t.name)).toContain("bash");
+    // 给子 Agent 的 bash 不能在后台跑
+    expect(JSON.stringify(sub.tools.find((t) => t.name === "bash")!.inputSchema)).not.toContain("run_in_background");
+    expect(textOf(shared.requests[2]!.messages.at(-1)!.content)).toContain("hello");
+    expect(textOf(shared.requests[3]!.messages.at(-1)!.content)).toContain("sub-agents can only run read-only commands");
+    expect(existsSync(path.join(cwd, "a.txt"))).toBe(true);
+  }, 30_000);
+
+  test("the model configured for sub-agents is the one they call", async () => {
+    const { host, shared, send } = await scriptedHost({ config: { "jade/task": { model: "cheap" } } });
+    shared.script.push(use("u1", "task", { description: "look", prompt: "look" }), say("report"), say("done"));
+    const s = await host.sessions.open();
+    await send(s, "go");
+    expect(shared.modelOptions).toEqual(["cheap"]);
   });
 
   test("a symlink inside the working directory that points outside is put to the user", async () => {

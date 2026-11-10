@@ -59,6 +59,7 @@ function fakeTerminal() {
       await sleep(100);
     },
     output: () => stripVTControlCharacters(out),
+    raw: () => out,
   };
 }
 
@@ -80,6 +81,8 @@ async function setup() {
   await mkdir(dir, { recursive: true });
   await writeFile(path.join(dir, "plugin.json"), JSON.stringify({ id: "test/fake-model", version: "1.0.0", api: "^1", entry: "index.mjs", provides: ["provider@1", "models@1"], replaces: ["jade/models"] }));
   await writeFile(path.join(dir, "index.mjs"), FAKE_MODEL);
+  // 不读这台机器上的 ~/.claude/CLAUDE.md
+  await writeFile(path.join(home, "config.json"), JSON.stringify({ "jade/prompts": { claudeInstructions: false } }));
   const start = () =>
     PluginHost.start({
       roots: [
@@ -243,6 +246,8 @@ test("a message, an approval dialog, slash commands and /exit through the termin
   await mkdir(dir, { recursive: true });
   await writeFile(path.join(dir, "plugin.json"), JSON.stringify({ id: "test/fake-model", version: "1.0.0", api: "^1", entry: "index.mjs", provides: ["provider@1", "models@1"], replaces: ["jade/models"] }));
   await writeFile(path.join(dir, "index.mjs"), FAKE_MODEL);
+  // 不读这台机器上的 ~/.claude/CLAUDE.md
+  await writeFile(path.join(home, "config.json"), JSON.stringify({ "jade/prompts": { claudeInstructions: false } }));
   g.__script = [
     { content: [{ kind: "tool_use", id: "t1", name: "write_file", input: { path: "hello.txt", content: "hi\n" }, origin: MODEL, trust: "trusted" }], stopReason: "tool_use" },
     { content: [{ kind: "text", text: "Created hello.txt for you.", origin: MODEL, trust: "trusted" }], stopReason: "end" },
@@ -333,6 +338,53 @@ test("the notice about loaded instruction files survives the screen clear when t
     await until(() => t.output().includes("Type / for commands"));
     await sleep(100);
     expect(t.output()).toContain("loaded instructions: AGENTS.md");
+    await t.type("/exit");
+    await t.type("\r");
+    expect(await done).toBe(0);
+  } finally {
+    await host.close();
+  }
+});
+
+test("a message that starts with a path is sent to the model, not run as a command", async () => {
+  const { start } = await setup();
+  g.__script = [{ content: [{ kind: "text", text: "path answer", origin: MODEL, trust: "trusted" }], stopReason: "end" }];
+  const t = fakeTerminal();
+  const host = await start();
+  try {
+    const done = host.service<Frontend>("frontend@1")!.run({ argv: [], sessions: host.sessions, signal: new AbortController().signal });
+    await sleep(300);
+    await t.type("/c/Users/me/a.ts has a bug");
+    await t.type("\r");
+    await until(() => t.output().includes("path answer"));
+    expect(t.output()).not.toContain("unknown command");
+    expect(g.__requests!.at(-1)!.messages.at(-1)!.content.some((b) => b.text === "/c/Users/me/a.ts has a bug")).toBe(true);
+    await t.type("/exit");
+    await t.type("\r");
+    expect(await done).toBe(0);
+  } finally {
+    await host.close();
+  }
+});
+
+test("/copy puts the last reply, or its last code block, on the clipboard as written", async () => {
+  const { start } = await setup();
+  const text = "Use this:\n\n```ts\nconst a = 1;\nconst b = 2;\n```\n\nDone.";
+  g.__script = [{ content: [{ kind: "text", text, origin: MODEL, trust: "trusted" }], stopReason: "end" }];
+  const t = fakeTerminal();
+  const host = await start();
+  // OSC 52 里的内容
+  const copied = () => [...t.raw().matchAll(/\x1b\]52;c;([A-Za-z0-9+/=]*)\x07/g)].map((m) => Buffer.from(m[1]!, "base64").toString("utf8"));
+  try {
+    const done = host.service<Frontend>("frontend@1")!.run({ argv: ["hello"], sessions: host.sessions, signal: new AbortController().signal });
+    await until(() => t.output().includes("Done."));
+    await t.type("/copy");
+    await t.type("\r");
+    await until(() => copied().length === 1);
+    await t.type("/copy code");
+    await t.type("\r");
+    await until(() => copied().length === 2);
+    expect(copied()).toEqual([text, "const a = 1;\nconst b = 2;"]);
     await t.type("/exit");
     await t.type("\r");
     expect(await done).toBe(0);

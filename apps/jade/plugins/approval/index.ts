@@ -4,8 +4,10 @@
 // auto 模式下规则判断不了、本来要问的调用先让模型审一次（review.ts）：它只能放行或转给用户，不能替用户拒绝。
 //
 // 没有这个插件（停用、坏掉、被隔离）时，核心的兜底关卡拒绝所有非只读工具（第 7 节），所以这里出错不会放行。
-// 用户选的"总是允许"记进日志（derived），恢复会话后仍然有效；模式是进程级的，来自配置，可以经 approval@1 改。
+// 用户选的"总是允许"记进日志（derived），恢复会话后仍然有效；选"在这个目录里总是允许"的记在
+// $JADE_HOME/state/approvals.json（按工作目录），以后在这个目录里开的会话都有效。模式是进程级的，来自配置，可以经 approval@1 改。
 
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { EventDataMap, GatedToolCall, Message } from "uncarved";
 import { definePlugin, type Caller, type SelectRequest, type UI } from "@uncarved/jade-api";
@@ -30,16 +32,19 @@ export interface Approval {
    */
   addApprover(approver: Approver): () => void;
   /**
-   * 这个只读调用（例如子 Agent 的）在会话 session 里能不能不问就执行：按该会话"总是允许"的规则、
-   * allowRead/allowWrite 登记的目录和 yolo 模式判断。会话不存在或不是只读调用时为 false
+   * 这个调用（例如子 Agent 的）在会话 session 里能不能不问就执行。只读工具：按该会话"总是允许"的规则、
+   * allowRead/allowWrite 登记的目录和 yolo 模式判断。其他工具（bash）：只读模式下也放行的才算（工作目录里的只读命令），
+   * yolo 模式和"总是允许"的规则都不放宽。会话不存在时为 false
    */
   allows(session: string, call: GatedToolCall): boolean;
 }
 
-/** 审批的回答：允许一次、本会话里总是允许、拒绝 */
-export type Answer = "once" | "always" | "deny";
+/** 审批的回答：允许一次、本会话里总是允许、在这个工作目录里以后都允许、拒绝 */
+export type Answer = "once" | "always" | "forever" | "deny";
 export type Approver = (request: SelectRequest<Answer>, signal: AbortSignal) => Promise<Answer | undefined>;
-const ANSWERS: readonly string[] = ["once", "always", "deny"] satisfies Answer[];
+const ANSWERS: readonly string[] = ["once", "always", "forever", "deny"] satisfies Answer[];
+/** 只有终端里有的一项：拒绝，并写一句话告诉模型该怎么做 */
+const EXPLAIN = "explain";
 
 /** derived 里保存"总是允许"规则的键 */
 const RULES_KEY = "jade/approval/rules";
@@ -104,7 +109,7 @@ export default definePlugin({
         caller.onDispose(remove);
         return remove;
       },
-      allows: (session: string, call: GatedToolCall) => call.tool?.effect === "read" && (sessionChecks.get(session)?.(call) ?? false),
+      allows: (session: string, call: GatedToolCall) => call.tool !== undefined && (sessionChecks.get(session)?.(call) ?? false),
     }));
   },
 
@@ -146,7 +151,10 @@ export default definePlugin({
     /** 日志里记下的"总是允许"规则，每次调用工具前取一次：子 Agent 在工具执行期间经 allows 用它 */
     let logged: AllowRule[] = [];
     const merged = (from: readonly AllowRule[]) => [...from, ...added.filter((r) => !from.some((l) => JSON.stringify(l) === JSON.stringify(r)))];
-    const saved = () => merged(logged);
+    /** "在这个目录里总是允许"的规则：会话打开时从文件读，本会话里新选的也加进来 */
+    const foreverFile = path.join(ctx.home, "state", "approvals.json");
+    const forever: AllowRule[] = (await readForever(foreverFile))[ctx.cwd] ?? [];
+    const saved = () => [...forever, ...merged(logged)];
     /** 这一轮里关卡看过、还没有决定的调用 */
     const seen = new Map<string, Asked>();
     /** 已经交给会话的回答：在日志里看到那条 approval 输入时记一条 answered 事件 */
@@ -158,7 +166,7 @@ export default definePlugin({
 
     const id = ctx.session.id;
     const check = (call: GatedToolCall) =>
-      rules.decide(call, { mode: mode === "yolo" ? "yolo" : "readonly", rules: [...logged, ...added] }).decision === "allow";
+      rules.decide(call, { mode: mode === "yolo" && call.tool.effect === "read" ? "yolo" : "readonly", rules: [...forever, ...logged, ...added] }).decision === "allow";
     sessionChecks.set(id, check);
     await ctx.effect(() => () => {
       if (sessionChecks.get(id) === check) sessionChecks.delete(id);
@@ -223,7 +231,7 @@ export default definePlugin({
       const shown = (await preview(renderers, call)) ?? detail(call);
       const expired = new AbortController();
       const timer = setTimeout(() => expired.abort(), askTimeoutMs);
-      let got: { answer: Answer; by: string } | undefined;
+      let got: { answer: Answer; by: string; said?: string } | undefined;
       try {
         got = await ask(
           ui,
@@ -234,7 +242,12 @@ export default definePlugin({
             options: [
               { label: "Allow once", value: "once" },
               // 别的插件要问的调用不能"总是允许"：这里的规则管不到它的关卡
-              ...(asked.mine ? [{ label: `Always allow ${describeRule(rule)} in this session`, value: "always" as const }] : []),
+              ...(asked.mine
+                ? [
+                    { label: `Always allow ${describeRule(rule)} in this session`, value: "always" as const },
+                    { label: `Always allow ${describeRule(rule)} in this directory, in every session`, value: "forever" as const },
+                  ]
+                : []),
               { label: "Deny", value: "deny" },
             ],
           },
@@ -250,7 +263,18 @@ export default definePlugin({
         added.push(rule);
         return { approved: true, answer: "always", by: got.by };
       }
-      if (got?.answer === "once" || got?.answer === "always") return { approved: true, answer: "once", by: got.by };
+      if (got?.answer === "forever" && asked.mine) {
+        forever.push(rule);
+        try {
+          await addForever(foreverFile, ctx.cwd, rule);
+          ui?.notify(`${describeRule(rule)} is now always allowed in ${ctx.cwd}. To ask again, remove it from ${foreverFile}`, "info");
+        } catch (e) {
+          ui?.notify(`could not save the rule to ${foreverFile} (${e instanceof Error ? e.message : String(e)}); it only applies to this session`, "warning");
+        }
+        return { approved: true, answer: "forever", by: got.by };
+      }
+      if (got !== undefined && got.answer !== "deny") return { approved: true, answer: "once", by: got.by };
+      if (got?.said) return { approved: false, answer: "deny", by: got.by, reason: `The user denied this tool call and said: ${got.said}` };
       return { approved: false, answer: "deny", by: got?.by ?? "nobody", reason: "The user denied this tool call. Do not retry it unchanged: adjust, or ask what to do instead." };
     };
 
@@ -337,15 +361,23 @@ function allow(caller: Caller, name: string, roots: string[], dir: string): () =
  * 把问题同时交给终端（能提问时）和所有审批渠道，返回先到的回答和回答的人（"terminal" 或渠道的插件 id），然后中止其余的。
  * 终端里取消（undefined）算拒绝；渠道返回 undefined、不认识的值或出错算它不回答。都不回答时返回 undefined（拒绝）
  */
-async function ask(ui: UI | undefined, request: SelectRequest<Answer>, signal: AbortSignal): Promise<{ answer: Answer; by: string } | undefined> {
+async function ask(ui: UI | undefined, request: SelectRequest<Answer>, signal: AbortSignal): Promise<{ answer: Answer; by: string; said?: string } | undefined> {
   const done = new AbortController();
   const stop = () => done.abort(signal.reason);
   signal.addEventListener("abort", stop, { once: true });
   try {
-    return await new Promise<{ answer: Answer; by: string } | undefined>((resolve, reject) => {
-      const channels: Promise<{ answer: Answer; by: string } | typeof NONE>[] = [];
+    return await new Promise<{ answer: Answer; by: string; said?: string } | undefined>((resolve, reject) => {
+      const channels: Promise<{ answer: Answer; by: string; said?: string } | typeof NONE>[] = [];
       if (ui?.interactive) {
-        channels.push(ui.select(request, done.signal).then((a): { answer: Answer; by: string } => ({ answer: a !== undefined && ANSWERS.includes(a) ? a : "deny", by: "terminal" })));
+        // 终端里多一项：拒绝并说明。选了它再问一句话，取消或什么都没写就是普通的拒绝
+        const options = [...request.options, { label: "Deny, and tell the agent what to do instead", value: EXPLAIN }];
+        channels.push(
+          ui.select<string>({ ...request, options }, done.signal).then(async (a) => {
+            if (a !== EXPLAIN) return { answer: a !== undefined && ANSWERS.includes(a) ? (a as Answer) : "deny", by: "terminal" };
+            const said = (await ui.input({ title: "What should the agent do instead?" }, done.signal))?.trim();
+            return { answer: "deny" as const, by: "terminal", ...(said ? { said } : {}) };
+          }),
+        );
       }
       for (const [approver, by] of approvers) {
         channels.push(
@@ -372,6 +404,30 @@ async function ask(ui: UI | undefined, request: SelectRequest<Answer>, signal: A
   }
 }
 const NONE = Symbol("no answer");
+
+/** approvals.json：工作目录 → 在这个目录里总是允许的规则。读不了或格式不对时当作没有 */
+async function readForever(file: string): Promise<Record<string, AllowRule[]>> {
+  try {
+    const data = JSON.parse(await readFile(file, "utf8")) as unknown;
+    if (!data || typeof data !== "object" || Array.isArray(data)) return {};
+    const out: Record<string, AllowRule[]> = {};
+    for (const [dir, rules] of Object.entries(data)) {
+      if (Array.isArray(rules)) out[dir] = rules.filter((r): r is AllowRule => !!r && typeof r === "object" && typeof (r as AllowRule).tool === "string");
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+async function addForever(file: string, cwd: string, rule: AllowRule): Promise<void> {
+  const all = await readForever(file);
+  const rules = all[cwd] ?? [];
+  if (!rules.some((r) => JSON.stringify(r) === JSON.stringify(rule))) rules.push(rule);
+  all[cwd] = rules;
+  await mkdir(path.dirname(file), { recursive: true });
+  await writeFile(file, `${JSON.stringify(all, null, 2)}\n`);
+}
 
 /**
  * 工具自己登记的审批预览（例如文件修改的 diff）。没有登记、返回的不是文字、或者出错时返回 undefined，

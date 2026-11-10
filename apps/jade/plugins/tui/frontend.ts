@@ -51,11 +51,12 @@ jade's own commands (plugins, update, --safe): jade help`;
 /** 前端自己的命令：帮助和退出。其余命令都来自 commands@1 */
 const OWN: CommandInfo[] = [
   { name: "help", about: "list the commands and keys" },
+  { name: "copy", args: "[code]", about: "copy the last reply to the clipboard as it was written (code: only its last code block)" },
   { name: "exit", about: "quit (the session stays resumable)" },
 ];
 
 const KEYS =
-  "Keys: enter send · \\ or alt+enter new line · ↑↓ history · esc interrupt (twice to also move queued messages back to the input) · ↑ on the first line edits queued messages · ctrl+o expand · ctrl+c twice to exit";
+  "Keys: enter send · ctrl+j, alt+enter or \\ then enter: new line · ↑↓ history · esc interrupt (twice to also move queued messages back to the input) · ↑ on the first line edits queued messages · ctrl+o expand · ctrl+c twice to exit";
 
 /** 第二次 esc 算作"再按一次"的时间窗口 */
 const SECOND_ESC_MS = 3000;
@@ -494,6 +495,8 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
     });
   }
 
+  /** 输入是命令时返回命令名。第一个词里还有 / 的是路径（/c/Users/…、/usr/bin/x），当普通消息发给模型 */
+  const commandName = (text: string) => /^\/([^\s/]+)(?=\s|$)/.exec(text)?.[1]!.toLowerCase();
   const instant = (name: string) => OWN.some((o) => o.name === name) || name === "quit" || commands.get(name)?.command.instant === true;
 
   /** 执行一条命令；返回 false 表示退出 */
@@ -508,6 +511,17 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
       screen.log(dim(KEYS));
       const pluginKeys = keys.list();
       if (pluginKeys.length > 0) screen.log(dim(`Plugin keys: ${pluginKeys.map((k) => `${k.key}${k.description ? ` ${k.description}` : ""} (${k.plugin})`).join(" · ")}`));
+      return true;
+    }
+    if (name === "copy") {
+      const reply = lastReply(current?.state.messages ?? []);
+      const text = rest.trim() === "code" ? reply && lastCodeBlock(reply) : reply;
+      if (!text) screen.log(dim(rest.trim() === "code" ? "The last reply has no code block." : "There is no reply to copy yet."));
+      else if (!screen.copy) screen.log(red("[error] this terminal cannot copy"));
+      else {
+        screen.copy(text);
+        screen.log(dim(`[copied ${[...text].length} characters]`));
+      }
       return true;
     }
     const found = commands.get(name);
@@ -535,7 +549,7 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
 
   function onSubmit(text: string) {
     if (quitting) return;
-    const name = text.startsWith("/") ? text.slice(1).split(/\s+/)[0]!.toLowerCase() : undefined;
+    const name = commandName(text);
     if (name !== undefined && instant(name)) {
       // 不碰会话的命令运行中也直接执行
       view.echo(text);
@@ -559,7 +573,7 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
         const text = queue.shift()!;
         screen.queued(queue);
         view.echo(text);
-        if (text.startsWith("/")) {
+        if (commandName(text) !== undefined) {
           if (!(await command(text))) {
             exit = true;
             return;
@@ -605,6 +619,23 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
 }
 
 /** 当前分支；不在仓库里或没有 git 时 undefined */
+/** 最近一条有正文的助手消息的正文（模型写的原文，没有折行和排版） */
+export function lastReply(messages: readonly { role: string; content: readonly Block[] }[]): string | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]!;
+    if (m.role !== "assistant") continue;
+    const text = m.content.flatMap((b) => (b.kind === "text" ? [b.text] : [])).join("\n").trim();
+    if (text) return text;
+  }
+  return undefined;
+}
+
+/** Markdown 里最后一个围栏代码块的内容 */
+export function lastCodeBlock(markdown: string): string | undefined {
+  const blocks = [...markdown.matchAll(/^ {0,3}(`{3,}|~{3,})[^\n]*\n([\s\S]*?)^ {0,3}\1[`~]*[ \t]*$/gm)];
+  return blocks.at(-1)?.[2]?.replace(/\n$/, "");
+}
+
 function gitBranch(cwd: string): Promise<string | undefined> {
   return new Promise((resolve) => {
     execFile("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd, timeout: 2000, windowsHide: true }, (err, stdout) => resolve(err ? undefined : stdout.trim() || undefined));

@@ -50,7 +50,7 @@ export interface TaskOptions {
   maxSteps: number;
   /** 不给时一律拒绝 */
   approve?: ApproveSubagent;
-  /** 主会话的规则（"总是允许"、可读写的目录、yolo）已经允许的调用不用再问 */
+  /** 主会话的规则（"总是允许"、可读写的目录、yolo）已经允许的调用不用再问；不是只读的工具只有它说可以的调用才执行 */
   allowed?(call: GatedToolCall): boolean;
   /** 子 Agent 插件的 id 前缀 */
   id: string;
@@ -186,7 +186,14 @@ function plugins(opts: TaskOptions, tools: Tool[], control: Control, signal: Abo
           point: "tool.gate",
           timeoutMs: ASK_TIMEOUT_MS,
           fn: async (call): Promise<GateResult> => {
-            if (call.tool.effect !== "read") return { decision: "deny", reason: `${call.name} is not read-only; sub-agents can only read. Describe the change in your report instead.` };
+            // 不是只读的工具（bash）：只放行主会话的审批规则认定为只读的调用（git log、ls、rg……），其余的不问用户，直接拒绝
+            if (call.tool.effect !== "read") {
+              if (opts.allowed?.(call)) return { decision: "allow" };
+              return {
+                decision: "deny",
+                reason: `${call.name}: sub-agents can only run read-only commands inside the working directory (for example git log, git diff, ls, rg). Describe anything else in your report instead.`,
+              };
+            }
             const why = needsApproval(opts.cwd, call.input);
             if (!why || opts.allowed?.(call)) return { decision: "allow" };
             const answer = opts.approve ? await opts.approve({ toolUseId: call.toolUseId, name: call.name, input: call.input, why }, signal) : NOBODY;

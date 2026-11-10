@@ -1,0 +1,14 @@
+{
+  "id": "jade/hooks",
+  "version": "0.1.0",
+  "api": "^1",
+  "entry": "./index.ts",
+  "requires": ["shell@1"],
+  "optional": ["ui@1", "prompts@1"],
+  "config": {
+    "hooks": {
+      "default": [],
+      "description": "shell commands to run around tool calls: a list of { \"on\": \"before\" | \"after\" | \"turn\", \"tool\": \"<name>\" (optional), \"command\": \"...\", \"timeoutSeconds\": 60 }. A failing \"before\" command denies the call; a failing \"after\" command is reported to the agent; \"turn\" runs when a turn ends"
+    }
+  }
+}

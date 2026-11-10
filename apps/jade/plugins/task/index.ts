@@ -14,8 +14,10 @@ import { clip, dim, red } from "./style.ts";
 /** task@1 */
 export interface Task {
   /**
-   * 给子 Agent 登记一个只读工具（effect 必须是 "read"），返回撤销函数；登记者的作用域关闭时自动撤销。
-   * 工具名已被登记时抛错。要求批准的情形（工作目录之外的路径、url 参数）由子 Agent 自己判断，经 ui@1 问用户。
+   * 给子 Agent 登记一个工具，返回撤销函数；登记者的作用域关闭时自动撤销。工具名已被登记时抛错。
+   * 只读工具（effect 是 "read"）：要求批准的情形（工作目录之外的路径、url 参数）由子 Agent 自己判断，经 ui@1 问用户。
+   * 其他工具（例如 bash）：只执行 approval@1 认定为只读的调用（只读模式下也放行的那些），其余的直接拒绝，不问用户；
+   * 没有 approval@1 时一律拒绝。子 Agent 因此始终不改任何东西。
    * opts.when：每次启动子 Agent 时调用，返回 false 时这次不给它这个工具（例如没有配置搜索服务时的 web_search）
    */
   tool(tool: Tool, opts?: { when?: () => boolean }): () => void;
@@ -51,7 +53,6 @@ export default definePlugin({
     ctx.provide("task@1", (caller): Task => ({
       tool(tool, opts) {
         if (typeof tool?.name !== "string" || typeof tool.execute !== "function") throw new Error("task.tool: a tool needs a name and execute");
-        if (tool.effect !== "read") throw new Error(`task.tool: ${tool.name} is not read-only (effect ${JSON.stringify(tool.effect)}); sub-agents only get read-only tools`);
         // 同一个插件重复登记是正常的：换会话时新会话先登记，旧会话随后撤销它的那份；取最后登记的
         const taken = registry.find((r) => r.tool.name === tool.name && r.plugin !== caller.plugin);
         if (taken) throw new Error(`task.tool: ${tool.name} is already registered by ${taken.plugin}`);
@@ -117,6 +118,8 @@ export default definePlugin({
     const usage = new Map<string, Usage>();
     const configured = ctx.config.maxSteps;
     const maxSteps = typeof configured === "number" && Number.isInteger(configured) && configured > 0 ? configured : DEFAULT_MAX_STEPS;
+    // 子 Agent 用的模型：/model 保存过的名字，或当前服务上的另一个模型；不设时用会话的模型
+    const model = typeof ctx.config.model === "string" && ctx.config.model ? ctx.config.model : undefined;
     const approve: ApproveSubagent = (call, signal) => {
       const ui = ctx.service<UI>("ui@1");
       if (!ui?.interactive) return Promise.resolve({ approved: false, reason: "Nobody can approve this action for a sub-agent. Report what you need instead." });
@@ -140,7 +143,7 @@ export default definePlugin({
     ctx.kernel.tool(
       taskTool({
         cwd: ctx.cwd,
-        provider: { id: ctx.plugin, complete: (req, o) => models.complete(req, o) },
+        provider: { id: ctx.plugin, complete: (req, o) => models.complete(req, model ? { ...o, model } : o) },
         tools: available,
         maxSteps,
         approve,

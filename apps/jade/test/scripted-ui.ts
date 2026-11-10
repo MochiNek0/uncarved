@@ -125,7 +125,7 @@ export async function scriptedHost(opts: { config?: Record<string, Record<string
   };
   await plugin("fake-model", { id: "test/fake-model", provides: ["provider@1", "models@1"], replaces: ["jade/models"] }, FAKE_MODEL);
   await plugin("fake-frontend", { id: "test/fake-frontend", provides: ["frontend@1", "ui@1"], replaces: ["jade/tui"], frontend: { name: "fake", default: true } }, FAKE_FRONTEND);
-  await writeFile(path.join(home, "config.json"), JSON.stringify({ "jade/approval": { mode: "yolo" }, ...opts.config }));
+  await writeFile(path.join(home, "config.json"), JSON.stringify({ "jade/approval": { mode: "yolo" }, "jade/prompts": { claudeInstructions: false }, ...opts.config }));
   for (const [file, text] of Object.entries(opts.files ?? {})) {
     await mkdir(path.dirname(path.join(home, file)), { recursive: true });
     await writeFile(path.join(home, file), text);
