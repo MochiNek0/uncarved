@@ -237,6 +237,87 @@ test("↑ takes queued messages back into the input; esc twice interrupts and mo
   }
 });
 
+test("a message typed while the agent works reaches the model with the next request instead of waiting for the turn to end", async () => {
+  const { start } = await setup();
+  let release!: () => void;
+  g.__hold = new Promise((r) => (release = r));
+  g.__script = [
+    { hold: true, content: [{ kind: "tool_use", id: "t1", name: "list_dir", input: { path: "." }, origin: MODEL, trust: "trusted" }], stopReason: "tool_use" },
+    { content: [{ kind: "text", text: "both done", origin: MODEL, trust: "trusted" }], stopReason: "end" },
+  ];
+  g.__requests = [];
+
+  const t = fakeTerminal();
+  const host = await start();
+  const ac = new AbortController();
+  try {
+    const frontend = host.service<Frontend>("frontend@1")!;
+    const done = frontend.run({ argv: [], sessions: host.sessions, signal: ac.signal });
+    await until(() => t.output().includes("Type / for commands"));
+
+    await t.type("look around\r");
+    await until(() => g.__requests!.length === 1);
+    await t.type("and count the files\r");
+    await until(() => t.output().includes("queued: and count the files"));
+    release();
+    await until(() => t.output().includes("both done"));
+    // 同一轮的第二次请求里就有这句话，排在工具结果后面；没有另起一轮
+    expect(g.__requests!.length).toBe(2);
+    const last = g.__requests![1]!.messages.at(-1)!;
+    expect(last.content[0]!.kind).toBe("tool_result");
+    expect(last.content.at(-1)!.text).toBe("and count the files");
+    expect(t.output()).toContain("› and count the files (sent while working)");
+    await sleep(200);
+    expect(g.__requests!.length).toBe(2);
+
+    ac.abort();
+    expect(await done).toBe(130);
+  } finally {
+    await host.close();
+  }
+});
+
+test("ctrl+g hands the terminal to the editor and puts what it saved back into the input", async () => {
+  const { home, start } = await setup();
+  // 假的编辑器：在文件末尾加一句就退出
+  const script = path.join(home, "editor.mjs");
+  await writeFile(script, `import { readFileSync, writeFileSync } from "node:fs";\nconst f = process.argv[2];\nwriteFileSync(f, readFileSync(f, "utf8") + " edited in the editor\\n");\n`);
+  await writeFile(
+    path.join(home, "config.json"),
+    JSON.stringify({ "jade/prompts": { claudeInstructions: false }, "jade/editor": { editor: `"${process.execPath}" "${script}"` } }),
+  );
+  g.__script = [{ content: [{ kind: "text", text: "got it", origin: MODEL, trust: "trusted" }], stopReason: "end" }];
+  g.__requests = [];
+
+  const t = fakeTerminal();
+  const host = await start();
+  const ac = new AbortController();
+  try {
+    const frontend = host.service<Frontend>("frontend@1")!;
+    const done = frontend.run({ argv: [], sessions: host.sessions, signal: ac.signal });
+    await until(() => t.output().includes("Type / for commands"));
+    const entered = () => t.raw().split("\x1b[?1049h").length - 1;
+    const before = entered();
+
+    await t.type("my draft");
+    await t.type("\x07");
+    // 让出终端（退出备用屏幕），编辑器退出后重新接管
+    await until(() => entered() > before, 15_000);
+    expect(t.raw()).toContain("\x1b[?1049l");
+    await until(() => t.output().includes("my draft edited in the editor"));
+
+    // 重新接管之后界面照常工作
+    await t.type("\r");
+    await until(() => t.output().includes("got it"));
+    expect(JSON.stringify(g.__requests![0])).toContain("my draft edited in the editor");
+
+    ac.abort();
+    expect(await done).toBe(130);
+  } finally {
+    await host.close();
+  }
+}, 30_000);
+
 test("a message, an approval dialog, slash commands and /exit through the terminal interface", async () => {
   const home = realpathSync.native(await mkdtemp(path.join(os.tmpdir(), "jade-tui-")));
   tmp.push(home);

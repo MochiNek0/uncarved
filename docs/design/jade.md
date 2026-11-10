@@ -122,6 +122,7 @@
 
 - `Frontend.run({ argv, sessions, signal })` 返回退出码。`argv` 是核心去掉自己的参数（`plugins`、`--safe`）之后的命令行，`sessions` 是核心的会话管理器（`SessionManager`：`open`、`close`、`current`）。
 - `UI`：`interactive`、`notify(message, level)`、`select({ title, detail, options }, signal)`、`input({ title, initial, placeholder, mask }, signal)`。不能提问的前端（`jade/print`）`interactive` 为 false，`select`、`input` 总是返回 `undefined`。
+- `UI.copy(text)`、`UI.suspend(fn)`（都可选，2026-11-10 加）：把文字放进系统剪贴板；把终端让出来执行 `fn`（例如启动 `$EDITOR`），结束后重新接管。`jade/tui` 的 `suspend` 卸载界面（退出备用屏幕、关掉 raw mode 和鼠标上报），`fn` 结束后重新画：界面的内容都在界面之外的状态里，输入框里打了一半的字先记下再放回去。期间会话照常运行。`jade/editor`（Ctrl+G 用 `$EDITOR` 编辑输入）就是靠它做成插件的。
 - `UI.session({ session, plugin })`（可选）：一个插件在一个会话里的界面——状态栏上它的一段（`status(text)`，一行，undefined 去掉）和输入框（`draft`：读、插入、整段替换、灰色提示）。核心为每个加入会话的插件调用一次，插件的作用域关闭时调用返回值的 `dispose()` 收掉它的段落。前端没有这些东西时返回 `undefined`，插件的 `ctx.status`、`ctx.input` 也就是 `undefined`。`jade/tui` 提供它；`jade/print` 没有。
 - `Session.history()` 返回会话日志里的全部事件：前端恢复会话时用它重新显示对话（日志存储归核心，前端拿不到）。
 
@@ -131,7 +132,7 @@
 
 - 包 `@uncarved/jade-api`（`packages/jade-api`，2026-11-10 从 `apps/jade/src/api.ts` 拆出）：只有类型和 `definePlugin`，没有运行时依赖，版本就是插件 API 的版本。内置插件也只从它 import，不 import 核心的模块（`test/boundaries.test.ts` 守着）。核心的 `src/api.ts` 把它原样转出，另加只有核心用得到值的东西：`API_VERSION`、层级顺序、错误类。错误类不在包里：插件自己装的那份和核心的不是同一个模块，`instanceof` 不成立，插件按 `error.name` 判断。插件 `api` 字段按 `^` 规则匹配，不接受 `>=` 这类开放范围（dsh 的 `engines.dsh: ">=0.2.0"` 永远拒绝不了未来的破坏性版本）。
 - 插件运行时用到的一切都从 `ctx` 拿，不从宿主的包里 import 值，避免两份模块副本造成单例错乱（pi #4748、#8620）。
-- 各插件提供的服务类型由提供者自己导出（`plugins/<名字>/index.ts`）。内置插件之间按相对路径 `import type`；这些类型还没有单独发布，第三方插件暂时拿不到（要用就照着写一份接口）。`ui@1`、`frontend@1` 的形状由 jade 定义，在 `@uncarved/jade-api` 里。
+- 内置插件提供的服务的类型（`Commands`、`Prompts`、`Models`、`Approval`……）在 `@uncarved/jade-api/services`（2026-11-10 从各插件目录搬过去）：只有类型，第三方插件 `import type` 就能用。形状仍由提供它的插件决定，那个文件是它们公开的一份；内置插件自己也只从那里 import，彼此之间不再按相对路径拿类型（`test/boundaries.test.ts` 守着），所以不会和实现走偏。它是包的一个子路径而不是主入口：核心转出的是主入口，核心里因此仍然不出现功能的名字（原则 1）。`ui@1`、`frontend@1` 的形状由 jade 定义，在主入口里。
 
 ## 4. 作用域与生命周期
 
@@ -190,6 +191,7 @@ pi 后来才补上"agent 停下来之后再执行"和延迟 reload。jade 从一
 
 - `session.afterTurn(fn)`：本轮完全结束（`turn.ended` 已落盘、没有在途工具）后执行一次。续写、溢出重试、建议提示都用它，不再需要旧 jade 只给内置插件的 `TurnParticipant`。
 - 插件想发起新一轮：`session.send(input)`。如果当前正在跑，排到本轮之后。想停下正在跑的这一轮（例如用户在聊天机器人里喊停）：`session.abort(reason?)`。两者都只有用户层插件能用；项目层插件不能替用户说话、不能替用户喊停（第 7 节）。
+- 看会话：`session.state()` 是会话现在的状态（阶段、消息、还没做完的工具调用、derived）的一份拷贝，`session.subscribe(fn)` 订阅运行时的通知（事件、增量、工具进度、停下来等人工审批的 `awaiting`），和前端拿到的 `Session.state`、`Session.subscribe` 是同一份东西（2026-11-10 加：原来只有前端有）。只读，项目层插件也能用。`session()` 执行期间可以订阅，但还读不到状态（Runtime 在全部插件加入之后才建）。
 - 会话里的界面：`ctx.status(text)` 在状态栏上占一段，`ctx.input` 改输入框（读、插入、整段替换、灰色提示）。两者来自前端 `ui@1.session`（3.4），每个插件一份，作用域关闭时自动收掉；前端不提供时都是 `undefined`。
 
 ## 5. 膜与故障隔离
@@ -257,7 +259,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
   | 宿主 → 插件 | `initialize` | `{ plugin, version, api }` → `{ id?, session? }`：核对 id；`session` 为 false 时不为它打开会话作用域。10 秒内不回复算激活失败 |
   | 宿主 → 插件 | `scope/open`、`scope/close` | `{ scope, kind: "process" \| "session", cwd, home, config, session? }`，对应 `process(ctx)`、`session(ctx)` 和关闭。`scope/open` 回复之前插件发来的注册才算数 |
   | 宿主 → 插件 | 通知 `caller/open`、`caller/close` | 按调用方提供的服务：新调用方出现、调用方关闭（插件在这里撤销它的注册） |
-  | 双向 | `call` | `{ scope, target, method?, args, caller? }`。`target` 是服务名、`"$session"`（`send`、`afterTurn`、`abort`）或函数句柄。宿主调用插件时，参数里的 `AbortSignal` 换成 `null`，信号中止时发 `$/cancel` |
+  | 双向 | `call` | `{ scope, target, method?, args, caller? }`。`target` 是服务名、`"$session"`（`send`、`afterTurn`、`abort`、`state`、`subscribe`）或函数句柄。宿主调用插件时，参数里的 `AbortSignal` 换成 `null`，信号中止时发 `$/cancel` |
   | 双向 | `$/cancel` | 取消一次调用（宿主在工具被中止、hook 超时时发） |
   | 插件 → 宿主 | `provide`、`kernel/tool`、`kernel/hook` | 注册：`provide` 列出方法名，`perCaller` 为 true 时按调用方创建实例；工具的 `execute`、hook 的 `fn` 是函数句柄 |
   | 插件 → 宿主 | `secrets/get`、`secrets/set` | 读写这个插件自己的密钥（第 8 节）：`{ scope, key, value? }`，`value` 为 null 时删除；宿主按插件 id 取，参数里没有插件 id |
@@ -270,7 +272,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 
 ## 7. 信任与审批
 
-审批是普通插件 `jade/approval`：它注册 `tool.gate`，要问用户时返回 `ask`。关卡不等用户：所有关卡合并的结果是 `ask` 时内核停下来等人工审批（`awaiting`），`jade/approval` 这时才通过 `ui@1` 弹审批对话框，把回答作为 `approval` 输入交给会话（`session.send`）。所以别的关卡拒绝的调用不会先问用户；别的插件的关卡返回 `ask` 时也由它来问（没有"总是允许"这一项）。日志里 `tool.decided` 记 `ask`，随后的 `input.received` 记用户的同意或拒绝，`jade/approval/answered` 记选了什么、谁回答的（`terminal`、审批渠道的插件 id、`rule`、`timeout`）。核心的会话把 `awaiting` 当作这一轮还没完：`send` 不 resolve、`afterTurn` 不执行；这时中止或离开会话，核心用内核的 `endTurn` 结束这一轮；上次退出时停在 `awaiting` 的会话，恢复时这一轮直接结束，不重新问。不需要任何特权，安全性靠三条规则：
+审批是普通插件 `jade/approval`：它注册 `tool.gate`，要问用户时返回 `ask`。关卡不等用户：所有关卡合并的结果是 `ask` 时内核停下来等人工审批（`awaiting`），`jade/approval` 这时才通过 `ui@1` 弹审批对话框，把回答作为 `approval` 输入交给会话（`session.send`）。所以别的关卡拒绝的调用不会先问用户；别的插件的关卡返回 `ask` 时也由它来问（没有"总是允许"这一项）。日志里 `tool.decided` 记 `ask`，随后的 `input.received` 记用户的同意或拒绝，`jade/approval/answered` 记选了什么、谁回答的（`terminal`、审批渠道的插件 id、`rule`、`timeout`）。核心的会话把 `awaiting` 当作这一轮还没完：`send` 不 resolve、`afterTurn` 不执行；这时中止或离开会话，核心用内核的 `endTurn` 结束这一轮；上次停在 `awaiting` 的会话（进程被杀、崩溃；正常退出时这一轮已经结束了）恢复时重新问：内核的 `recover` 再发一次 `awaiting` 通知，`jade/approval` 经 `ctx.session.subscribe` 收到，从 `ctx.session.state()` 里取那些调用的名字和参数来问，核心的会话接着等回答。这时只知道名字和参数（工具的声明只有关卡拿得到），所以只有"允许一次"和"拒绝"，不重新套规则；没有审批插件守着时和平时一样直接结束这一轮。代替 `jade/approval` 的插件也要这样回答恢复时的 `awaiting`，否则这一轮要等用户中断。不需要任何特权，安全性靠三条规则：
 
 1. **拒绝优先**（宪法 I-7）：其他插件的 gate 只能让审批更严，不能推翻拒绝。
 2. **兜底关卡**：`approval@1` 的提供者（不能是项目层插件）没有在会话里注册仍然有效的 `tool.gate` 时，核心拒绝所有 `effect` 不是 `read` 的工具调用。审批插件坏掉、被停用、被隔离，结果是"什么都改不了"，而不是"什么都放行"。同样的条件下，别的插件的关卡要求人工审批（`ask`）时没有人会问，核心直接结束这一轮并说明原因，而不是一直等。（uncarved 在所有 gate 弃权时放行，这条由 jade 核心补上。）只认审批服务的提供者，是因为别的插件也会注册 gate（例如 `jade/repeats` 拒绝重复调用），它们平时弃权；若按"有任何 gate"判断，审批插件停用后兜底关卡就失效了。
@@ -304,12 +306,12 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 | `jade/modes` | `modes@1`（`current`、`set`、`cycle`、`subscribe`），Shift+Tab、`/mode`；计划模式：往系统提示词里加"先给计划"的段落，`propose_plan` 工具（只在计划模式、能问用户时发给模型）问"执行这个计划？"，批准了就换模式，工具结果让模型开始做 | `approval@1`；可选 `keys@1`、`commands@1`、`prompts@1`、`ui@1` | Shift+Tab、`/mode`、计划模式的批准流程（`test/modes.test.ts`） |
 | `jade/plugins` | `/plugins [id]`：每个插件的状态和原因、每个服务的提供者（来自核心的 `jade@1`） | `commands@1`、`jade@1` | — |
 | `jade/sessions` | 命令 `/clear` `/resume` `/retry`；会话索引 `$JADE_HOME/state/sessions.jsonl` | `commands@1` | `plugins/sessions.ts`、`session-lifecycle.ts` |
-| `jade/prompts` | `prompts@1`（`add`：其他插件往系统提示词里加段落；项目层插件加的、或标了 `untrusted` 的段落为不可信。`note(会话, 文字)`：给模型留一句说明，下一次请求时以 `[Note from jade]` 附在最后一条用户消息后面并记进日志，不发起新的一轮） | `models@1`（可选，写上当前模型） | `plugins/prompts.ts` |
+| `jade/prompts` | `prompts@1`（`add`：其他插件往系统提示词里加段落；项目层插件加的、或标了 `untrusted` 的段落为不可信。`note(会话, 文字)`：给模型留一句说明，下一次请求时以 `[Note from jade]` 附在最后一条用户消息后面并记进日志，不发起新的一轮。`instructions(会话)`：这个会话读到的指令文件，给自己另起模型对话的插件用） | `models@1`（可选，写上当前模型） | `plugins/prompts.ts` |
 | `jade/fs`、`jade/shell` | 工具；shell 还提供 `shell@1`（`executable`、`unavailable`、`run(command, { cwd, timeoutMs, signal })`、`which`）：其他插件执行命令的入口，找 shell、补 Git Bash 的 PATH、连子进程一起杀只有这一份 | `renderers@1`、`prompts@1`（可选）；fs 可选 `task@1`（把只读工具另建一套给子 Agent） | `tools/*` |
 | `jade/web` | `web_fetch`、`web_search`、`/search`；只读工具另建一套经 `task@1` 给子 Agent（`web_search` 只在配置了搜索服务时给） | 可选 `ui@1`、`prompts@1`、`commands@1`、`renderers@1`、`task@1` | `tools/web.ts` |
 | `jade/screenshot` | `screenshot` 工具：用本机的 Chrome / Edge / Chromium 无头模式渲染本地文件或网页，把截图交给模型看（`JADE_BROWSER` 可以指定浏览器；没有浏览器时不注册；模型不能看图片时说明原因） | 可选 `renderers@1`、`prompts@1`、`models@1` | `tools/screenshot.ts`（`test/screenshot.test.ts`） |
 | `jade/todo`、`jade/ask` | 工具 | `ask` 需要 `ui@1`，不能提问时不注册工具 | `tools/todo.ts`、`tools/ask.ts` |
-| `jade/task` | `task` 工具、`task@1`（`tool(tool, { when })`：其他插件给子 Agent 登记只读工具，`when` 每次启动子 Agent 时决定给不给） | `models@1` | `tools/task.ts`。子 Agent 是嵌套的 `Runtime`，日志在内存里，不关联到父会话 |
+| `jade/task` | `task` 工具、`task@1`（`tool(tool, { when })`：其他插件给子 Agent 登记只读工具，`when` 每次启动子 Agent 时决定给不给）；子 Agent 的系统提示词里带上主会话的指令文件（经 `prompts@1.instructions`，仓库里的保持不可信，配置 `instructions: false` 关掉） | `models@1`；可选 `prompts@1` | `tools/task.ts`。子 Agent 是嵌套的 `Runtime`，日志在内存里，不关联到父会话 |
 | `jade/compact` | `context.project` 里清理旧输出、总结；`/compact`；上下文溢出后压缩并经 `afterTurn` 重试 | `models@1` | `plugins/compact.ts` |
 | `jade/mcp` | MCP 服务的工具、`/mcp`；`/mcp add\|remove` 和 `jade mcp add\|remove` 改配置文件；项目层服务启动前确认（`$JADE_HOME/trust.jsonl`） | 可选 `ui@1`、`commands@1`、`prompts@1`、`task@1`、`cli@1` | `mcp.ts`。插件自带的 MCP 配置（旧的 PluginBundle）没有了 |
 | `jade/skills` | `skill` 工具、`/skills`、`/<skill 名>`；`/skills add\|update\|remove` 和 `jade skills …` 从 git、npm 或本地目录安装（下载经核心的 `sources@1`）；每次调用模型前重新查找 skill，会话中途装的马上能用（`skill` 工具因此总是注册、名字不写成 enum，列表变了才改提示词）；工具说明告诉模型用 `jade skills add` 装到 `.jade`；skill 目录经 `approval@1.allowRead` 可直接读 | 可选 | `skills.ts` |
@@ -323,6 +325,8 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 | `jade/schedule` | 定时任务：五字段 cron（本机时区），存在 `$JADE_HOME/state/schedules.json`，重启后还在。到点时投到创建它的目录里正在运行的 jade 的当前会话（正在跑就排在本轮之后）；没有 jade 开着就等，下次打开时错过的几次只补一次；`jade -p` 不投递。同一台机器开着几个 jade 时，所有读写经一把目录锁，到点的任务只由一个进程认领、只投递一次；上一次还没跑完的不再认领。`/schedule`（list、add、once、pause、resume、rm、run）和模型工具 `schedule_create`、`schedule_list`、`schedule_edit` 共用这份存储；创建和修改的 effect 是 `external`，auto 模式下也要审 | 可选 `commands@1`、`ui@1` | 新功能，参考 dsh 的 `dsh-schedule`（`test/schedule.test.ts`）。任务的 `target` 现在只有 `cwd` 一种；一个进程能同时挂多个会话之后，再加"后台另开会话"（dsh 的 `new`） |
 | `jade/custom-commands` | `$JADE_HOME/commands/<名字>.md`、`<工作目录>/.jade/commands/<名字>.md` 变成 `/<名字> [参数]`：文件内容作为用户消息发出去，`$ARGUMENTS` 换成参数；启动时登记，内容每次执行时重新读；名字被占用的不登记 | `commands@1`；可选 `ui@1` | 新功能（`test/custom-commands.test.ts`） |
 | `jade/hooks` | 配置 `hooks` 里的 shell 命令：`before`（`tool.gate`，退出码非 0 时拒绝，输出作理由）、`after`（`tool.after`，失败时经 `prompts@1.note` 告诉模型）、`turn`（一轮结束后）。配置键没有标 `project`，仓库设不了 | `shell@1`；可选 `ui@1`、`prompts@1` | 新功能（`test/hooks.test.ts`） |
+| `jade/steer` | `steer@1`（`push`、`pending`、`take`、`subscribe`）：一轮中途对模型说话。内核只在空闲时接受用户消息，所以不走输入：`push` 的话在下一次请求模型时由 `context.project` 附在最后一条消息（刚执行完的工具的结果）后面，写进 `derived`（之后的投影、恢复的会话里位置不变），另记一条 `jade/steer/said` 事件给前端显示。这一轮没有再请求模型就结束时话还留着，调用方用 `take` 取回当普通消息发。`jade/tui` 在模型工作时提交的消息走它（前面已经有东西在排队、或者是命令时照旧排队）；停用它就回到"排队等这一轮结束"。项目层插件不能用 | 可选 `renderers@1` | 新功能（`test/steer.test.ts`） |
+| `jade/editor` | Ctrl+G（配置 `key` 可换；键被别的插件占了时提示一次，插件照常激活）把输入框里的文字交给编辑器（配置 `editor`，否则 `$VISUAL`、`$EDITOR`），存盘退出后换回输入框；终端编辑器经 `ui@1.suspend` 独占终端 | `keys@1`；可选 `ui@1` | 新功能（`test/tui-frontend.test.ts`） |
 | `jade/cost` | 按配置的单价（每百万 token，按模型名前缀）把日志里的用量换算成钱：状态栏一段（`ctx.status`，合计每轮记进 `derived`）、`/cost` | 可选 `commands@1`、`models@1` | 新功能（`test/cost.test.ts`） |
 
 2026-11-10 之后的补充（都在插件里，核心没有改）：
@@ -335,6 +339,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 - `jade/prompts`：`$JADE_HOME` 里没有指令文件时用 `~/.claude/CLAUDE.md`（配置 `claudeInstructions: false` 关掉）。
 - `jade/tui`：对话框弹出时用户正在打字，接着打出来的回车和数字不当成回答；审批预览用 PgUp/PgDn 翻看；第一个词里还有 `/` 的输入（路径）当普通消息；`/copy`；Ctrl+J、单独上报的 Shift+Enter 换行。
 - `jade/print`：`-c/--continue`（经 `sessions@1`）、`--json`。`jade/compact`：`/compact <要留意的事>`。
+- `jade/tui`：用鼠标选中复制时，自动折行出来的续行接回上一行（一行很长的命令复制出来还是一行），列表的缩进、代码块的竖线不带出来。折行时在续行开头放一个看不见的记号（`markdown.ts` 的 `softRow`），显示之前去掉。
 
 几条值得注意的变化：
 
@@ -360,6 +365,8 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 | 项目层的进程外插件 | 内核的确认（哈希整个目录、检查 import 不出目录）只懂 JS | **暂不支持**：项目层的进程外插件激活失败并说明原因。要支持，得先决定"确认一个 Python 插件"确认的是什么（目录哈希够不够、解释器和它的依赖算不算） |
 | 项目层插件的确认 | 内核的 `checkImports`（检查插件不 import 目录外的代码）没有导出；`loadProjectPluginFactory` 要求默认导出内核插件，和 jade 的模块形状不同 | **已解决，内核新增 `importProjectModule`**：确认流程和 `loadProjectPluginFactory` 完全相同（后者改为调用它），但不管模块形状，返回模块和一个可多次使用的 `mark(plugin)`。jade 每个会话用它标记交给内核的插件。安全检查只有内核这一份 |
 | 停在等待人工审批的一轮结束不了 | `abort` 只发信号，等待期间没有操作在跑；发新消息被拒绝，逐个拒绝又会再请求一次模型 | **已解决，内核新增 `Runtime.endTurn`**（宪法 4.4，v0.10）：没有在驱动时写入 `turn.ended`（`aborted`）。jade 的会话和 `jade/approval` 已经用上（第 7 节）。子 Agent（`jade/task`）的关卡还是在关卡里面等回答 |
+| 一批工具调用里有一个不是 `safe` 的，整批都依次执行 | 内核规定（第六章） | **已解决，修宪**（v0.11）：按模型给出的顺序分段，连续的 `safe` 调用并发，`exclusive` 的单独执行。执行工具只有运行时能做，内核之外改不了 |
+| 一轮中途不能再发用户消息 | 内核只在 `idle` 阶段接受消息输入 | **不改内核**：`context.project` 加 `derived` 就能把话附在工具结果后面（`jade/steer`），和 `prompts@1.note` 是同一个办法；内核外能做对，按宪法 1.3 不进内核。代价是日志里这句话是插件记的 `derived` 和 `jade/steer/said`，不是 `input.received` |
 
 ## 11. 实施顺序
 

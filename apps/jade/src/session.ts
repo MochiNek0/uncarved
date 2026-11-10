@@ -101,6 +101,8 @@ class LiveSession implements Session {
   #answers: { input: UserInput; resolve: () => void; reject: (e: unknown) => void }[] = [];
   /** 审批插件是不是守着这个会话（第 7 节）：不是的话没有人会回答审批 */
   #attended: () => boolean;
+  /** 插件订阅的运行时通知（ctx.session.subscribe） */
+  #watchers = new Set<{ fn: (n: RuntimeNotice) => void; owner: Owner }>();
 
   readonly #store: LogStore;
 
@@ -200,12 +202,33 @@ class LiveSession implements Session {
     while (this.#pump) await this.#pump;
   }
 
-  /** 和输入排同一个队：恢复可能要跑完一整轮，这期间插件发来的输入排在它后面，而不是撞上 RuntimeBusy */
+  /**
+   * 和输入排同一个队：恢复可能要跑完一整轮，这期间插件发来的输入排在它后面，而不是撞上 RuntimeBusy。
+   * 上次停在等待人工审批的（进程被杀、崩溃）：内核再发一次 awaiting 通知，审批插件据此重新问（ctx.session.subscribe），
+   * 这一轮接着等回答；没有审批插件守着时和平时一样直接结束
+   */
   recover(): Promise<void> {
-    return this.#enqueue(() => {
-      // 上次退出时停在等待人工审批：问过的对话框已经不在了，这一轮到此为止
-      if (this.rt.phase === "awaiting" && !this.rt.state.held) return this.rt.endTurn(new Error("jade exited while this turn was waiting for approval"));
-      return this.#drive(() => this.rt.recover());
+    return this.#enqueue(() => this.#drive(() => this.rt.recover()));
+  }
+
+  /** 插件订阅运行时通知，返回取消订阅。Runtime 建好之前就可以订阅（session() 里） */
+  watch(fn: (n: RuntimeNotice) => void, owner: Owner): () => void {
+    const w = { fn, owner };
+    this.#watchers.add(w);
+    return () => void this.#watchers.delete(w);
+  }
+
+  /** Runtime 建好之后调用一次：把通知转给订阅的插件，以插件身份执行，出错只报告 */
+  attach(): void {
+    this.rt.subscribe((n) => {
+      for (const w of this.#watchers) {
+        if (w.owner.scope.closed) continue;
+        try {
+          invoke(w.owner, "session.subscribe", () => w.fn(n));
+        } catch (e) {
+          this.#report(e instanceof Error ? e.message : String(e));
+        }
+      }
     });
   }
 
@@ -312,6 +335,7 @@ export class Sessions implements SessionManager {
       await this.#closeParts(s);
       throw e;
     }
+    s.attach();
     s.rt.subscribe((n) => {
       if (n.type === "hook-error") host.report(`plugin ${n.info.plugin} failed at ${n.info.point}: ${n.info.error instanceof Error ? n.info.error.message : String(n.info.error)}`);
     });
@@ -395,6 +419,18 @@ export class Sessions implements SessionManager {
           if (scope.closed) throw new StaleContext(id);
           if (layer === "project") throw new Error(`plugin ${id}: project plugins cannot stop turns on the user's behalf`);
           s.abort(new Error(reason ?? `stopped by plugin ${id}`));
+        },
+        state: () => {
+          if (scope.closed) throw new StaleContext(id);
+          // session() 执行期间 Runtime 还没建（全部插件加入之后才建）
+          if (!s.rt) throw new Error(`plugin ${id}: the session's state is not available while session() runs`);
+          return s.rt.state;
+        },
+        subscribe: (fn) => {
+          if (scope.closed) throw new StaleContext(id);
+          const off = s.watch(fn, owner);
+          scope.add(off);
+          return off;
         },
       },
       kernel: {

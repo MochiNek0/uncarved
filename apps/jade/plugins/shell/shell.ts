@@ -7,6 +7,7 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import type { Tool } from "uncarved";
 import { runSync, spawn as spawnProc, which, type Proc } from "./sys.ts";
+import type { RunCommand, RunResult } from "@uncarved/jade-api/services";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_TIMEOUT_MS = 600_000;
@@ -38,16 +39,6 @@ export interface ShellTools {
   /** 宿主和插件自己执行一条命令（不经过模型和审批），找不到 shell 时为 undefined */
   run?: RunCommand;
 }
-
-export interface RunResult {
-  /** 超时被杀掉时为 null */
-  code: number | null;
-  /** stdout 和 stderr 合在一起，超长时保留首尾 */
-  output: string;
-  timedOut: boolean;
-}
-
-export type RunCommand = (command: string, opts: { cwd?: string; timeoutMs: number; signal?: AbortSignal }) => Promise<RunResult>;
 
 /** 只要 bash 工具时用（测试） */
 export function shellTool(opts: ShellOptions): Tool {

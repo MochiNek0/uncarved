@@ -189,6 +189,14 @@ class Context:
         """本轮完全结束后执行一次（会话级）"""
         self._conn.call(self.scope, "$session", "afterTurn", [fn])
 
+    def state(self) -> dict:
+        """会话现在的状态（阶段、消息、还没做完的工具调用、derived）。scope 打开期间（session 函数里）还没有"""
+        return self._conn.call(self.scope, "$session", "state", [])
+
+    def subscribe(self, fn: Callable[[dict], Any]) -> None:
+        """订阅运行时的通知（事件、增量、工具进度、awaiting），作用域关闭时自动取消（会话级）"""
+        self._conn.call(self.scope, "$session", "subscribe", [fn])
+
     def on_close(self, fn: Callable[[], Any]) -> None:
         """作用域关闭时执行，逆序"""
         self._on_close.append(fn)

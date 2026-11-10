@@ -10,15 +10,9 @@ import os from "node:os";
 import path from "node:path";
 import type { Block } from "uncarved";
 import type { Frontend, OpenOptions, Session, SessionManager, SessionUI, UI } from "@uncarved/jade-api";
-import type { CommandContext, Commands } from "../commands/index.ts";
-import type { Keys } from "../keys/index.ts";
-import type { Compact } from "../compact/index.ts";
-import type { Models } from "../models/index.ts";
-import type { Modes } from "../modes/index.ts";
-import type { Renderers } from "../renderers/index.ts";
+import type { CommandContext, Commands, Compact, Keys, Models, Modes, Renderers, SessionIndex, Steer } from "@uncarved/jade-api/services";
 import { InputHistory } from "./history.ts";
 import { mentionCandidates } from "./mentions.ts";
-import type { SessionIndex } from "../sessions/index.ts";
 import { dim, red, safeScreen, yellow, type CommandInfo, type Screen } from "./screen.ts";
 import { transcript, type Transcript } from "./transcript.ts";
 
@@ -90,6 +84,8 @@ export interface FrontendServices {
   compact?: Compact;
   /** 会话索引（jade/sessions），--continue 用 */
   index?: SessionIndex;
+  /** 一轮中途说的话（jade/steer）：有它时，模型工作中提交的消息在下一次请求模型时就交给它，不等这一轮结束 */
+  steer?: Steer;
 }
 
 /** 状态栏上插件的一段最多显示这么多字符（超出的截断，换行并成空格） */
@@ -127,6 +123,13 @@ export class ScreenBridge {
       if (!this.screen) return undefined;
       return this.screen.input(req.title, { ...(req.initial ? { initial: req.initial } : {}), ...(req.placeholder ? { placeholder: req.placeholder } : {}), ...(req.mask ? { mask: true } : {}), ...(signal ? { signal } : {}) });
     },
+    copy: (text) => {
+      if (!this.screen?.copy) return false;
+      this.screen.copy(String(text));
+      return true;
+    },
+    // 界面没有占着终端（不是终端界面、还没起来）时没有什么要让的，直接执行
+    suspend: async (fn) => (this.screen?.suspend ? this.screen.suspend(fn) : fn()),
     session: ({ session, plugin }) => this.#sessionUI(session, plugin),
   };
 
@@ -250,7 +253,7 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
     return 2;
   }
 
-  const { cwd, home, commands, keys, renderers, modes, models, compact, index } = services;
+  const { cwd, home, commands, keys, renderers, modes, models, compact, index, steer } = services;
   const sessions = opts.sessions;
   // --continue：这个目录里最近用过的会话（索引由 jade/sessions 在收到第一条消息时写）
   if (args.cont && !index) {
@@ -401,6 +404,41 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
 
   /** 等待执行的输入：运行中提交的消息和需要独占会话的命令排在这里，按顺序执行 */
   const queue: string[] = [];
+  /**
+   * 已经交给 jade/steer、还没交给模型的话：下一次请求模型时它们就到模型那里；这一轮先结束了的取回来，
+   * 排到队列最前面当普通消息发。steer@1 出错时当作没有它
+   */
+  const steered = {
+    pending(): string[] {
+      try {
+        return current && steer ? steer.pending(current.id) : [];
+      } catch {
+        return [];
+      }
+    },
+    take(): string[] {
+      try {
+        return current && steer ? steer.take(current.id) : [];
+      } catch {
+        return [];
+      }
+    },
+    push(text: string): boolean {
+      try {
+        return current !== undefined && steer !== undefined && steer.push(current.id, text);
+      } catch {
+        return false;
+      }
+    },
+  };
+  /** 输入框上方显示的等待中的消息：中途说的话在前（它们先到模型那里） */
+  const showQueued = () => screen.queued([...steered.pending(), ...queue]);
+  let offSteer: (() => void) | undefined;
+  try {
+    offSteer = steer?.subscribe(showQueued);
+  } catch {
+    // 没有订阅上：交给模型之后显示的列表要等下一次变化才更新
+  }
   let running = false;
   let work: Promise<void> | undefined;
   let interruptedAt = 0;
@@ -442,13 +480,14 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
     for (const ac of commandAborts) ac.abort(new Error("interrupted by user"));
     current?.abort(new Error("interrupted by user"));
     screen.busy("Interrupting");
-    if (queue.length === 0) return;
-    const n = queue.length;
+    const n = queue.length + steered.pending().length;
+    if (n === 0) return;
     if (again) {
       if (takeBack()) screen.log(dim(`[moved ${n} queued message${n > 1 ? "s" : ""} back to the input]`));
       else {
+        steered.take();
         queue.length = 0;
-        screen.queued(queue);
+        showQueued();
         screen.log(dim(`[cleared ${n} queued message${n > 1 ? "s" : ""}]`));
       }
     } else {
@@ -458,10 +497,10 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
 
   /** 排队的消息不再自动发送，放回输入框（在已经输入的内容前面，一条一行）；没有可放回的返回 false */
   function takeBack(): boolean {
-    if (queue.length === 0 || !screen.draft) return false;
+    if (!screen.draft || queue.length + steered.pending().length === 0) return false;
     const typed = screen.draft.text();
-    screen.draft.set([...queue.splice(0), ...(typed.trim() ? [typed] : [])].join("\n"));
-    screen.queued(queue);
+    screen.draft.set([...steered.take(), ...queue.splice(0), ...(typed.trim() ? [typed] : [])].join("\n"));
+    showQueued();
     return true;
   }
 
@@ -473,6 +512,7 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
     keyAbort.abort(new Error("exiting"));
     offMode?.();
     offModel?.();
+    offSteer?.();
     unsubscribe?.();
     await screen.close();
     bridge.detach();
@@ -558,8 +598,16 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
       });
       return;
     }
+    // 模型正在工作、前面也没有别的在排队：这句话在下一次请求模型时就交给它（jade/steer），不等这一轮结束。
+    // 命令、已经有东西在排队时照旧排队，先后顺序不变
+    if (running && name === undefined && queue.length === 0 && steered.push(text)) {
+      showQueued();
+      // 没赶上这一轮的，等正在做的事做完再发（那时不一定是 pump 在跑，例如刚恢复会话）
+      void work?.catch(() => {}).then(() => pump());
+      return;
+    }
     queue.push(text);
-    if (running) screen.queued(queue);
+    if (running) showQueued();
     void pump();
   }
 
@@ -567,11 +615,14 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
     if (running) return;
     let exit = false;
     await occupy(async () => {
-      while (queue.length > 0 && !quitting) {
+      for (;;) {
+        // 中途说的话没赶上这一轮（模型没有再被请求就结束了）：当普通消息发，排在后来排队的前面
+        queue.unshift(...steered.take());
+        if (queue.length === 0 || quitting) break;
         if (interruptPending) interruptedAt = Date.now();
         interruptPending = false;
         const text = queue.shift()!;
-        screen.queued(queue);
+        showQueued();
         view.echo(text);
         if (commandName(text) !== undefined) {
           if (!(await command(text))) {

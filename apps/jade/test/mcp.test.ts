@@ -5,7 +5,7 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { Block } from "uncarved";
-import type { CommandContext, Commands } from "../plugins/commands/index.ts";
+import type { CommandContext, Commands } from "@uncarved/jade-api/services";
 import { manageMcp } from "../plugins/mcp/install.ts";
 import { expandEnv, loadMcpConfig, McpClient, mcpToolName, mcpTools, type McpServerEntry } from "../plugins/mcp/mcp.ts";
 import type { SessionManager, UI } from "../src/index.ts";

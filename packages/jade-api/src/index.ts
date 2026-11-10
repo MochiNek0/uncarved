@@ -118,6 +118,17 @@ export interface SessionControl {
   send(input: UserInput): Promise<void>;
   /** 中止正在跑的这一轮（例如用户在别处喊停）；空闲时什么都不做。项目层插件不能用 */
   abort(reason?: string): void;
+  /**
+   * 会话现在的状态（阶段、消息、还没做完的工具调用、derived）的一份拷贝，和前端的 Session.state 相同。
+   * session() 执行期间还没有（会话在全部插件加入之后才建），那时调用会抛错：在 hook、工具、afterTurn、subscribe 的回调里用
+   */
+  state(): State;
+  /**
+   * 订阅运行时的通知（写进日志的事件、流式增量、工具进度、停下来等人工审批的 awaiting），和前端的 Session.subscribe 相同；
+   * 返回取消订阅，作用域关闭时自动取消。可以在 session() 里订阅。回调要马上返回：它在内核运行的中途被调用。
+   * 例如审批插件用 awaiting 知道有调用在等回答，包括恢复一个上次停在等审批的会话时
+   */
+  subscribe(fn: (n: RuntimeNotice) => void): () => void;
 }
 
 export interface SessionContext extends ScopeContext {
@@ -294,6 +305,17 @@ export interface UI {
   select<T extends string>(request: SelectRequest<T>, signal?: AbortSignal): Promise<T | undefined>;
   /** 请用户输入一行；不能提问、用户取消或 signal 中止时返回 undefined */
   input(request: InputRequest, signal?: AbortSignal): Promise<string | undefined>;
+  /**
+   * 把文字放进用户的系统剪贴板；交给终端了返回 true，这个前端现在做不到返回 false。
+   * 没有剪贴板的前端（例如 -p）没有这个方法
+   */
+  copy?(text: string): boolean;
+  /**
+   * 把终端让出来给另一个程序用（例如 $EDITOR）：前端停止画界面、不再读键盘，把终端恢复成普通状态，然后执行 fn；
+   * fn 结束（或抛错）后前端重新接管、重画界面，返回 fn 的结果。期间会话照常运行，输出在重新接管后显示。
+   * 在 fn 里启动的程序用 stdio: "inherit"。不占着终端的前端没有这个方法
+   */
+  suspend?<T>(fn: () => T | Promise<T>): Promise<T>;
   /**
    * 某个插件在一个会话里的界面（4.3）：状态栏上它的一段、输入框。
    * 核心为每个加入会话的插件调用一次；不能显示时返回 undefined。插件的作用域关闭时核心调用 dispose

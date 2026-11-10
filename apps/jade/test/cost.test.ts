@@ -2,7 +2,7 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 import type { UI } from "../src/index.ts";
-import type { CommandContext, Commands } from "../plugins/commands/index.ts";
+import type { CommandContext, Commands } from "@uncarved/jade-api/services";
 import { costOf, parsePrices, priceOf } from "../plugins/cost/index.ts";
 import { cleanup, say, scriptedHost } from "./scripted-ui.ts";
 

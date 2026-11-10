@@ -6,13 +6,14 @@
 import { realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import type { GatedToolCall, GateResult } from "uncarved";
+import type { ApprovalMode } from "@uncarved/jade-api/services";
 import { validate } from "./schema.ts";
 
 /**
  * 权限模式。ask：改东西先问；auto：工作目录里的改动和只建目录、碰文件的命令不问；
  * plan：不改任何东西，拒绝时告诉模型先给出计划；readonly：不改任何东西（子 Agent 用）；yolo：什么都不问
  */
-export const MODES = ["ask", "auto", "plan", "readonly", "yolo"] as const;
+export const MODES = ["ask", "auto", "plan", "readonly", "yolo"] as const satisfies readonly ApprovalMode[];
 export type Mode = (typeof MODES)[number];
 
 /**

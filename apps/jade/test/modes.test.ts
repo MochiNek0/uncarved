@@ -2,9 +2,9 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 import path from "node:path";
-import { APPROVED_NOTE, NOT_APPROVED, type Modes } from "../plugins/modes/index.ts";
+import { APPROVED_NOTE, NOT_APPROVED } from "../plugins/modes/index.ts";
 import { PluginHost } from "../src/index.ts";
-import type { Approval } from "../plugins/approval/index.ts";
+import type { Approval, Modes } from "@uncarved/jade-api/services";
 import type { ModelRequest } from "uncarved";
 import { cleanup, MODEL, say, scriptedHost, textOf, type Step } from "./scripted-ui.ts";
 

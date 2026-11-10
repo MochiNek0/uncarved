@@ -11,12 +11,9 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { definePlugin, type SessionContext, type UI } from "@uncarved/jade-api";
-import type { Approval } from "../approval/index.ts";
-import type { Commands } from "../commands/index.ts";
-import type { EventRenderer, Renderers } from "../renderers/index.ts";
+import type { Approval, Commands, EventRenderer, Renderers, Shell } from "@uncarved/jade-api/services";
 import { changedFiles, checks, type Check, type Checks } from "./checks.ts";
 import { bold, dim, display, realPath, repoRoot, TrustFile, yellow } from "./project.ts";
-import type { Shell } from "../shell/service.ts";
 
 /** 确认记录：同一个目录里的同一条命令只问一次。和旧 jade 的算法相同 */
 const checkHash = (c: Check) => createHash("sha256").update(`jade-check\0${c.cwd}\0${c.command}`).digest("hex");

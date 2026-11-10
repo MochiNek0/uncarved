@@ -6,7 +6,7 @@ import path from "node:path";
 import type { Message } from "uncarved";
 import type { UI } from "../src/api.ts";
 import type { PluginHost } from "../src/index.ts";
-import type { CommandContext, Commands } from "../plugins/commands/index.ts";
+import type { CommandContext, Commands } from "@uncarved/jade-api/services";
 import { frame, SYSTEM, tidy, transcriptOf } from "../plugins/suggest/index.ts";
 import { cleanup, MODEL, say, scriptedHost, textOf, use } from "./scripted-ui.ts";
 

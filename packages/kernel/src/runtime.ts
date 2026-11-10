@@ -564,13 +564,16 @@ export class Runtime {
       await this.#commit("tool.completed", { toolUseId: c.toolUseId, content: out.content, isError: out.isError, child }, origin);
     };
 
-    // 全部是 safe 的工具才并发，否则按模型给出的顺序依次执行（第六章）
-    if (calls.every((c) => this.#tools.get(c.name)?.concurrency === "safe")) {
-      const settled = await Promise.allSettled(calls.map(run));
+    // 按模型给出的顺序分段：连续的 safe 调用并发，exclusive 的调用单独执行（第六章）。
+    // exclusive 的调用不和任何调用同时执行，它前后的调用也不会越过它
+    const safe = (c: PendingCall) => this.#tools.get(c.name)?.concurrency === "safe";
+    for (let i = 0; i < calls.length; ) {
+      let end = i + 1;
+      if (safe(calls[i]!)) while (end < calls.length && safe(calls[end]!)) end++;
+      const settled = await Promise.allSettled(calls.slice(i, end).map(run));
       const failed = settled.find((r) => r.status === "rejected");
       if (failed) throw failed.reason;
-    } else {
-      for (const c of calls) await run(c);
+      i = end;
     }
   }
 

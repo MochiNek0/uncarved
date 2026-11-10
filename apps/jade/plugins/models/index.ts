@@ -7,40 +7,12 @@
 import path from "node:path";
 import type { ModelRequest, ModelResponse, Provider } from "uncarved";
 import { definePlugin, type UI } from "@uncarved/jade-api";
-import type { Commands } from "../commands/index.ts";
+import type { Commands, Models } from "@uncarved/jade-api/services";
 import { contextWindow } from "./context.ts";
 import { envWithFile, hasProvider, parseTokens } from "./config.ts";
 import { configurator } from "./configure.ts";
 import { isBuiltinKind, listModels, MODEL_KEY, providerFromEnv, providerInfo, providerKind, RateGate, rpmFromEnv, visionFromEnv, withRetry, type RetriedResponse } from "./provider.ts";
 import { MODEL_SETTINGS, readSavedServices, type Env } from "./saved.ts";
-
-/** models@1 */
-export interface Models {
-  /** 当前配置的服务和模型；没有配置时 undefined。via 是给人看的服务说明，例如 "the Anthropic API" */
-  current(): {
-    kind: string;
-    model: string;
-    via: string;
-    /** 上下文窗口（token） */
-    contextWindow: number;
-    /** 模型能不能看图片（JADE_VISION；不设时按服务推断） */
-    vision: boolean;
-    /** 每次回复的输出上限（JADE_MAX_TOKENS，含 .env 里的）；不设或写错时没有，用服务的默认值 */
-    maxTokens?: number;
-  } | undefined;
-  /**
-   * 完成一次请求，带重试和限速。默认用当前配置的模型（限速和会话共用）；
-   * model 是 /model 保存过的模型名（$JADE_HOME/models.json），用它和它自己的设置；
-   * 没保存过时当作当前服务上的模型名（list() 里的那些），用这个服务的默认设置
-   */
-  complete(request: ModelRequest, options: { signal: AbortSignal; onDelta?: (delta: import("uncarved").Delta) => void; model?: string }): Promise<ModelResponse>;
-  /** 服务提供的模型列表；不支持或出错时为空 */
-  list(): Promise<string[]>;
-  /** /model 保存过的模型名（complete 的 model 能用的那些），最近用过的在前 */
-  saved?(): Promise<string[]>;
-  /** 配置换了（/model）时调用，返回取消订阅。前端用它更新状态栏 */
-  subscribe?(fn: () => void): () => void;
-}
 
 export default definePlugin({
   async process(ctx) {

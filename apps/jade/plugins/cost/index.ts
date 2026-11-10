@@ -10,8 +10,7 @@
 
 import type { LogEvent, Usage } from "uncarved";
 import { definePlugin } from "@uncarved/jade-api";
-import type { Commands } from "../commands/index.ts";
-import type { Models } from "../models/index.ts";
+import type { Commands, Models } from "@uncarved/jade-api/services";
 
 export interface Price {
   input: number;

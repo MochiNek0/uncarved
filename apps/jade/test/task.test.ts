@@ -50,6 +50,28 @@ describe("jade/task", () => {
     ]);
   });
 
+  test("the sub-agent gets the session's instruction files, the repository's ones untrusted; instructions: false leaves them out", async () => {
+    for (const off of [false, true]) {
+      const { cwd, host, shared, send } = await scriptedHost(off ? { config: { "jade/task": { instructions: false } } } : {});
+      await writeFile(path.join(cwd, "AGENTS.md"), "Always cite the design doc.");
+      shared.script.push(use("u1", "task", { description: "look", prompt: "look around" }), say("report"), say("done"));
+      const s = await host.sessions.open();
+      await send(s, "go");
+      const sub = shared.requests[1]!;
+      const project = sub.system.filter((seg) => seg.text.includes("Always cite the design doc."));
+      if (off) {
+        expect(project).toEqual([]);
+        continue;
+      }
+      expect(project).toHaveLength(1);
+      expect(project[0]!.trust).toBe("untrusted");
+      expect(project[0]!.origin).toMatchObject({ by: "plugin", id: "jade/task", source: { layer: "project", path: "AGENTS.md" } });
+      // 子 Agent 自己的提示词排在前面
+      expect(sub.system[0]!.text).toContain("read-only research sub-agent");
+      expect(sub.system.indexOf(project[0]!)).toBeGreaterThan(1);
+    }
+  });
+
   test("the sub-agent's token usage is logged in the session, so the status bar can count it", async () => {
     const { host, shared, send } = await scriptedHost();
     shared.script.push(

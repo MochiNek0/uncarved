@@ -6,16 +6,7 @@ import { appendFile, mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import type { UserInput } from "uncarved";
 import { definePlugin } from "@uncarved/jade-api";
-import type { Commands } from "../commands/index.ts";
-
-export interface SessionSummary {
-  id: string;
-  cwd: string;
-  /** 第一条消息的开头 */
-  title: string;
-  /** 最近一次使用的时间（ISO） */
-  at: string;
-}
+import type { Commands, SessionIndex, SessionSummary } from "@uncarved/jade-api/services";
 
 const TITLE_CHARS = 80;
 
@@ -76,12 +67,6 @@ function titleOf(input: UserInput): string | undefined {
   const text = input.content.flatMap((b) => (b.kind === "text" && b.origin.by === "user" ? [b.text] : [])).join(" ").replace(/\s+/g, " ").trim();
   if (!text) return undefined;
   return text.length > TITLE_CHARS ? `${text.slice(0, TITLE_CHARS)}…` : text;
-}
-
-/** sessions@1 */
-export interface SessionIndex {
-  /** cwd 里的会话，最近用过的在前（jade --continue 取第一个） */
-  list(cwd: string): Promise<SessionSummary[]>;
 }
 
 export default definePlugin({

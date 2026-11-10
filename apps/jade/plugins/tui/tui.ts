@@ -25,10 +25,9 @@ import {
   useSyncExternalStore,
 } from "./vendor.ts";
 import stringWidth from "string-width";
-import wrapAnsi from "wrap-ansi";
 import { mentionAt, mentionText, rankPaths } from "./mentions.ts";
 import { charWidth, edit, empty, layout, moveRow, offsetAt, type EditState } from "./editor.ts";
-import { expandTabs, markdownStream, type MdLine } from "./markdown.ts";
+import { expandTabs, markdownStream, softInfo, visibleRow, wrapRows, type MdLine } from "./markdown.ts";
 import { cells, FRAME_MS, Mascot, moodOf, nextChange, title } from "./mascot.ts";
 import {
   dim,
@@ -116,9 +115,8 @@ interface UiState {
 /** 对话最多保留这么多行（折行前），超出时丢掉最早的一段 */
 const MAX_LINES = 10_000;
 
-/** 按显示宽度折行，保留颜色；每一项是屏幕上的一行。制表符先换成空格：按 0 列算宽度会对不齐、超宽 */
-const wrap = (text: string, width: number) =>
-  wrapAnsi(expandTabs(text), width, { hard: true, trim: false }).split("\n");
+/** 按显示宽度折行，保留颜色；每一项是屏幕上的一行，自动折出来的续行开头带记号（markdown.ts），显示之前用 visibleRow 去掉 */
+const wrap = wrapRows;
 
 /**
  * 对话里的一项：普通的一行，或者可以点击展开、收起的一段。
@@ -534,29 +532,36 @@ export function tuiScreen(opts: TuiOptions): Screen {
 
   // 切到备用屏幕后光标还停在原来的位置（不少终端不会自动归位），Ink 从那里往下画第一帧会让屏幕滚动，
   // 之后每帧只重写变化的行，整个界面就错位了。所以先自己切过去、清屏、把光标移到左上角
-  stdout.write("\x1b[?1049h\x1b[2J\x1b[H");
   const commands = opts.commands;
-  const instance = render(
-    h(App, {
-      store,
-      copy: (text: string) => void stdout.write(osc52(text)),
-      version: opts.version,
-      commands: typeof commands === "function" ? commands : () => commands,
-      handlers: opts.handlers,
-      history: opts.history ?? [],
-      draft,
-    }),
-    {
-      exitOnCtrlC: false,
-      alternateScreen: true,
-      // 全屏每帧只重写变化的行
-      incrementalRendering: true,
-      ...(opts.io
-        ? { ...opts.io, interactive: true, patchConsole: false }
-        : {}),
-    },
-  );
-  stdout.write(MOUSE_ON + CURSOR_BLINK);
+  /** 接管终端、画界面。界面的内容都在 store 里，所以让出终端（suspend）之后可以再画一个新的 */
+  const mount = () => {
+    stdout.write("\x1b[?1049h\x1b[2J\x1b[H");
+    const mounted = render(
+      h(App, {
+        store,
+        copy: (text: string) => void stdout.write(osc52(text)),
+        version: opts.version,
+        commands: typeof commands === "function" ? commands : () => commands,
+        handlers: opts.handlers,
+        history: opts.history ?? [],
+        draft,
+      }),
+      {
+        exitOnCtrlC: false,
+        alternateScreen: true,
+        // 全屏每帧只重写变化的行
+        incrementalRendering: true,
+        ...(opts.io
+          ? { ...opts.io, interactive: true, patchConsole: false }
+          : {}),
+      },
+    );
+    stdout.write(MOUSE_ON + CURSOR_BLINK);
+    return mounted;
+  };
+  let instance = mount();
+  /** 让出终端一次只做一回，后来的排在后面 */
+  let yielding: Promise<unknown> = Promise.resolve();
   const closeTitle = titleBar(stdout, store);
   // 没走 close 就退出（process.exit）时也要把终端还原，否则会留在备用屏幕、鼠标上报也开着
   const restore = () => {
@@ -656,6 +661,28 @@ export function tuiScreen(opts: TuiOptions): Screen {
       hint: (text) => store.update({ hint: text ? text.replace(/\r\n?/g, "\n") : undefined }),
     },
     copy: (text) => void stdout.write(osc52(text)),
+    suspend<T>(fn: () => T | Promise<T>): Promise<T> {
+      const run = yielding.then(async () => {
+        // 输入框里打了一半的字在组件里，卸载就没了：先记下
+        const typed = draft.current?.get();
+        stdout.write(MOUSE_OFF + CURSOR_RESET);
+        // 卸载时 Ink 退出备用屏幕、关掉 raw mode、不再读 stdin：终端回到普通状态，别的程序可以用
+        instance.unmount();
+        await instance.waitUntilExit();
+        delete draft.current;
+        try {
+          return await fn();
+        } finally {
+          instance = mount();
+          // 等输入框画出来再返回：调用方接着就可能改输入框（编辑器里写好的内容）
+          const input = (): DraftBridge["current"] => draft.current;
+          for (let i = 0; i < 100 && !input(); i++) await new Promise((r) => setTimeout(r, 10));
+          if (typed) input()?.apply(() => ({ value: typed, cursor: typed.length }));
+        }
+      });
+      yielding = run.catch(() => {});
+      return run;
+    },
     select: <T>(title: string, choices: Choice<T>[], o?: { body?: string; signal?: AbortSignal }) => {
       if (longBusy()) notify(title);
       return ask<T | undefined>(
@@ -782,18 +809,25 @@ function highlight(line: string, from: number, to: number): string {
   return out + (on ? INVERSE_OFF : "");
 }
 
-/** 选中的纯文字：每行去掉行尾空白，用换行连起来（自动折行的地方也是换行） */
-function selectedText(s: Selection, row: (i: number) => string | undefined): string {
+/**
+ * 选中的纯文字：每行去掉行尾空白，用换行连起来。自动折行出来的续行接回上一行（补上折行时去掉的空格、
+ * 跳过排版加的缩进），所以一行很长的命令复制出来还是一行。row 给的是带续行记号的行
+ */
+export function selectedText(s: Selection, row: (i: number) => string | undefined): string {
   const lines: string[] = [];
   const { anchor: a, focus: f } = s;
-  for (let r = Math.min(a.row, f.row); r <= Math.max(a.row, f.row); r++) {
+  const first = Math.min(a.row, f.row);
+  for (let r = first; r <= Math.max(a.row, f.row); r++) {
     const [from, to] = selectedCols(s, r)!;
+    const { text: line, soft, gap, indent } = softInfo(row(r) ?? "");
     let text = "";
-    walk(row(r) ?? "", from, to, (ch, inside) => void (inside && (text += ch)));
+    // 续行开头的缩进、竖线是排版加的
+    walk(line, Math.max(from, soft ? indent : 0), to, (ch, inside) => void (inside && (text += ch)));
+    if (soft && r > first) lines[lines.length - 1] += " ".repeat(gap) + text;
     // 代码块左边的竖线是排版加的，不是代码的一部分
-    lines.push(text.trimEnd().replace(/^┃ ?/, ""));
+    else lines.push(text.replace(/^┃ ?/, ""));
   }
-  return lines.join("\n");
+  return lines.map((l) => l.trimEnd()).join("\n");
 }
 
 /** OSC 52：让终端把文字放进系统剪贴板（Windows Terminal、iTerm2、kitty、WezTerm 等支持） */
@@ -1012,7 +1046,9 @@ function App({
             overflowY: "hidden",
             paddingX: 1,
           },
-          shown.map((l, i) => {
+          shown.map((raw, i) => {
+            // 续行的记号不显示
+            const l = visibleRow(raw);
             const cols = selection && selectedCols(selection, start + i);
             return h(Text, { key: i, wrap: "truncate-end" }, cols ? highlight(l || " ", ...cols) : l || " ");
           }),
@@ -2025,7 +2061,7 @@ function SelectDialog({
   const visible = roomFor(rows, VISIBLE);
   // 预览（例如要写入的文件）过长时截断：整个界面高过终端时 Ink 会每帧清屏重画，底部的选项和提示也会被裁掉。
   // 按折行后的屏幕行数截断（一行长代码会占好几行），每一行单独显示、不再折行
-  const lines = !dialog.body ? [] : wrap(dialog.body, Math.max(1, columns - 4));
+  const lines = !dialog.body ? [] : wrap(dialog.body, Math.max(1, columns - 4)).map(visibleRow);
   const room = Math.max(3, rows - Math.min(n, visible) - 16);
   // 放不下时 PgUp/PgDn 翻看预览（批准之前要能看完整个 diff），最后一行说明还有多少
   const page = room - 1;

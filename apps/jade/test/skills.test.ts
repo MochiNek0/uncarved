@@ -6,7 +6,7 @@ import { existsSync } from "node:fs";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import type { CommandContext, Commands } from "../plugins/commands/index.ts";
+import type { CommandContext, Commands } from "@uncarved/jade-api/services";
 import { manageSkills } from "../plugins/skills/index.ts";
 import { readRecords } from "../plugins/skills/install.ts";
 import { loadSkills, parseSkill, skillTool } from "../plugins/skills/skills.ts";

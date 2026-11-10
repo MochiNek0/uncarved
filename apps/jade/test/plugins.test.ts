@@ -5,7 +5,7 @@ import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promis
 import os from "node:os";
 import path from "node:path";
 import { PluginHost } from "../src/index.ts";
-import type { CommandContext, Commands } from "../plugins/commands/index.ts";
+import type { CommandContext, Commands } from "@uncarved/jade-api/services";
 import type { UI } from "../src/api.ts";
 
 const BUNDLED = path.resolve(import.meta.dir, "../plugins");

@@ -7,7 +7,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Block, Message } from "uncarved";
 import type { UI } from "../src/index.ts";
-import type { CommandContext, Commands } from "../plugins/commands/index.ts";
+import type { CommandContext, Commands } from "@uncarved/jade-api/services";
 import { lastTurnChanges, turnToolNames, type Checkpoint } from "../plugins/undo/checkpoint.ts";
 import { say, cleanup, scriptedHost, textOf, use } from "./scripted-ui.ts";
 

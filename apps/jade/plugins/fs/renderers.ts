@@ -6,7 +6,7 @@
 import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import type { ToolRenderer } from "../renderers/index.ts";
+import type { ToolRenderer } from "@uncarved/jade-api/services";
 import { diffLines, diffStats, renderDiff } from "./diff.ts";
 import { applyEditsToText, display, type Edit } from "./fs.ts";
 import { clip, dim, green, red, yellow } from "./style.ts";

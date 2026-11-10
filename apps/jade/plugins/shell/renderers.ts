@@ -3,7 +3,7 @@
 // 运行中的输出不登记 progress：bash 推送的是 { kind, stream, text }，前端对 { text } 形式的进度默认逐行显示，
 // 正是想要的；自己写 progress 反而只能把一次推送（可能是好几行、半行）显示成一行。
 
-import type { ToolRenderer } from "../renderers/index.ts";
+import type { ToolRenderer } from "@uncarved/jade-api/services";
 
 // 截断和颜色从旧 jade 的 ui/render.ts、ui/screen.ts 复制：插件之间不共享代码，fs 插件也有一份
 const clip = (s: string, n: number) => (s.length > n ? s.slice(0, n) + "…" : s);

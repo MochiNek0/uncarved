@@ -3,9 +3,7 @@
 // 访问网络的 URL 由 jade/approval 的关卡决定要不要问用户（effect 是 read，路径之外的 URL 会问）。
 
 import { definePlugin } from "@uncarved/jade-api";
-import type { Models } from "../models/index.ts";
-import type { Prompts } from "../prompts/index.ts";
-import type { Renderers } from "../renderers/index.ts";
+import type { Models, Prompts, Renderers } from "@uncarved/jade-api/services";
 import { findBrowser, screenshotTool } from "./tool.ts";
 
 /** 提示词里的一段：有截图工具时才加 */

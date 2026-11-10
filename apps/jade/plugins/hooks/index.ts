@@ -18,8 +18,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { definePlugin, type UI } from "@uncarved/jade-api";
-import type { Prompts } from "../prompts/index.ts";
-import type { Shell } from "../shell/service.ts";
+import type { Prompts, Shell } from "@uncarved/jade-api/services";
 
 export interface UserHook {
   on: "before" | "after" | "turn";

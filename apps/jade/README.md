@@ -55,7 +55,9 @@ jade -v                    # 打印版本
 - `/shells` 列出 agent 启动的后台命令，`/shells kill <编号>` 停掉一个；后台命令自己结束时会提示。
 - 自定义命令：把提示词写进 `$JADE_HOME/commands/<名字>.md`（或仓库里的 `.jade/commands/`），之后用 `/<名字> [参数]` 发送；正文里的 `$ARGUMENTS` 换成参数。
 
-输入框里回车发送；换行用 Ctrl+J（Windows Terminal 里 Ctrl+Enter 也行）、Alt+Enter，或行尾写 `\` 再回车。终端单独上报 Shift+Enter 时它也换行。
+输入框里回车发送；换行用 Ctrl+J（Windows Terminal 里 Ctrl+Enter 也行）、Alt+Enter，或行尾写 `\` 再回车。终端单独上报 Shift+Enter 时它也换行。Ctrl+G 用编辑器（`$VISUAL`、`$EDITOR`，或配置 `{"jade/editor": {"editor": "code --wait"}}`）写这条消息，存盘退出后回到输入框。
+
+agent 工作的时候可以接着打字：发出去的话在它下一次请求模型时就到（跟在刚执行完的工具的结果后面），不用等这一轮结束；这一轮先结束了的，当下一条消息发。按 ↑ 或连按两次 Esc 可以把还没送到的话取回来改。
 
 连续两次 Ctrl+C（2 秒内）直接退出，不经过任何插件——插件出问题时你一定能停下来。
 
@@ -100,6 +102,8 @@ jade 自带的功能全是 `apps/jade/plugins/` 下的普通插件，和第三�
 | `jade/custom-commands` | 把 Markdown 文件变成斜杠命令 |
 | `jade/hooks` | 在配置里写 shell 命令，工具调用前后、一轮结束时运行 |
 | `jade/cost` | 按配置的单价把 token 用量换算成钱，`/cost` |
+| `jade/steer` | agent 工作时说的话在下一次请求模型时就交给它 |
+| `jade/editor` | Ctrl+G 用 `$EDITOR` 编辑输入 |
 
 完整清单见 [docs/design/jade.md](../../docs/design/jade.md) 第 9 节。
 

@@ -6,7 +6,7 @@
 
 import type { Tool } from "uncarved";
 import { definePlugin, type UI } from "@uncarved/jade-api";
-import type { Renderers, ToolRenderer } from "../renderers/index.ts";
+import type { Renderers, ToolRenderer } from "@uncarved/jade-api/services";
 
 export interface Question {
   question: string;

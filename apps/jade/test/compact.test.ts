@@ -6,8 +6,7 @@ import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Block, Message } from "uncarved";
 import type { UI } from "../src/index.ts";
-import type { CommandContext, Commands } from "../plugins/commands/index.ts";
-import type { Renderers } from "../plugins/renderers/index.ts";
+import type { CommandContext, Commands, Renderers } from "@uncarved/jade-api/services";
 import { compactThreshold, DERIVED_KEY, estimateTokens, isContextOverflow, parseTokens, TRIMMED, type CompactState } from "../plugins/compact/compact.ts";
 import { say, cleanup, scriptedHost, textOf, use } from "./scripted-ui.ts";
 

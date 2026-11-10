@@ -6,7 +6,7 @@ import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { UI } from "../src/index.ts";
-import type { CommandContext, Commands } from "../plugins/commands/index.ts";
+import type { CommandContext, Commands } from "@uncarved/jade-api/services";
 import { Memory, projectRoot } from "../plugins/memory/memory.ts";
 import { say, cleanup, scriptedHost, textOf, use } from "./scripted-ui.ts";
 

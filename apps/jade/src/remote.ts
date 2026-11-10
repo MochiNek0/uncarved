@@ -242,6 +242,8 @@ export async function startRemote(source: PluginSource, owner: Owner, opts: Remo
           if (p.method === "send") result = await session.send(a[0] as Parameters<typeof session.send>[0]);
           else if (p.method === "afterTurn") session.afterTurn(a[0] as () => void);
           else if (p.method === "abort") session.abort(a[0] === undefined || a[0] === null ? undefined : String(a[0]));
+          else if (p.method === "state") result = session.state();
+          else if (p.method === "subscribe") result = session.subscribe(a[0] as Parameters<typeof session.subscribe>[0]);
           else throw new Error(`$session has no method ${String(p.method)}`);
         } else if (typeof target === "string") {
           const service = ctx.service<Record<string, unknown>>(target);

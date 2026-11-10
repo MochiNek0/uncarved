@@ -3,9 +3,7 @@
 
 import type { LogEvent } from "uncarved";
 import { definePlugin, type UI } from "@uncarved/jade-api";
-import type { Commands } from "../commands/index.ts";
-import type { Models } from "../models/index.ts";
-import type { Renderers } from "../renderers/index.ts";
+import type { Commands, Compact, Models, Renderers } from "@uncarved/jade-api/services";
 import { compactor, compactThreshold, isContextOverflow, parseTokens } from "./compact.ts";
 import { dim } from "./style.ts";
 
@@ -15,12 +13,6 @@ const FALLBACK_THRESHOLD = 120_000;
 const ANTHROPIC_REPLY_TOKENS = 64_000;
 /** 总结要调用模型，比 hook 默认的 30 秒长 */
 const SUMMARY_TIMEOUT_MS = 300_000;
-
-/** compact@1 */
-export interface Compact {
-  /** 历史超过这么多 token 时自动压缩（界面显示用） */
-  threshold(): number;
-}
 
 /** 自动压缩的阈值：配置的 thresholdTokens，否则按当前模型的上下文窗口算 */
 function thresholdFor(config: Record<string, unknown>, models: Models): () => number {

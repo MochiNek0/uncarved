@@ -11,37 +11,10 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { EventDataMap, GatedToolCall, Message } from "uncarved";
 import { definePlugin, type Caller, type SelectRequest, type UI } from "@uncarved/jade-api";
-import type { Models } from "../models/index.ts";
-import type { Renderers } from "../renderers/index.ts";
+import type { Answer, Approval, Approver, Models, Renderers } from "@uncarved/jade-api/services";
 import { describeRule, MODES, policy, type AllowRule, type Mode } from "./policy.ts";
 import { reviewer, type Review } from "./review.ts";
 
-/** approval@1 */
-export interface Approval {
-  mode(): Mode;
-  setMode(mode: Mode): void;
-  /** 读这个目录（绝对路径）里的文件不用问，例如 skill 的目录。返回撤销函数，调用方的作用域关闭时自动撤销。项目层插件不能用 */
-  allowRead(dir: string): () => void;
-  /** 这个目录（绝对路径）和工作目录同样对待：auto 模式下在里面改文件不用问，例如会话的临时目录。返回撤销函数，调用方的作用域关闭时自动撤销。项目层插件不能用 */
-  allowWrite(dir: string): () => void;
-  /**
-   * 登记一个审批渠道（例如聊天机器人）：要问用户时，问题同时交给终端和所有渠道，先回答的算数，
-   * 其余的经 signal 收到中止。渠道返回 undefined、不认识的值或出错，算它不回答，不算拒绝；
-   * 终端里取消照旧算拒绝。有渠道时，不能提问的前端（-p）也会问。返回撤销函数，调用方的作用域关闭时自动撤销。
-   * 项目层插件不能用
-   */
-  addApprover(approver: Approver): () => void;
-  /**
-   * 这个调用（例如子 Agent 的）在会话 session 里能不能不问就执行。只读工具：按该会话"总是允许"的规则、
-   * allowRead/allowWrite 登记的目录和 yolo 模式判断。其他工具（bash）：只读模式下也放行的才算（工作目录里的只读命令），
-   * yolo 模式和"总是允许"的规则都不放宽。会话不存在时为 false
-   */
-  allows(session: string, call: GatedToolCall): boolean;
-}
-
-/** 审批的回答：允许一次、本会话里总是允许、在这个工作目录里以后都允许、拒绝 */
-export type Answer = "once" | "always" | "forever" | "deny";
-export type Approver = (request: SelectRequest<Answer>, signal: AbortSignal) => Promise<Answer | undefined>;
 const ANSWERS: readonly string[] = ["once", "always", "forever", "deny"] satisfies Answer[];
 /** 只有终端里有的一项：拒绝，并写一句话告诉模型该怎么做 */
 const EXPLAIN = "explain";
@@ -159,6 +132,8 @@ export default definePlugin({
     const seen = new Map<string, Asked>();
     /** 已经交给会话的回答：在日志里看到那条 approval 输入时记一条 answered 事件 */
     const answered = new Map<string, { answer: string; by: string }>();
+    /** 这一轮里已经在问、或者问过的调用 */
+    const handled = new Set<string>();
     /** 这一轮结束（包括被中断）时中止还开着的问题 */
     let turn = new AbortController();
     const canAsk = () => ui?.interactive === true || approvers.size > 0;
@@ -185,7 +160,7 @@ export default definePlugin({
       point: "tool.gate",
       timeoutMs: GATE_TIMEOUT_MS,
       fn: async (call, hook) => {
-        seen.set(call.toolUseId, { call, mine: false });
+        seen.set(call.toolUseId, { call });
         const result = rules.decide(call, { mode, rules: saved() });
         if (result.decision !== "ask") return result;
         // auto 模式：规则判断不了、本来要问的调用先让模型审一次。审查只能放行或转给用户，不会替用户拒绝
@@ -213,7 +188,7 @@ export default definePlugin({
           }
           return { decision: "deny", reason: nobody(call.name) };
         }
-        seen.set(call.toolUseId, { call, mine: true, ...(why ? { why } : {}) });
+        seen.set(call.toolUseId, { call, mine: call, ...(why ? { why } : {}) });
         return { decision: "ask" };
       },
     });
@@ -222,7 +197,7 @@ export default definePlugin({
     const decide = async (asked: Asked, signal: AbortSignal): Promise<Verdict> => {
       const { call } = asked;
       if (asked.mine) {
-        const again = rules.decide(call, { mode, rules: saved() });
+        const again = rules.decide(asked.mine, { mode, rules: saved() });
         if (again.decision === "allow") return { approved: true, answer: "allow", by: "rule" };
         if (again.decision === "deny") return { approved: false, answer: "deny", by: "rule", reason: again.reason };
       }
@@ -306,6 +281,7 @@ export default definePlugin({
           seen.delete(d.toolUseId);
           if (d.decision !== "ask" || !asked) return;
           // 不在这里等回答：observe 要马上返回，内核才能停下来等
+          handled.add(d.toolUseId);
           const signal = turn.signal;
           asking = asking.then(() => settle(asked, signal));
         } else if (e.type === "input.received") {
@@ -322,18 +298,40 @@ export default definePlugin({
           turn = new AbortController();
           seen.clear();
           answered.clear();
+          handled.clear();
         }
       },
+    });
+
+    // 恢复一个上次停在等审批的会话（进程被杀、崩溃）：那些调用的关卡是上一个进程跑的，这里没见过。
+    // 内核恢复时再发一次 awaiting，据此重新问。只知道调用的名字和参数（工具的声明只有关卡拿得到），
+    // 所以当作别的关卡要问的：只有"允许一次"和"拒绝"，不重新套规则
+    ctx.session.subscribe((n) => {
+      if (n.type !== "awaiting") return;
+      const waiting = n.toolUseIds.filter((t) => !handled.has(t) && !seen.has(t));
+      if (waiting.length === 0) return;
+      const batch = ctx.session.state().batch;
+      const signal = turn.signal;
+      for (const toolUseId of waiting) {
+        const c = batch.find((x) => x.toolUseId === toolUseId && x.decision === "ask");
+        if (!c) continue;
+        handled.add(toolUseId);
+        asking = asking.then(() => settle({ call: { toolUseId, name: c.name, input: c.input } }, signal));
+      }
     });
   },
 });
 
-/** 关卡看过的一个调用。mine：是这里的规则要问的（否则是别的插件的关卡要问）；why：auto 模式的审查转给用户时的理由 */
+/** 一个要问的调用。没有 mine 的是别的插件的关卡要问的，或者恢复会话时还在等的；why：auto 模式的审查转给用户时的理由 */
 interface Asked {
-  call: GatedToolCall;
-  mine: boolean;
+  call: AskedCall;
+  /** 这里的规则要问的：关卡看到的完整调用，问之前按它重新判断一次 */
+  mine?: GatedToolCall;
   why?: string;
 }
+
+/** 要问的调用里给用户看的部分；恢复的会话里只有这些 */
+type AskedCall = Pick<GatedToolCall, "toolUseId" | "name" | "input">;
 
 /** 交给内核的回答，和记进 answered 事件的部分（answer、by） */
 interface Verdict {
@@ -433,7 +431,7 @@ async function addForever(file: string, cwd: string, rule: AllowRule): Promise<v
  * 工具自己登记的审批预览（例如文件修改的 diff）。没有登记、返回的不是文字、或者出错时返回 undefined，
  * 用下面的 detail：预览是别的插件的代码，它坏了不能让审批卡住或失败
  */
-async function preview(renderers: Renderers | undefined, call: GatedToolCall): Promise<string | undefined> {
+async function preview(renderers: Renderers | undefined, call: AskedCall): Promise<string | undefined> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     // 预览可能读文件、算 diff；一直不返回时也要能问用户
@@ -450,7 +448,7 @@ async function preview(renderers: Renderers | undefined, call: GatedToolCall): P
 }
 
 /** 给用户看的调用内容：命令、路径和要写的内容，太长的截断 */
-function detail(call: GatedToolCall): string {
+function detail(call: AskedCall): string {
   const input = call.input as Record<string, unknown> | null;
   let text: string;
   if (typeof input?.command === "string") text = input.command;

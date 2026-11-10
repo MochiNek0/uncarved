@@ -3,7 +3,7 @@
 
 import type { Block, LogEvent, RuntimeNotice, Usage } from "uncarved";
 import { definePlugin, type Frontend, type UI } from "@uncarved/jade-api";
-import type { SessionIndex } from "../sessions/index.ts";
+import type { SessionIndex } from "@uncarved/jade-api/services";
 
 const USAGE = `usage: jade -p <prompt> [--resume <session id> | --continue] [--json]
        echo <prompt> | jade -p

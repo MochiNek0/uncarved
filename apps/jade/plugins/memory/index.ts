@@ -3,9 +3,7 @@
 // 用户在 /memory 里改了，下一次请求时附一条说明告诉模型）。
 
 import { definePlugin } from "@uncarved/jade-api";
-import type { Commands } from "../commands/index.ts";
-import type { Prompts } from "../prompts/index.ts";
-import type { Renderers } from "../renderers/index.ts";
+import type { Commands, Prompts, Renderers } from "@uncarved/jade-api/services";
 import { Memory, MEMORY_SCOPES, memoryTool, projectRoot, type MemoryScope } from "./memory.ts";
 import { clip, dim, green, red } from "./style.ts";
 

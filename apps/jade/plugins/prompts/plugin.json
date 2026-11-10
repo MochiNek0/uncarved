@@ -1,6 +1,6 @@
 {
   "id": "jade/prompts",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "api": "^1",
   "entry": "./index.ts",
   "provides": ["prompts@1"],

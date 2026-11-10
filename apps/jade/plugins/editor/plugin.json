@@ -1,0 +1,17 @@
+{
+  "id": "jade/editor",
+  "version": "0.1.0",
+  "api": "^1",
+  "entry": "./index.ts",
+  "requires": ["keys@1"],
+  "optional": ["ui@1"],
+  "config": {
+    "key": {
+      "default": "ctrl+g",
+      "description": "the key that opens the editor: ctrl+<letter> or alt+<letter or digit>"
+    },
+    "editor": {
+      "description": "the editor command ctrl+g opens the input in, for example \"vim\" or \"code --wait\"; default: $VISUAL, then $EDITOR, then vi (notepad on Windows)"
+    }
+  }
+}

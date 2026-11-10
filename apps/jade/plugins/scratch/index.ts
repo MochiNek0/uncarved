@@ -6,8 +6,7 @@ import { mkdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { definePlugin } from "@uncarved/jade-api";
-import type { Approval } from "../approval/index.ts";
-import type { Prompts } from "../prompts/index.ts";
+import type { Approval, Prompts } from "@uncarved/jade-api/services";
 
 /** 会话 id 对应的临时目录 */
 export const scratchDir = (session: string): string => path.join(os.tmpdir(), "jade-scratch", session);

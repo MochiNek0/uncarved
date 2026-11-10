@@ -95,7 +95,52 @@ export function markdownStream(): MarkdownStream {
 export function renderMarkdown(text: string, width: number): string[] {
   const md = markdownStream();
   const out = [...text.split("\n").flatMap((l) => md.push(l)), ...md.flush()];
-  return out.flatMap((l) => (typeof l === "string" ? [l] : l.render(width)));
+  return out.flatMap((l) => (typeof l === "string" ? [l] : l.render(width))).map(visibleRow);
+}
+
+// ---------- 自动折行的记号 ----------
+//
+// 一行太长折成屏幕上的几行时，后面的几行（续行）开头带一个看不见的记号：用鼠标选中复制时，续行接回上一行，
+// 而不是变成换行。记号只用几个控制字符（显示之前去掉；外面来的文字里的控制字符早被 safeScreen 去掉了，不会撞上）：
+//   \x1f  \x1e × gap  \x1d × indent  \x1c
+// gap：折行时上一行行尾去掉了几个空格，接回去时补上；indent：续行开头排版加的几列（列表的缩进、代码块的竖线），接回去时跳过
+
+const SOFT_HEAD = /^\x1f(\x1e*)(\x1d*)\x1c/;
+
+/** 把一行标成续行 */
+export const softRow = (row: string, gap = 0, indent = 0): string => `\x1f${"\x1e".repeat(gap)}${"\x1d".repeat(indent)}\x1c${row}`;
+
+/** 去掉记号，得到要显示的那一行 */
+export const visibleRow = (row: string): string => (row.charCodeAt(0) === 0x1f ? row.replace(SOFT_HEAD, "") : row);
+
+/** 一行是不是续行，以及接回上一行时要补的空格数、要跳过的列数；text 是去掉记号的那一行 */
+export function softInfo(row: string): { text: string; soft: boolean; gap: number; indent: number } {
+  const m = row.charCodeAt(0) === 0x1f ? SOFT_HEAD.exec(row) : null;
+  if (!m) return { text: row, soft: false, gap: 0, indent: 0 };
+  return { text: row.slice(m[0].length), soft: true, gap: m[1]!.length, indent: m[2]!.length };
+}
+
+const WRAP = { hard: true, trim: false } as const;
+
+/**
+ * 按显示宽度折行，保留颜色；每一项是屏幕上的一行，续行带记号。制表符先换成空格：按 0 列算宽度会对不齐、超宽。
+ * 不去掉空格（trim: false），所以续行直接接在上一行后面就是原文
+ */
+export function wrapRows(text: string, width: number): string[] {
+  const expanded = expandTabs(text);
+  // 整段一起折：颜色可能跨行，分开折会丢掉后面几行的颜色
+  const rows = wrapAnsi(expanded, width, WRAP).split("\n");
+  const logical = expanded.split("\n");
+  if (rows.length === logical.length) return rows;
+  // 每个原来的行占了几行：放得下的占一行，放不下的单独折一次数出来（颜色不占宽度，不影响在哪里折）
+  const counts = logical.map((l) => (stringWidth(l) <= width ? 1 : wrapAnsi(l, width, WRAP).split("\n").length));
+  if (counts.reduce((a, b) => a + b, 0) !== rows.length) return rows;
+  let at = 0;
+  for (const n of counts) {
+    for (let i = 1; i < n; i++) rows[at + i] = softRow(rows[at + i]!);
+    at += n;
+  }
+  return rows;
 }
 
 /** 代码块和表格以外的一行 */
@@ -167,11 +212,11 @@ export function expandTabs(text: string, stop = 4): string {
 function hanging(head: string, body: string, rest = " ".repeat(stringWidth(head))): MdLine {
   return {
     render: (width) => {
-      const room = Math.max(1, width - stringWidth(head));
-      return wrapAnsi(expandTabs(body), room, { hard: true, trim: false })
-        .split("\n")
-        // 折行处留下的行尾空格看不见，去掉免得多占一列
-        .map((r, i) => (i === 0 ? head : rest) + r.trimEnd());
+      const indent = stringWidth(head);
+      const room = Math.max(1, width - indent);
+      const rows = wrapAnsi(expandTabs(body), room, WRAP).split("\n");
+      // 折行处留下的行尾空格看不见，去掉免得多占一列；去掉了几个记在续行的记号里，复制时补回去
+      return rows.map((r, i) => (i === 0 ? head + r.trimEnd() : softRow(rest + r.trimEnd(), rows[i - 1]!.length - rows[i - 1]!.trimEnd().length, indent)));
     },
   };
 }

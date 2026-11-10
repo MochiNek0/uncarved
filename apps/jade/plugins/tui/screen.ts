@@ -73,6 +73,8 @@ export interface Screen {
   readonly draft?: { text(): string; insert(text: string): void; set(text: string): void; hint(text: string | undefined): void };
   /** 把文字放进系统剪贴板（OSC 52）；只有终端界面有 */
   copy?(text: string): void;
+  /** 把终端让出来执行 fn（例如启动 $EDITOR），结束后重新接管、重画界面；只有终端界面有 */
+  suspend?<T>(fn: () => T | Promise<T>): Promise<T>;
   /** 清空已经显示的对话（开始新会话时） */
   clear(): void;
   close(): Promise<void>;
@@ -172,6 +174,7 @@ export function safeScreen(screen: Screen): Screen {
       hint: (t) => screen.draft!.hint(t === undefined ? undefined : plain(lf(t))),
     },
     ...(screen.copy ? { copy: (t: string) => screen.copy!(t) } : {}),
+    ...(screen.suspend ? { suspend: <T>(fn: () => T | Promise<T>) => screen.suspend!(fn) } : {}),
     clear: () => screen.clear(),
     close: () => screen.close(),
   };

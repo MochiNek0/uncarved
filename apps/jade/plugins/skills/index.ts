@@ -6,9 +6,7 @@
 
 import path from "node:path";
 import { definePlugin, type Cli, type Sources, type UI } from "@uncarved/jade-api";
-import type { Approval } from "../approval/index.ts";
-import type { Commands } from "../commands/index.ts";
-import type { Prompts } from "../prompts/index.ts";
+import type { Approval, Commands, Prompts } from "@uncarved/jade-api/services";
 import { addSkill, removeSkill, skillsRoot, updateSkills } from "./install.ts";
 import { bold, clip, dim, display, estimateTokens, realPath, red, repoRoot, splitArgs } from "./project.ts";
 import { loadSkills, skillLine, skillsPrompt, skillTool, type Skill } from "./skills.ts";

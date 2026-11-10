@@ -6,10 +6,7 @@
 
 import path from "node:path";
 import { definePlugin, type ScopeContext, type UI } from "@uncarved/jade-api";
-import type { Commands } from "../commands/index.ts";
-import type { Prompts } from "../prompts/index.ts";
-import type { Renderers } from "../renderers/index.ts";
-import type { Task } from "../task/index.ts";
+import type { Commands, Prompts, Renderers, Task } from "@uncarved/jade-api/services";
 import { envWithFile, updateEnvFile, type Env } from "./env.ts";
 import { webRenderers } from "./renderers.ts";
 import { parseOrder, parseResults, SEARCH_PROVIDERS, webTools } from "./web.ts";

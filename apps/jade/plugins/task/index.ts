@@ -5,23 +5,9 @@
 
 import type { Tool, Usage } from "uncarved";
 import { definePlugin, type UI } from "@uncarved/jade-api";
-import type { Approval } from "../approval/index.ts";
-import type { Models } from "../models/index.ts";
-import type { Renderers } from "../renderers/index.ts";
+import type { Approval, Models, Prompts, Renderers, Task } from "@uncarved/jade-api/services";
 import { taskTool, type ApproveSubagent, type TaskProgress } from "./subagent.ts";
 import { clip, dim, red } from "./style.ts";
-
-/** task@1 */
-export interface Task {
-  /**
-   * 给子 Agent 登记一个工具，返回撤销函数；登记者的作用域关闭时自动撤销。工具名已被登记时抛错。
-   * 只读工具（effect 是 "read"）：要求批准的情形（工作目录之外的路径、url 参数）由子 Agent 自己判断，经 ui@1 问用户。
-   * 其他工具（例如 bash）：只执行 approval@1 认定为只读的调用（只读模式下也放行的那些），其余的直接拒绝，不问用户；
-   * 没有 approval@1 时一律拒绝。子 Agent 因此始终不改任何东西。
-   * opts.when：每次启动子 Agent 时调用，返回 false 时这次不给它这个工具（例如没有配置搜索服务时的 web_search）
-   */
-  tool(tool: Tool, opts?: { when?: () => boolean }): () => void;
-}
 
 const DEFAULT_MAX_STEPS = 40;
 const MAX_DETAIL_LINES = 40;
@@ -148,6 +134,8 @@ export default definePlugin({
         maxSteps,
         approve,
         allowed: (call) => ctx.service<Approval>("approval@1")?.allows(ctx.session.id, call) ?? false,
+        // 用到的时候再取：prompts@1 的提供者在自己的 session() 里才读指令文件，可能排在本插件后面
+        ...(ctx.config.instructions === false ? {} : { instructions: () => ctx.service<Prompts>("prompts@1")?.instructions?.(ctx.session.id) ?? [] }),
         id: ctx.plugin,
         usage: (toolUseId, u) => void usage.set(toolUseId, u),
         contextWindow: () => models.current()?.contextWindow,

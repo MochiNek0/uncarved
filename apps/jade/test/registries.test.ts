@@ -7,11 +7,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PluginHost, type SessionManager, type UI } from "../src/index.ts";
-import type { Approval } from "../plugins/approval/index.ts";
-import type { CommandContext, Commands } from "../plugins/commands/index.ts";
-import type { Keys } from "../plugins/keys/index.ts";
-import type { Modes } from "../plugins/modes/index.ts";
-import type { Renderers } from "../plugins/renderers/index.ts";
+import type { Approval, CommandContext, Commands, Keys, Modes, Renderers } from "@uncarved/jade-api/services";
 
 const BUNDLED = path.resolve(import.meta.dir, "../plugins");
 

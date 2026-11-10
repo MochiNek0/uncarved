@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { diffLines, diffStats, hunks, renderDiff } from "../plugins/fs/diff.ts";
 import { fsRenderers } from "../plugins/fs/renderers.ts";
-import type { ToolRenderer } from "../plugins/renderers/index.ts";
+import type { ToolRenderer } from "@uncarved/jade-api/services";
 
 const plain = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
 

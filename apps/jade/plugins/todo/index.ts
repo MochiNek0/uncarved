@@ -5,7 +5,7 @@
 
 import type { Message, Tool } from "uncarved";
 import { definePlugin } from "@uncarved/jade-api";
-import type { Renderers, ToolRenderer } from "../renderers/index.ts";
+import type { Renderers, ToolRenderer } from "@uncarved/jade-api/services";
 
 export type TodoStatus = "pending" | "in_progress" | "completed";
 

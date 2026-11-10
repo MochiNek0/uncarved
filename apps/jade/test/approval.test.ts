@@ -3,6 +3,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
+import { cp, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import { featureHost, msg, reply, results, textOf, use } from "./feature-host.ts";
 
@@ -268,6 +269,42 @@ describe("asking through the kernel", () => {
       expect(w.state.script).toEqual([]);
     } finally {
       await w.host.close();
+    }
+  }, 30_000);
+});
+
+describe("resuming", () => {
+  test("a session killed while it waited for approval asks again when it is resumed", async () => {
+    g.__approver = { answers: ["hang"], seen: [], aborted: 0 };
+    const a = await featureHost({ plugins: [APPROVER] });
+    a.state.interactive = false;
+    a.state.script.push({ content: [use("w", "write_file", { path: "hello.txt", content: "hi\n" })], stopReason: "tool_use" });
+    const s = await a.host.sessions.open();
+    const first = s.send(msg("write it")).catch(() => {});
+    while (s.state.phase !== "awaiting") await Bun.sleep(1);
+    // 进程被杀：正常关闭会结束这一轮，所以先留一份停在等审批的日志，关掉之后放回去
+    const logs = path.join(a.home, "sessions");
+    await cp(logs, `${logs}.killed`, { recursive: true });
+    await a.host.close();
+    await first;
+    await rm(logs, { recursive: true });
+    await rename(`${logs}.killed`, logs);
+
+    g.__approver = { answers: ["once"], seen: [], aborted: 0 };
+    const b = await featureHost({ home: a.home, cwd: a.cwd, plugins: [APPROVER] });
+    b.state.interactive = false;
+    b.state.script.push(reply("done"));
+    try {
+      const r = await b.host.sessions.open({ resume: s.id });
+      await r.recover();
+      expect(existsSync(path.join(b.cwd, "hello.txt"))).toBe(true);
+      // 这个进程里的关卡没见过这个调用：只能允许一次或拒绝
+      expect(g.__approver.seen).toEqual([{ title: "Allow write_file?", detail: expect.stringContaining("+ hi"), options: ["once", "deny"] }]);
+      const answered = (await r.history()).filter((e) => e.type === "jade/approval/answered").map((e) => e.data);
+      expect(answered).toEqual([{ toolUseId: "w", answer: "once", by: "test/approver" }]);
+      expect(r.state.phase).toBe("idle");
+    } finally {
+      await b.host.close();
     }
   }, 30_000);
 });

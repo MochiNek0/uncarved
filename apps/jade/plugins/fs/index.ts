@@ -1,8 +1,7 @@
 // jade/fs：文件工具 read_file、write_file、edit_file、multi_edit、list_dir、glob、grep。
 
 import { definePlugin } from "@uncarved/jade-api";
-import type { Renderers } from "../renderers/index.ts";
-import type { Task } from "../task/index.ts";
+import type { Renderers, Task } from "@uncarved/jade-api/services";
 import { fsTools, SeenFiles } from "./fs.ts";
 import { fsRenderers } from "./renderers.ts";
 

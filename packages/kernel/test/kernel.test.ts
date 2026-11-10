@@ -1344,6 +1344,54 @@ describe("中断与进度", () => {
     expect((await readAll(store, rt.state.sessionId)).some((e) => e.type === "model.requested")).toBe(false);
   });
 
+  test("一批里连续的 safe 调用并发执行，exclusive 的调用单独执行，前后的调用不越过它", async () => {
+    const trace: string[] = [];
+    let running = 0;
+    const timed = (name: string, concurrency: Tool["concurrency"]): Tool => ({
+      ...recordingTool(name, { concurrency }).tool,
+      async execute(input) {
+        const id = (input as { id: string }).id;
+        trace.push(`start ${id} (${running} running)`);
+        running++;
+        await new Promise((r) => setTimeout(r, 10));
+        running--;
+        trace.push(`end ${id}`);
+        return { content: id };
+      },
+    });
+    const { provider } = scripted([
+      {
+        content: [
+          toolUse("t1", "read", { id: "r1" }),
+          toolUse("t2", "read", { id: "r2" }),
+          toolUse("t3", "write", { id: "w" }),
+          toolUse("t4", "read", { id: "r3" }),
+          toolUse("t5", "read", { id: "r4" }),
+        ],
+        stopReason: "tool_use",
+      },
+      { content: [{ kind: "text", text: "done", origin: MODEL, trust: "trusted" }], stopReason: "end" },
+    ]);
+    const rt = await Runtime.create({
+      store: new MemoryLogStore(),
+      provider,
+      plugins: [plugin("p", { tools: [timed("read", "safe"), timed("write", "exclusive")] })],
+    });
+    await rt.send(say("go"));
+    expect(trace).toEqual([
+      "start r1 (0 running)",
+      "start r2 (1 running)",
+      "end r1",
+      "end r2",
+      "start w (0 running)",
+      "end w",
+      "start r3 (0 running)",
+      "start r4 (1 running)",
+      "end r3",
+      "end r4",
+    ]);
+  });
+
   test("依次执行的工具中途被中断：后面的不再启动，未执行的补上错误结果", async () => {
     let rt!: Runtime;
     const a = recordingTool("a", { concurrency: "exclusive" });

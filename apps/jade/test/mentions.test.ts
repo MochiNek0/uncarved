@@ -3,7 +3,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { Renderers } from "../plugins/renderers/index.ts";
+import type { Renderers } from "@uncarved/jade-api/services";
 import { parseMentions } from "../plugins/mentions/attach.ts";
 import { say, cleanup, scriptedHost, textOf } from "./scripted-ui.ts";
 

@@ -15,7 +15,7 @@
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { definePlugin, type UI } from "@uncarved/jade-api";
-import type { Commands } from "../commands/index.ts";
+import type { Commands } from "@uncarved/jade-api/services";
 
 const MAX_DESCRIPTION = 80;
 

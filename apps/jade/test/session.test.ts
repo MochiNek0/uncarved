@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { cp, rename, rm } from "node:fs/promises";
+import path from "node:path";
 import type { Block, ModelResponse, State } from "uncarved";
 import { NO_APPROVAL_REASON, NO_APPROVER_ERROR, ServiceUnavailable, StaleContext } from "../src/index.ts";
 import { info, world } from "./helpers.ts";
@@ -291,6 +293,43 @@ describe("waiting for approval", () => {
     expect(await turn).toContain("was closed");
     expect((await ended(s)).map((e) => e.reason)).toEqual(["aborted"]);
     await host.close();
+  });
+
+  test("a session killed while it waited for approval waits again when resumed: plugins get the awaiting notice and can answer", async () => {
+    // 订阅通知的审批插件：恢复后从 awaiting 通知和 ctx.session.state() 知道哪个调用在等
+    const WATCH = `export default { process(ctx) { ctx.provide("approval@1", {}); }, session(ctx) {
+      globalThis.__ctx = ctx;
+      ctx.kernel.hook({ kind: "gate", point: "tool.gate", fn: (call) => ({ decision: call.tool.effect === "read" ? "allow" : "ask" }) });
+      ctx.session.subscribe((n) => {
+        if (n.type === "awaiting") globalThis.__log.push("awaiting " + n.toolUseIds.map((id) => ctx.session.state().batch.find((c) => c.toolUseId === id).name + ":" + id).join(","));
+      });
+    } };`;
+    const { w, host } = await setup((x) => x.plugin("bundled", { id: "approval", provides: ["approval@1"] }, WATCH));
+    g.__script!.push(call(use("t1", "poke")), say("done"));
+    const s = await host.sessions.open();
+    const first = s.send(msg("go")).catch(() => {});
+    await waiting(s);
+    // 进程被杀：日志停在等审批的地方。正常关闭会结束这一轮，所以先留一份日志，关掉之后放回去
+    const logs = path.join(w.home, "sessions");
+    await cp(logs, `${logs}.killed`, { recursive: true });
+    await host.close();
+    await first;
+    await rm(logs, { recursive: true });
+    await rename(`${logs}.killed`, logs);
+    g.__log = [];
+
+    const again = await w.start();
+    const r = await again.sessions.open({ resume: s.id });
+    expect(r.state.phase).toBe("awaiting");
+    let done = false;
+    const recovered = r.recover().then(() => (done = true));
+    while (!g.__log!.includes("awaiting poke:t1")) await Bun.sleep(1);
+    expect(done).toBe(false);
+    await g.__ctx!.session.send({ kind: "approval", toolUseId: "t1", approved: true });
+    await recovered;
+    expect(results(r.state)).toEqual({ t1: [false, "poke ok"] });
+    expect(g.__log).toEqual(["awaiting poke:t1", "ran poke"]);
+    await again.close();
   });
 
   test("when a plugin asks but no approval plugin guards the session, the turn ends instead of waiting forever", async () => {

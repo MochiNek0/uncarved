@@ -8,7 +8,7 @@ import type { ToolContext } from "uncarved";
 import { shellService } from "../plugins/shell/service.ts";
 import { shellTool, shellTools } from "../plugins/shell/shell.ts";
 import type { UI } from "../src/index.ts";
-import type { CommandContext, Commands } from "../plugins/commands/index.ts";
+import type { CommandContext, Commands } from "@uncarved/jade-api/services";
 import { cleanup, say, scriptedHost, textOf, use } from "./scripted-ui.ts";
 
 let tmp: string[] = [];

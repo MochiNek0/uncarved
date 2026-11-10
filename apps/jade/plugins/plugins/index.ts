@@ -2,7 +2,7 @@
 // 以及每个服务由谁提供。数据来自核心自己的 jade@1 服务，和救援 CLI `jade plugins list` 是同一份状态。
 
 import { definePlugin, type Jade } from "@uncarved/jade-api";
-import type { Commands } from "../commands/index.ts";
+import type { Commands } from "@uncarved/jade-api/services";
 
 export default definePlugin({
   process(ctx) {

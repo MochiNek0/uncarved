@@ -1,15 +1,19 @@
 {
   "id": "jade/task",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "api": "^1",
   "entry": "./index.ts",
   "provides": ["task@1"],
   "requires": ["models@1"],
-  "optional": ["ui@1", "renderers@1", "approval@1"],
+  "optional": ["ui@1", "renderers@1", "approval@1", "prompts@1"],
   "config": {
     "maxSteps": {
       "default": 40,
       "description": "how many responses a sub-agent may make before it is asked for its report"
+    },
+    "instructions": {
+      "default": true,
+      "description": "give sub-agents the user and project instruction files (AGENTS.md / CLAUDE.md) the session loaded; false leaves them out"
     },
     "model": {
       "description": "the model sub-agents use: a model saved by /model, or another model of the current service (for example a cheaper, faster one); default: the session's model"

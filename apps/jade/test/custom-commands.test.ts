@@ -4,7 +4,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { UI } from "../src/index.ts";
-import type { CommandContext, Commands } from "../plugins/commands/index.ts";
+import type { CommandContext, Commands } from "@uncarved/jade-api/services";
 import { fill, parseCommand } from "../plugins/custom-commands/index.ts";
 import { cleanup, scriptedHost } from "./scripted-ui.ts";
 

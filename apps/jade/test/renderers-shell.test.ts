@@ -1,7 +1,7 @@
 // bash 等工具的显示（plugins/shell/renderers.ts）：从旧 jade 的 test/transcript.test.ts 移植。
 
 import { describe, expect, test } from "bun:test";
-import type { ToolRenderer } from "../plugins/renderers/index.ts";
+import type { ToolRenderer } from "@uncarved/jade-api/services";
 import { shellRenderers } from "../plugins/shell/renderers.ts";
 
 const plain = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");

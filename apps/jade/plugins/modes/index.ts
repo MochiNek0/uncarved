@@ -11,22 +11,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type { Tool } from "uncarved";
 import { definePlugin, type UI } from "@uncarved/jade-api";
-import type { Approval } from "../approval/index.ts";
-import type { Commands } from "../commands/index.ts";
-import type { Keys } from "../keys/index.ts";
-import type { Prompts } from "../prompts/index.ts";
-
-/** modes@1 */
-export interface Modes {
-  current(): string;
-  list(): { name: string; description: string }[];
-  /** 换模式，从下一个工具调用起生效 */
-  set(mode: string): void;
-  /** 换到轮换顺序里的下一个 */
-  cycle(): string;
-  /** 模式变化时调用，返回取消订阅的函数；调用方关闭时自动取消 */
-  subscribe(fn: (mode: string) => void): () => void;
-}
+import type { Approval, Commands, Keys, Modes, Prompts } from "@uncarved/jade-api/services";
 
 export const DESCRIPTIONS: Record<string, string> = {
   ask: "ask before edits and commands",

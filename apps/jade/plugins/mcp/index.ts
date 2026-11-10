@@ -8,9 +8,7 @@
 
 import path from "node:path";
 import { definePlugin, type Cli, type ProcessContext, type UI } from "@uncarved/jade-api";
-import type { Commands } from "../commands/index.ts";
-import type { Prompts } from "../prompts/index.ts";
-import type { Task } from "../task/index.ts";
+import type { Commands, Prompts, Task } from "@uncarved/jade-api/services";
 import { describeServer, loadMcpConfig, McpClient, mcpTools, mcpTrustHash } from "./mcp.ts";
 import { manageMcp, manageUsage } from "./install.ts";
 import { bold, clip, dim, display, estimateTokens, green, realPath, red, repoRoot, splitArgs, TrustFile, yellow } from "./project.ts";

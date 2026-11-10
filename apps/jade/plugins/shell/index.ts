@@ -2,10 +2,7 @@
 // 后台命令自己结束时告诉用户，并给模型留一句说明（不用它一直轮询）；/shells 给用户看和停掉后台命令。
 
 import { definePlugin, type UI } from "@uncarved/jade-api";
-import type { Commands } from "../commands/index.ts";
-import type { Prompts } from "../prompts/index.ts";
-import type { Renderers } from "../renderers/index.ts";
-import type { Task } from "../task/index.ts";
+import type { Commands, Prompts, Renderers, Task } from "@uncarved/jade-api/services";
 import { shellRenderers } from "./renderers.ts";
 import { shellService } from "./service.ts";
 import { shellTools, type ShellTools } from "./shell.ts";

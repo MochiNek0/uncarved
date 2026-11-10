@@ -8,7 +8,7 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { GatedToolCall, GateResult, Message, ModelRequest, Usage } from "uncarved";
-import type { Models } from "../models/index.ts";
+import type { Models } from "@uncarved/jade-api/services";
 
 /** 审查的结论，加上这次审查用掉的 token（计入会话用量） */
 export type Review = GateResult & { usage?: Usage };

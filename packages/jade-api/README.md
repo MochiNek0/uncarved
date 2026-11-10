@@ -32,4 +32,10 @@ export default definePlugin({
 运行时用到的一切都从 `ctx` 拿，不要 import jade 本身（`@uncarved/jade`）：那会在进程里加载第二份宿主。
 jade 抛给插件的错误（`PluginError`、`StaleContext`、`ServiceUnavailable`）按 `error.name` 判断。
 
-内置插件提供的服务（`commands@1`、`prompts@1`……）的类型目前在 jade 包里各插件的目录下，还没有单独发布。
+内置插件提供的服务（`commands@1`、`prompts@1`、`models@1`……）的类型在子路径 `@uncarved/jade-api/services` 里，只有类型：
+
+```ts
+import type { Commands, Prompts } from "@uncarved/jade-api/services";
+
+const commands = ctx.require<Commands>("commands@1");
+```

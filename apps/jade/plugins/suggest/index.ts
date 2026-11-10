@@ -10,8 +10,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Delta, Message, ModelRequest } from "uncarved";
 import { definePlugin, type UI } from "@uncarved/jade-api";
-import type { Commands } from "../commands/index.ts";
-import type { Models } from "../models/index.ts";
+import type { Commands, Models } from "@uncarved/jade-api/services";
 
 export const SYSTEM = [
   "You predict the next message the USER will type to an AI coding assistant.",

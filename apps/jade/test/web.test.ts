@@ -5,7 +5,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { Block, Tool, ToolContext } from "uncarved";
 import type { UI } from "../src/index.ts";
-import type { CommandContext, Commands } from "../plugins/commands/index.ts";
+import type { CommandContext, Commands } from "@uncarved/jade-api/services";
 import { htmlToMarkdown, isPrivateHost, parseOrder, parseResults, SEARCH_OFF, SEARCH_PROVIDERS, webTools } from "../plugins/web/web.ts";
 import { msg, say, scripted, turn } from "./scripted-host.ts";
 

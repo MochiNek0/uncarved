@@ -9,7 +9,7 @@
 
 import type { Block, Message } from "uncarved";
 import { definePlugin } from "@uncarved/jade-api";
-import type { Renderers } from "../renderers/index.ts";
+import type { Renderers } from "@uncarved/jade-api/services";
 import { attachMentions } from "./attach.ts";
 import { clip, dim, yellow } from "./style.ts";
 

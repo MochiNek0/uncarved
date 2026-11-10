@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import type { LogEvent } from "uncarved";
-import type { EventRenderer, ToolRenderer } from "../plugins/renderers/index.ts";
+import type { EventRenderer, ToolRenderer } from "@uncarved/jade-api/services";
 import type { Screen, StatusInfo } from "../plugins/tui/screen.ts";
 import { transcript, type TranscriptOptions } from "../plugins/tui/transcript.ts";
 import { clipStyled } from "../plugins/tui/render.ts";

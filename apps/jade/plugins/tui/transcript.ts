@@ -4,7 +4,7 @@
 // 只负责显示和统计，不驱动运行时；前端（frontend.ts）用 lastEnd、turnFailed 决定接下来做什么。
 
 import type { Block, EventDataMap, LogEvent, PendingCall, Runtime, TurnEndReason, Usage } from "uncarved";
-import type { EventRenderer, ToolRenderer } from "../renderers/index.ts";
+import type { EventRenderer, ToolRenderer } from "@uncarved/jade-api/services";
 import { clip, clipStyled, detailsOf, preview, summarize } from "./render.ts";
 import { bold, cyan, dim, green, red, yellow, type Screen } from "./screen.ts";
 
