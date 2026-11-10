@@ -79,7 +79,8 @@ class LiveSession implements Session {
   readonly id: string;
   readonly parts: Part[] = [];
   rt!: Runtime;
-  #queue: { input: UserInput; resolve: () => void; reject: (e: unknown) => void }[] = [];
+  /** 排队的工作：一条输入，或者恢复（recover）。一次只跑一项，Runtime 同一时间只接受一个调用 */
+  #queue: { run: () => Promise<void>; resolve: () => void; reject: (e: unknown) => void }[] = [];
   #after: { fn: () => void | Promise<void>; owner: Owner }[] = [];
   #pump: Promise<void> | undefined;
   /** 离开时的原因；有了以后不再接受输入 */
@@ -103,9 +104,13 @@ class LiveSession implements Session {
   }
 
   send(input: UserInput): Promise<void> {
+    return this.#enqueue(() => this.rt.send(input));
+  }
+
+  #enqueue(run: () => Promise<void>): Promise<void> {
     if (this.#left) return Promise.reject(this.#left);
     return new Promise((resolve, reject) => {
-      this.#queue.push({ input, resolve, reject });
+      this.#queue.push({ run, resolve, reject });
       this.#kick();
     });
   }
@@ -128,8 +133,9 @@ class LiveSession implements Session {
     while (this.#pump) await this.#pump;
   }
 
+  /** 和输入排同一个队：恢复可能要跑完一整轮，这期间插件发来的输入排在它后面，而不是撞上 RuntimeBusy */
   recover(): Promise<void> {
-    return this.rt.recover();
+    return this.#enqueue(() => this.rt.recover());
   }
 
   abort(reason?: unknown): void {
@@ -148,14 +154,14 @@ class LiveSession implements Session {
     });
   }
 
-  /** 一次处理一条输入；每轮之后执行 afterTurn，它们可能又排进新的输入 */
+  /** 一次处理一项排队的工作；每轮之后执行 afterTurn，它们可能又排进新的输入 */
   async #run(): Promise<void> {
     await null; // 让调用方先拿到 send 的 Promise
     for (;;) {
       const job = this.#queue.shift();
       if (job) {
         try {
-          await this.rt.send(job.input);
+          await job.run();
           job.resolve();
         } catch (e) {
           job.reject(e);

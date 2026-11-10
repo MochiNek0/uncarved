@@ -203,6 +203,18 @@ describe("afterTurn and send", () => {
     expect(s.state.messages.length).toBe(4);
     await host.close();
   });
+
+  test("recover takes its place in the queue instead of colliding with an input as busy", async () => {
+    const { host } = await setup();
+    g.__script!.push(say("one"), say("two"));
+    const s = await host.sessions.open();
+    const first = s.send(msg("first"));
+    const recovered = s.recover();
+    const second = s.send(msg("second"));
+    await Promise.all([first, recovered, second]);
+    expect(s.state.messages.length).toBe(4);
+    await host.close();
+  });
 });
 
 describe("switching", () => {

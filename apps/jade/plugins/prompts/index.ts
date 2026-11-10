@@ -1,10 +1,12 @@
 // jade/prompts：在 context.build 里生成系统提示词。其他插件经 prompts@1 往里加段落。
-// 也负责内核不写的、给模型看的说明：内容为空的错误工具结果在投影里补一句原因（results.ts）。
+// 也负责内核不写的、给模型看的说明：内容为空的错误工具结果在投影里补一句原因（results.ts）；
+// 其他插件经 prompts@1 的 note 给模型留一句说明（notes.ts）。
 
 import path from "node:path";
 import type { ContentSource, LogEvent, SystemSegment } from "uncarved";
 import { definePlugin, type UI } from "../../src/api.ts";
 import type { Models } from "../models/index.ts";
+import { Notes } from "./notes.ts";
 import { allInstructions, environment, mainPrompt, realPath } from "./prompts.ts";
 import { explainEmptyResults, whyEmpty, type Reasons, type Why } from "./results.ts";
 
@@ -16,6 +18,13 @@ export interface Prompts {
    * 项目层插件加的段落标为不可信；untrusted 为 true 时也标为不可信（内容来自外部，例如 MCP 服务的说明、仓库里的 skill）
    */
   add(section: { text: string; stable?: boolean; untrusted?: boolean }): () => void;
+  /**
+   * 给模型留一句说明：下一次请求模型时以 "[Note from jade] …" 附在那个会话最后一条用户消息后面，并记进日志，
+   * 之后的请求、恢复的会话里它都在同一个位置。用在命令里做了模型该知道的事（例如用户撤销了它改的文件）、
+   * 又不该替用户发一条消息的时候。不发起新的一轮；会话没有再请求模型就关闭时，说明丢掉。
+   * 项目层插件留的说明标为不可信
+   */
+  note(session: string, text: string): void;
 }
 
 interface Section {
@@ -29,6 +38,8 @@ const ID = "jade/prompts";
 
 /** 其他插件加的段落。模块每个进程只加载一次，进程级和会话级共用 */
 const sections: Section[] = [];
+/** 其他插件留给模型的说明 */
+const notes = new Notes();
 
 function segment(text: string, trust: SystemSegment["trust"] = "trusted", stability: SystemSegment["stability"] = "stable", by = ID, source?: ContentSource): SystemSegment {
   return { text, stability, origin: { by: "plugin", id: by, ...(source ? { source } : {}) }, trust };
@@ -54,6 +65,11 @@ export default definePlugin({
         };
         caller.onDispose(remove);
         return remove;
+      },
+      note(session, text) {
+        if (typeof session !== "string" || !session) throw new Error("prompts.note: session must be a session id");
+        if (typeof text !== "string" || !text) throw new Error("prompts.note: text must be a non-empty string");
+        notes.add(session, { plugin: caller.plugin, text, trusted: caller.layer !== "project" });
       },
     }));
   },
@@ -90,6 +106,9 @@ export default definePlugin({
       optional: true,
       fn: (messages, hook) => explainEmptyResults(messages, { ...(hook.derived[reasonsKey] as Reasons | undefined), ...reasons }, ID),
     });
+
+    ctx.kernel.hook(notes.hook(ctx.session.id, `${ID}/notes`));
+    await ctx.effect(() => () => notes.drop(ctx.session.id));
 
     ctx.kernel.hook({
       kind: "transform",

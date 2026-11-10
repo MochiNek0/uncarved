@@ -6,7 +6,7 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { checkForUpdate } from "../plugins/update/index.ts";
-import { autoUpdate, autoUpdateEnabled, detectInstall, isNewer, newerVersion, upgradeHint, VERSION } from "../src/update.ts";
+import { autoUpdate, autoUpdateEnabled, detectInstall, isNewer, newerVersion, updater, upgradeHint, VERSION } from "../src/update.ts";
 
 describe("update check", () => {
   test("compares versions", () => {
@@ -117,18 +117,18 @@ describe("jade/update", () => {
 
   test("installs a newer jade in the background and says to restart", async () => {
     const notes: string[] = [];
-    await alive(checkForUpdate({ home: await home(), auto: true, install: npm, latest: async () => "99.0.0", command: [process.execPath, "-e", ""], notify: (m) => notes.push(m) }));
+    await alive(checkForUpdate({ update: updater(await home(), { install: npm, latest: async () => "99.0.0", command: [process.execPath, "-e", ""] }), auto: true, notify: (m) => notes.push(m) }));
     expect(notes).toEqual(["jade 99.0.0 was installed in the background; restart jade to use it"]);
   });
 
   test("with auto off it only tells, and an up-to-date or dev jade says nothing", async () => {
     const notes: string[] = [];
     const notify = (m: string) => void notes.push(m);
-    await checkForUpdate({ home: await home(), auto: false, install: npm, latest: async () => "99.0.0", notify });
+    await checkForUpdate({ update: updater(await home(), { install: npm, latest: async () => "99.0.0" }), auto: false, notify });
     expect(notes).toEqual([`jade 99.0.0 is available (you have ${VERSION}); run jade update`]);
     notes.length = 0;
-    await checkForUpdate({ home: await home(), auto: true, install: npm, latest: async () => VERSION, notify });
-    await checkForUpdate({ home: await home(), auto: true, install: { kind: "dev", dir: "/src/jade" }, latest: async () => "99.0.0", notify });
+    await checkForUpdate({ update: updater(await home(), { install: npm, latest: async () => VERSION }), auto: true, notify });
+    await checkForUpdate({ update: updater(await home(), { install: { kind: "dev", dir: "/src/jade" }, latest: async () => "99.0.0" }), auto: true, notify });
     expect(notes).toEqual([]);
   });
 });

@@ -1,7 +1,7 @@
 // /skills add|update|remove：从 git 仓库、npm 包或本地目录安装 skill。
 //
 // 不加 --project 装到 $JADE_HOME/skills/<名字>，加了装到 <工作目录>/.jade/skills/<名字>。
-// 来源的写法和下载复用核心的 source.ts、fetch.ts（和 jade plugins add 同一份）：先下到 skills 目录里的 .staging-*
+// 来源的写法和下载经核心的 sources@1 服务（和 jade plugins add 同一份）：先下到 skills 目录里的 .staging-*
 // （以 . 开头，查找 skill 时跳过），找到 SKILL.md 后再换进正式目录。
 // 安装记录在 skills 目录的 .installed.json（按名字），update 按它重新下载；记录里有安装时的内容哈希，
 // 装好后手动改过的默认不覆盖，要加 --force。skill 只是文字和附带的文件：安装不执行任何东西，也不装依赖。
@@ -9,9 +9,7 @@
 import { randomBytes } from "node:crypto";
 import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { fetchSource, inSubdir } from "../../src/fetch.ts";
-import { treeHash } from "../../src/hash.ts";
-import { parseSource, type PluginSourceSpec } from "../../src/source.ts";
+import type { PluginSourceSpec, Sources } from "../../src/api.ts";
 import { NAME, parseSkill } from "./skills.ts";
 
 export interface SkillRecord {
@@ -31,6 +29,8 @@ export interface SkillRecord {
 }
 
 export interface InstallOptions {
+  /** 核心的 sources@1：识别来源、下载、算内容哈希 */
+  sources: Sources;
   /** $JADE_HOME/skills 或 <工作目录>/.jade/skills */
   root: string;
   /** 解析相对路径用 */
@@ -67,9 +67,26 @@ async function writeRecords(root: string, records: Record<string, SkillRecord>):
 
 const exists = (p: string) => stat(p).then(() => true, () => false);
 
+/** 把 --path 限制在来源目录里，不能跑到外面去 */
+function inSubdir(root: string, subdir: string): string {
+  const full = path.resolve(root, subdir);
+  const rel = path.relative(root, full);
+  if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) throw new Error(`--path ${subdir} points outside the source`);
+  return full;
+}
+
+/** 服务里抛出的错误带着 "plugin jade (sources@1.fetch): " 的前缀；给用户看的只要原来那句 */
+async function plain<T>(call: Promise<T>): Promise<T> {
+  try {
+    return await call;
+  } catch (e) {
+    throw e instanceof Error && e.name === "PluginError" && e.cause instanceof Error ? e.cause : e;
+  }
+}
+
 /** 安装一个 skill，返回它的名字和目录 */
 export async function addSkill(spec: string, opts: InstallOptions): Promise<{ name: string; dir: string }> {
-  const source = await parseSource(spec, opts.cwd);
+  const source = await plain(opts.sources.parse(spec, opts.cwd));
   const record = await install(source, opts);
   return { name: record.name, dir: path.join(path.resolve(opts.root), record.name) };
 }
@@ -87,7 +104,7 @@ export async function updateSkills(names: readonly string[], opts: Omit<InstallO
     }
     try {
       const dir = path.join(root, name);
-      if (!opts.force && (await exists(dir)) && (await treeHash(dir)) !== rec.hash) {
+      if (!opts.force && (await exists(dir)) && (await opts.sources.hash(dir)) !== rec.hash) {
         lines.push(`${name}: changed since it was installed; add --force to overwrite the changes`);
         continue;
       }
@@ -131,7 +148,7 @@ async function install(source: PluginSourceSpec, opts: InstallOptions, prev?: Sk
   const records = await readRecords(root);
   const staging = path.join(root, `.staging-${randomBytes(4).toString("hex")}`);
   try {
-    const { root: fetched, commit } = await fetchSource(source, staging, opts.log);
+    const { root: fetched, commit } = await plain(opts.sources.fetch(source, staging, opts.log));
     const dir = opts.subdir ? inSubdir(fetched, opts.subdir) : fetched;
     if (!(await exists(path.join(dir, "SKILL.md")))) throw new Error(await noSkillMessage(source.spec, dir, fetched));
     const name = prev?.name ?? skillName(parseSkill(await readFile(path.join(dir, "SKILL.md"), "utf8")).meta.name, source, opts.subdir);
@@ -139,7 +156,7 @@ async function install(source: PluginSourceSpec, opts: InstallOptions, prev?: Sk
     if (!opts.force && (await exists(target))) {
       throw new Error(`skill ${name} is already installed in ${target}; run "/skills update ${name}", or add --force to replace it`);
     }
-    const hash = await treeHash(dir);
+    const hash = await opts.sources.hash(dir);
     await rm(target, { recursive: true, force: true });
     await rename(dir, target);
     const now = new Date().toISOString();

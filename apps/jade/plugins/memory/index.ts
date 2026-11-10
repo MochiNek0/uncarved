@@ -7,10 +7,7 @@ import type { Commands } from "../commands/index.ts";
 import type { Prompts } from "../prompts/index.ts";
 import type { Renderers } from "../renderers/index.ts";
 import { Memory, MEMORY_SCOPES, memoryTool, projectRoot, type MemoryScope } from "./memory.ts";
-import { Notes } from "./notes.ts";
 import { clip, dim, green, red } from "./style.ts";
-
-const notes = new Notes();
 
 const args = (input: unknown) => (input ?? {}) as { action?: string; scope?: string; text?: string };
 
@@ -38,7 +35,8 @@ export default definePlugin({
       async run(input, { ui, sessions, signal }) {
         const note = (text: string) => {
           const id = sessions.current?.id;
-          if (id) notes.add(id, text);
+          // 用到的时候再取：可选服务在 process() 开头不一定已经有了
+          if (id) ctx.service<Prompts>("prompts@1")?.note(id, text);
         };
         let text = input.trim();
         if (!text) {
@@ -97,7 +95,6 @@ export default definePlugin({
   async session(ctx) {
     const memory = new Memory(ctx.home, projectRoot(ctx.cwd));
     ctx.kernel.tool(memoryTool(memory));
-    ctx.kernel.hook(notes.hook(ctx.session.id, ctx.plugin, ctx.plugin));
     const text = await memory.prompt();
     // 段落随会话作用域撤销
     if (text) ctx.service<Prompts>("prompts@1")?.add({ text });

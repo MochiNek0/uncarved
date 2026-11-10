@@ -9,8 +9,8 @@ import { realpathSync } from "node:fs";
 import path from "node:path";
 import { definePlugin } from "../../src/api.ts";
 import type { Commands } from "../commands/index.ts";
+import type { Prompts } from "../prompts/index.ts";
 import { Checkpoints, lastTurnChanges, sha256, turnToolNames, type Checkpoint } from "./checkpoint.ts";
-import { Notes } from "./notes.ts";
 import { dim, green } from "./style.ts";
 
 /** 会改文件、参数里有 path 的工具 */
@@ -18,8 +18,6 @@ export const WRITE_TOOLS = new Set(["write_file", "edit_file", "multi_edit"]);
 
 /** shell 命令改了什么无从得知，撤销不了；这一轮跑过时提醒一句 */
 const SHELL_NOTE = "This turn also ran shell commands; what they changed is not undone.";
-
-const notes = new Notes();
 
 /** 显示用：工作目录内的路径用相对形式，统一为正斜杠 */
 function display(cwd: string, full: string): string {
@@ -95,7 +93,7 @@ export default definePlugin({
         const what = [...files.values()].map((cp) =>
           cp.before === null ? `deleted ${show(cp.path)} (you had created it)` : `restored ${show(cp.path)} to its content before your changes`,
         );
-        notes.add(s.id, `The user undid your changes from your last turn: ${what.join("; ")}. Read these files again before changing them.`);
+        ctx.service<Prompts>("prompts@1")?.note(s.id, `The user undid your changes from your last turn: ${what.join("; ")}. Read these files again before changing them.`);
         return green(`Undid ${cps.length} change${cps.length > 1 ? "s" : ""} from the last turn:`) + "\n" + dim(list) + (shellToo ? `\n${dim(SHELL_NOTE)}` : "");
       },
     });
@@ -138,6 +136,5 @@ export default definePlugin({
     });
     // 被拒绝、被中断的调用不经过 tool.after：一轮结束时还留着的都不会再用到，不然整个文件的内容一直占着内存
     ctx.kernel.hook({ kind: "observe", point: "event", fn: (e) => void (e.type === "turn.ended" && before.clear()) });
-    ctx.kernel.hook(notes.hook(sessionId, ctx.plugin, ctx.plugin));
   },
 });

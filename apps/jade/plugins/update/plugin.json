@@ -1,8 +1,9 @@
 {
   "id": "jade/update",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "api": "^1",
   "entry": "./index.ts",
+  "requires": ["update@1"],
   "optional": ["ui@1"],
   "config": {
     "auto": {

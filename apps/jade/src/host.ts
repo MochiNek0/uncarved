@@ -18,15 +18,20 @@ import {
   type PluginSource,
   type ProcessContext,
   type Secrets,
+  type Sources,
 } from "./api.ts";
 import { pluginConfig, readConfigFile, type ConfigFile } from "./config.ts";
+import { fetchSource } from "./fetch.ts";
+import { treeHash } from "./hash.ts";
 import { discover, type BrokenSource, type LayerRoot } from "./manifest.ts";
 import { ambient, invoke, Scope, serviceHandle, type Owner } from "./membrane.ts";
 import { startRemote } from "./remote.ts";
 import { resolve, type Plan, type PlanState } from "./resolve.ts";
 import { scopedSecrets, SecretsStore } from "./secrets.ts";
 import { Sessions } from "./session.ts";
+import { parseSource } from "./source.ts";
 import { countFault, readFaults, readPluginsConfig, writeFaults, type Faults } from "./state.ts";
+import { updater } from "./update.ts";
 
 /** untrusted：项目层插件没有得到用户确认，没有执行它的任何代码 */
 export type PluginState = PlanState | "broken" | "failed" | "untrusted" | "quarantined";
@@ -63,7 +68,11 @@ const CORE_ID = "jade";
 export const JADE_SERVICE = "jade@1";
 /** 核心自己提供的 jade <子命令> 注册表（3.4），名字要和 api.ts 的 Cli 一致 */
 export const CLI_SERVICE = "cli@1";
-const CORE_SERVICES = [JADE_SERVICE, CLI_SERVICE];
+/** 核心自己的下载器（3.4），名字要和 api.ts 的 Sources 一致 */
+export const SOURCES_SERVICE = "sources@1";
+/** jade 本身的版本和升级（3.4），名字要和 api.ts 的 Updater 一致 */
+export const UPDATE_SERVICE = "update@1";
+const CORE_SERVICES = [JADE_SERVICE, CLI_SERVICE, SOURCES_SERVICE, UPDATE_SERVICE];
 
 /** main.ts 在启动宿主之前自己处理的第一个参数：插件注册了也轮不到，所以不让注册 */
 const CORE_WORDS: ReadonlySet<string> = new Set(["plugins", "update", "upgrade", "help", "list", "ls", "add", "install", "remove", "rm", "uninstall", "enable", "disable"]);
@@ -130,6 +139,9 @@ export class PluginHost {
       } satisfies Jade,
       provider: this.#core,
     });
+    // 核心自己装插件、升级自己用的代码，插件经服务用同一份，不 import 核心的模块（3.5）
+    this.#services.set(SOURCES_SERVICE, { impl: { parse: parseSource, fetch: fetchSource, hash: treeHash } satisfies Sources, provider: this.#core });
+    this.#services.set(UPDATE_SERVICE, { impl: updater(opts.home), provider: this.#core });
     // jade <子命令> 的注册表：每个调用方一个实例，调用方关闭（停用、被隔离）时撤销它注册的
     this.#services.set(CLI_SERVICE, {
       impl: (caller: Caller): Cli => ({

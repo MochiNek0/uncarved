@@ -10,17 +10,8 @@ import { stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-export type SourceKind = "git" | "npm" | "local";
-
-export interface PluginSourceSpec {
-  kind: SourceKind;
-  /** git：仓库地址；npm：交给包管理器的写法；local：绝对路径 */
-  location: string;
-  /** git 的分支、tag 或提交 */
-  ref?: string;
-  /** 用户写的原文，记进安装记录 */
-  spec: string;
-}
+import type { PluginSourceSpec } from "./api.ts";
+export type { PluginSourceSpec, SourceKind } from "./api.ts";
 
 /** 识别一个来源。本地路径在这里就已经解析成绝对路径；不检查插件的 plugin.json */
 export async function parseSource(text: string, cwd: string): Promise<PluginSourceSpec> {

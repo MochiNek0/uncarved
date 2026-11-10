@@ -10,7 +10,8 @@ import type { CommandContext, Commands } from "../plugins/commands/index.ts";
 import { manageSkills } from "../plugins/skills/index.ts";
 import { readRecords } from "../plugins/skills/install.ts";
 import { loadSkills, parseSkill, skillTool } from "../plugins/skills/skills.ts";
-import type { SessionManager, UI } from "../src/index.ts";
+import { fetchSource } from "../src/fetch.ts";
+import { parseSource, treeHash, type SessionManager, type Sources, type UI } from "../src/index.ts";
 import { featureHost, msg, reply, results, tempDir, textOf, use } from "./feature-host.ts";
 
 async function skill(base: string, name: string, text: string, files: Record<string, string> = {}) {
@@ -24,6 +25,8 @@ async function skill(base: string, name: string, text: string, files: Record<str
   return dir;
 }
 
+/** 和核心给插件的 sources@1 是同一份函数 */
+const sources: Sources = { parse: parseSource, fetch: fetchSource, hash: treeHash };
 const ui: UI = { interactive: false, notify: () => {}, select: async () => undefined, input: async () => undefined };
 const ctxFor = (sessions: SessionManager): CommandContext => ({ signal: new AbortController().signal, ui, sessions, print: () => {} });
 
@@ -169,30 +172,30 @@ describe("installing skills", () => {
     const src = await tempDir("jade-skills-src-");
     const dir = await skill(src, "pdf-tools", "---\nname: pdf\ndescription: work with PDFs\n---\nv1", { "scripts/a.py": "print(1)" });
 
-    expect(await manageSkills(["add", dir], { home, cwd, cmd: "/skills" })).toContain("installed skill pdf");
+    expect(await manageSkills(["add", dir], { home, cwd, cmd: "/skills", sources })).toContain("installed skill pdf");
     expect(await readFile(path.join(home, "skills", "pdf", "scripts", "a.py"), "utf8")).toBe("print(1)");
-    expect(await manageSkills(["add", dir, "--project"], { home, cwd, cmd: "/skills" })).toContain("installed skill pdf into .jade/skills/pdf");
+    expect(await manageSkills(["add", dir, "--project"], { home, cwd, cmd: "/skills", sources })).toContain("installed skill pdf into .jade/skills/pdf");
     expect(existsSync(path.join(cwd, ".jade", "skills", "pdf", "SKILL.md"))).toBe(true);
     // 装好的 skill 能被找到
     const { skills } = await loadSkills({ home, root: cwd, cwd, userHome: await tempDir("jade-skills-user-") });
     expect(skills.map((s) => [s.name, s.layer])).toEqual([["pdf", "project"]]);
 
-    await expect(manageSkills(["add", dir], { home, cwd, cmd: "/skills" })).rejects.toThrow("already installed");
-    expect(await manageSkills(["update"], { home, cwd, cmd: "/skills" })).toBe("current pdf");
+    await expect(manageSkills(["add", dir], { home, cwd, cmd: "/skills", sources })).rejects.toThrow("already installed");
+    expect(await manageSkills(["update"], { home, cwd, cmd: "/skills", sources })).toBe("current pdf");
     await writeFile(path.join(dir, "SKILL.md"), "---\nname: pdf\ndescription: work with PDFs\n---\nv2");
-    expect(await manageSkills(["update", "pdf"], { home, cwd, cmd: "/skills" })).toContain("updated pdf");
+    expect(await manageSkills(["update", "pdf"], { home, cwd, cmd: "/skills", sources })).toContain("updated pdf");
     expect(await readFile(path.join(home, "skills", "pdf", "SKILL.md"), "utf8")).toContain("v2");
     // 装好后手动改过的不覆盖，除非 --force
     await writeFile(path.join(home, "skills", "pdf", "SKILL.md"), "---\ndescription: mine\n---\nlocal edit");
-    expect(await manageSkills(["update"], { home, cwd, cmd: "/skills" })).toContain("changed since it was installed");
-    expect(await manageSkills(["update", "--force"], { home, cwd, cmd: "/skills" })).toContain("pdf");
+    expect(await manageSkills(["update"], { home, cwd, cmd: "/skills", sources })).toContain("changed since it was installed");
+    expect(await manageSkills(["update", "--force"], { home, cwd, cmd: "/skills", sources })).toContain("pdf");
     expect(await readFile(path.join(home, "skills", "pdf", "SKILL.md"), "utf8")).toContain("v2");
 
-    expect(await manageSkills(["remove", "pdf"], { home, cwd, cmd: "/skills" })).toContain("removed skill pdf");
+    expect(await manageSkills(["remove", "pdf"], { home, cwd, cmd: "/skills", sources })).toContain("removed skill pdf");
     expect(existsSync(path.join(home, "skills", "pdf"))).toBe(false);
     expect(await readRecords(path.join(home, "skills"))).toEqual({});
     expect(existsSync(path.join(cwd, ".jade", "skills", "pdf"))).toBe(true);
-    await expect(manageSkills(["remove", "../x"], { home, cwd, cmd: "/skills" })).rejects.toThrow("invalid skill name");
+    await expect(manageSkills(["remove", "../x"], { home, cwd, cmd: "/skills", sources })).rejects.toThrow("invalid skill name");
   });
 
   test.skipIf(!HAS_GIT)("a git repository with several skills: lists them, --path picks one", async () => {
@@ -205,8 +208,8 @@ describe("installing skills", () => {
     git("add", ".");
     git("commit", "-qm", "init");
     const url = pathToFileURL(repo).href;
-    await expect(manageSkills(["add", `git+${url}`], { home, cwd: home, cmd: "/skills" })).rejects.toThrow(/skills\/docx\n  skills\/xlsx/);
-    expect(await manageSkills(["add", `git+${url}`, "--path", "skills/xlsx"], { home, cwd: home, cmd: "/skills" })).toContain("installed skill xlsx");
+    await expect(manageSkills(["add", `git+${url}`], { home, cwd: home, cmd: "/skills", sources })).rejects.toThrow(/skills\/docx\n  skills\/xlsx/);
+    expect(await manageSkills(["add", `git+${url}`, "--path", "skills/xlsx"], { home, cwd: home, cmd: "/skills", sources })).toContain("installed skill xlsx");
     const rec = (await readRecords(path.join(home, "skills"))).xlsx!;
     expect(rec.kind).toBe("git");
     expect(rec.subdir).toBe("skills/xlsx");

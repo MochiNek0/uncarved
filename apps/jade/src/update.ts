@@ -1,5 +1,5 @@
 // jade 本身的升级：查 npm 上的最新版本，按 jade 的安装方式（npm、bun、pnpm、yarn 全局安装）升级。
-// jade update 直接用这里（核心命令，插件坏了也能升级）；启动时的检查和后台升级在 jade/update 插件里，也用这里。
+// jade update 直接用这里（核心命令，插件坏了也能升级）；启动时的检查和后台升级在 jade/update 插件里，经核心的 update@1 服务（updater）用这里。
 // 启动时的检查每天最多一次，结果缓存在 $JADE_HOME/update-check.json，查不到时什么也不说
 
 import { spawn } from "node:child_process";
@@ -7,7 +7,10 @@ import { closeSync, openSync, readFileSync, realpathSync } from "node:fs";
 import { mkdir, open, readFile, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import type { AutoUpdateResult, Install, Updater } from "./api.ts";
 import { npmCommand, which } from "./fetch.ts";
+
+export type { AutoUpdateResult, Install } from "./api.ts";
 
 export const PACKAGE = "@uncarved/jade";
 /** 正在运行的 jade 的版本 */
@@ -78,8 +81,6 @@ export async function newerVersion(home: string, opts: { now?: number; current?:
   }
   return isNewer(cache.latest, current) ? cache.latest : undefined;
 }
-
-export type Install = { kind: "npm" | "bun" | "pnpm" | "yarn"; dir: string } | { kind: "dev"; dir: string };
 
 /**
  * 看 jade 的包目录（解析符号链接后）在哪：不在 node_modules 里就是仓库里的开发版或 npm link；
@@ -184,13 +185,6 @@ export function autoUpdateEnabled(): boolean {
   return !off(process.env.JADE_AUTO_UPDATE) && !off(process.env.JADE_UPDATE_CHECK);
 }
 
-export type AutoUpdateResult =
-  /** 装好了，下次启动生效 */
-  | { status: "installed" }
-  /** 别的 jade 正在升级，或者这个版本不久前刚失败过：这次不试 */
-  | { status: "skipped"; why: "busy" | "failed-recently" | "unsupported" }
-  | { status: "failed"; log: string };
-
 interface Attempt {
   version: string;
   at: number;
@@ -244,6 +238,18 @@ export async function autoUpdate(home: string, latest: string, opts: { install?:
   }
   await writeFile(attemptFile, JSON.stringify({ version: latest, at: Date.now(), ok } satisfies Attempt) + "\n").catch(() => {});
   return ok ? { status: "installed" } : { status: "failed", log };
+}
+
+/** update@1（3.4）：$JADE_HOME 固定下来的这一套。opts 是测试用的：假装的安装方式、最新版本和升级命令 */
+export function updater(home: string, opts: { install?: Install; latest?: () => Promise<string>; command?: string[] } = {}): Updater {
+  const install = opts.install ?? detectInstall();
+  return {
+    version: VERSION,
+    install: install.kind,
+    newer: () => newerVersion(home, opts.latest ? { latest: opts.latest } : {}),
+    autoEnabled: autoUpdateEnabled,
+    upgrade: (latest) => autoUpdate(home, latest, { install, ...(opts.command ? { command: opts.command } : {}) }),
+  };
 }
 
 /** 新建锁文件；已经有了且不算太旧时返回 false，太旧的（上次的进程不在了）删掉重来 */

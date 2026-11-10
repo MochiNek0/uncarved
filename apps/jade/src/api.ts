@@ -226,6 +226,59 @@ export interface PluginStatus {
   reason?: string;
 }
 
+/**
+ * sources@1：核心自己的下载器，由核心提供（不是插件，见 3.4）。`jade plugins add` 用的就是它；
+ * 插件要从 git、npm 或本地目录装东西（例如 jade/skills 装 skill）时用同一份，不用自己再写一遍。
+ * 只下载，不执行下载下来的任何代码，也不装依赖
+ */
+export interface Sources {
+  /** 识别一个来源的写法（本地目录、npm 包、git 仓库，见 5.4）；相对路径按 cwd 解析。不下载 */
+  parse(text: string, cwd: string): Promise<PluginSourceSpec>;
+  /** 把来源下载到 staging 目录，返回 staging 里来源的根目录；git 来源同时返回提交。清理 staging 是调用方的事 */
+  fetch(source: PluginSourceSpec, staging: string, log?: (text: string) => void): Promise<{ root: string; commit?: string }>;
+  /** 目录内容的哈希（不算 node_modules、.git 和 lock 文件）：记下来，以后判断装好的东西有没有被手动改过 */
+  hash(dir: string): Promise<string>;
+}
+
+export type SourceKind = "git" | "npm" | "local";
+
+/** 识别出来的一个来源（Sources.parse） */
+export interface PluginSourceSpec {
+  kind: SourceKind;
+  /** git：仓库地址；npm：交给包管理器的写法；local：绝对路径 */
+  location: string;
+  /** git 的分支、tag 或提交 */
+  ref?: string;
+  /** 用户写的原文，记进安装记录 */
+  spec: string;
+}
+
+/**
+ * update@1：jade 本身的版本和升级，由核心提供（不是插件，见 3.4）。和 `jade update` 是同一套代码；
+ * 启动时要不要查、查到了怎么告诉用户是插件的事（jade/update）
+ */
+export interface Updater {
+  /** 正在运行的 jade 的版本 */
+  readonly version: string;
+  /** jade 是怎么装的；dev 是仓库里的开发版或 npm link，不能自动升级 */
+  readonly install: Install["kind"];
+  /** 有比当前更新的版本时返回它的版本号。每天最多查一次 npm，其余时候用缓存；查不到时 undefined */
+  newer(): Promise<string | undefined>;
+  /** 用户有没有用环境变量关掉自动升级（JADE_AUTO_UPDATE、JADE_UPDATE_CHECK） */
+  autoEnabled(): boolean;
+  /** 在后台把 jade 升级到 latest，下次启动生效 */
+  upgrade(latest: string): Promise<AutoUpdateResult>;
+}
+
+export type Install = { kind: "npm" | "bun" | "pnpm" | "yarn"; dir: string } | { kind: "dev"; dir: string };
+
+export type AutoUpdateResult =
+  /** 装好了，下次启动生效 */
+  | { status: "installed" }
+  /** 别的 jade 正在升级，或者这个版本不久前刚失败过：这次不试 */
+  | { status: "skipped"; why: "busy" | "failed-recently" | "unsupported" }
+  | { status: "failed"; log: string };
+
 /** ui@1：前端提供的和用户打交道的方式。每个前端都提供它，形状由 jade 定义 */
 export interface UI {
   /** 能不能向用户提问。不能时 select 总是返回 undefined */

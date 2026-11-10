@@ -1,7 +1,7 @@
 {
   "id": "jade/undo",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "api": "^1",
   "entry": "./index.ts",
-  "optional": ["commands@1"]
+  "optional": ["commands@1", "prompts@1"]
 }

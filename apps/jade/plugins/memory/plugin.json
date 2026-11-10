@@ -1,6 +1,6 @@
 {
   "id": "jade/memory",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "api": "^1",
   "entry": "./index.ts",
   "optional": ["prompts@1", "commands@1", "renderers@1"]

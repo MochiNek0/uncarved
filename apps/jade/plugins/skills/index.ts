@@ -5,7 +5,7 @@
 // 它只是给模型看的文字，不执行代码；和旧 jade 一样，列表里有项目层的 skill 时整段标为不可信。
 
 import path from "node:path";
-import { definePlugin, type Cli, type UI } from "../../src/api.ts";
+import { definePlugin, type Cli, type Sources, type UI } from "../../src/api.ts";
 import type { Approval } from "../approval/index.ts";
 import type { Commands } from "../commands/index.ts";
 import type { Prompts } from "../prompts/index.ts";
@@ -37,7 +37,7 @@ export const manageUsage = (cmd: string) => `usage: ${cmd} [list]
 /** list / add / update / remove，参数已经切好；返回给用户看的结果，用法错误或失败时抛错。cmd 用在提示里 */
 export async function manageSkills(
   argv: readonly string[],
-  env: { home: string; cwd: string; cmd: string; log?: (text: string) => void; skills?: Skill[] },
+  env: { home: string; cwd: string; cmd: string; sources: Sources; log?: (text: string) => void; skills?: Skill[] },
 ): Promise<string> {
   const usage = manageUsage(env.cmd);
   const [sub, ...tail] = argv;
@@ -78,12 +78,12 @@ export async function manageSkills(
     case "add":
     case "install": {
       if (positionals.length !== 1) throw new Error(usage);
-      const { name, dir } = await addSkill(positionals[0]!, { root, cwd: env.cwd, force, ...(subdir ? { subdir } : {}), ...(env.log ? { log: env.log } : {}) });
+      const { name, dir } = await addSkill(positionals[0]!, { sources: env.sources, root, cwd: env.cwd, force, ...(subdir ? { subdir } : {}), ...(env.log ? { log: env.log } : {}) });
       return `installed skill ${name} into ${display(env.cwd, dir)}; ${later}`;
     }
     case "update": {
       if (subdir) throw new Error(usage);
-      const lines = await updateSkills(positionals, { root, cwd: env.cwd, force, ...(env.log ? { log: env.log } : {}) });
+      const lines = await updateSkills(positionals, { sources: env.sources, root, cwd: env.cwd, force, ...(env.log ? { log: env.log } : {}) });
       if (lines.length === 0) return `no skills in ${display(env.cwd, root)} were installed with "${env.cmd} add"`;
       if (lines.some((l) => l.startsWith("updated "))) lines.push("a running jade uses the updated skills from its next step");
       return lines.join("\n");
@@ -113,6 +113,7 @@ const warned = new Set<string>();
 
 export default definePlugin({
   process(ctx) {
+    const sources = ctx.require<Sources>("sources@1");
     latest = undefined;
     skillCommands.clear();
     ctx.service<Commands>("commands@1")?.register({
@@ -128,7 +129,7 @@ export default definePlugin({
           return red(errorText(e));
         }
         try {
-          return await manageSkills(argv, { home: ctx.home, cwd: ctx.cwd, cmd: "/skills", log: (t) => cctx.print(dim(t)), ...(latest ? { skills: latest } : {}) });
+          return await manageSkills(argv, { home: ctx.home, cwd: ctx.cwd, cmd: "/skills", sources, log: (t) => cctx.print(dim(t)), ...(latest ? { skills: latest } : {}) });
         } catch (e) {
           return red(errorText(e));
         }
@@ -137,7 +138,7 @@ export default definePlugin({
     // 同样的事也能在终端里做：jade skills add <source> [--project]（cli@1，核心提供）
     ctx.service<Cli>("cli@1")?.register({
       name: "skills",
-      run: (argv, cli) => manageSkills(argv, { home: ctx.home, cwd: ctx.cwd, cmd: "jade skills", log: cli.log }),
+      run: (argv, cli) => manageSkills(argv, { home: ctx.home, cwd: ctx.cwd, cmd: "jade skills", sources, log: cli.log }),
     });
   },
 
