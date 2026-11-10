@@ -369,7 +369,7 @@ export async function listModels(env: Env = process.env, fetchImpl: typeof fetch
   }
 }
 
-function jsonObject(name: string, text: string): Record<string, unknown> {
+export function jsonObject(name: string, text: string): Record<string, unknown> {
   let value: unknown;
   try {
     value = JSON.parse(text);

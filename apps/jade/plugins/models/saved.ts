@@ -1,5 +1,5 @@
 // 保存过的模型：$JADE_HOME/models.json。同一个服务（类型、地址、密钥都相同）只存一份，下面是在它上面用过的模型，
-// 每个模型带自己的设置（输出上限、思考力度、上下文窗口）。.env 里始终是当前用的那一个，这里记着用过的全部，
+// 每个模型带自己的设置（输出上限、思考力度、上下文窗口、openai-compat 的额外请求参数等）。.env 里始终是当前用的那一个，这里记着用过的全部，
 // /model 可以切回去。
 
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -8,7 +8,7 @@ import path from "node:path";
 export type Env = Record<string, string | undefined>;
 
 /** 每个模型自己的设置：切换模型时一起换掉 */
-export const MODEL_SETTINGS = ["JADE_MAX_TOKENS", "JADE_EFFORT", "JADE_CONTEXT_WINDOW", "JADE_RPM", "JADE_VISION"];
+export const MODEL_SETTINGS = ["JADE_MAX_TOKENS", "JADE_EFFORT", "JADE_CONTEXT_WINDOW", "JADE_RPM", "JADE_VISION", "OPENAI_COMPAT_EXTRA_BODY"];
 
 export interface SavedModel {
   name: string;
@@ -34,11 +34,15 @@ export async function readSavedServices(file: string): Promise<SavedService[]> {
     return data.services.flatMap((raw: unknown) => {
       const s = raw as { env?: unknown; models?: unknown } | null;
       if (!s || !Array.isArray(s.models)) return [];
+      // 以前额外请求参数存在服务上：分给它下面没有自己那份的模型
+      const { OPENAI_COMPAT_EXTRA_BODY: extraBody, ...env } = strings(s.env);
       const models = s.models.flatMap((m: unknown) => {
         const name = (m as { name?: unknown } | null)?.name;
-        return typeof name === "string" && name ? [{ name, settings: strings((m as { settings?: unknown }).settings) }] : [];
+        const settings = strings((m as { settings?: unknown }).settings);
+        if (extraBody && settings.OPENAI_COMPAT_EXTRA_BODY === undefined) settings.OPENAI_COMPAT_EXTRA_BODY = extraBody;
+        return typeof name === "string" && name ? [{ name, settings }] : [];
       });
-      return models.length ? [{ env: strings(s.env), models }] : [];
+      return models.length ? [{ env, models }] : [];
     });
   } catch {
     return [];

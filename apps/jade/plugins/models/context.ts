@@ -1,13 +1,13 @@
 // 模型的上下文窗口（最大输入 token 数）。前端显示上下文用量，以后的 jade/compact 据此决定什么时候压缩。
 //
-// 窗口优先取 JADE_CONTEXT_WINDOW；不设时按模型名在一张小表里找（只收录确定的、取偏小的值），找不到用 128000。
+// 窗口优先取 JADE_CONTEXT_WINDOW；不设时按模型名在一张小表里找（只收录确定的、取偏小的值），找不到用 256000。
 
 import { parseTokens } from "./config.ts";
 
 type Env = Record<string, string | undefined>;
 
 /** 认不出模型时的窗口 */
-export const DEFAULT_CONTEXT_WINDOW = 128_000;
+export const DEFAULT_CONTEXT_WINDOW = 256_000;
 
 /** 模型名（不区分大小写，可以带 "anthropic/" 这类前缀）→ 窗口；按顺序取第一个匹配的 */
 const KNOWN_WINDOWS: [RegExp, number][] = [
