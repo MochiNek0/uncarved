@@ -73,7 +73,18 @@ export function withRetry(inner: Provider, opts: RetryOptions = {}): Provider {
           // 实际回复的是被包装者（4.7 第 3 款）
           return { ...res, provider: res.provider ?? inner.id, ...(failures.length > 0 ? { retries: failures } : {}) };
         } catch (err) {
-          if (!(err instanceof ProviderError) || !err.retryable || attempt > retries || options.signal.aborted) throw err;
+          if (!(err instanceof ProviderError) || options.signal.aborted) throw err;
+          if (!err.retryable || attempt > retries) {
+            if (failures.length === 0) throw err;
+            // 失败时没有回复可以带上重试记录：写进错误信息里，会话日志（turn.ended）和界面上都看得到重试过、等了多久
+            const waited = Math.round(failures.reduce((ms, f) => ms + f.delayMs, 0) / 1000);
+            throw new ProviderError(`${err.message} (after ${failures.length} ${failures.length === 1 ? "retry" : "retries"}, ${waited}s of waiting)`, {
+              retryable: err.retryable,
+              status: err.status,
+              retryAfterMs: err.retryAfterMs,
+              cause: err,
+            });
+          }
           // 在计划的时间上随机缩短最多 20%，并行的子 Agent 同时遇到 429 时不会同时重试。
           // 上游给的 retryAfterMs 只当下限：有的服务（尤其是并发数限流）每次都回 Retry-After: 1，
           // 拿它代替退避计划会每秒撞一次，十几秒就把重试次数用完

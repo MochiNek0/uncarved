@@ -134,7 +134,7 @@ describe("withRetry", () => {
       withRetry(inner, { delaysMs: scaled, maxDelayMs: 15, random: () => 1, onRetry: (i) => delays.push(i.delayMs) }).complete(request, {
         signal: new AbortController().signal,
       }),
-    ).rejects.toThrow("429");
+    ).rejects.toThrow("HTTP 429 (after 9 retries, 0s of waiting)");
     // 第一次和最后一次都不超过上限；中间按计划递增
     expect(calls).toBe(10);
     expect(delays).toEqual([15, ...scaled.slice(1).map((d) => Math.round(Math.min(d, 15)))]);
