@@ -50,7 +50,13 @@ const OWN: CommandInfo[] = [
 ];
 
 const KEYS =
-  "Keys: enter send · ctrl+j, alt+enter or \\ then enter: new line · ↑↓ history · esc interrupt (twice to also move queued messages back to the input) · ↑ on the first line edits queued messages · ctrl+o expand · ctrl+c twice to exit";
+  "Keys: enter send · !<command> runs a shell command yourself · ctrl+j, alt+enter or \\ then enter: new line · ↑↓ history · esc interrupt (twice to also move queued messages back to the input) · ↑ on the first line edits queued messages · ctrl+o expand · ctrl+c twice to exit";
+
+/** 退出时最多等正在做的事这么久 */
+const QUIT_WAIT_MS = 3000;
+
+/** 命令运行中的临时显示（CommandContext.progress）最多占几行 */
+const LIVE_ROWS = 8;
 
 /** 第二次 esc 算作"再按一次"的时间窗口 */
 const SECOND_ESC_MS = 3000;
@@ -508,7 +514,9 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
     if (quitting) return;
     quitting = true;
     if (running) current?.abort(new Error("exiting"));
-    await work?.catch(() => {});
+    // 正在做的事停不下来时（例如命令杀不掉）不一直等：退出不能被它卡住
+    for (const ac of commandAborts) ac.abort(new Error("exiting"));
+    await Promise.race([work?.catch(() => {}), new Promise((r) => setTimeout(r, QUIT_WAIT_MS))]);
     keyAbort.abort(new Error("exiting"));
     offMode?.();
     offModel?.();
@@ -571,7 +579,18 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
     }
     const ac = new AbortController();
     commandAborts.add(ac);
-    const ctx: CommandContext = { signal: ac.signal, ui: bridge.ui, sessions: manager, print: (t) => screen.log(t) };
+    // 命令的临时显示：末尾几行，每行占进度区的一行
+    const showLive = (text: string | undefined) => {
+      const lines = text?.replace(/\r\n?/g, "\n").trimEnd().split("\n").slice(-LIVE_ROWS) ?? [];
+      for (let i = 0; i < LIVE_ROWS; i++) screen.progress(`command:${i}`, text !== undefined && i < lines.length ? dim(`  │ ${lines[i]}`) : undefined);
+    };
+    const ctx: CommandContext = {
+      signal: ac.signal,
+      ui: bridge.ui,
+      sessions: manager,
+      print: (t, o) => screen.log(t, o?.details ? { details: o.details } : undefined),
+      progress: showLive,
+    };
     try {
       const result = await found.command.run(rest, ctx);
       if (typeof result === "string") screen.log(result);
@@ -582,6 +601,7 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
     } catch (e) {
       if (!ac.signal.aborted) screen.log(red(`[error] /${name}: ${errorText(e)}`));
     } finally {
+      showLive(undefined);
       commandAborts.delete(ac);
     }
     return true;
@@ -589,6 +609,8 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
 
   function onSubmit(text: string) {
     if (quitting) return;
+    // !<命令> 是 /sh <命令> 的简写（jade/shell 提供）：用户自己执行，不经过模型
+    if (/^!\s*\S/.test(text)) text = `/sh ${text.slice(1).trim()}`;
     const name = commandName(text);
     if (name !== undefined && instant(name)) {
       // 不碰会话的命令运行中也直接执行
@@ -625,6 +647,8 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
         showQueued();
         view.echo(text);
         if (commandName(text) !== undefined) {
+          // 命令可能要跑一阵（/sh 跑测试）：让用户看到它在跑
+          screen.busy("Running");
           if (!(await command(text))) {
             exit = true;
             return;

