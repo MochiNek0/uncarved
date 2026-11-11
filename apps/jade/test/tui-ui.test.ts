@@ -225,7 +225,7 @@ describe("terminal UI", () => {
     expect(screen.draft!.text()).toBe("");
   });
 
-  test("a plugin's hint shows in the empty input; tab or → takes it, typing or a new session drops it", async () => {
+  test("a plugin's hint shows in the empty input; tab or → takes it, typing hides it until the input is empty again, taking, sending or a new session drops it", async () => {
     const { screen, calls, type, output, clear } = setup();
     screen.draft!.hint("run the tests\nand fix what fails");
     await sleep(80);
@@ -235,6 +235,10 @@ describe("terminal UI", () => {
     expect(screen.draft!.text()).toBe("run the tests\nand fix what fails");
     await type("\r");
     expect(calls.submit).toEqual(["run the tests\nand fix what fails"]);
+
+    // 发出去之后提示没了，再按 Tab 什么也不做
+    await type("\t");
+    expect(screen.draft!.text()).toBe("");
 
     // → 也能接受；接受之后提示没了，再按 Tab 什么也不做
     screen.draft!.hint("next");
@@ -246,15 +250,20 @@ describe("terminal UI", () => {
     await type("\t");
     expect(screen.draft!.text()).toBe("");
 
-    // 开始打字就去掉，删回空的也不再出现
+    // 打字时不显示，删回空的又出现，还能接受
     screen.draft!.hint("later");
     await sleep(80);
     await type("x");
-    await type("\x7f");
     clear();
-    await type("\t");
-    expect(screen.draft!.text()).toBe("");
+    await sleep(80);
     expect(output()).not.toContain("later");
+    await type("\x7f");
+    await sleep(80);
+    expect(output()).toContain("later");
+    await type("\t");
+    expect(screen.draft!.text()).toBe("later");
+    screen.draft!.set("");
+    await sleep(80);
 
     // Shift+Tab 仍然切换模式，不接受提示
     screen.draft!.hint("again");

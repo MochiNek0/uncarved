@@ -1641,8 +1641,7 @@ function Prompt({
   /** 提示只在空闲、输入框为空、没有在搜索历史时显示，也只有这时能接受 */
   const hinting = () => hint !== undefined && !busy && current().value === "" && !getSearch();
   const set = (s: EditState) => {
-    // 用户开始打字（或者插件改了输入框）：提示作废
-    if (s.value && hint !== undefined) onHintDone();
+    // 打字时提示只是不显示（hinting() 要求输入框为空），删回空的又出现；发出去才作废
     setState(s);
     setSelected(0);
     setNotice(undefined);
@@ -1657,6 +1656,7 @@ function Prompt({
   };
   const submit = (text: string) => {
     if (!text.trim()) return;
+    if (hint !== undefined) onHintDone();
     remember(text);
     set(empty);
     // 发出去之后弹出的对话框是用户自己要的（/mode、/model），马上就能回答
