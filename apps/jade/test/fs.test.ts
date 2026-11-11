@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import type { Block, Tool, ToolContext } from "uncarved";
 import { applyEditsToText, fsTools, nearMiss, SeenFiles } from "../plugins/fs/fs.ts";
+import { validate } from "../plugins/approval/schema.ts";
 
 // ---------- 辅助 ----------
 
@@ -270,6 +271,16 @@ describe.each(variants)("grep (%s)", (_name, rg) => {
     expect((await exec(tools, "grep", { pattern: "foo", output_mode: "files_with_matches" })).text).toBe("a.ts\nb.md");
     expect((await exec(tools, "grep", { pattern: "foo", output_mode: "count" })).text).toBe("a.ts:2\nb.md:1");
     expect((await exec(tools, "grep", { pattern: "nothing" })).text).toBe("No matches");
+  });
+
+  test("head_limit and glob, the names other tools use", async () => {
+    const { tools } = await repo();
+    expect((await exec(tools, "grep", { pattern: "foo", glob: "*.ts" })).text).toBe("a.ts:2:foo two\na.ts:6:foo six");
+    expect((await exec(tools, "grep", { pattern: "foo", head_limit: 2 })).text).toBe("a.ts:2:foo two\na.ts:6:foo six\n(showing the first 2 of 3 lines)");
+    expect((await exec(tools, "grep", { pattern: "foo", head_limit: "1", output_mode: "files" })).text).toBe("a.ts\n(showing the first 1 of 2 lines)");
+    expect((await exec(tools, "grep", { pattern: "foo", head_limit: 3 })).text).toBe("a.ts:2:foo two\na.ts:6:foo six\nb.md:2:foo");
+    const grep = tools.find((t) => t.name === "grep")!;
+    expect(validate(grep.inputSchema, { pattern: "foo", head_limit: "30", glob: "*.ts" })).toBeUndefined();
   });
 
   test("context lines, with -- between groups", async () => {

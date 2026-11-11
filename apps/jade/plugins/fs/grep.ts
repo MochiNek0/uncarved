@@ -64,7 +64,8 @@ export function grepTool(cwd: string, opts: GrepOptions = {}): Tool {
       `optionally only files matching the glob include (e.g. "*.ts" matches at any depth; "src/**/*.ts" limits it to src). Skips files ignored by git, binary files and .git/node_modules. ` +
       `output_mode: "content" (default) returns "file:line:text" for matches and "file-line-text" for context lines, at most ${MAX_MATCHES} matches; ` +
       `"files" returns only the paths of matching files; "count" returns "file:count". ` +
-      `context (0-${MAX_CONTEXT}) adds that many lines before and after each match in content mode.`,
+      `context (0-${MAX_CONTEXT}) adds that many lines before and after each match in content mode. ` +
+      "head_limit keeps only the first that many lines of the output.",
     inputSchema: {
       type: "object",
       properties: {
@@ -75,6 +76,10 @@ export function grepTool(cwd: string, opts: GrepOptions = {}): Tool {
         // files_with_matches 是 ripgrep / Claude Code 的叫法，很多模型会这样传，当作 files
         output_mode: { type: "string", enum: ["content", "files", "count", "files_with_matches"] },
         context: { type: "integer" },
+        // head_limit、glob 也是 ripgrep / Claude Code 的叫法；不接受的话模型要多花一轮去掉它们重发。
+        // 有的模型把数字写成字符串（"30"），也接受
+        head_limit: { type: ["integer", "string"] },
+        glob: { type: "string" },
       },
       required: ["pattern"],
       additionalProperties: false,
@@ -83,10 +88,12 @@ export function grepTool(cwd: string, opts: GrepOptions = {}): Tool {
     concurrency: "safe",
     idempotent: true,
     async execute(input, { signal }) {
-      const { pattern, path: p = ".", include, ignore_case = false, output_mode = "content", context = 0 } = input as {
+      const { pattern, path: p = ".", glob, include = glob, ignore_case = false, output_mode = "content", context = 0, head_limit } = input as {
         pattern: string;
         path?: string;
         include?: string;
+        glob?: string;
+        head_limit?: number | string;
         ignore_case?: boolean;
         output_mode?: Mode | "files_with_matches";
         context?: number;
@@ -115,7 +122,10 @@ export function grepTool(cwd: string, opts: GrepOptions = {}): Tool {
         else found = result;
       }
       found ??= await jsGrep(search);
-      return { content: format(cwd, found, search) };
+      const lines = format(cwd, found, search).split("\n");
+      const limit = Number(head_limit);
+      if (limit > 0 && lines.length > limit) lines.splice(limit, Infinity, `(showing the first ${limit} of ${lines.length} lines)`);
+      return { content: lines.join("\n") };
     },
   };
 }
