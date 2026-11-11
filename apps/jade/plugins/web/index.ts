@@ -105,7 +105,7 @@ export default definePlugin({
       const shared = ctx.service<Tools>("tools@1");
       if (shared) {
         const sub = webTools({ ...opts, env: () => keys ?? env });
-        for (const tool of sub.tools) shared.register(tool,tool.name === "web_search" ? { when: () => sub.search().length > 0 } : {});
+        for (const tool of sub.tools) shared.register(tool, tool.name === "web_search" ? { when: () => sub.search().length > 0 } : {});
       }
     } catch {}
 
