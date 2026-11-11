@@ -50,7 +50,7 @@ export function shellTool(opts: ShellOptions): Tool {
 interface Background {
   id: string;
   command: string;
-  proc: Proc;
+  proc: Tagged;
   /** 还没被 bash_output 读走的输出 */
   unread: string;
   /** 因超出缓存而丢弃的字符数，下次读取时告诉模型 */
@@ -73,13 +73,7 @@ export function shellTools(opts: ShellOptions): ShellTools {
   const background = new Map<string, Background>();
   let nextId = 1;
 
-  const spawn = (command: string, cwd = opts.cwd) =>
-    spawnProc([executable, "-c", command], {
-      cwd,
-      env,
-      // 自成进程组，超时/中断时能连同子进程一起杀掉
-      detached: process.platform !== "win32",
-    });
+  const spawn = (command: string, cwd = opts.cwd) => launch(executable, env, command, cwd);
 
   async function startBackground(command: string): Promise<string> {
     const id = `bg${nextId++}`;
@@ -106,7 +100,7 @@ export function shellTools(opts: ShellOptions): ShellTools {
   const stop = async (bg: Background) => {
     if (bg.exitCode !== undefined) return;
     bg.killed = true;
-    killTree(executable, env, bg.proc.pid);
+    killTree(executable, env, bg.proc);
     await bg.proc.exited;
   };
 
@@ -137,17 +131,22 @@ export function shellTools(opts: ShellOptions): ShellTools {
       const timeout = Math.min(Math.max(timeout_ms ?? DEFAULT_TIMEOUT_MS, 1000), MAX_TIMEOUT_MS);
       const proc = await spawn(command);
       let timedOut = false;
+      const killed = giveUp();
       const timer = setTimeout(() => {
         timedOut = true;
-        killTree(executable, env, proc.pid);
+        killTree(executable, env, proc);
+        killed.start();
       }, timeout);
-      const kill = () => killTree(executable, env, proc.pid);
+      const kill = () => {
+        killTree(executable, env, proc);
+        killed.start();
+      };
       signal.addEventListener("abort", kill, { once: true });
       try {
         const [stdout, stderr, code] = await Promise.all([
-          collect(proc.stdout, (text) => progress({ kind: "output", stream: "stdout", text })),
-          collect(proc.stderr, (text) => progress({ kind: "output", stream: "stderr", text })),
-          proc.exited,
+          collect(proc.stdout, (text) => progress({ kind: "output", stream: "stdout", text }), true, killed.done),
+          collect(proc.stderr, (text) => progress({ kind: "output", stream: "stderr", text }), true, killed.done),
+          Promise.race([proc.exited, killed.done.then(() => null)]),
         ]);
         signal.throwIfAborted();
         const parts = [
@@ -228,7 +227,7 @@ export function shellTools(opts: ShellOptions): ShellTools {
       for (const bg of background.values()) {
         if (bg.exitCode !== undefined) continue;
         bg.killed = true;
-        killTree(executable, env, bg.proc.pid);
+        killTree(executable, env, bg.proc);
       }
     },
     list: () => [...background.values()].map((bg) => ({ id: bg.id, command: bg.command, status: status(bg) })),
@@ -245,23 +244,34 @@ export function shellTools(opts: ShellOptions): ShellTools {
  * 执行一条命令并把输出收下来（不经过模型、不推进度）；超时或中止时连同子进程一起杀掉。
  * 后台命令和别的插件（`shell@1`，例如 jade/checks）都用它
  */
-export async function capture(executable: string, env: NodeJS.ProcessEnv | undefined, command: string, opts: { cwd?: string; timeoutMs: number; signal?: AbortSignal }): Promise<RunResult> {
+export async function capture(executable: string, env: NodeJS.ProcessEnv | undefined, command: string, opts: { cwd?: string; timeoutMs: number; signal?: AbortSignal; onOutput?: (text: string) => void }): Promise<RunResult> {
   opts.signal?.throwIfAborted();
-  const proc = await spawnProc([executable, "-c", command], {
-    cwd: opts.cwd,
-    env,
-    // 自成进程组，超时/中断时能连同子进程一起杀掉
-    detached: process.platform !== "win32",
-  });
+  const proc = await launch(executable, env, command, opts.cwd);
+  // 输出一到就推给调用方（用户自己执行的命令要边跑边看）；它出错不影响命令
+  const onOutput = (text: string) => {
+    try {
+      opts.onOutput?.(text);
+    } catch {
+      // 调用方的错
+    }
+  };
   let timedOut = false;
-  const kill = () => killTree(executable, env, proc.pid);
+  const killed = giveUp();
+  const kill = () => {
+    killTree(executable, env, proc);
+    killed.start();
+  };
   const timer = setTimeout(() => {
     timedOut = true;
     kill();
   }, opts.timeoutMs);
   opts.signal?.addEventListener("abort", kill, { once: true });
   try {
-    const [stdout, stderr, code] = await Promise.all([collect(proc.stdout, () => {}), collect(proc.stderr, () => {}), proc.exited]);
+    const [stdout, stderr, code] = await Promise.all([
+      collect(proc.stdout, onOutput, true, killed.done),
+      collect(proc.stderr, onOutput, true, killed.done),
+      Promise.race([proc.exited, killed.done.then(() => null)]),
+    ]);
     opts.signal?.throwIfAborted();
     return { code: timedOut ? null : code, output: [stdout, stderr].filter(Boolean).join("\n"), timedOut };
   } finally {
@@ -326,31 +336,69 @@ export function shellEnv(executable: string, env: NodeJS.ProcessEnv = process.en
   return { ...env, [key]: [...dirs, env[key]].filter(Boolean).join(path.delimiter) };
 }
 
+/** 启动的命令和它的标记（killTree 用） */
+type Tagged = Proc & { tag: string };
+
+/** 标记用的环境变量：命令启动的进程都继承它，killTree 在 Windows 上靠它把它们找出来 */
+const TAG = "JADE_SHELL_TAG";
+let launched = 0;
+
+/** 启动 shell 执行一条命令 */
+async function launch(executable: string, env: NodeJS.ProcessEnv | undefined, command: string, cwd: string | undefined): Promise<Tagged> {
+  const tag = `${process.pid}-${Date.now().toString(36)}-${++launched}`;
+  const proc = await spawnProc([executable, "-c", command], {
+    cwd,
+    env: process.platform === "win32" ? { ...(env ?? process.env), [TAG]: tag } : env,
+    // 自成进程组，超时/中断时能连同子进程一起杀掉
+    detached: process.platform !== "win32",
+  });
+  return Object.assign(proc, { tag });
+}
+
 /**
  * 只杀 shell 本身不够：它启动的子进程还占着 stdout/stderr 管道，读取会一直等到它们退出。
- * POSIX 上杀整个进程组。Windows 上 Git Bash（msys）模拟 fork，Windows 进程树里看不到父子关系，
- * 要先在 msys 里按 WINPID 找到 shell 的 msys PID（它也是进程组号）杀掉整组；taskkill /T 兜底非 msys 的 shell
+ * POSIX 上杀整个进程组。Windows 上 Git Bash（msys）模拟 fork，Windows 进程树里看不到父子关系；
+ * 按 WINPID 找也不行：msys 的 exec（bash -c "npm login" 直接换成 npm 那个脚本）会换一个 Windows 进程，
+ * 我们手里的 pid 只剩一个空壳。所以启动时在环境变量里放一个标记，这里在 msys 的 /proc 里把带标记的进程
+ * 找出来，连同它们的进程组（里面有 node 这类不是 msys 的子进程）一起杀掉
  */
-function killTree(shell: string, env: NodeJS.ProcessEnv | undefined, pid: number) {
+function killTree(shell: string, env: NodeJS.ProcessEnv | undefined, proc: Tagged) {
   try {
-    if (process.platform !== "win32") return process.kill(-pid, "SIGKILL");
-    const script = `for d in /proc/[0-9]*; do [ "$(cat "$d/winpid" 2>/dev/null)" = "${pid}" ] && kill -9 -- "-\${d#/proc/}"; done`;
+    if (process.platform !== "win32") return process.kill(-proc.pid, "SIGKILL");
+    const script =
+      `for d in /proc/[0-9]*; do ` +
+      `if grep -qa "${TAG}=${proc.tag}" "$d/environ" 2>/dev/null || [ "$(cat "$d/winpid" 2>/dev/null)" = "${proc.pid}" ]; then ` +
+      `kill -9 -- "-$(cat "$d/pgid")" "\${d#/proc/}" 2>/dev/null; fi; done`;
+    // 先按 Windows 的进程树杀：cmd、node 这类不是 msys 的进程启动的子进程只有这里找得到，先杀掉它们的父进程就找不到了
+    runSync(["taskkill", "/T", "/F", "/PID", String(proc.pid)]);
     try {
+      // 用没有标记的环境变量跑，免得它把自己也算进去
       runSync([shell, "-c", script], { env });
     } catch {
       // 不是 msys/cygwin 的 shell
     }
-    runSync(["taskkill", "/T", "/F", "/PID", String(pid)]);
   } catch {
     // 已经退出
   }
+}
+
+/** 杀掉之后最多再等这么久就不等了：没杀干净的进程还占着输出管道时，读取永远等不到结束，这一轮（和整个界面）就卡在那里 */
+const KILL_GRACE_MS = 2000;
+
+/** start 之后过 KILL_GRACE_MS，done 就 resolve；不 start 永远不 resolve */
+function giveUp(): { start(): void; done: Promise<void> } {
+  let start = () => {};
+  const done = new Promise<void>((resolve) => {
+    start = () => void setTimeout(resolve, KILL_GRACE_MS);
+  });
+  return { start, done };
 }
 
 /**
  * 返回截好的输出：超过 MAX_OUTPUT_CHARS 时保留开头和结尾各一半，中间截掉。
  * 边读边截，输出再多也只占几倍 MAX_OUTPUT_CHARS 的内存。keep 为 false 时只推给 onChunk，不累积，返回空串
  */
-async function collect(stream: AsyncIterable<Uint8Array>, onChunk: (text: string) => void, keep = true): Promise<string> {
+async function collect(stream: AsyncIterable<Uint8Array>, onChunk: (text: string) => void, keep = true, stop?: Promise<void>): Promise<string> {
   const half = MAX_OUTPUT_CHARS / 2;
   const decoder = new TextDecoder();
   let head = "";
@@ -369,8 +417,17 @@ async function collect(stream: AsyncIterable<Uint8Array>, onChunk: (text: string
     // 攒到两倍再截，不用每块都复制
     if (tail.length > 2 * half) tail = tail.slice(-half);
   };
-  for await (const chunk of stream) {
-    const text = decoder.decode(chunk, { stream: true });
+  // stop：不再等（进程杀掉之后管道还被别的进程占着），返回已经读到的
+  const it = stream[Symbol.asyncIterator]();
+  const stopped = stop?.then(() => undefined);
+  for (;;) {
+    const r = await (stopped ? Promise.race([it.next(), stopped]) : it.next());
+    if (!r) {
+      void Promise.resolve(it.return?.()).catch(() => {});
+      break;
+    }
+    if (r.done) break;
+    const text = decoder.decode(r.value, { stream: true });
     if (text) add(text);
   }
   const rest = decoder.decode();

@@ -202,8 +202,11 @@ export default definePlugin({
         if (again.decision === "deny") return { approved: false, answer: "deny", by: "rule", reason: again.reason };
       }
       if (!canAsk()) return { approved: false, answer: "deny", by: "nobody", reason: nobody(call.name) };
-      const rule = rules.ruleFor(call);
-      const shown = (await preview(renderers, call)) ?? detail(call);
+      const allow = rules.rulesFor(call);
+      const described = allow.map(describeRule).join(", ");
+      // "总是允许"的范围只在正文里写一次：写进选项里时，长命令会把两个选项句尾的区别（本会话 / 这个目录）挤出屏幕
+      const covers = asked.mine ? `"Always allow" covers: ${allow.length === 1 && allow[0]!.command !== undefined ? `${allow[0]!.tool}, this exact command only` : described}\n\n` : "";
+      const shown = covers + ((await preview(renderers, call)) ?? detail(call));
       const expired = new AbortController();
       const timer = setTimeout(() => expired.abort(), askTimeoutMs);
       let got: { answer: Answer; by: string; said?: string } | undefined;
@@ -219,8 +222,8 @@ export default definePlugin({
               // 别的插件要问的调用不能"总是允许"：这里的规则管不到它的关卡
               ...(asked.mine
                 ? [
-                    { label: `Always allow ${describeRule(rule)} in this session`, value: "always" as const },
-                    { label: `Always allow ${describeRule(rule)} in this directory, in every session`, value: "forever" as const },
+                    { label: "Always allow in this session", value: "always" as const },
+                    { label: "Always allow in this directory, in every session", value: "forever" as const },
                   ]
                 : []),
               { label: "Deny", value: "deny" },
@@ -235,14 +238,14 @@ export default definePlugin({
         return { approved: false, answer: "deny", by: "timeout", reason: `Nobody answered the approval request for ${call.name} in time. Do not retry it; tell the user what you wanted to do.` };
       }
       if (got?.answer === "always" && asked.mine) {
-        added.push(rule);
+        added.push(...allow);
         return { approved: true, answer: "always", by: got.by };
       }
       if (got?.answer === "forever" && asked.mine) {
-        forever.push(rule);
+        forever.push(...allow);
         try {
-          await addForever(foreverFile, ctx.cwd, rule);
-          ui?.notify(`${describeRule(rule)} is now always allowed in ${ctx.cwd}. To ask again, remove it from ${foreverFile}`, "info");
+          await addForever(foreverFile, ctx.cwd, allow);
+          ui?.notify(`${described} is now always allowed in ${ctx.cwd}. To ask again, remove it from ${foreverFile}`, "info");
         } catch (e) {
           ui?.notify(`could not save the rule to ${foreverFile} (${e instanceof Error ? e.message : String(e)}); it only applies to this session`, "warning");
         }
@@ -368,7 +371,7 @@ async function ask(ui: UI | undefined, request: SelectRequest<Answer>, signal: A
       const channels: Promise<{ answer: Answer; by: string; said?: string } | typeof NONE>[] = [];
       if (ui?.interactive) {
         // 终端里多一项：拒绝并说明。选了它再问一句话，取消或什么都没写就是普通的拒绝
-        const options = [...request.options, { label: "Deny, and tell the agent what to do instead", value: EXPLAIN }];
+        const options = [...request.options, { label: "Deny, and say what to do instead", value: EXPLAIN }];
         channels.push(
           ui.select<string>({ ...request, options }, done.signal).then(async (a) => {
             if (a !== EXPLAIN) return { answer: a !== undefined && ANSWERS.includes(a) ? (a as Answer) : "deny", by: "terminal" };
@@ -418,10 +421,10 @@ async function readForever(file: string): Promise<Record<string, AllowRule[]>> {
   }
 }
 
-async function addForever(file: string, cwd: string, rule: AllowRule): Promise<void> {
+async function addForever(file: string, cwd: string, add: AllowRule[]): Promise<void> {
   const all = await readForever(file);
   const rules = all[cwd] ?? [];
-  if (!rules.some((r) => JSON.stringify(r) === JSON.stringify(rule))) rules.push(rule);
+  for (const rule of add) if (!rules.some((r) => JSON.stringify(r) === JSON.stringify(rule))) rules.push(rule);
   all[cwd] = rules;
   await mkdir(path.dirname(file), { recursive: true });
   await writeFile(file, `${JSON.stringify(all, null, 2)}\n`);

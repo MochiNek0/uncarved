@@ -19,7 +19,7 @@ export type Mood =
   | "writing" // 输出正文或工具参数：低头，眼睛随打字左右移，旁边打字的点
   | "tool" // 运行工具：看向右边转着的圈，身上扫过一道光
   | "asking" // 弹出对话框等用户：睁大眼，头上一个闪烁的感叹号
-  | "stopping" // 正在中断：眯眼，变成琥珀色，冒一滴汗
+  | "stopping" // 正在中断：眯眼，变成琥珀色，汗一滴滴往下滑
   | "happy"; // 刚做完：^ ^ 地原地蹦一下，落地一亮，转头看右边画出一个 ✓，再回过头冲你眨一只眼
 
 /** 做完后笑多久 */
@@ -386,12 +386,13 @@ function side(mood: Mood, now: number, t: number): [number, number, RGB][] {
       const c = mix(BANG[0]!, BANG[1]!, 0.5 + 0.5 * Math.sin(now / 160));
       return [0, 1, 2, 4].map((y) => [1, y, c]);
     }
-    case "stopping":
-      // 汗珠挂在头的右上角，贴着身体
-      return [
-        [-1, 0, SWEAT],
-        [-1, 1, mix(SWEAT, rgb("#ffffff"), 0.4)],
-      ];
+    case "stopping": {
+      // 汗珠从头的右上角贴着身体一滴滴往下滑：亮的一头在下面，上面拖一格淡的；滑到底停一拍再冒下一滴
+      const row = Math.floor((now % 1000) / 200);
+      if (row > 3) return [];
+      const head: [number, number, RGB] = [-1, row, mix(SWEAT, rgb("#ffffff"), 0.4)];
+      return row > 0 ? [[-1, row - 1, SWEAT], head] : [head];
+    }
     default:
       return [];
   }

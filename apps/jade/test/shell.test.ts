@@ -196,4 +196,35 @@ describe("jade/shell in a session", () => {
     await w.send(s, "and now?");
     expect(w.shared.requests.at(-1)!.messages.map((m) => textOf(m.content)).join("\n")).toContain("[Note from jade] Background shell bg1 (exit 3) exited with code 3. Read its remaining output with bash_output.");
   }, 30_000);
+
+  test("/sh runs the user's command without the model and notes the output for the next request", async () => {
+    const w = await scriptedHost();
+    const s = await w.host.sessions.open();
+    const sh = w.host.service<Commands>("commands@1")!.get("sh")!.command;
+    const printed: unknown[] = [];
+    const live: (string | undefined)[] = [];
+    const base = { ui: w.host.service<UI>("ui@1")!, sessions: w.host.sessions, print: (t: string, o?: { details?: string }) => void printed.push([t, o]), progress: (t: string | undefined) => void live.push(t) };
+    const c: CommandContext = { ...base, signal: new AbortController().signal };
+    await sh.run("echo hi", c);
+    // 输出一到就交给前端显示
+    expect(live).toEqual(["hi\n"]);
+    await sh.run("echo no; echo more; exit 3", c);
+    // 用户中途停掉（esc）：已经输出的留下来
+    const ac = new AbortController();
+    const stopping = sh.run("echo started; sleep 10", { ...base, signal: ac.signal });
+    for (let i = 0; i < 50 && !live.some((t) => t?.includes("started")); i++) await Bun.sleep(100);
+    ac.abort(new Error("interrupted by user"));
+    await stopping;
+    // 一行摘要；多行的输出折叠在 details 里
+    expect(printed).toEqual([
+      ["⎿ hi", undefined],
+      ["⎿ exit code 3 · no (+1 lines)", { details: "    no\n    more" }],
+      ["⎿ stopped by the user · started", undefined],
+    ]);
+    expect(await sh.run("  ", c)).toContain("Usage");
+    expect(w.shared.requests).toEqual([]);
+    w.shared.script.push(say("ok"));
+    await w.send(s, "what did it print?");
+    expect(w.shared.requests.at(-1)!.messages.map((m) => textOf(m.content)).join("\n")).toContain("[Note from jade] The user ran this shell command themselves (exit code 0):\n$ echo hi\nhi");
+  }, 30_000);
 });

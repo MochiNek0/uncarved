@@ -32,8 +32,13 @@ export interface CommandContext {
   ui: UI;
   /** 当前会话、新建、恢复（/clear、/resume 用它） */
   sessions: SessionManager;
-  /** 在对话里显示一段文字，可以带 ANSI 颜色 */
-  print(text: string): void;
+  /** 在对话里显示一段文字，可以带 ANSI 颜色。details：折叠起来的完整内容，终端界面里点击或 ctrl+o 展开，其他前端可以不显示 */
+  print(text: string, opts?: { details?: string }): void;
+  /**
+   * 命令还在跑时临时显示的内容（例如正在执行的程序的输出），可以多行；再调用一次换掉上一次的，undefined 去掉。
+   * 显示在对话的最后，只显示末尾几行，命令结束时自动去掉。前端可以不提供
+   */
+  progress?(text: string | undefined): void;
 }
 
 export interface CommandEntry {
@@ -260,7 +265,8 @@ export interface RunResult {
   timedOut: boolean;
 }
 
-export type RunCommand = (command: string, opts: { cwd?: string; timeoutMs: number; signal?: AbortSignal }) => Promise<RunResult>;
+/** onOutput：输出一到就调用（stdout、stderr 各自按到达的顺序，一次可能是半行或好几行） */
+export type RunCommand = (command: string, opts: { cwd?: string; timeoutMs: number; signal?: AbortSignal; onOutput?: (text: string) => void }) => Promise<RunResult>;
 
 /** shell@1 */
 export interface Shell {

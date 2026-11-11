@@ -14,14 +14,69 @@ const firstLine = (command: string) => {
   return line.length > 80 ? `${line.slice(0, 80)}…` : line;
 };
 
+/** /sh 的时限：用户自己看着它跑（登录、安装），给到 bash 工具的上限；不想等就按 esc */
+const SH_TIMEOUT_MS = 600_000;
+/** 边跑边显示的输出最多留这么多个字符（前端只显示末尾几行） */
+const SH_LIVE_CHARS = 4000;
+/** /sh 的结果收起时那一行最多这么多个字符 */
+const SH_SUMMARY = 160;
+// 设了 NO_COLOR（非空）或标准输出不是终端时不输出颜色
+const colors = Boolean(process.stdout.isTTY) && !process.env.NO_COLOR;
+/** 失败的红色，其余的灰色 */
+const shade = (failed: boolean, s: string) => (colors ? (failed ? `\x1b[31m${s}\x1b[39m` : `\x1b[2m${s}\x1b[22m`) : s);
+
 export default definePlugin({
   process(ctx) {
     // 显示方式和会话无关，登记一次留到进程结束；没有 renderers@1（例如 print）时用前端的默认显示
     const renderers = ctx.service<Renderers>("renderers@1");
     if (renderers) for (const r of shellRenderers) renderers.tool(r);
     // shell@1：找 shell 和杀进程树只有一份（见 service.ts）
-    ctx.provide("shell@1", shellService(typeof ctx.config.shell === "string" ? { shell: ctx.config.shell } : {}));
-    ctx.service<Commands>("commands@1")?.register({
+    const shell = shellService(typeof ctx.config.shell === "string" ? { shell: ctx.config.shell } : {});
+    ctx.provide("shell@1", shell);
+    const commands = ctx.service<Commands>("commands@1");
+    // 用户自己执行一条命令（前端里 !<命令> 是它的简写）：不经过模型和审批，不占一轮；
+    // 输出显示给用户，并给模型留一句说明，下一次请求时它能看到
+    commands?.register({
+      name: "sh",
+      args: "<command>",
+      description: "run a shell command yourself (short form: !<command>); the agent sees its output with your next message",
+      // 不是 instant：和消息一样排队，前端才把它当作正在做的事（esc 能停掉它）
+      async run(args, { sessions: manager, signal, print, progress }) {
+        const command = args.trim();
+        if (!command) return "Usage: /sh <command>, or !<command>";
+        if (!shell.executable) return shell.unavailable;
+        // 边跑边显示输出（npm login 这类要看着它的提示）；被 esc 停掉时，已经输出的也留下来
+        let live = "";
+        let r: { code: number | null; output: string; timedOut: boolean };
+        let stopped = false;
+        try {
+          r = await shell.run(command, {
+            cwd: ctx.cwd,
+            timeoutMs: SH_TIMEOUT_MS,
+            signal,
+            onOutput(text) {
+              live = (live + text).slice(-SH_LIVE_CHARS);
+              progress?.(live);
+            },
+          });
+        } catch (e) {
+          if (!signal.aborted) throw e;
+          stopped = true;
+          r = { code: null, output: live.trimEnd(), timedOut: false };
+        }
+        const status = stopped ? "stopped by the user" : r.timedOut ? `timed out after ${SH_TIMEOUT_MS / 1000}s` : `exit code ${r.code}`;
+        const id = manager.current?.id;
+        if (id) ctx.service<Prompts>("prompts@1")?.note(id, `The user ran this shell command themselves (${status}):\n$ ${command}\n${r.output}`);
+        // 和 bash 工具的结果一个样子：一行摘要，完整输出折叠起来
+        const lines = r.output ? r.output.split("\n") : [];
+        const failed = r.code !== 0;
+        const first = failed ? `${status}${lines.length ? ` · ${lines[0]}` : ""}` : (lines[0] ?? "(no output)");
+        const more = lines.length > 1 ? ` (+${lines.length - 1} lines)` : "";
+        const folded = lines.length > 1 || first.length > SH_SUMMARY;
+        print(shade(failed, `⎿ ${first.length > SH_SUMMARY ? `${first.slice(0, SH_SUMMARY)}…` : first}${more}`), folded ? { details: r.output.replace(/^/gm, "    ") } : undefined);
+      },
+    });
+    commands?.register({
       name: "shells",
       args: "[kill <id>]",
       description: "list the background commands the agent started, or stop one",

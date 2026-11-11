@@ -357,9 +357,21 @@ test("a message, an approval dialog, slash commands and /exit through the termin
     // 审批插件经 ui@1 弹出对话框，预览来自 jade/fs 的渲染器
     await until(() => t.output().includes("Allow once"));
     expect(t.output()).toContain("+ hi");
+    // "总是允许"管到什么只在正文里写一次，选项里只有范围
+    expect(t.output()).toContain('"Always allow" covers: write_file');
+    expect(t.output()).toContain("Always allow in this session");
+    expect(t.output()).toContain("Always allow in this directory, in every session");
     await t.type("\r");
     await until(() => t.output().includes("Created hello.txt for you."));
     expect(await readFile(path.join(cwd, "hello.txt"), "utf8")).toBe("hi\n");
+
+    // !<命令>：用户自己执行，不经过模型（脚本里没有多的回复）
+    await t.type("!echo from-$((40+2)); echo second");
+    // 输入框上边框的右边说明这一行是 shell 命令
+    await until(() => t.output().includes(" shell command "));
+    await t.type("\r");
+    // 结果和工具的结果一样收成一行，其余的折叠起来
+    await until(() => t.output().includes("from-42 (+1 lines)"));
 
     await t.type("/mode auto");
     await t.type("\r");

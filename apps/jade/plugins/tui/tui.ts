@@ -1791,7 +1791,12 @@ function Prompt({
           ? setSearch({ query: "", index: 0 })
           : undefined;
       if (key.ctrl && input === "c") {
-        if (busy) return handlers.interrupt();
+        if (busy) {
+          // 第一下中断；停不下来时（卡在 Interrupting）再按一下也能退出
+          if (Date.now() - lastCtrlC.current < 2000) return handlers.exit();
+          lastCtrlC.current = Date.now();
+          return handlers.interrupt();
+        }
         if (state.value) return discard();
         if (Date.now() - lastCtrlC.current < 2000) return handlers.exit();
         lastCtrlC.current = Date.now();
@@ -1888,13 +1893,16 @@ function Prompt({
       ? [Math.min(drag.anchor, drag.focus), Math.max(drag.anchor, drag.focus)]
       : undefined;
 
+  // ! 开头：这一行是用户自己执行的 shell 命令（/sh），边框换个颜色、上边框的右边写一行说明
+  const bang = !search && state.value.startsWith("!");
+
   // 对话框打开时隐藏但不卸载，输入到一半的内容和历史都保留
   return h(
     Box,
     { flexDirection: "column", marginTop: 1, display: active ? "flex" : "none" },
     h(
       Box,
-      { borderStyle: "round", borderColor: busy ? "gray" : "cyan", paddingX: 1 },
+      { borderStyle: "round", borderColor: bang ? "magenta" : busy ? "gray" : "cyan", paddingX: 1 },
       search
         ? h(EditableText, {
             state: { value: search.query, cursor: search.query.length },
@@ -1991,7 +1999,16 @@ function Prompt({
             ? h(Text, { color: "yellow" }, ` ${notice}`)
             : null,
     // 压在输入框上边框的右边，不占行，出现和消失时下面的内容不跳
-    flash ? h(Box, { position: "absolute", top: 0, right: 2 }, h(Text, { color: "green" }, ` ${flash} `)) : null,
+    // ! 开头时同一个位置写这一行是什么（刚复制的提示优先）
+    flash
+      ? h(Box, { position: "absolute", top: 0, right: 2 }, h(Text, { color: "green" }, ` ${flash} `))
+      : bang
+        ? h(
+            Box,
+            { position: "absolute", top: 0, right: 2 },
+            h(Text, { color: "magenta" }, columns >= 70 ? (busy ? " shell command · runs after this turn · esc stops it " : " shell command · you run it, not the agent · esc stops it ") : " shell command "),
+          )
+        : null,
   );
 }
 

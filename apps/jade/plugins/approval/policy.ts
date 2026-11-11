@@ -53,7 +53,8 @@ export interface PolicyOptions {
 
 export interface Policy {
   /** 给"总是允许"一个默认规则：bash 取命令的前两个词，工作目录之外的路径取所在目录，URL 取主机，其他取工具名 */
-  ruleFor(call: { name: string; input: unknown }): AllowRule;
+  /** 用户选"总是允许"时记下的规则；bash 的复合命令可能是好几条 */
+  rulesFor(call: { name: string; input: unknown }): AllowRule[];
   decide(call: GatedToolCall, settings: PolicySettings): GateResult;
   /** 工具参数里的相对路径换成绝对路径，日志里记下的、关卡判断的都是确定的路径 */
   absolutePath(input: unknown): unknown;
@@ -364,19 +365,31 @@ function prefixCovers(words: Word[], prefix: string): boolean {
 
 /**
  * bash 的"总是允许"默认规则：一般取前两个词（"cargo build"、"git commit"），
- * 运行脚本的命令取三个词（"npm run build"）。第二个词就是选项（"rm -rf x"）、只有一个词、
- * 或者分不了词时，只允许这一条命令本身
+ * 运行脚本的命令取三个词（"npm run build"）。第二个词就是选项（"rm -rf x"）、只有一个词时，只允许这一条命令本身。
+ * 复合命令（"git add -A && git commit -m …"、"bun test 2>&1 | tail -20"）里每条不是只读的命令各记一条：
+ * 关卡对复合命令逐条判断，所以下次换了提交信息、换了组合也不用再问。
+ * 分不了词、有输出重定向、或者不是只读的命令带输入重定向时，只允许整条命令原文
  */
-export function bashRule(command: string): AllowRule {
-  const exact = { tool: "bash", command: command.trim() };
-  // 复合命令里只有一条不是只读命令（"bun test 2>&1 | tail -20"）时，规则取它；关卡对复合命令逐条判断
+export function bashRules(command: string): AllowRule[] {
+  const exact = [{ tool: "bash", command: command.trim() }];
   const cmds = shellCommands(command);
   const unsafe = cmds?.filter((c) => c.words[0]!.value !== "cd" && commandKind(c.words.map((w) => w.value)) !== "read");
-  if (!cmds || !unsafe || unsafe.length !== 1 || !cmds.every(quietOutputs) || unsafe[0]!.inputs.length > 0) return exact;
-  const words = unsafe[0]!.words.map((w) => w.value);
-  if (!words || words.length < 2 || words[1]!.startsWith("-") || words.some((w) => DANGEROUS_ARGS.test(w))) return exact;
+  if (!cmds || !unsafe || unsafe.length === 0 || !cmds.every(quietOutputs) || unsafe.some((c) => c.inputs.length > 0)) return exact;
+  // 只有一条命令、又只能按原文记时，记整条原文（和关卡比较的是同一个字符串）
+  if (cmds.length === 1 && !prefixOf(unsafe[0]!.words)) return exact;
+  const rules = unsafe.map((c): AllowRule => {
+    const prefix = prefixOf(c.words);
+    return prefix ? { tool: "bash", prefix } : { tool: "bash", command: joined(c.words) };
+  });
+  return rules.filter((r, i) => rules.findIndex((o) => o.prefix === r.prefix && o.command === r.command) === i);
+}
+
+/** 一条简单命令的前缀规则；只能按原文记时返回 undefined */
+function prefixOf(all: Word[]): string | undefined {
+  const words = all.map((w) => w.value);
+  if (words.length < 2 || words[1]!.startsWith("-") || words.some((w) => DANGEROUS_ARGS.test(w))) return undefined;
   const n = RUNNERS.test(words.slice(0, 2).join(" ")) && words.length >= 3 && !words[2]!.startsWith("-") ? 3 : 2;
-  return { tool: "bash", prefix: words.slice(0, n).join(" ") };
+  return words.slice(0, n).join(" ");
 }
 
 const hostOf = (url: string) => {
@@ -496,12 +509,12 @@ export function policy(opts: PolicyOptions): Policy {
       if (!input || typeof input !== "object" || typeof (input as { path?: unknown }).path !== "string") return input;
       return { ...input, path: path.resolve(opts.cwd, (input as { path: string }).path) };
     },
-    ruleFor(call) {
-      if (call.name === "bash") return bashRule(String((call.input as { command?: unknown }).command ?? ""));
+    rulesFor(call) {
+      if (call.name === "bash") return bashRules(String((call.input as { command?: unknown }).command ?? ""));
       const input = call.input as { path?: unknown; url?: unknown } | null;
       if (typeof input?.url === "string") {
         const host = hostOf(input.url);
-        if (host) return { tool: call.name, host };
+        if (host) return [{ tool: call.name, host }];
       }
       if (typeof input?.path === "string" && !inside(input.path)) {
         const full = path.resolve(opts.cwd, input.path);
@@ -511,9 +524,9 @@ export function policy(opts: PolicyOptions): Policy {
         } catch {
           // 还不存在的文件
         }
-        return { tool: call.name, dir: isDir ? full : path.dirname(full) };
+        return [{ tool: call.name, dir: isDir ? full : path.dirname(full) }];
       }
-      return { tool: call.name };
+      return [{ tool: call.name }];
     },
     decide(call, { mode, rules }) {
       const { tool } = call;
