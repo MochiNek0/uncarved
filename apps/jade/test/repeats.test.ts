@@ -81,6 +81,32 @@ describe("jade/repeats", () => {
     expect(run("read_file", { path: "a.ts" }, false, "read")).not.toContain("already ran earlier");
   });
 
+  test("the same text switched back and forth in a file gets a note the third time, until the user says something", () => {
+    const { respond, gate, after, observe } = hooks();
+    let n = 0;
+    const edit = (name: string, input: object) => {
+      respond();
+      const call = { toolUseId: `t${++n}`, name, input };
+      gate({ ...call, tool: { effect: "write" } });
+      const r = after({ call, content: [{ kind: "text", text: "Edited", origin: { by: "tool", name } }], isError: false });
+      const last = r?.content.at(-1);
+      return last?.kind === "text" ? last.text : "";
+    };
+    const on = { path: "a.tsx", old_string: 'className="bg"', new_string: 'className="overflow-hidden bg"' };
+    const off = { path: "a.tsx", old_string: on.new_string, new_string: on.old_string };
+    expect(edit("edit_file", on)).toBe("");
+    // 改回去一次是正常的撤销
+    expect(edit("edit_file", off)).toBe("");
+    // 别的文件里同样的文字、同一个文件里别的修改都不算
+    expect(edit("edit_file", { ...on, path: "b.tsx" })).toBe("");
+    expect(edit("edit_file", { path: "a.tsx", old_string: "gap-6", new_string: "gap-4" })).toBe("");
+    expect(edit("edit_file", on)).toContain("back and forth 3 times");
+    expect(edit("multi_edit", { path: "a.tsx", edits: [{ old_string: "x", new_string: "y" }, off] })).toContain("back and forth 4 times");
+    // 用户发了新消息（可能就是让它改回去）：重新计
+    observe({ type: "input.received", data: { kind: "message" } });
+    expect(edit("edit_file", on)).toBe("");
+  });
+
   test("repeat notes: a command repeated with nothing else run in between, but not when its output changed", () => {
     const { respond, gate, after } = hooks();
     let n = 0;

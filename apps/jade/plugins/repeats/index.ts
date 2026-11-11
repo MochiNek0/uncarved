@@ -8,6 +8,7 @@
 // 不拒绝：也可能是在等外面的东西变化，只提醒。压缩插件清理或总结了历史后，之前的结果可能已经不在上下文里，都不算重复。
 // 打开文件给用户看（start、xdg-open……）会弹出新窗口：这一轮里打开过、之后什么都没改，再打开就直接拒绝。
 // write_file 之后什么都没改又读回同一个文件，提醒模型内容就是它写的那些。
+// 同一个文件里同一处文字被来回改（A 改成 B、B 改回 A、又改成 B）：模型在凭不可靠的依据猜，第三次起提醒它停下来换个办法查，或者问用户。
 // 这些记录只在本会话的作用域里：恢复会话后从零开始，最多多重试一轮。
 //
 // 从旧 jade 的 plugins/repeats.ts 移植。
@@ -42,6 +43,15 @@ function normalize(cwd: string, p: string): string {
 
 /** 提醒模型的失败次数 */
 const WARN_AFTER = 2;
+/** 同一处文字来回改到第几次时提醒：改过去、改回来各算一次，改回来一次是正常的撤销 */
+const FLIP_AFTER = 3;
+
+/** edit_file、multi_edit 里的每一处替换 */
+function replacements(call: { name: string; input: unknown }): { old_string: string; new_string: string }[] {
+  const input = call.input as { old_string?: unknown; new_string?: unknown; edits?: unknown } | null;
+  const list = call.name === "edit_file" ? [input] : call.name === "multi_edit" && Array.isArray(input?.edits) ? input.edits : [];
+  return list.filter((e): e is { old_string: string; new_string: string } => typeof e?.old_string === "string" && typeof e?.new_string === "string");
+}
 
 const hash = (content: Block[]) => createHash("sha1").update(JSON.stringify(content.map((b) => (b.kind === "text" ? b.text : b)))).digest("hex");
 
@@ -67,6 +77,8 @@ export function repeatsHooks(opts: { cwd: string; id?: string }): LocalHookSpec[
   const opened = new Map<string, number>();
   /** 本轮用 write_file 写过的文件 → 写完时的 changes；用户发消息时清空 */
   const written = new Map<string, number>();
+  /** 文件里互相替换的一对文字 → 本轮里换了几次（不分方向）；用户发消息时清空 */
+  const flips = new Map<string, number>();
   const key = (call: { name: string; input: unknown }) => `${call.name}\0${JSON.stringify(call.input)}`;
   const note = (text: string): Block => ({ kind: "text", text: `[Note from jade] ${text}`, origin: { by: "plugin", id }, trust: "trusted" });
   return [
@@ -120,13 +132,30 @@ export function repeatsHooks(opts: { cwd: string; id?: string }): LocalHookSpec[
             outcome.call.name === "read_file" && typeof file === "string" && written.get(normalize(cwd, file)) === changes
               ? note("You wrote this file with write_file earlier and nothing has changed since: its content is exactly what you gave. Do not read files back to check them.")
               : undefined;
+          let most = 0;
+          if (typeof file === "string") {
+            for (const e of replacements(outcome.call)) {
+              const pair = `${normalize(cwd, file)} ${[e.old_string, e.new_string].sort().join(" ")}`;
+              const n = (flips.get(pair) ?? 0) + 1;
+              flips.set(pair, n);
+              most = Math.max(most, n);
+            }
+          }
+          const flipped =
+            most >= FLIP_AFTER
+              ? note(
+                  `You have now switched this same text back and forth ${most} times in this file. Going back and forth means what you are judging by is unreliable or incomplete. ` +
+                    "Do not flip it again: check your assumption another way (measure it, read the code involved), or tell the user what you see and ask.",
+                )
+              : undefined;
+          const extra = [readBack, flipped].filter((b) => b !== undefined);
           const before = succeeded.get(k);
           // 只读之外的调用（包括这一个）可能改了东西，之后的调用都不算"什么都没变"
           if (!read) version++;
           const result = hash(outcome.content);
           const repeated = before !== undefined && before.version === (read ? version : version - 1) && before.result === result;
           succeeded.set(k, { version, result });
-          if (!repeated) return readBack ? { ...outcome, content: [...outcome.content, readBack] } : undefined;
+          if (!repeated) return extra.length > 0 ? { ...outcome, content: [...outcome.content, ...extra] } : undefined;
           const text =
             "This exact call already ran earlier with the same result, and nothing has changed since (no edits, no other commands, no new message from the user). " +
             "Do not repeat it: use what you already have, or end your turn and tell the user where things stand.";
@@ -152,6 +181,7 @@ export function repeatsHooks(opts: { cwd: string; id?: string }): LocalHookSpec[
           version++;
           opened.clear();
           written.clear();
+          flips.clear();
         }
       },
     },

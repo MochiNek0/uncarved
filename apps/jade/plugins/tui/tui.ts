@@ -1516,7 +1516,7 @@ function Prompt({
   bridge: DraftBridge;
   /** 插件设置的灰色提示 */
   hint?: string;
-  /** 提示被接受了，或者用户开始打字了：去掉它 */
+  /** 提示随消息发出去了：去掉它 */
   onHintDone(): void;
   busy: boolean;
   /** 有排队等待发送的消息 */
@@ -1834,7 +1834,6 @@ function Prompt({
       }
       // Tab 或 →：把提示变成输入框里的文字，接着可以改
       if (((key.tab && !key.shift) || key.rightArrow) && hinting()) {
-        onHintDone();
         browsing.current = -1;
         return set({ value: hint!, cursor: hint!.length });
       }

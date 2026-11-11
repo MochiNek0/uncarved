@@ -1,6 +1,6 @@
 // jade/screenshot：截图工具（见 tool.ts）。本机没有能无头截图的浏览器时不注册这个工具。
 // 模型能不能看图片由 jade/models 的 models@1 给出（JADE_VISION）：不能看时请求里没有这个工具和提示，调用了也不截图。
-// 访问网络的 URL 由 jade/approval 的关卡决定要不要问用户（effect 是 read，路径之外的 URL 会问）。
+// 访问网络的 URL 由 jade/approval 的关卡决定要不要问用户（effect 是 read，本机之外的 URL 会问）。
 
 import { definePlugin } from "@uncarved/jade-api";
 import type { Models, Prompts, Renderers } from "@uncarved/jade-api/services";
@@ -8,7 +8,8 @@ import { findBrowser, screenshotTool } from "./tool.ts";
 
 /** 提示词里的一段：有截图工具时才加 */
 const NOTE =
-  "- When the work is visual (a page, a drawing, styles), take a screenshot of the result and look at it instead of guessing from the source.";
+  "- When the work is visual (a page, a drawing, styles), take a screenshot of the result and look at it instead of guessing from the source. " +
+  "If screenshots keep failing, or keep showing something you cannot explain after a couple of attempts, stop changing code to chase it: tell the user what you see and let them look.";
 
 export default definePlugin({
   process(ctx) {

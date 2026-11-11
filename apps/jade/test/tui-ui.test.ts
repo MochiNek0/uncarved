@@ -225,7 +225,7 @@ describe("terminal UI", () => {
     expect(screen.draft!.text()).toBe("");
   });
 
-  test("a plugin's hint shows in the empty input; tab or → takes it, typing hides it until the input is empty again, taking, sending or a new session drops it", async () => {
+  test("a plugin's hint shows in the empty input; tab or → takes it, typing or taking hides it until the input is empty again, sending or a new session drops it", async () => {
     const { screen, calls, type, output, clear } = setup();
     screen.draft!.hint("run the tests\nand fix what fails");
     await sleep(80);
@@ -240,15 +240,19 @@ describe("terminal UI", () => {
     await type("\t");
     expect(screen.draft!.text()).toBe("");
 
-    // → 也能接受；接受之后提示没了，再按 Tab 什么也不做
+    // → 也能接受；接受之后删回空的，提示又出现，还能再接受
     screen.draft!.hint("next");
     await sleep(80);
     await type("\x1b[C");
     expect(screen.draft!.text()).toBe("next");
+    await type("\x7f\x7f\x7f\x7f");
+    clear();
+    await sleep(80);
+    expect(screen.draft!.text()).toBe("");
+    await type("\t");
+    expect(screen.draft!.text()).toBe("next");
     screen.draft!.set("");
     await sleep(80);
-    await type("\t");
-    expect(screen.draft!.text()).toBe("");
 
     // 打字时不显示，删回空的又出现，还能接受
     screen.draft!.hint("later");

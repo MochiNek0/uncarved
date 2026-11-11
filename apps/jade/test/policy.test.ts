@@ -193,6 +193,13 @@ describe("policy", () => {
     expect(p.decide(gated("web_fetch", { url: "https://evil.example.net/?d=secret" }), { mode: "ask", rules }).decision).toBe("ask");
   });
 
+  test("a url on this machine is not asked about; a name that only looks local is", () => {
+    const p = policy({ cwd });
+    const ask = (url: string) => p.decide(gated("web_fetch", { url }), { mode: "ask", rules: [] }).decision;
+    for (const url of ["http://localhost:3000/products?v=2", "http://127.0.0.1:5173/", "http://[::1]:8080/", "http://app.localhost/"]) expect(ask(url)).toBe("allow");
+    for (const url of ["http://localhost.example.com/", "http://127.0.0.1.nip.io/", "http://192.168.1.5/"]) expect(ask(url)).toBe("ask");
+  });
+
   test("safe commands exclude arguments that write files or run programs", () => {
     for (const c of ["git branch -D main", "git branch new", "git diff --output=x", "git log --output x", "rg --pre sh x", "tree -o out", "tree -ao out"]) {
       expect(isSafeCommand(c)).toBe(false);

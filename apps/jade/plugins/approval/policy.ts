@@ -2,6 +2,7 @@
 // 纯判断，不碰界面和日志；那些在 index.ts。
 //
 // 带 url 参数的只读工具（web_fetch）也要问：网页里的提示注入可以让模型把读到的内容拼进 URL 发出去。
+// 指向本机的 URL（localhost 上的开发服务器，截图最常见的用途）不问：数据不会离开这台机器。
 
 import { realpathSync, statSync } from "node:fs";
 import path from "node:path";
@@ -400,6 +401,10 @@ const hostOf = (url: string) => {
   }
 };
 
+/** 本机的地址：localhost、127.x.x.x、::1（URL 会把 127.1 这类写法规范成 127.0.0.1） */
+const isLoopback = (host: string | undefined) =>
+  host !== undefined && (host === "localhost" || host.endsWith(".localhost") || /^127(\.\d{1,3}){3}$/.test(host) || host === "[::1]");
+
 /**
  * Windows 上 bash 工具跑的是 Git Bash，模型常把路径写成 /c/Users/...（MSYS 的写法）。
  * path.resolve 会把它当成当前盘符下的 \c\Users\...，判断成工作目录之外，只读命令也要确认。
@@ -538,7 +543,7 @@ export function policy(opts: PolicyOptions): Policy {
         (typeof input.path === "string" && !inside(input.path)) ||
         (call.name === "glob" && typeof input.pattern === "string" && globEscapes(input.pattern));
       /** 会把参数发到网络上的只读工具 */
-      const network = typeof input.url === "string";
+      const network = typeof input.url === "string" && !isLoopback(hostOf(input.url));
       const covers = (r: AllowRule) => {
         if (r.tool !== call.name) return false;
         if (r.command !== undefined) return (input.command ?? "").trim() === r.command;
