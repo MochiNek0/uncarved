@@ -20,7 +20,8 @@ const PNG = Buffer.from(
 let tmp: string[] = [];
 afterEach(async () => {
   await cleanup();
-  for (const d of tmp.splice(0)) await rm(d, { recursive: true, force: true });
+  // Windows 上浏览器主进程退出后，子进程还会锁住 profile 一小会儿
+  for (const d of tmp.splice(0)) await rm(d, { recursive: true, force: true, maxRetries: 10 });
 });
 
 async function dir(): Promise<string> {

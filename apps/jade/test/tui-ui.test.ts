@@ -531,8 +531,7 @@ describe("terminal UI", () => {
       context: { used: 50_000, limit: 200_000, compactAt: 136_000 },
       spent: { input: 1_250_000, output: 40_000 },
     });
-    await sleep(80);
-    expect(output()).toContain("plan (shift+tab)");
+    await until(output, "plan (shift+tab)");
     expect(output()).toContain("ctx 50k/200k (25%), compacts at 136k");
     expect(output()).toContain("session 1.3M in / 40k out");
     // shift+tab 不改输入框
