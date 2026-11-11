@@ -20,7 +20,8 @@ export default definePlugin({
     const modelsFile = path.join(ctx.home, "models.json");
     // 当前的模型配置。改配置时整份换掉（updateEnvFile 改的是这一份，apply 再从文件读一遍）
     let env = await envWithFile(envFile);
-    const ui = ctx.service<UI>("ui@1");
+    // 用的时候再取：jade/tui 也依赖这个插件（models@1），它在这之后才激活，这里取到的是 undefined，重试的提示就没人显示
+    const ui = () => ctx.service<UI>("ui@1");
     const watchers = new Set<() => void>();
     const notify = () => {
       for (const fn of watchers) {
@@ -44,11 +45,11 @@ export default definePlugin({
     // 用创建时的这份配置：之后换了配置，新的一份自己建 provider
     const build = (snapshot: Env): Promise<Provider> => {
       return (async () => {
-        const gate = new RateGate({ rpm: rpmFromEnv(snapshot), onLearn: (rpm) => ui?.notify(`rate limited: spacing requests to ${rpm} per minute from now on`, "warning") });
+        const gate = new RateGate({ rpm: rpmFromEnv(snapshot), onLearn: (rpm) => ui()?.notify(`rate limited: spacing requests to ${rpm} per minute from now on`, "warning") });
         return withRetry(await providerFromEnv(snapshot), {
           gate,
           onRetry: ({ attempt, retries, delayMs, error }) =>
-            ui?.notify(`model request failed (${error.message}); retry ${attempt} of ${retries} in ${Math.round(delayMs / 1000)}s`, "warning"),
+            ui()?.notify(`model request failed (${error.message}); retry ${attempt} of ${retries} in ${Math.round(delayMs / 1000)}s`, "warning"),
         });
       })();
     };
