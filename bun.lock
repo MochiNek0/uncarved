@@ -17,7 +17,7 @@
     },
     "apps/jade": {
       "name": "@uncarved/jade",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "bin": {
         "jade": "./bin/jade.js",
       },
@@ -42,7 +42,7 @@
     },
     "packages/jade-api": {
       "name": "@uncarved/jade-api",
-      "version": "1.1.0",
+      "version": "1.2.0",
       "peerDependencies": {
         "uncarved": "workspace:^",
       },

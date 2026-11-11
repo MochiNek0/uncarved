@@ -5,7 +5,7 @@ import type { PluginLayer } from "@uncarved/jade-api";
 export * from "@uncarved/jade-api";
 
 /** 插件 API 的版本，插件在 plugin.json 的 api 字段里用 ^ 范围声明。和 @uncarved/jade-api 的版本一致 */
-export const API_VERSION = "1.1.0";
+export const API_VERSION = "1.2.0";
 
 /** 来源层级，后面的层级更高（3.3） */
 export const LAYERS: readonly PluginLayer[] = ["bundled", "user", "project"];
