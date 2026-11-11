@@ -107,7 +107,7 @@ describe("copying a selection across wrapped rows", () => {
   test("a selection that starts on a continuation row starts a line of its own", () => {
     const rows = rendered("```\naaaa bbbb cccc dddd\n```", 8);
     expect(selectedText({ anchor: { row: 1, col: 0 }, focus: { row: rows.length - 1, col: 1000 } }, (i) => rows[i])).toBe(
-      "aaaa bbbb cccc dddd".slice(rows.map(visibleRow)[0]!.replace("┃ ", "").length).trimStart(),
+      "aaaa bbbb cccc dddd".slice(strip(visibleRow(rows[0]!)).replace("┃ ", "").length).trimStart(),
     );
   });
 });

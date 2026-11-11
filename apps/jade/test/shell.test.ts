@@ -203,7 +203,7 @@ describe("jade/shell in a session", () => {
     const sh = w.host.service<Commands>("commands@1")!.get("sh")!.command;
     const printed: unknown[] = [];
     const live: (string | undefined)[] = [];
-    const base = { ui: w.host.service<UI>("ui@1")!, sessions: w.host.sessions, print: (t: string, o?: { details?: string }) => void printed.push([t, o]), progress: (t: string | undefined) => void live.push(t) };
+    const base = { ui: w.host.service<UI>("ui@1")!, sessions: w.host.sessions, print: (t: string, o?: { details?: string }) => void printed.push([t.replace(/\x1b\[[0-9;]*m/g, ""), o]), progress: (t: string | undefined) => void live.push(t) };
     const c: CommandContext = { ...base, signal: new AbortController().signal };
     await sh.run("echo hi", c);
     // 输出一到就交给前端显示
