@@ -227,4 +227,20 @@ describe("jade/shell in a session", () => {
     await w.send(s, "what did it print?");
     expect(w.shared.requests.at(-1)!.messages.map((m) => textOf(m.content)).join("\n")).toContain("[Note from jade] The user ran this shell command themselves (exit code 0):\n$ echo hi\nhi");
   }, 30_000);
+
+  test("/sh in a conversation that has started sends the result as the user's message, so the agent continues", async () => {
+    const w = await scriptedHost();
+    const s = await w.host.sessions.open();
+    w.shared.script.push(say("run npm login first"));
+    await w.send(s, "publish it");
+    const sh = w.host.service<Commands>("commands@1")!.get("sh")!.command;
+    const c: CommandContext = { signal: new AbortController().signal, ui: w.host.service<UI>("ui@1")!, sessions: w.host.sessions, print: () => {} };
+    expect(await sh.run("echo logged in; exit 1", c)).toEqual({ prompt: "I ran this shell command myself (exit code 1):\n$ echo logged in; exit 1\nlogged in" });
+    // 用户按 esc 停掉的不接着做：只留说明
+    const ac = new AbortController();
+    const stopping = sh.run("sleep 10", { ...c, signal: ac.signal });
+    await Bun.sleep(300);
+    ac.abort(new Error("interrupted by user"));
+    expect(await stopping).toBeUndefined();
+  }, 30_000);
 });

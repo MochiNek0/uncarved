@@ -34,12 +34,13 @@ export default definePlugin({
     const shell = shellService(typeof ctx.config.shell === "string" ? { shell: ctx.config.shell } : {});
     ctx.provide("shell@1", shell);
     const commands = ctx.service<Commands>("commands@1");
-    // 用户自己执行一条命令（前端里 !<命令> 是它的简写）：不经过模型和审批，不占一轮；
-    // 输出显示给用户，并给模型留一句说明，下一次请求时它能看到
+    // 用户自己执行一条命令（前端里 !<命令> 是它的简写）：不经过模型和审批。
+    // 输出显示给用户；会话里已经有对话时，结果作为用户的消息发给模型，它接着做（例如它让用户先 npm login）；
+    // 还没有对话、或用户按 esc 停掉时不开始一轮，只给模型留一句说明，下一次请求时它能看到
     commands?.register({
       name: "sh",
       args: "<command>",
-      description: "run a shell command yourself (short form: !<command>); the agent sees its output with your next message",
+      description: "run a shell command yourself (short form: !<command>); then the agent continues with its output",
       // 不是 instant：和消息一样排队，前端才把它当作正在做的事（esc 能停掉它）
       async run(args, { sessions: manager, signal, print, progress }) {
         const command = args.trim();
@@ -65,8 +66,6 @@ export default definePlugin({
           r = { code: null, output: live.trimEnd(), timedOut: false };
         }
         const status = stopped ? "stopped by the user" : r.timedOut ? `timed out after ${SH_TIMEOUT_MS / 1000}s` : `exit code ${r.code}`;
-        const id = manager.current?.id;
-        if (id) ctx.service<Prompts>("prompts@1")?.note(id, `The user ran this shell command themselves (${status}):\n$ ${command}\n${r.output}`);
         // 和 bash 工具的结果一个样子：一行摘要，完整输出折叠起来
         const lines = r.output ? r.output.split("\n") : [];
         const failed = r.code !== 0;
@@ -74,6 +73,9 @@ export default definePlugin({
         const more = lines.length > 1 ? ` (+${lines.length - 1} lines)` : "";
         const folded = lines.length > 1 || first.length > SH_SUMMARY;
         print(shade(failed, `⎿ ${first.length > SH_SUMMARY ? `${first.slice(0, SH_SUMMARY)}…` : first}${more}`), folded ? { details: r.output.replace(/^/gm, "    ") } : undefined);
+        const session = manager.current;
+        if (!stopped && session && session.state.messages.length > 0) return { prompt: `I ran this shell command myself (${status}):\n$ ${command}\n${r.output}` };
+        if (session) ctx.service<Prompts>("prompts@1")?.note(session.id, `The user ran this shell command themselves (${status}):\n$ ${command}\n${r.output}`);
       },
     });
     commands?.register({
