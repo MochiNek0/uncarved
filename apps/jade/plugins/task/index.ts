@@ -1,59 +1,22 @@
 // jade/task：task 工具，把调研交给只读的子 Agent（见 subagent.ts）。
 //
-// 子 Agent 用哪些工具：插件经 task@1 登记只读工具（jade/fs 登记 read_file、list_dir、glob、grep），
-// 登记随登记者的作用域撤销。主会话里的工具对象是各插件私有的，子 Agent 拿到的是登记者另给的一份。
+// 子 Agent 用哪些工具：其他插件登记在 tools@1（jade/tools）里的那些（jade/fs 登记 read_file、list_dir、glob、grep），
+// 每次启动子 Agent 时取。主会话里的工具对象是各插件私有的，子 Agent 拿到的是登记者另给的一份。
 
-import type { Tool, Usage } from "uncarved";
+import type { Usage } from "uncarved";
 import { definePlugin, type UI } from "@uncarved/jade-api";
-import type { Approval, Models, Prompts, Renderers, Task } from "@uncarved/jade-api/services";
+import type { Approval, Models, Prompts, Renderers, Tools } from "@uncarved/jade-api/services";
 import { taskTool, type ApproveSubagent, type TaskProgress } from "./subagent.ts";
 import { clip, dim, red } from "./style.ts";
 
 const DEFAULT_MAX_STEPS = 40;
 const MAX_DETAIL_LINES = 40;
 
-/** 登记的只读工具，按登记顺序 */
-const registry: { tool: Tool; plugin: string; when?: () => boolean }[] = [];
-
-/** 这次启动子 Agent 时给它的工具：同名的取最后登记的那个，when 返回 false 或出错的不给 */
-function available(): Tool[] {
-  const latest = new Map<string, (typeof registry)[number]>();
-  for (const r of registry) {
-    latest.delete(r.tool.name);
-    latest.set(r.tool.name, r);
-  }
-  return [...latest.values()].flatMap((r) => {
-    try {
-      return !r.when || r.when() ? [r.tool] : [];
-    } catch {
-      return [];
-    }
-  });
-}
-
 /** 子 Agent 的审批一次问一个：并行的几个子 Agent 不同时弹对话框 */
 let asking: Promise<unknown> = Promise.resolve();
 
 export default definePlugin({
   process(ctx) {
-    ctx.provide("task@1", (caller): Task => ({
-      tool(tool, opts) {
-        if (typeof tool?.name !== "string" || typeof tool.execute !== "function") throw new Error("task.tool: a tool needs a name and execute");
-        // 同一个插件重复登记是正常的：换会话时新会话先登记，旧会话随后撤销它的那份；取最后登记的
-        const taken = registry.find((r) => r.tool.name === tool.name && r.plugin !== caller.plugin);
-        if (taken) throw new Error(`task.tool: ${tool.name} is already registered by ${taken.plugin}`);
-        if (opts?.when !== undefined && typeof opts.when !== "function") throw new Error("task.tool: when must be a function");
-        const entry = { tool, plugin: caller.plugin, ...(opts?.when ? { when: opts.when } : {}) };
-        registry.push(entry);
-        const revoke = () => {
-          const i = registry.indexOf(entry);
-          if (i !== -1) registry.splice(i, 1);
-        };
-        caller.onDispose(revoke);
-        return revoke;
-      },
-    }));
-
     const renderers = ctx.service<Renderers>("renderers@1");
     if (renderers) {
       // 运行中每个只有一行进度（标签、调用过几个工具、正在做什么），并行的几个靠标签分清；结束时把它调用过的工具放进结果的折叠内容里
@@ -130,7 +93,14 @@ export default definePlugin({
       taskTool({
         cwd: ctx.cwd,
         provider: { id: ctx.plugin, complete: (req, o) => models.complete(req, model ? { ...o, model } : o) },
-        tools: available,
+        // 没有 jade/tools、或者它被隔离了（服务已失效，调用会抛错）：子 Agent 没有工具
+        tools: () => {
+          try {
+            return ctx.service<Tools>("tools@1")?.list() ?? [];
+          } catch {
+            return [];
+          }
+        },
         maxSteps,
         approve,
         allowed: (call) => ctx.service<Approval>("approval@1")?.allows(ctx.session.id, call) ?? false,

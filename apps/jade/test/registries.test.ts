@@ -7,7 +7,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PluginHost, type SessionManager, type UI } from "../src/index.ts";
-import type { Approval, CommandContext, Commands, Keys, Modes, Renderers } from "@uncarved/jade-api/services";
+import type { Approval, CommandContext, Commands, Keys, Modes, Renderers, Tools } from "@uncarved/jade-api/services";
 
 const BUNDLED = path.resolve(import.meta.dir, "../plugins");
 
@@ -26,11 +26,12 @@ const FAKE_MODEL = `export default { process(ctx) {
   ctx.provide("models@1", { current: () => ({ kind: "scripted", model: "s1", via: "a script", contextWindow: 1000 }), complete: provider.complete, list: async () => [] });
 } };`;
 
-// 一个注册命令、键、渲染器的用户层插件
+// 一个注册命令、键、渲染器、给嵌套 Agent 的工具的用户层插件
 const USER = `export default { process(ctx) {
   ctx.require("commands@1").register({ name: "hello", description: "says hello", run: (args) => "hello " + args });
   ctx.require("keys@1").register({ key: "ctrl+g", description: "go", run: () => {} });
   ctx.require("renderers@1").event({ event: "ping", render: (d) => ({ line: "ping " + d }) });
+  ctx.require("tools@1").register({ name: "peek", description: "peeks", inputSchema: { type: "object" }, effect: "read", concurrency: "safe", idempotent: true, execute: async () => ({ content: "peeked" }) });
 } };`;
 
 async function start() {
@@ -43,7 +44,7 @@ async function start() {
     await writeFile(path.join(dir, "index.mjs"), code);
   };
   await plugin("fake-model", { id: "test/fake-model", provides: ["provider@1", "models@1"], replaces: ["jade/models"] }, FAKE_MODEL);
-  await plugin("user", { id: "test/user", requires: ["commands@1", "keys@1", "renderers@1"] }, USER);
+  await plugin("user", { id: "test/user", requires: ["commands@1", "keys@1", "renderers@1", "tools@1"] }, USER);
   const reports: string[] = [];
   const host = await PluginHost.start({
     roots: [
@@ -108,6 +109,27 @@ describe("registries", () => {
       const r = host.service<Renderers>("renderers@1")!;
       expect(r.forEvent("test/user/ping")!.renderer.render(1)).toEqual({ line: "ping 1" });
       expect(r.forEvent("ping")).toBeUndefined();
+    } finally {
+      await host.close();
+    }
+  });
+
+  test("tools for nested agents: any plugin registers them, any plugin lists them, and they are revoked with their plugin", async () => {
+    const { host } = await start();
+    try {
+      // 取用的一方（这里是核心，换成任何插件都一样）不用登记的一方认识它
+      const tools = host.service<Tools>("tools@1")!;
+      await host.sessions.open();
+      const names = () => tools.list().map((t) => t.name);
+      expect(names()).toEqual(expect.arrayContaining(["read_file", "grep", "bash", "web_fetch", "peek"]));
+      expect(names()).not.toContain("write_file");
+      const signal = new AbortController().signal;
+      const peek = tools.list().find((t) => t.name === "peek")!;
+      expect(await peek.execute({}, { sessionId: "s", toolUseId: "t", signal, parent: { sessionId: "s", eventId: "e" }, progress() {} })).toEqual({ content: "peeked" });
+      expect(() => tools.register({ ...peek, name: "read_file" })).toThrow("already registered by jade/fs");
+      await host.quarantine("test/user", "test");
+      expect(names()).not.toContain("peek");
+      expect(names()).toContain("read_file");
     } finally {
       await host.close();
     }

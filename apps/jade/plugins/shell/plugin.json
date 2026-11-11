@@ -9,7 +9,7 @@
     "prompts@1",
     "renderers@1",
     "commands@1",
-    "task@1"
+    "tools@1"
   ],
   "config": {
     "shell": {

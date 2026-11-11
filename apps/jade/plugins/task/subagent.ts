@@ -1,6 +1,6 @@
 // task 工具：启动一个只读的子 Agent。从旧 jade 的 tools/task.ts 移植。
 //
-// 子 Agent 是一个嵌套的 uncarved Runtime：工具是其他插件经 task@1 登记的只读工具，模型经 models@1 调用。
+// 子 Agent 是一个嵌套的 uncarved Runtime：工具是其他插件登记在 tools@1 里的工具，模型经 models@1 调用。
 // 它的日志放在内存里：会话日志存储归 jade 核心，插件拿不到，所以子会话不和父会话的日志关联（不返回 child 引用）。
 // 子 Agent 调用的工具通过 ctx.progress 推给前端显示；要用户批准的调用（工作目录之外的路径、带 URL 的工具）经 ui@1 问。
 
@@ -45,7 +45,7 @@ export interface TaskOptions {
   cwd: string;
   /** 调用模型（models@1） */
   provider: Provider;
-  /** 每次调用时取：其他插件登记的只读工具 */
+  /** 每次调用时取：其他插件登记给嵌套 Agent 的工具（tools@1） */
   tools(): Tool[];
   /** 子 Agent 一次最多回复几次 */
   maxSteps: number;

@@ -1,5 +1,5 @@
 // jade/task：只读的子 Agent。从旧 jade 的 test/jade.test.ts（task …）移植：
-// 子 Agent 的工具来自 task@1 的登记（jade/fs 登记它的只读工具），模型经 models@1。
+// 子 Agent 的工具来自 tools@1（jade/tools）的登记（jade/fs 登记它的只读工具），模型经 models@1。
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";

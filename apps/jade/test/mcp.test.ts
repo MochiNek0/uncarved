@@ -200,8 +200,8 @@ describe("jade/mcp plugin", () => {
     const home = await tempDir("jade-mcp-home-");
     const mark = path.join(home, "mark.txt");
     await writeFile(path.join(home, "mcp.json"), JSON.stringify({ mcpServers: { fake: { ...fakeServer, env: { MCP_MARK: mark } } } }));
-    // 假的 task@1：记下登记给子 Agent 的工具
-    const task = { manifest: { id: "test/task", provides: ["task@1"] }, code: `export default { process(ctx) { ctx.provide("task@1", { tool: (t) => { globalThis.__jadeTest.notes.push("task tool " + t.name); return () => {}; } }); } };` };
+    // 假的 tools@1：记下登记给嵌套 Agent 的工具
+    const task = { manifest: { id: "test/tools", provides: ["tools@1"], replaces: ["jade/tools"] }, code: `export default { process(ctx) { ctx.provide("tools@1", { list: () => [], register: (t) => { globalThis.__jadeTest.notes.push("task tool " + t.name); return () => {}; } }); } };` };
     const { host, state } = await featureHost({ home, config: { "jade/approval": { mode: "yolo" } }, plugins: [task] });
     try {
       state.script.push({ content: [use("e", "mcp__fake__echo", { text: "hi" }), use("p", "mcp__fake__picture", {}), use("f", "mcp__fake__fail", {})], stopReason: "tool_use" }, reply("ok"));

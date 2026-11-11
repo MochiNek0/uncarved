@@ -280,18 +280,26 @@ export interface Shell {
   which(bin: string): string | undefined;
 }
 
-// ---------- task@1（jade/task） ----------
+// ---------- tools@1（jade/tools） ----------
 
-/** task@1 */
-export interface Task {
+/**
+ * tools@1：给嵌套 Agent（子 Agent 之类）用的工具的注册表。主会话里的工具对象是各插件私有的，
+ * 所以提供工具的插件在这里另登记一套实例，另起 Agent 的插件来取。登记的一方不用知道谁在用
+ */
+export interface Tools {
   /**
-   * 给子 Agent 登记一个工具，返回撤销函数；登记者的作用域关闭时自动撤销。工具名已被登记时抛错。
-   * 只读工具（effect 是 "read"）：要求批准的情形（工作目录之外的路径、url 参数）由子 Agent 自己判断，经 ui@1 问用户。
-   * 其他工具（例如 bash）：只执行 approval@1 认定为只读的调用（只读模式下也放行的那些），其余的直接拒绝，不问用户；
-   * 没有 approval@1 时一律拒绝。子 Agent 因此始终不改任何东西。
-   * opts.when：每次启动子 Agent 时调用，返回 false 时这次不给它这个工具（例如没有配置搜索服务时的 web_search）
+   * 登记一个工具，返回撤销函数；登记者的作用域关闭时自动撤销。工具名已被别的插件登记时抛错。
+   * 登记的工具不经过主会话的关卡（审批、hook），所以只登记嵌套 Agent 用得着的：现在登记的都是只读的，
+   * 或者由使用方把关的（jade/shell 的 bash）。
+   * opts.when：每次 list 时调用，返回 false 时这次不给（例如没有配置搜索服务时的 web_search）
    */
-  tool(tool: Tool, opts?: { when?: () => boolean }): () => void;
+  register(tool: Tool, opts?: { when?: () => boolean }): () => void;
+  /**
+   * 现在登记着的工具，同名的取最后登记的。使用方自己筛选、自己把关：这些工具在它的 Agent 里执行时没有主会话的关卡守着，
+   * 工具声明的 effect 说明它会不会改东西。例如 jade/task：只读工具读工作目录之外的路径、带 url 参数时问用户，
+   * 其他工具（bash）只执行 approval@1 认定为只读的调用
+   */
+  list(): Tool[];
 }
 
 // ---------- steer@1（jade/steer） ----------

@@ -37,7 +37,7 @@
 │ 插件（全部可停用、可代替）                                           │
 │  前端：tui · print · rpc        行为：fs · shell · web · prompts ·  │
 │  注册表：commands · keys ·       compact · mcp · skills · task ·    │
-│          renderers               memory · todo · ask · checks ·     │
+│          renderers · tools       memory · todo · ask · checks ·     │
 │  模型：models（provider 适配）    continue · mentions · repeats ·   │
 │  审批：approval                  budget · undo · modes …            │
 ├────────────────────────────────────────────────────────────────┤
@@ -307,13 +307,14 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 | `jade/plugins` | `/plugins [id]`：每个插件的状态和原因、每个服务的提供者（来自核心的 `jade@1`） | `commands@1`、`jade@1` | — |
 | `jade/sessions` | 命令 `/clear` `/resume` `/retry`；会话索引 `$JADE_HOME/state/sessions.jsonl` | `commands@1` | `plugins/sessions.ts`、`session-lifecycle.ts` |
 | `jade/prompts` | `prompts@1`（`add`：其他插件往系统提示词里加段落；项目层插件加的、或标了 `untrusted` 的段落为不可信。`note(会话, 文字)`：给模型留一句说明，下一次请求时以 `[Note from jade]` 附在最后一条用户消息后面并记进日志，不发起新的一轮。`instructions(会话)`：这个会话读到的指令文件，给自己另起模型对话的插件用） | `models@1`（可选，写上当前模型） | `plugins/prompts.ts` |
-| `jade/fs`、`jade/shell` | 工具；shell 还提供 `shell@1`（`executable`、`unavailable`、`run(command, { cwd, timeoutMs, signal })`、`which`）：其他插件执行命令的入口，找 shell、补 Git Bash 的 PATH、连子进程一起杀只有这一份 | `renderers@1`、`prompts@1`（可选）；fs 可选 `task@1`（把只读工具另建一套给子 Agent） | `tools/*` |
-| `jade/web` | `web_fetch`、`web_search`、`/search`；只读工具另建一套经 `task@1` 给子 Agent（`web_search` 只在配置了搜索服务时给） | 可选 `ui@1`、`prompts@1`、`commands@1`、`renderers@1`、`task@1` | `tools/web.ts` |
+| `jade/fs`、`jade/shell` | 工具；shell 还提供 `shell@1`（`executable`、`unavailable`、`run(command, { cwd, timeoutMs, signal })`、`which`）：其他插件执行命令的入口，找 shell、补 Git Bash 的 PATH、连子进程一起杀只有这一份 | `renderers@1`、`prompts@1`（可选）；fs、shell 可选 `tools@1`（fs 把只读工具、shell 把不能在后台跑的 `bash` 另建一套登记给嵌套 Agent） | `tools/*` |
+| `jade/web` | `web_fetch`、`web_search`、`/search`；只读工具另建一套经 `tools@1` 给嵌套 Agent（`web_search` 只在配置了搜索服务时给） | 可选 `ui@1`、`prompts@1`、`commands@1`、`renderers@1`、`tools@1` | `tools/web.ts` |
 | `jade/screenshot` | `screenshot` 工具：用本机的 Chrome / Edge / Chromium 无头模式渲染本地文件或网页，把截图交给模型看（`JADE_BROWSER` 可以指定浏览器；没有浏览器时不注册；模型不能看图片时说明原因） | 可选 `renderers@1`、`prompts@1`、`models@1` | `tools/screenshot.ts`（`test/screenshot.test.ts`） |
 | `jade/todo`、`jade/ask` | 工具 | `ask` 需要 `ui@1`，不能提问时不注册工具 | `tools/todo.ts`、`tools/ask.ts` |
-| `jade/task` | `task` 工具、`task@1`（`tool(tool, { when })`：其他插件给子 Agent 登记只读工具，`when` 每次启动子 Agent 时决定给不给）；子 Agent 的系统提示词里带上主会话的指令文件（经 `prompts@1.instructions`，仓库里的保持不可信，配置 `instructions: false` 关掉） | `models@1`；可选 `prompts@1` | `tools/task.ts`。子 Agent 是嵌套的 `Runtime`，日志在内存里，不关联到父会话 |
+| `jade/tools` | `tools@1`：给嵌套 Agent（子 Agent 之类）用的工具的注册表。`register(tool, { when })`：提供工具的插件另登记一套实例（主会话里的工具对象是各插件私有的），`when` 每次取用时决定给不给；`list()`：另起 Agent 的插件来取，自己筛选、自己把关（这些工具执行时没有主会话的关卡守着）。登记的一方不用知道谁在用 | — | 2026-11-11 从 `jade/task` 的 `task@1` 拆出来（见 jade-log"架构挡了路"） |
+| `jade/task` | `task` 工具；子 Agent 的工具每次启动时从 `tools@1` 取；子 Agent 的系统提示词里带上主会话的指令文件（经 `prompts@1.instructions`，仓库里的保持不可信，配置 `instructions: false` 关掉） | `models@1`；可选 `tools@1`、`prompts@1` | `tools/task.ts`。子 Agent 是嵌套的 `Runtime`，日志在内存里，不关联到父会话 |
 | `jade/compact` | `context.project` 里清理旧输出、总结；`/compact`；上下文溢出后压缩并经 `afterTurn` 重试 | `models@1` | `plugins/compact.ts` |
-| `jade/mcp` | MCP 服务的工具、`/mcp`；`/mcp add\|remove` 和 `jade mcp add\|remove` 改配置文件；项目层服务启动前确认（`$JADE_HOME/trust.jsonl`） | 可选 `ui@1`、`commands@1`、`prompts@1`、`task@1`、`cli@1` | `mcp.ts`。插件自带的 MCP 配置（旧的 PluginBundle）没有了 |
+| `jade/mcp` | MCP 服务的工具、`/mcp`；`/mcp add\|remove` 和 `jade mcp add\|remove` 改配置文件；项目层服务启动前确认（`$JADE_HOME/trust.jsonl`） | 可选 `ui@1`、`commands@1`、`prompts@1`、`tools@1`、`cli@1` | `mcp.ts`。插件自带的 MCP 配置（旧的 PluginBundle）没有了 |
 | `jade/skills` | `skill` 工具、`/skills`、`/<skill 名>`；`/skills add\|update\|remove` 和 `jade skills …` 从 git、npm 或本地目录安装（下载经核心的 `sources@1`）；每次调用模型前重新查找 skill，会话中途装的马上能用（`skill` 工具因此总是注册、名字不写成 enum，列表变了才改提示词）；工具说明告诉模型用 `jade skills add` 装到 `.jade`；skill 目录经 `approval@1.allowRead` 可直接读 | 可选 | `skills.ts` |
 | `jade/scratch` | 每个会话一个临时目录（系统临时目录下的 `jade-scratch/<会话 id>`，恢复会话时还是同一个，不主动删除），经 `prompts@1` 告诉模型临时文件放这里，经 `approval@1.allowWrite` 和工作目录同样对待 | 可选 `approval@1`、`prompts@1` | 新功能，参考 Claude Code 的 scratchpad（`test/scratch.test.ts`） |
 | `jade/checks` | 改文件后在 `context.project` 里跑项目检查、`/checks`；命令第一次运行前确认 | `shell@1`（运行检查）；可选 `ui@1`、`approval@1`、`renderers@1`、`commands@1` | `plugins/checks.ts` |
@@ -333,10 +334,11 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 
 - `jade/fs`：不是合法 UTF-8 的文件（多半是 GBK）只读不改，`read_file` 按 GB18030 解码给模型看，`write_file`、`edit_file` 拒绝，免得把原来的字节写坏。
 - `jade/approval`：回答多了"在这个目录里总是允许"（`forever`，记在 `$JADE_HOME/state/approvals.json`，按工作目录；不进日志）；终端里多了"拒绝并说明"，说的话作为拒绝的理由交给模型。`allows` 对不是只读的工具只按只读模式判断（yolo 和"总是允许"都不放宽）。
-- `jade/task`：`task@1.tool` 也收不是只读的工具，但只执行 `approval@1.allows` 认定为只读的调用，所以子 Agent 仍然不改任何东西；`jade/shell` 据此给子 Agent 一个不能在后台跑的 `bash`。配置 `model` 让子 Agent 用另一个模型。
+- `jade/task`：`task@1.tool`（2026-11-11 起是 `tools@1.register`，见下）也收不是只读的工具，但只执行 `approval@1.allows` 认定为只读的调用，所以子 Agent 仍然不改任何东西；`jade/shell` 据此给子 Agent 一个不能在后台跑的 `bash`。配置 `model` 让子 Agent 用另一个模型。
 - `jade/undo`：在 git 仓库里，每轮第一次 `bash` 之前把工作区拍进 `$JADE_HOME/checkpoints/<会话>/shadow` 里的影子 git 仓库（tree 对象，对象库借用项目的，不做换行转换和 filter），`/undo` 时把之后变了的文件恢复回去；项目自己的 `.git` 不碰。被忽略的文件不在快照里。
 - `jade/shell`：后台命令自己结束时提示用户并经 `prompts@1.note` 告诉模型；`/shells`。`/sh <命令>`（`jade/tui` 里 `!<命令>` 是它的简写，2026-11-11）：用户自己执行一条命令，不经过模型和审批、不占一轮，输出显示给用户并经 `prompts@1.note` 留给模型。运行中边跑边显示输出的末尾几行（`shell@1.run` 的 `onOutput`、`CommandContext.progress`，同日加），esc 停掉；结果收成一行，完整输出折叠起来（`print(text, { details })`，同日加）。时限 10 分钟；命令读不到键盘输入。输入以 `!` 开头时输入框边框变色、上边框右边有一行说明。
 - `jade/approval`（2026-11-11）：bash 复合命令的"总是允许"按每条不是只读的命令各记一条规则（原来只认整条原文，换个提交信息又要问）。"总是允许"管到什么（例如 `bash "git commit…"`）只在对话框正文里写一次，选项里只写范围（本会话 / 这个目录）：原来写在选项里，长命令会把两个选项句尾的区别截掉。
+- `jade/tools`（2026-11-11）：给嵌套 Agent 的工具原来登记在 `jade/task` 的 `task@1` 里，`fs`、`shell`、`web`、`mcp` 各写一句"向 `task@1` 登记"——提供工具的一方要认识用工具的一方，第三方插件想另起一个 Agent 就得改这四个内置插件。拆成中立的注册表 `tools@1`：提供方只管登记，`jade/task` 和任何第三方插件一样用 `list()` 取。`task@1` 没有了（没有外部插件在用）。登记的内容没变（只读工具，加上由使用方把关的 `bash`）；`bash` 的说明文字仍是按 `jade/task` 的"只放行只读命令"写的。
 - `jade/prompts`：`$JADE_HOME` 里没有指令文件时用 `~/.claude/CLAUDE.md`（配置 `claudeInstructions: false` 关掉）。
 - `jade/tui`：对话框弹出时用户正在打字，接着打出来的回车和数字不当成回答；审批预览用 PgUp/PgDn 翻看；第一个词里还有 `/` 的输入（路径）当普通消息；`/copy`；Ctrl+J、单独上报的 Shift+Enter 换行。
 - `jade/print`：`-c/--continue`（经 `sessions@1`）、`--json`。`jade/compact`：`/compact <要留意的事>`。
@@ -386,6 +388,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 6. **TUI 和注册表插件**：`jade/tui`、`jade/commands`、`jade/keys`、`jade/renderers`、`jade/modes`、`jade/sessions`。
    已完成：`test/tui-frontend.test.ts` 用假终端和假模型跑真实的 bundled 插件：输入消息、在审批对话框里批准（预览是 `jade/fs` 的 diff）、看到回复、`/mode`、`/help`、`/exit`、`@` 补全（候选来自 `jade/fs` 的 `listFiles`，发送时由 `jade/mentions` 附上内容）、`--continue`。`test/registries.test.ts` 覆盖注册、撤销、保留键、`/clear`、`/resume`。插件在状态栏显示自己的段落、`ctx.input`（改输入框）已由 `ui@1.session` 提供，见 `test/session-ui.test.ts`。`/model` 已完成（`test/model.test.ts`），`/plugins` 由单独的 `jade/plugins` 提供（`test/plugins.test.ts`）。
 7. **其余功能插件**逐个移植。每移植一个，都检查它没有用到第三方拿不到的东西。
+   每做一个插件，再问一句：**有没有改到别的内置插件？改的是"给它的服务加方法"，还是"让它认识我"？** 前者是接口在长，记一笔就行。后者说明依赖的方向反了（第三方插件没法让内置插件认识它），记进 [jade-log.md](./jade-log.md) 的"架构挡了路"，把那个接口改成中立的注册表：提供方只管登记，谁要用谁来取（例子：`task@1` → `tools@1`）。
    大部分已完成：web、todo、ask、task、compact、mcp、skills、checks、memory、undo、mentions、continue、repeats、budget，各有测试（`test/<插件>.test.ts`）。期间核心改了两处：会话队列的竞争（上一条 `send` 刚 resolve 就再 `send`，新输入没人处理），兜底关卡只认 `approval@1` 的提供者（见第 7 节）。
    已完成：从 npm、git 和本地目录安装/更新插件（`test/install.test.ts` 覆盖本地目录、git 提交、npm 包、`--link`、`--project`、`--path`、本地改动保护和更新记录）。
    移植中发现的缺口，以后再定：子 Agent 的日志不能关联到父会话；`session()` 执行期间（包括 `ctx.effect` 里立即执行的部分）调用 `session.send` 会失败，因为 Runtime 在全部插件加入之后才建（`jade/schedule` 因此等第一次定时再检查）；一个进程同时只有一个会话、工作目录和项目层插件按进程定，所以后台另开会话、桌面端同时开几个对话都要先让 `SessionManager` 能同时挂同一目录的多个会话。已经补上的："给模型留一句说明"的接口（`prompts@1.note`，memory、undo 原来各自在 `context.project` 里附说明；`/undo` 的已撤销记录仍存在 `$JADE_HOME/checkpoints`）；`jade/checks` 不再复制 jade/shell 找 shell、杀进程树的代码，改由 `shell@1` 提供。

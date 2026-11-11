@@ -1,4 +1,4 @@
-// jade/mcp：配置的 MCP 服务的工具交给模型（声明只读的也经 task@1 交给子 Agent）；/mcp 查看状态、重连，
+// jade/mcp：配置的 MCP 服务的工具交给模型（声明只读的也经 tools@1 交给嵌套 Agent）；/mcp 查看状态、重连，
 // /mcp add、/mcp remove 改配置文件（见 install.ts；终端里是 jade mcp add|remove）。
 //
 // 服务是进程级的资源：第一个会话打开时读配置、确认项目层的服务、连接，之后各会话共用；进程退出时（进程作用域关闭）全部关掉。
@@ -8,7 +8,7 @@
 
 import path from "node:path";
 import { definePlugin, type Cli, type ProcessContext, type UI } from "@uncarved/jade-api";
-import type { Commands, Prompts, Task } from "@uncarved/jade-api/services";
+import type { Commands, Prompts, Tools } from "@uncarved/jade-api/services";
 import { describeServer, loadMcpConfig, McpClient, mcpTools, mcpTrustHash } from "./mcp.ts";
 import { manageMcp, manageUsage } from "./install.ts";
 import { bold, clip, dim, display, estimateTokens, green, realPath, red, repoRoot, splitArgs, TrustFile, yellow } from "./project.ts";
@@ -211,9 +211,9 @@ export default definePlugin({
     if (!servers) return;
     await servers.start();
     for (const tool of mcpTools(servers.clients)) ctx.kernel.tool(tool);
-    // 子 Agent（jade/task）只拿声明了只读（readOnlyHint）的工具：另一套实例，和 jade/fs 一样
-    const task = ctx.service<Task>("task@1");
-    if (task) for (const tool of mcpTools(servers.clients, { readOnly: true })) task.tool(tool);
+    // 嵌套 Agent（例如 jade/task 的子 Agent）只拿声明了只读（readOnlyHint）的工具：另一套实例，和 jade/fs 一样
+    const shared = ctx.service<Tools>("tools@1");
+    if (shared) for (const tool of mcpTools(servers.clients, { readOnly: true })) shared.register(tool);
     const prompts = ctx.service<Prompts>("prompts@1");
     for (const text of instructions(servers.clients)) prompts?.add({ text, untrusted: true });
   },

@@ -95,6 +95,7 @@ jade 自带的功能全是 `apps/jade/plugins/` 下的普通插件，和第三�
 | `jade/modes` | 模式切换、计划模式 |
 | `jade/compact` | 上下文压缩、溢出后自动重试 |
 | `jade/task` | 子 Agent（嵌套 Runtime） |
+| `jade/tools` | 给嵌套 Agent 用的工具的注册表（`tools@1`） |
 | `jade/mcp` | MCP 服务工具 |
 | `jade/skills`、`jade/memory` | 技能目录、长期记忆 |
 | `jade/schedule` | 定时任务（cron，重启后仍生效） |

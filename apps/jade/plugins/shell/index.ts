@@ -2,7 +2,7 @@
 // 后台命令自己结束时告诉用户，并给模型留一句说明（不用它一直轮询）；/shells 给用户看和停掉后台命令。
 
 import { definePlugin, type UI } from "@uncarved/jade-api";
-import type { Commands, Prompts, Renderers, Task } from "@uncarved/jade-api/services";
+import type { Commands, Prompts, Renderers, Tools } from "@uncarved/jade-api/services";
 import { shellRenderers } from "./renderers.ts";
 import { shellService } from "./service.ts";
 import { shellTools, type ShellTools } from "./shell.ts";
@@ -105,11 +105,12 @@ export default definePlugin({
       },
     });
     sessions.set(id, { list, kill });
-    // 子 Agent（jade/task）的 bash：只收命令和时限，不能在后台跑；哪些命令能执行由 jade/task 按审批规则把关（只读的才行）
+    // 嵌套 Agent 的 bash：只收命令和时限，不能在后台跑。它不是只读工具，哪些命令能执行由使用方把关
+    // （jade/task 按审批规则只放行只读的命令，下面的说明文字是按这个写的）
     const bash = tools.find((t) => t.name === "bash");
     try {
       if (bash) {
-        ctx.service<Task>("task@1")?.tool({
+        ctx.service<Tools>("tools@1")?.register({
           ...bash,
           description:
             "Run a read-only shell command in the working directory (for example git log, git diff, git status, ls, rg) and return its exit code and output. " +
@@ -119,7 +120,7 @@ export default definePlugin({
         });
       }
     } catch {
-      // jade/task 被隔离时它的服务已失效：子 Agent 没有 bash，主会话的照常
+      // jade/tools 被隔离时它的服务已失效：嵌套 Agent 没有 bash，主会话的照常
     }
     if (unavailable) ctx.service<UI>("ui@1")?.notify(unavailable, "warning");
     for (const tool of tools) ctx.kernel.tool(tool);
