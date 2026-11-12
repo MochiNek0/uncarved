@@ -166,6 +166,23 @@ describe("afterTurn and send", () => {
     await host.close();
   });
 
+  test("afterTurn registered in session() runs once the session is ready, with the resumed history in state()", async () => {
+    const { host } = await setup((w) =>
+      w.plugin("bundled", { id: "seed" }, `export default { session(ctx) {
+        ctx.session.afterTurn(() => { globalThis.__log.push("messages " + ctx.session.state().messages.length); });
+      } };`),
+    );
+    g.__script!.push(say("hi"));
+    const s = await host.sessions.open();
+    await s.idle();
+    await s.send(msg("go"));
+    await s.idle();
+    const resumed = await host.sessions.open({ resume: s.id });
+    await resumed.idle();
+    expect(g.__log!.filter((x) => x.startsWith("messages "))).toEqual(["messages 0", "messages 2"]);
+    await host.close();
+  });
+
   test("a plugin stops the running turn", async () => {
     const { host } = await setup((w) =>
       w.plugin("bundled", { id: "stopper" }, `export default { session(ctx) {

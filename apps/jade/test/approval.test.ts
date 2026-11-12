@@ -5,6 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { cp, rename, rm } from "node:fs/promises";
 import path from "node:path";
+import { plainText } from "@uncarved/jade-api";
 import { featureHost, msg, reply, results, textOf, use } from "./feature-host.ts";
 
 interface ApproverState {
@@ -46,6 +47,11 @@ async function run(answers: string[], interactive: boolean, uiAnswers: (string |
 }
 
 describe("approvers", () => {
+  test("plainText gives a channel the words of a styled detail", () => {
+    expect(plainText(["$ ", { text: "rm -rf build", style: "code" }, "\n", { text: "+ hi", style: ["added", "bold"] }, "\x1b[2m!\x1b[22m"])).toBe("$ rm -rf build\n+ hi!");
+    expect(plainText(undefined)).toBe("");
+  });
+
   test("a front end that cannot ask still asks the approver, and its answer counts", async () => {
     const r = await run(["once"], false);
     expect(r.written).toBe(true);

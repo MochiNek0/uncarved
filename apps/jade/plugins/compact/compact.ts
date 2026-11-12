@@ -43,6 +43,8 @@ export interface Compactor {
   observe(e: LogEvent): void;
   /** 下一次请求前无论是否超过阈值都总结一次；focus 是用户要总结特别留意的事（/compact 后面写的） */
   request(focus?: string): void;
+  /** 最近一次 project 给出的投影有多少 token：和判断要不要压缩用的是同一个数（能用真实用量就用）；还没投影过时 undefined */
+  projected(): number | undefined;
 }
 
 const SUMMARY_SYSTEM =
@@ -131,6 +133,7 @@ export function compactor(opts: CompactorOptions): Compactor {
   /** 最近一次投影：它对应的消息条数和压缩状态；收到回复后补上真实用量 */
   let last: { length: number; state: string; tokens?: number } | undefined;
   let pending: { length: number; state: string } | undefined;
+  let projected: number | undefined;
 
   const view = (messages: Message[], c: CompactState | undefined): Message[] => {
     if (!c) return messages;
@@ -171,6 +174,8 @@ export function compactor(opts: CompactorOptions): Compactor {
     const keep = opts.keepTokens ?? Math.floor(threshold * 0.3);
     const done = (out: Message[], c = prev) => {
       pending = { length: messages.length, state: JSON.stringify(c ?? null) };
+      // 没有清理、没有压缩时就是上面量出来的那个数；变了的（少见）重新估
+      projected = out === current ? tokens : estimateTokens(out);
       return out;
     };
     const current = view(messages, prev);
@@ -245,6 +250,7 @@ export function compactor(opts: CompactorOptions): Compactor {
       forced = true;
       focus = what;
     },
+    projected: () => projected,
   };
 }
 

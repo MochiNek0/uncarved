@@ -216,14 +216,15 @@ export const capture: Capture = async (browser, req, signal) => {
     return await Promise.race([work(), aborted]);
   } finally {
     signal.removeEventListener("abort", abort);
-    // 先让浏览器自己关：直接结束主进程时，Windows 上它的子进程还会占着 profile 好几秒，临时目录删不掉
-    if (cdp) {
+    // 先让浏览器自己关：直接结束主进程时，Windows 上它的子进程还会占着 profile 好几秒，临时目录删不掉。
+    // 中止了（用户打断、超时）就不等它：马上结束，删不掉的临时目录留给系统清理
+    if (cdp && !signal.aborted) {
       void cdp.send("Browser.close").catch(() => {});
       let timer: ReturnType<typeof setTimeout> | undefined;
       await Promise.race([proc.exited, new Promise((r) => (timer = setTimeout(r, CLOSE_MS)))]);
       clearTimeout(timer);
-      cdp.close();
     }
+    cdp?.close();
     proc.kill();
     await proc.exited;
   }

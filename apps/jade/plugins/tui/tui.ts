@@ -1783,13 +1783,14 @@ function Prompt({
   };
   /**
    * 大段粘贴在输入框里只占一个占位符，发送（和放进历史、给插件读）时换回原文。
-   * 占位符被删掉一部分时认不出来，按打出来的样子发送
+   * 占位符被删掉一部分时认不出来，按打出来的样子发送。发送、清空之后原文已经换回去了（历史里存的也是原文），不再留着
    */
   const pastes = useRef(new Map<string, string>());
   const unfold = (text: string) => (pastes.current.size ? text.replace(PASTED, (m) => pastes.current.get(m) ?? m) : text);
   const submit = (folded: string) => {
     if (!folded.trim()) return;
     const text = unfold(folded);
+    pastes.current.clear();
     if (hint !== undefined) onHintDone();
     remember(text);
     set(empty);
@@ -1801,6 +1802,7 @@ function Prompt({
   /** 清空输入；清掉的内容放进（本次运行的）历史，按 ↑ 能找回来 */
   const discard = () => {
     const text = unfold(current().value);
+    pastes.current.clear();
     if (text.trim()) remember(text);
     set(empty);
   };

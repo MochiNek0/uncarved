@@ -173,11 +173,19 @@ const enough = (s: Search, files: FileHits[], matches: number) =>
 
 // ---------- ripgrep ----------
 
-/** ripgrep 不存在时返回 "missing"；正则语法 ripgrep 不支持时返回 undefined，由调用方改用 JS 搜索 */
+/**
+ * ripgrep 不存在时返回 "missing"；正则语法 ripgrep 不支持时返回 undefined，由调用方改用 JS 搜索。
+ * 先不用 --sort path：它让 ripgrep 只用一个线程（几万个文件的仓库慢好几倍），文件的先后在收完之后自己排。
+ * 结果多到提前停下时，先搜到的是哪些文件每次不同：按路径顺序再搜一次，同样的调用总是留下路径最靠前的那些。
+ * 这时命中很密，按顺序搜很快就够数了
+ */
 async function ripgrep(rg: string, s: Search): Promise<Found | undefined | "missing"> {
-  // 不用 --sort path：它让 ripgrep 只用一个线程（几万个文件的仓库慢好几倍），文件的先后在收完之后自己排。
-  // 代价：结果多到提前停下时，留下的是先搜到的那些文件，不一定是路径最靠前的
-  const args = ["--hidden", "--glob", "!.git", "--glob", "!node_modules", "--max-filesize", `${MAX_FILE_BYTES}`];
+  const first = await ripgrepOnce(rg, s, false);
+  return typeof first === "object" && first.truncated ? ripgrepOnce(rg, s, true) : first;
+}
+
+async function ripgrepOnce(rg: string, s: Search, sorted: boolean): Promise<Found | undefined | "missing"> {
+  const args = [...(sorted ? ["--sort", "path"] : []), "--hidden", "--glob", "!.git", "--glob", "!node_modules", "--max-filesize", `${MAX_FILE_BYTES}`];
   // files、count 模式用不到每一行的内容：让 ripgrep 只报文件名（和行数），不用逐条解析 JSON
   if (s.mode === "content") args.push("--json");
   else if (s.mode === "files") args.push("--files-with-matches", "--null");

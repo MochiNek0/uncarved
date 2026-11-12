@@ -118,7 +118,7 @@ export default definePlugin({
 
     commands.register({
       name: "rewind",
-      description: "go back to before one of your messages, in a copy of this session (files stay as they are; /undo restores them)",
+      description: "go back to before one of your messages, in a copy of this session (files stay as they are; to restore them, /undo in the session before rewinding)",
       async run(_args, c) {
         const s = c.sessions.current;
         if (!s) return "There is no open session.";
@@ -141,7 +141,7 @@ export default definePlugin({
         await c.sessions.open({ fork: { session: s.id, before: to.seq } });
         // 那条消息放回输入框，改一改再发
         input?.set(to.text);
-        return `Rewound to before that message${input ? "; it is back in the input" : ""}. Files were not changed (/undo restores them). The session before rewinding: jade --resume ${s.id}`;
+        return `Rewound to before that message${input ? "; it is back in the input" : ""}. Files were not changed; to restore them, run /undo in the session before rewinding: jade --resume ${s.id}`;
       },
     });
 

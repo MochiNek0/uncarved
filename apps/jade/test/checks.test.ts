@@ -228,6 +228,36 @@ describe.skipIf(!hasShell)("jade/checks plugin", () => {
     }
   }, 30_000);
 
+  test("a check confirmed by 0.3.1 in $JADE_HOME/trust.jsonl is still confirmed after upgrading", async () => {
+    const cwd = await repo();
+    // 先确认一次，拿到这条检查的哈希
+    const first = await tempDir("jade-checks-home-");
+    let w = await featureHost({ home: first, cwd, config: { "jade/approval": { mode: "auto" } } });
+    try {
+      w.state.answers.push("yes");
+      w.state.script.push(edit, reply("done"));
+      await (await w.host.sessions.open()).send(msg("go"));
+    } finally {
+      await w.host.close();
+    }
+    const records = (JSON.parse(await readFile(path.join(first, "state", "confirmed.json"), "utf8")) as { records: { hash: string }[] }).records;
+    const hash = records[0]!.hash.split("\0")[1]!;
+
+    // 旧 jade 的记录：只有 trust.jsonl，没有 state/confirmed.json；不能提问时照样运行
+    const home = await tempDir("jade-checks-home-");
+    await writeFile(path.join(home, "trust.jsonl"), `${JSON.stringify({ hash, path: cwd, at: new Date().toISOString() })}\n`);
+    w = await featureHost({ home, cwd, config: { "jade/approval": { mode: "auto" } } });
+    try {
+      w.state.interactive = false;
+      w.state.script.push(edit, reply("done"));
+      await (await w.host.sessions.open()).send(msg("go"));
+      expect(w.state.selects).toEqual([]);
+      expect(textOf((w.state.requests[1]!.messages.at(-1)!.content[0] as Extract<Block, { kind: "tool_result" }>).content)).toContain("lint says no");
+    } finally {
+      await w.host.close();
+    }
+  }, 30_000);
+
   test("does not run unconfirmed commands when nobody can confirm them; can be turned off in config", async () => {
     const cwd = await repo();
     let w = await featureHost({ cwd, config: { "jade/approval": { mode: "auto" } } });

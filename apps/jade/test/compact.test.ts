@@ -7,7 +7,7 @@ import path from "node:path";
 import type { Block, Message } from "uncarved";
 import type { UI } from "../src/index.ts";
 import type { CommandContext, Commands, Renderers } from "@uncarved/jade-api/services";
-import { compactThreshold, DERIVED_KEY, estimateTokens, isContextOverflow, parseTokens, TRIMMED, type CompactState } from "../plugins/compact/compact.ts";
+import { compactor, compactThreshold, DERIVED_KEY, estimateTokens, isContextOverflow, parseTokens, TRIMMED, type CompactState } from "../plugins/compact/compact.ts";
 import { say, cleanup, scriptedHost, textOf, use } from "./scripted-ui.ts";
 import { plain as plainText } from "../plugins/tui/screen.ts";
 import type { Text } from "@uncarved/jade-api";
@@ -76,6 +76,20 @@ describe("jade/compact helpers", () => {
 });
 
 describe("jade/compact in a session", () => {
+  test("projected() is the number the compaction decision used: the real usage of the previous request when there is one", async () => {
+    const c = compactor({ complete: () => Promise.reject(new Error("no summary expected")), threshold: () => 1_000_000, writes: () => undefined });
+    const hook = { sessionId: "s", signal: new AbortController().signal, derived: {}, record: async () => {}, emit: async () => {} };
+    const text = (role: Message["role"], t: string): Message => ({ role, content: [{ kind: "text", text: t, origin: { by: "user" }, trust: "trusted" }] });
+    const first = [text("user", "hello")];
+    expect(c.projected()).toBeUndefined();
+    await c.project(first, hook);
+    expect(c.projected()).toBe(estimateTokens(first));
+    c.observe({ type: "model.responded", data: { usage: { inputTokens: 50_000, outputTokens: 10 } } } as never);
+    const next = [...first, text("assistant", "hi"), text("user", "more")];
+    await c.project(next, hook);
+    expect(c.projected()).toBe(50_010 + estimateTokens(next.slice(2)));
+  });
+
   test("old large tool output is cleared first, judged by the real usage of the previous request", async () => {
     const { cwd, host, shared, send } = await scriptedHost({ config: { "jade/compact": { thresholdTokens: 12_000 } } });
     const big = Array.from({ length: 800 }, () => "a".repeat(40)).join("\n");

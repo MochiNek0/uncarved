@@ -96,6 +96,26 @@ export async function forgetFaults(home: string, id: string): Promise<void> {
   if (changed) await writeFaults(home, faults);
 }
 
+/** 0.3.1 及以前 jade/checks、jade/mcp 写的确认记录（$JADE_HOME/trust.jsonl，每行 { hash, path, at }）里的哈希；只读，没有这份文件时为空 */
+export async function readLegacyTrust(file: string): Promise<Set<string>> {
+  let text = "";
+  try {
+    text = await readFile(file, "utf8");
+  } catch {
+    return new Set();
+  }
+  const hashes = new Set<string>();
+  for (const line of text.split("\n")) {
+    try {
+      const hash = (JSON.parse(line) as { hash?: unknown }).hash;
+      if (typeof hash === "string") hashes.add(hash);
+    } catch {
+      // 空行、写到一半的行
+    }
+  }
+  return hashes;
+}
+
 /** 项目层插件的确认记录（第 7 节），存在 $JADE_HOME/state/trust.json，按插件目录内容的哈希 */
 export class FileTrustStore implements TrustStore {
   readonly #file: string;

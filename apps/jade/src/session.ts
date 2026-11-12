@@ -107,6 +107,8 @@ class LiveSession implements Session {
   #attended: () => boolean;
   /** 插件订阅的运行时通知（ctx.session.subscribe） */
   #watchers = new Set<{ fn: (n: RuntimeNotice) => void; owner: Owner }>();
+  /** Runtime 建好了（attach 之后）：session() 里登记的 afterTurn 等到这时才执行，那时 state() 才有 */
+  #attached = false;
 
   readonly #store: LogStore;
 
@@ -201,7 +203,7 @@ class LiveSession implements Session {
   afterTurn(fn: () => void | Promise<void>, owner: Owner): void {
     if (this.#left) return;
     this.#after.push({ fn, owner });
-    this.#kick();
+    if (this.#attached) this.#kick();
   }
 
   /** 离开会话：还没开始的输入全部拒绝、afterTurn 不再执行，再中止正在跑的一轮。之后的 send 直接拒绝 */
@@ -234,6 +236,8 @@ class LiveSession implements Session {
 
   /** Runtime 建好之后调用一次：把通知转给订阅的插件，以插件身份执行，出错只报告 */
   attach(): void {
+    this.#attached = true;
+    if (this.#after.length > 0) this.#kick();
     this.rt.subscribe((n) => {
       for (const w of this.#watchers) {
         if (w.owner.scope.closed) continue;

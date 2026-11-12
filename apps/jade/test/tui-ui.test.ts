@@ -848,7 +848,7 @@ describe("terminal UI", () => {
   });
 
   test("a long paste is one placeholder in the input and is sent in full", async () => {
-    const { type, output, calls } = setup();
+    const { type, output, calls, clear } = setup();
     const log = Array.from({ length: 30 }, (_, i) => `log-${i}`).join("\r\n");
     await type("see ");
     await type(`\x1b[200~${log}\x1b[201~`);
@@ -859,6 +859,14 @@ describe("terminal UI", () => {
     expect(output()).not.toContain("log-29");
     await type("\r");
     expect(calls.submit).toEqual([`see ${log.replaceAll("\r\n", "\n")} and ${"x".repeat(3000)}`]);
+
+    // 发出去之后不再留着原文：下一段粘贴从 #1 重新编号，照样发送全文
+    clear();
+    await type(`\x1b[200~${"y".repeat(3000)}\x1b[201~`);
+    await sleep(50);
+    expect(output()).toContain("[Pasted text #1 3000 chars]");
+    await type("\r");
+    expect(calls.submit.at(-1)).toBe("y".repeat(3000));
   });
 
   test("ctrl+o expands and collapses the latest foldable item", async () => {

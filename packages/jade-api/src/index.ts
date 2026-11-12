@@ -3,6 +3,7 @@
 // 和 jade 用的不是同一份模块也没有关系。错误类（PluginError 等）因此不在这里：跨模块副本 instanceof 不成立，
 // 插件按 error.name 判断。
 
+import { stripVTControlCharacters } from "node:util";
 import type { LocalHookSpec, LogEvent, RemoteHookSpec, RuntimeNotice, State, Tool, ToolInfo, UserInput } from "uncarved";
 export type { LocalHookSpec, LogEvent, RemoteHookSpec, RuntimeNotice, State, Tool, ToolInfo, UserInput } from "uncarved";
 
@@ -77,6 +78,14 @@ export interface ToolMeta {
  * 字符串里仍可以带 ANSI 颜色（旧的写法），终端界面照常显示，其他前端会去掉
  */
 export type Text = string | Span | readonly Text[];
+
+/** Text 里的文字，去掉样式和 ANSI 颜色：只能显示纯文字的地方（聊天渠道、日志）用它 */
+export function plainText(text: Text | undefined): string {
+  if (text === undefined || text === null) return "";
+  if (typeof text === "string") return stripVTControlCharacters(text);
+  if (Array.isArray(text)) return (text as readonly Text[]).map(plainText).join("");
+  return stripVTControlCharacters(String((text as Span).text ?? ""));
+}
 
 /** 一段带样式的文字 */
 export interface Span {
@@ -157,7 +166,7 @@ export interface ProcessContext extends ScopeContext {
 /** 插件在会话里能做的事（4.3） */
 export interface SessionControl {
   readonly id: string;
-  /** 本轮完全结束（turn.ended 已落盘、没有在途工具）后执行一次；会话空闲时尽快执行 */
+  /** 本轮完全结束（turn.ended 已落盘、没有在途工具）后执行一次；会话空闲时尽快执行。在 session() 里登记的等会话建好（state() 可用）之后执行 */
   afterTurn(fn: () => void | Promise<void>): void;
   /**
    * 发起一轮。正在跑时排到当前这一轮之后，这一轮跑完时 resolve。

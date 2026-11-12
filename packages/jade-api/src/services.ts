@@ -198,6 +198,7 @@ export interface Approval {
    * 登记一个审批渠道（例如聊天机器人）：要问用户时，问题同时交给终端和所有渠道，先回答的算数，
    * 其余的经 signal 收到中止。渠道返回 undefined、不认识的值或出错，算它不回答，不算拒绝；
    * 终端里取消照旧算拒绝。有渠道时，不能提问的前端（-p）也会问。返回撤销函数，调用方的作用域关闭时自动撤销。
+   * request.detail 是 Text（可能带样式片段），只能显示纯文字的渠道用 plainText(request.detail)。
    * 项目层插件不能用
    */
   addApprover(approver: Approver): () => void;

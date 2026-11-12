@@ -31,7 +31,7 @@ import { resolve, type Plan, type PlanState } from "./resolve.ts";
 import { scopedSecrets, SecretsStore } from "./secrets.ts";
 import { Sessions } from "./session.ts";
 import { parseSource } from "./source.ts";
-import { countFault, FileTrustStore, readFaults, readPluginsConfig, writeFaults, type Faults } from "./state.ts";
+import { countFault, FileTrustStore, readFaults, readLegacyTrust, readPluginsConfig, writeFaults, type Faults } from "./state.ts";
 import { updater } from "./update.ts";
 
 /** untrusted：项目层插件没有得到用户确认，没有执行它的任何代码 */
@@ -150,13 +150,19 @@ export class PluginHost {
     const confirmed = new FileTrustStore(path.join(opts.home, "state", "confirmed.json"));
     /** 写入排队：FileTrustStore 每次读出整份再写回，并发的两次写会丢一条 */
     let writing: Promise<unknown> = Promise.resolve();
+    // 0.3.1 及以前 jade/checks 和 jade/mcp 自己把确认记在 $JADE_HOME/trust.jsonl（哈希不带插件 id），升级后照认，不用再确认一遍。
+    // 只给这两个插件查：别的插件没写过那份文件
+    const legacyCallers = new Set(["jade/checks", "jade/mcp"]);
+    let legacy: Promise<Set<string>> | undefined;
     this.#services.set(TRUST_SERVICE, {
       impl: (caller: Caller): Trust => {
         const key = (hash: string) => `${caller.plugin}\0${String(hash)}`;
         return {
           has: async (hash) => {
             await writing;
-            return confirmed.has(key(hash));
+            if (await confirmed.has(key(hash))) return true;
+            if (!legacyCallers.has(caller.plugin)) return false;
+            return (await (legacy ??= readLegacyTrust(path.join(opts.home, "trust.jsonl")))).has(String(hash));
           },
           add: (hash, where) => {
             const run = writing.then(() => confirmed.add({ hash: key(hash), path: String(where), at: new Date().toISOString() }));

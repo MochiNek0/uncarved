@@ -4,7 +4,7 @@
 import type { LogEvent } from "uncarved";
 import { definePlugin, type UI } from "@uncarved/jade-api";
 import type { Commands, Compact, Models, Renderers } from "@uncarved/jade-api/services";
-import { compactor, compactThreshold, estimateTokens, isContextOverflow, parseTokens } from "./compact.ts";
+import { compactor, compactThreshold, isContextOverflow, parseTokens } from "./compact.ts";
 import { dim } from "./style.ts";
 
 /** 认不出窗口时的阈值 */
@@ -88,7 +88,7 @@ export default definePlugin({
           c.request(focus || undefined);
         }
         const out = await c.project(messages, hook);
-        show(estimateTokens(out));
+        show(c.projected());
         return out;
       },
     });

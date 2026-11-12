@@ -112,5 +112,12 @@ export default definePlugin({
   },
   session(ctx) {
     ctx.kernel.tool(todoTool((todos) => ctx.panel?.(todoPanel(todos))));
+    // 恢复的、/rewind 复制出的会话：历史里最后一份清单接着显示
+    if (ctx.panel) {
+      ctx.session.afterTurn(() => {
+        const todos = latestTodos(ctx.session.state().messages);
+        if (Array.isArray(todos)) ctx.panel?.(todoPanel(todos));
+      });
+    }
   },
 });
