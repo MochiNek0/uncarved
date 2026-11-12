@@ -6,10 +6,11 @@
 import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import type { Span, Text } from "@uncarved/jade-api";
 import type { ToolRenderer } from "@uncarved/jade-api/services";
 import { diffLines, diffStats, renderDiff } from "./diff.ts";
 import { applyEditsToText, display, type Edit } from "./fs.ts";
-import { clip, dim, green, red, yellow } from "./style.ts";
+import { added, clip, dim, lines as joinLines, removed, warn } from "./style.ts";
 
 type Args = Record<string, unknown>;
 const args = (input: unknown) => (input !== null && typeof input === "object" ? input : {}) as Args;
@@ -21,18 +22,18 @@ function pathOf(cwd: string, i: Args): string {
 }
 
 /** 预览里的多行文字：每行前面加上标记，最多 max 行 */
-function marked(s: string, mark: string, color: (s: string) => string, max = 30): string {
+function marked(s: string, mark: string, color: (s: string) => Span, max = 30): Text {
   const all = s.split("\n");
   const shown = all.slice(0, max).map((l) => color(`${mark} ${l}`));
   if (all.length > max) shown.push(dim(`  … ${all.length - max} more lines`));
-  return shown.join("\n");
+  return joinLines(shown);
 }
 
 /** 折叠内容里的多行文字（缩进由前端加），最多 max 行 */
-function capped(lines: string[], color: (s: string) => string, max: number): string {
-  const shown = lines.slice(0, max).map(color);
+function capped(lines: string[], max: number): Text {
+  const shown: Text[] = lines.slice(0, max);
   if (lines.length > max) shown.push(dim(`… ${lines.length - max} more lines`));
-  return shown.join("\n");
+  return joinLines(shown);
 }
 
 type FileTool = "edit_file" | "multi_edit" | "write_file";
@@ -42,29 +43,29 @@ const editsOf = (tool: FileTool, i: Args) => (tool === "edit_file" ? [i] : Array
  * 审批时的预览：带行号和上下文的 diff（读出文件、按工具的规则算出修改后的内容）。
  * 文件读不了、替换不成立时退回到只显示参数里的新旧文本
  */
-async function filePreview(cwd: string, tool: FileTool, input: unknown): Promise<string> {
+async function filePreview(cwd: string, tool: FileTool, input: unknown): Promise<Text> {
   const i = args(input);
   const file = typeof i.path === "string" ? path.resolve(cwd, i.path) : undefined;
   const current = file ? await readFile(file, "utf8").catch(() => undefined) : undefined;
   if (tool === "write_file") {
     const content = String(i.content ?? "");
-    if (current !== undefined) return `${dim("  overwrites the existing file:")}\n${renderDiff(current, content)}`;
-    return marked(content, "+", green, 20);
+    if (current !== undefined) return [dim("  overwrites the existing file:"), "\n", renderDiff(current, content)];
+    return marked(content, "+", added, 20);
   }
   if (tool === "multi_edit" && !Array.isArray(i.edits)) return dim(clip(JSON.stringify(input, null, 2), 2000));
   const edits = editsOf(tool, i);
-  const raw = (e: Args) => `${marked(String(e.old_string ?? ""), "-", red)}\n${marked(String(e.new_string ?? ""), "+", green)}`;
-  const fallback = () => edits.map((e) => raw(e as unknown as Args)).join(dim("\n  ⋯\n"));
+  const raw = (e: Args): Text => [marked(String(e.old_string ?? ""), "-", removed), "\n", marked(String(e.new_string ?? ""), "+", added)];
+  const fallback = (): Text => edits.map((e) => raw(e as unknown as Args)).flatMap((t, k) => (k ? [dim("\n  ⋯\n"), t] : [t]));
   if (current === undefined) return fallback();
   const r = applyEditsToText(current, edits, display(cwd, file!));
-  if (typeof r === "string") return `${fallback()}\n${yellow(`  (this edit will fail: ${clip(r, 200)})`)}`;
+  if (typeof r === "string") return [fallback(), "\n", warn(`  (this edit will fail: ${clip(r, 200)})`)];
   return renderDiff(current, r.text);
 }
 
 interface FileDiff {
   added: number;
   removed: number;
-  text: string;
+  text: Text;
 }
 
 /** 对话里折叠的 diff 最多显示这么多行 */
@@ -109,8 +110,8 @@ function fileRenderer(cwd: string, tool: FileTool, summary: (input: unknown) => 
       const diff = before as FileDiff | undefined;
       if (!diff || isError) return undefined;
       const [first = "", ...rest] = text.split("\n");
-      const extra = rest.length ? [capped(rest, (s) => s, MAX_RESULT_LINES)] : [];
-      return { line: dim(`${clip(first, 150)} `) + `${green(`+${diff.added}`)} ${red(`-${diff.removed}`)}`, details: [...extra, diff.text].join("\n") };
+      const extra = rest.length ? [capped(rest, MAX_RESULT_LINES)] : [];
+      return { line: [dim(`${clip(first, 150)} `), added(`+${diff.added}`), " ", removed(`-${diff.removed}`)], details: joinLines([...extra, diff.text]) };
     },
   };
 }

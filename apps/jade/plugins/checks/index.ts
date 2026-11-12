@@ -10,10 +10,10 @@
 
 import { createHash } from "node:crypto";
 import path from "node:path";
-import { definePlugin, type SessionContext, type Trust, type UI } from "@uncarved/jade-api";
+import { definePlugin, type SessionContext, type Text, type Trust, type UI } from "@uncarved/jade-api";
 import type { Approval, Commands, EventRenderer, Renderers, Shell } from "@uncarved/jade-api/services";
 import { changedFiles, checks, type Check, type Checks } from "./checks.ts";
-import { bold, dim, display, realPath, repoRoot, yellow } from "./project.ts";
+import { bold, dim, display, lines as joinLines, realPath, repoRoot, warn } from "./project.ts";
 
 /** 确认记录：同一个目录里的同一条命令只问一次。和旧 jade 的算法相同 */
 const checkHash = (c: Check) => createHash("sha256").update(`jade-check\0${c.cwd}\0${c.command}`).digest("hex");
@@ -34,9 +34,9 @@ export const checksRenderers: EventRenderer[] = [
       const bad = d.summary.filter((s) => s.problems > 0 || s.others || s.failed);
       const lines = d.report ? d.report.split("\n").slice(1) : [];
       const details = lines.length
-        ? [...lines.slice(0, MAX_DETAIL_LINES), ...(lines.length > MAX_DETAIL_LINES ? [dim(`… ${lines.length - MAX_DETAIL_LINES} more lines`)] : [])].join("\n")
+        ? joinLines([...lines.slice(0, MAX_DETAIL_LINES), ...(lines.length > MAX_DETAIL_LINES ? [dim(`… ${lines.length - MAX_DETAIL_LINES} more lines`)] : [])])
         : undefined;
-      const withDetails = (line: string) => (details ? { line, details } : { line });
+      const withDetails = (line: Text) => (details ? { line, details } : { line });
       if (bad.length === 0) return withDetails(dim(`✓ checks passed: ${d.summary.map((s) => s.name).join(", ")}`));
       const what = bad.map((s) =>
         s.failed
@@ -45,7 +45,7 @@ export const checksRenderers: EventRenderer[] = [
               .filter(Boolean)
               .join(", ")}`,
       );
-      return withDetails(yellow(`⚠ checks: ${what.join("; ")}`));
+      return withDetails(warn(`⚠ checks: ${what.join("; ")}`));
     },
   },
 ];
@@ -75,15 +75,15 @@ export default definePlugin({
           if (arg === "on") checks.reset();
           return `checks: ${arg}`;
         }
-        if (arg) return yellow("usage: /checks [on|off]");
+        if (arg) return warn("usage: /checks [on|off]");
         const files = changedFiles(session.state.messages, realPath(ctx.cwd), (t) => session.tool(t)?.meta?.writes);
         const found = await checks.resolve(files);
-        const lines = [`Edit-time checks are ${checks.enabled ? "on" : "off"} in this session.`];
+        const lines: Text[] = [`Edit-time checks are ${checks.enabled ? "on" : "off"} in this session.`];
         if (found.length > 0) {
           lines.push("For the files changed in this session:");
           for (const check of found) {
             const pending = (await trust.has(checkHash(check))) ? "" : ", not confirmed yet";
-            lines.push(`  ${bold(check.name)} ${dim(`in ${display(ctx.cwd, check.cwd) || "."}${pending}`)}\n    ${dim(check.command)}`);
+            lines.push(["  ", bold(check.name), " ", dim(`in ${display(ctx.cwd, check.cwd) || "."}${pending}`), "\n    ", dim(check.command)]);
           }
         } else lines.push(dim(files.length ? "No checks apply to the files changed in this session." : "No files changed in this session yet."));
         lines.push(
@@ -92,7 +92,7 @@ export default definePlugin({
               `Add your own in .jade/checks.json or ${path.join(ctx.home, "checks.json")}; JADE_CHECKS=off turns them off.`,
           ),
         );
-        return lines.join("\n");
+        return joinLines(lines);
       },
     });
 

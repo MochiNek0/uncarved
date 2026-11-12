@@ -3,7 +3,8 @@
 // 先去掉相同的开头和结尾，只对中间部分求最长公共子序列；中间部分太大时（整个文件重写）
 // 不再逐行比较，整段显示为删除加新增，避免占用大量内存和时间。
 
-import { dim, green, red } from "./style.ts";
+import type { Text } from "@uncarved/jade-api";
+import { added as plus, dim, lines as joinLines, removed as minus } from "./style.ts";
 
 export type DiffLine = { kind: " " | "-" | "+"; text: string; /** 旧文件里的行号（删除、相同） */ old?: number; /** 新文件里的行号（新增、相同） */ new?: number };
 
@@ -110,11 +111,11 @@ export function diffStats(lines: DiffLine[]): DiffStats {
  * 显示用：每行前面是行号（新增行用新文件的行号，其余用旧文件的），段与段之间用 ⋯ 分开。
  * 超过 maxLines 行时截断
  */
-export function renderDiff(before: string, after: string, maxLines = 60, lines = diffLines(before, after)): string {
+export function renderDiff(before: string, after: string, maxLines = 60, lines = diffLines(before, after)): Text {
   const parts = hunks(lines);
   if (parts.length === 0) return dim("  (no changes)");
   const width = String(lines.reduce((w, l) => Math.max(w, l.old ?? 0, l.new ?? 0), 0)).length;
-  const out: string[] = [];
+  const out: Text[] = [];
   let shown = 0;
   let total = 0;
   for (const h of parts) total += h.length;
@@ -124,12 +125,12 @@ export function renderDiff(before: string, after: string, maxLines = 60, lines =
       if (shown >= maxLines) break;
       const no = String((l.kind === "+" ? l.new : l.old) ?? "").padStart(width);
       const text = `${no} ${l.kind} ${l.text}`;
-      out.push(l.kind === "+" ? green(text) : l.kind === "-" ? red(text) : dim(text));
+      out.push(l.kind === "+" ? plus(text) : l.kind === "-" ? minus(text) : dim(text));
       shown++;
     }
   }
   if (total > shown) out.push(dim(`  … ${total - shown} more lines`));
   const { added, removed } = diffStats(lines);
-  out.push(dim(`  ${green(`+${added}`)} ${red(`-${removed}`)}`));
-  return out.join("\n");
+  out.push(["  ", plus(`+${added}`), " ", minus(`-${removed}`)]);
+  return joinLines(out);
 }

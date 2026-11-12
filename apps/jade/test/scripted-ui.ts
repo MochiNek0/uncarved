@@ -84,13 +84,14 @@ const FAKE_MODEL = `export default { process(ctx) {
   }, list: async () => g().listed, saved: async () => g().saved });
 } };`;
 
-const FAKE_FRONTEND = `export default { process(ctx) {
+const FAKE_FRONTEND = `const plain = (t) => (typeof t === "string" ? t : Array.isArray(t) ? t.map(plain).join("") : (t?.text ?? ""));
+export default { process(ctx) {
   const g = () => globalThis.__jadeScriptedUi;
   ctx.provide("frontend@1", { run: async () => 0 });
   ctx.provide("ui@1", {
     get interactive() { return g().interactive; },
     notify: (m) => void g().notes.push(m),
-    select: async (r) => { g().asked.push(r.title); g().dialogs.push({ title: r.title, ...(r.detail ? { detail: r.detail } : {}) }); const a = g().answers.shift(); return a === undefined ? r.options[0]?.value : a === "" ? undefined : a; },
+    select: async (r) => { g().asked.push(r.title); g().dialogs.push({ title: r.title, ...(r.detail ? { detail: plain(r.detail) } : {}) }); const a = g().answers.shift(); return a === undefined ? r.options[0]?.value : a === "" ? undefined : a; },
     input: async () => undefined,
     session: ({ plugin }) => ({
       status: (segment) => void g().statuses.push({ plugin, segment }),

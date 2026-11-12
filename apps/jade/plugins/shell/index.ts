@@ -1,7 +1,7 @@
 // jade/shell：bash 工具，以及后台命令的 bash_output、kill_shell；shell@1 给其他插件执行命令。
 // 后台命令自己结束时告诉用户，并给模型留一句说明（不用它一直轮询）；/shells 给用户看和停掉后台命令。
 
-import { definePlugin, type UI } from "@uncarved/jade-api";
+import { definePlugin, type Span, type UI } from "@uncarved/jade-api";
 import type { Commands, Prompts, Renderers, Tools } from "@uncarved/jade-api/services";
 import { shellRenderers } from "./renderers.ts";
 import { shellService } from "./service.ts";
@@ -20,10 +20,8 @@ const SH_TIMEOUT_MS = 600_000;
 const SH_LIVE_CHARS = 4000;
 /** /sh 的结果收起时那一行最多这么多个字符 */
 const SH_SUMMARY = 160;
-// 设了 NO_COLOR（非空）或标准输出不是终端时不输出颜色
-const colors = Boolean(process.stdout.isTTY) && !process.env.NO_COLOR;
-/** 失败的红色，其余的灰色 */
-const shade = (failed: boolean, s: string) => (colors ? (failed ? `\x1b[31m${s}\x1b[39m` : `\x1b[2m${s}\x1b[22m`) : s);
+/** 结果的一行：失败的是错误，成功的是次要的（带语义样式的文字，怎么画由前端决定） */
+const shade = (failed: boolean, text: string): Span => ({ text, style: failed ? "error" : "dim" });
 
 export default definePlugin({
   process(ctx) {

@@ -1,5 +1,6 @@
 // 仓库目录、确认记录、显示用的小工具、斜杠命令参数的切分、token 估算。插件之间不共享代码（只能共享类型），jade/skills、jade/checks 各有一份。
 
+import type { Span, Text, TextStyle } from "@uncarved/jade-api";
 import { existsSync, realpathSync } from "node:fs";
 import path from "node:path";
 
@@ -41,15 +42,15 @@ export function display(cwd: string, full: string): string {
 
 export const clip = (s: string, n: number) => (s.length > n ? s.slice(0, n) + "…" : s);
 
-// 设了 NO_COLOR（非空）或标准输出不是终端时不输出颜色，见 https://no-color.org
-const colors = Boolean(process.stdout.isTTY) && !process.env.NO_COLOR;
-const paint = (open: string, close: string) => (s: string) =>
-  colors ? `\x1b[${open}m${s.replaceAll(`\x1b[${close}m`, `\x1b[${close}m\x1b[${open}m`)}\x1b[${close}m` : s;
-export const dim = paint("2", "22");
-export const red = paint("31", "39");
-export const green = paint("32", "39");
-export const yellow = paint("33", "39");
-export const bold = paint("1", "22");
+// 带语义样式的文字（jade-api 的 Text）：插件只说这段是次要的、成功、警告……，怎么画由前端决定
+const styled = (style: TextStyle) => (text: string): Span => ({ text, style });
+export const dim = styled("dim");
+export const bold = styled("bold");
+export const ok = styled("ok");
+export const warn = styled("warn");
+export const error = styled("error");
+/** 几行接成一段，行之间换行 */
+export const lines = (rows: readonly Text[]): Text => rows.flatMap((r, i) => (i ? ["\n", r] : [r]));
 
 /** 斜杠命令的参数按空白切开；"…" 或 '…' 里的空白不切（不处理反斜杠，Windows 路径照写） */
 export function splitArgs(text: string): string[] {

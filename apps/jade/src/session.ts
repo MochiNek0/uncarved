@@ -36,6 +36,7 @@ import {
   type SessionTool,
   type SessionUI,
   type StatusSegment,
+  type Text,
   type ToolMeta,
   type UI,
 } from "./api.ts";
@@ -402,7 +403,8 @@ export class Sessions implements SessionManager {
       ...(sessionUI
         ? {
             status: (text: string | StatusSegment | undefined) => uiCall(() => sessionUI.status(statusSegment(text))),
-            ...(sessionUI.panel ? { panel: (text: string | undefined) => uiCall(() => sessionUI.panel!(text === undefined ? undefined : String(text))) } : {}),
+            // 带样式的文字（Text）原样交给前端，由它决定怎么画
+            ...(sessionUI.panel ? { panel: (text: Text | undefined) => uiCall(() => sessionUI.panel!(text)) } : {}),
             // 项目层插件拿不到输入框（第 7 节）：克隆的仓库不能替用户写字
             ...(sessionUI.draft && layer !== "project" ? { input: sessionUI.draft } : {}),
           }

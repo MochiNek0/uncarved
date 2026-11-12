@@ -12,7 +12,7 @@ import { definePlugin } from "@uncarved/jade-api";
 import type { Completions, Renderers } from "@uncarved/jade-api/services";
 import { attachMentions } from "./attach.ts";
 import { mentionCandidates } from "./candidates.ts";
-import { clip, dim, yellow } from "./style.ts";
+import { clip, dim, lines as joinLines, warn } from "./style.ts";
 
 export interface MentionsState {
   /** state.messages 的前 upTo 条已经处理过 */
@@ -44,10 +44,10 @@ export default definePlugin({
       render: (data) => {
         const d = data as { attached: string[]; failed: { path: string; reason: string }[] };
         const lines = [
-          ...d.failed.map((f) => yellow(`[@${f.path} not attached: ${clip(f.reason, 200)}]`)),
+          ...d.failed.map((f) => warn(`[@${f.path} not attached: ${clip(f.reason, 200)}]`)),
           ...(d.attached.length ? [dim(`[attached ${d.attached.map((p) => `@${p}`).join(", ")}]`)] : []),
         ];
-        return lines.length ? { line: lines.join("\n") } : undefined;
+        return lines.length ? { line: joinLines(lines) } : undefined;
       },
     });
   },

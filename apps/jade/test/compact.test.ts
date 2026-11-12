@@ -9,6 +9,10 @@ import type { UI } from "../src/index.ts";
 import type { CommandContext, Commands, Renderers } from "@uncarved/jade-api/services";
 import { compactThreshold, DERIVED_KEY, estimateTokens, isContextOverflow, parseTokens, TRIMMED, type CompactState } from "../plugins/compact/compact.ts";
 import { say, cleanup, scriptedHost, textOf, use } from "./scripted-ui.ts";
+import { plain as plainText } from "../plugins/tui/screen.ts";
+import type { Text } from "@uncarved/jade-api";
+/** 插件给的是带样式的文字（Text）：只比文字 */
+const shown = (r: unknown) => plainText(r as Text);
 
 afterEach(cleanup);
 
@@ -99,7 +103,7 @@ describe("jade/compact in a session", () => {
 
     const compact = host.service<Commands>("commands@1")!.get("compact")!.command;
     const c: CommandContext = { signal: new AbortController().signal, ui: host.service<UI>("ui@1")!, sessions: host.sessions, print: () => {} };
-    expect(await compact.run("keep the API decisions", c)).toContain("will be compacted");
+    expect(shown(await compact.run("keep the API decisions", c))).toContain("will be compacted");
     shared.script.push(say("SUMMARY"), say("C"));
     await send(s, "third");
 
@@ -117,7 +121,7 @@ describe("jade/compact in a session", () => {
     expect(compacted.summary).toContain("verbatim:\n> first");
     expect(compacted.summary).toContain("read a file again before editing it");
     expect((await s.history()).filter((e) => e.type === "jade/compact/compacted")).toHaveLength(1);
-    expect(host.service<Renderers>("renderers@1")!.forEvent("jade/compact/compacted")!.renderer.render({ from: 0, upTo: 1, before: 99 })!.line).toContain("compacted 1 messages");
+    expect(shown(host.service<Renderers>("renderers@1")!.forEvent("jade/compact/compacted")!.renderer.render({ from: 0, upTo: 1, before: 99 })!.line)).toContain("compacted 1 messages");
 
     // 恢复后直接使用日志里的摘要，不再调用总结
     const id = s.id;

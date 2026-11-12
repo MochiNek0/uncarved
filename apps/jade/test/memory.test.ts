@@ -9,6 +9,10 @@ import type { UI } from "../src/index.ts";
 import type { CommandContext, Commands } from "@uncarved/jade-api/services";
 import { Memory, projectRoot } from "../plugins/memory/memory.ts";
 import { say, cleanup, scriptedHost, textOf, use } from "./scripted-ui.ts";
+import { plain as plainText } from "../plugins/tui/screen.ts";
+import type { Text } from "@uncarved/jade-api";
+/** 插件给的是带样式的文字（Text）：只比文字 */
+const shown = (r: unknown) => plainText(r as Text);
 
 afterEach(cleanup);
 
@@ -75,7 +79,7 @@ describe("jade/memory", () => {
     const c: CommandContext = { signal: new AbortController().signal, ui: host.service<UI>("ui@1")!, sessions: host.sessions, print: () => {} };
     // 第一项是"Add a memory…"，第二项是这条记忆；然后确认
     shared.answers.push("0", "yes");
-    expect(await memory.run("", c)).toContain("Removed from project memory: Use tabs");
+    expect(shown(await memory.run("", c))).toContain("Removed from project memory: Use tabs");
     expect(await new Memory(home, cwd).list("project")).toEqual([]);
 
     shared.script.push(say("ok"), say("ok again"));
@@ -88,7 +92,7 @@ describe("jade/memory", () => {
 
     // 带参数：直接记住
     shared.answers.push("user");
-    expect(await memory.run("Answer briefly", c)).toContain("Saved to user memory");
+    expect(shown(await memory.run("Answer briefly", c))).toContain("Saved to user memory");
     expect(await new Memory(home, cwd).list("user")).toEqual(["Answer briefly"]);
   });
 });

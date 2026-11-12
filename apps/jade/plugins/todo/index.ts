@@ -4,7 +4,7 @@
 // 压缩插件可以从历史里找最后一份清单（latestTodos）写进摘要。从旧 jade 的 tools/todo.ts 移植。
 
 import type { Message, Tool } from "uncarved";
-import { definePlugin } from "@uncarved/jade-api";
+import { definePlugin, type Span, type Text } from "@uncarved/jade-api";
 import type { Renderers, ToolRenderer } from "@uncarved/jade-api/services";
 
 export type TodoStatus = "pending" | "in_progress" | "completed";
@@ -83,9 +83,8 @@ export function latestTodos(messages: Message[]): Todo[] | undefined {
   return undefined;
 }
 
-// 设了 NO_COLOR（非空）或标准输出不是终端时不输出颜色，见 https://no-color.org
-const colors = Boolean(process.stdout.isTTY) && !process.env.NO_COLOR;
-const bold = (s: string) => (colors ? `\x1b[1m${s}\x1b[22m` : s);
+// 带语义样式的文字（jade-api 的 Text）：怎么画由前端决定
+const bold = (text: string): Span => ({ text, style: "bold" });
 const args = (input: unknown) => (input !== null && typeof input === "object" ? input : {}) as Record<string, unknown>;
 const list = (input: unknown) => (Array.isArray(args(input).todos) ? (args(input).todos as Todo[]) : []);
 
@@ -94,17 +93,17 @@ const list = (input: unknown) => (Array.isArray(args(input).todos) ? (args(input
 export const todoRenderer: ToolRenderer = {
   tool: "todo_write",
   summary: (input) => progressLine(list(input)),
-  call: (input) => `${bold("Todos")} ${progressLine(list(input))}`,
+  call: (input) => [bold("Todos"), " ", progressLine(list(input))],
   details: (input) => renderTodos(list(input)),
   // 清单就是参数，结果不再显示（出错时照常显示）
   result: ({ isError }) => (isError ? undefined : null),
 };
 
 /** 输入框上方的一块：还有没做完的项时显示，全部做完或清空时去掉 */
-export function todoPanel(todos: Todo[]): string | undefined {
+export function todoPanel(todos: Todo[]): Text | undefined {
   if (todos.every((t) => t?.status === "completed")) return undefined;
   const p = progressOf(todos);
-  return `${bold("Todos")} ${p.done}/${p.total}\n${renderTodos(todos).replace(/^/gm, "  ")}`;
+  return [bold("Todos"), ` ${p.done}/${p.total}\n${renderTodos(todos).replace(/^/gm, "  ")}`];
 }
 
 export default definePlugin({

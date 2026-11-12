@@ -5,16 +5,15 @@
 // 不用重开会话；会话的工具清单在创建时就定了。
 
 import path from "node:path";
-import { definePlugin, type ScopeContext, type UI } from "@uncarved/jade-api";
+import { definePlugin, type ScopeContext, type Span, type UI } from "@uncarved/jade-api";
 import type { Commands, Prompts, Renderers, Tools } from "@uncarved/jade-api/services";
 import { envWithFile, updateEnvFile, type Env } from "./env.ts";
 import { webRenderers } from "./renderers.ts";
 import { parseOrder, parseResults, SEARCH_PROVIDERS, webTools } from "./web.ts";
 
-// 设了 NO_COLOR（非空）或标准输出不是终端时不输出颜色，见 https://no-color.org
-const colors = Boolean(process.stdout.isTTY) && !process.env.NO_COLOR;
-const dim = (s: string) => (colors ? `\x1b[2m${s}\x1b[22m` : s);
-const green = (s: string) => (colors ? `\x1b[32m${s}\x1b[39m` : s);
+// 带语义样式的文字（jade-api 的 Text）：怎么画由前端决定
+const dim = (text: string): Span => ({ text, style: "dim" });
+const ok = (text: string): Span => ({ text, style: "ok" });
 
 /**
  * API key 所在的环境：每次开会话时重新读，/search 改了之后原地更新。模块每个进程只加载一次，进程级的命令和会话级的工具共用
@@ -79,7 +78,7 @@ export default definePlugin({
         await updateEnvFile(file, { [p.env]: key }, env);
         offNote?.();
         offNote = undefined;
-        return green(`Web search is on with ${p.name}: web_search uses it, and web_fetch falls back to it when a page cannot be fetched directly.`);
+        return ok(`Web search is on with ${p.name}: web_search uses it, and web_fetch falls back to it when a page cannot be fetched directly.`);
       },
     });
   },

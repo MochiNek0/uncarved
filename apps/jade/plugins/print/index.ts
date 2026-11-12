@@ -1,6 +1,7 @@
 // jade/print：jade -p "<prompt>" 跑一轮就退出。模型的回复写到 stdout，工具调用和提示写到 stderr。
 // 不能向用户提问：ui@1 的 select 总是返回 undefined，要审批的调用由审批插件拒绝。
 
+import { stripVTControlCharacters } from "node:util";
 import type { Block, LogEvent, RuntimeNotice, Usage } from "uncarved";
 import { definePlugin, type Frontend, type UI } from "@uncarved/jade-api";
 import type { SessionIndex } from "@uncarved/jade-api/services";
@@ -18,10 +19,12 @@ Runs one prompt and exits. The reply goes to stdout; tool calls and notices go t
 Exit code: 0 when the turn ends normally, 1 on an error, 130 when interrupted.
 jade's own commands (plugins, update, --safe): jade help`;
 
-const ui: UI = {
+/** -p 的 ui@1（导出给测试） */
+export const ui: UI = {
   interactive: false,
   notify(message, level = "info") {
-    process.stderr.write(`${level === "info" ? "" : `[${level}] `}${message}\n`);
+    // 输出常常被重定向、交给别的程序：插件和工具带来的颜色、控制序列都去掉
+    process.stderr.write(`${level === "info" ? "" : `[${level}] `}${stripVTControlCharacters(String(message))}\n`);
   },
   select: async () => undefined,
   input: async () => undefined,
@@ -96,11 +99,11 @@ const frontend: Frontend = {
       }
       if (e.type === "tool.decided") {
         const d = e.data as { decision: string; reason?: string };
-        if (d.decision === "deny") process.stderr.write(`  denied${d.reason ? `: ${d.reason}` : ""}\n`);
+        if (d.decision === "deny") process.stderr.write(`  denied${d.reason ? `: ${stripVTControlCharacters(d.reason)}` : ""}\n`);
       }
       if (e.type === "tool.completed") {
         const d = e.data as { isError: boolean; content: Block[] };
-        if (d.isError) process.stderr.write(`  failed: ${firstLine(d.content)}\n`);
+        if (d.isError) process.stderr.write(`  failed: ${stripVTControlCharacters(firstLine(d.content))}\n`);
       }
       if (e.type === "turn.ended") ended = e.data as { reason: string; error?: string };
     });

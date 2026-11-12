@@ -5,10 +5,10 @@
 // 它只是给模型看的文字，不执行代码；和旧 jade 一样，列表里有项目层的 skill 时整段标为不可信。
 
 import path from "node:path";
-import { definePlugin, type Cli, type Sources, type UI } from "@uncarved/jade-api";
+import { definePlugin, type Cli, type Sources, type Text, type UI } from "@uncarved/jade-api";
 import type { Approval, Commands, Prompts } from "@uncarved/jade-api/services";
 import { addSkill, removeSkill, skillsRoot, updateSkills } from "./install.ts";
-import { bold, clip, dim, display, estimateTokens, realPath, red, repoRoot, splitArgs } from "./project.ts";
+import { bold, clip, dim, display, error, estimateTokens, lines as joinLines, plain, realPath, repoRoot, splitArgs } from "./project.ts";
 import { loadSkills, skillLine, skillsPrompt, skillTool, type Skill } from "./skills.ts";
 
 const ID = "jade/skills";
@@ -36,7 +36,7 @@ export const manageUsage = (cmd: string) => `usage: ${cmd} [list]
 export async function manageSkills(
   argv: readonly string[],
   env: { home: string; cwd: string; cmd: string; sources: Sources; log?: (text: string) => void; skills?: Skill[] },
-): Promise<string> {
+): Promise<Text> {
   const usage = manageUsage(env.cmd);
   const [sub, ...tail] = argv;
   if (sub === "-h" || sub === "--help" || tail.includes("-h") || tail.includes("--help")) return usage;
@@ -50,10 +50,10 @@ export async function manageSkills(
       return dim(`(no skills) install one with ${env.cmd} add <source>, or put it in ${display(env.cwd, path.join(env.home, "skills"))}/<name>/SKILL.md or .jade/skills/<name>/SKILL.md\nthe skill tool itself takes ≈${toolTokens} tokens in every request`);
     }
     const total = toolTokens + estimateTokens(skillsPrompt(skills)!);
-    return [
-      ...skills.map((sk) => `${bold(sk.name)} ${dim(`${sk.layer} · ${display(env.cwd, sk.dir)} · ≈${estimateTokens(skillLine(sk))} tokens`)}\n  ${clip(sk.description.replace(/\s+/g, " "), 300)}`),
+    return joinLines([
+      ...skills.map((sk): Text => [bold(sk.name), " ", dim(`${sk.layer} · ${display(env.cwd, sk.dir)} · ≈${estimateTokens(skillLine(sk))} tokens`), `\n  ${clip(sk.description.replace(/\s+/g, " "), 300)}`]),
       dim(`≈${total} tokens in every request (the skill list and the skill tool); a skill's instructions are read only when it is used`),
-    ].join("\n");
+    ]);
   }
   const positionals: string[] = [];
   let project = false;
@@ -124,19 +124,20 @@ export default definePlugin({
         try {
           argv = splitArgs(args);
         } catch (e) {
-          return red(errorText(e));
+          return error(errorText(e));
         }
         try {
           return await manageSkills(argv, { home: ctx.home, cwd: ctx.cwd, cmd: "/skills", sources, log: (t) => cctx.print(dim(t)), ...(latest ? { skills: latest } : {}) });
         } catch (e) {
-          return red(errorText(e));
+          return error(errorText(e));
         }
       },
     });
     // 同样的事也能在终端里做：jade skills add <source> [--project]（cli@1，核心提供）
     ctx.service<Cli>("cli@1")?.register({
       name: "skills",
-      run: (argv, cli) => manageSkills(argv, { home: ctx.home, cwd: ctx.cwd, cmd: "jade skills", sources, log: cli.log }),
+      // 终端里的命令输出到 stdout，常常被管道接走：只要文字
+      run: async (argv, cli) => plain(await manageSkills(argv, { home: ctx.home, cwd: ctx.cwd, cmd: "jade skills", sources, log: cli.log })),
     });
   },
 

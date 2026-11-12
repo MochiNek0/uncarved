@@ -4,7 +4,7 @@
 // 核心不 import 这个文件：核心不认识任何功能（原则 1）。
 
 import type { ContentSource, GatedToolCall, ModelRequest, ModelResponse, Tool } from "uncarved";
-import type { SelectRequest, SessionManager, UI } from "./index.ts";
+import type { SelectRequest, SessionManager, Text, UI } from "./index.ts";
 
 // ---------- commands@1（jade/commands） ----------
 
@@ -30,7 +30,7 @@ export interface Command {
   run(args: string, ctx: CommandContext): CommandResult | Promise<CommandResult>;
 }
 
-export type CommandResult = string | { prompt: string } | void | undefined;
+export type CommandResult = Text | { prompt: string } | void | undefined;
 
 /** 前端执行命令时给的上下文 */
 export interface CommandContext {
@@ -39,13 +39,13 @@ export interface CommandContext {
   ui: UI;
   /** 当前会话、新建、恢复（/clear、/resume 用它） */
   sessions: SessionManager;
-  /** 在对话里显示一段文字，可以带 ANSI 颜色。details：折叠起来的完整内容，终端界面里点击或 ctrl+o 展开，其他前端可以不显示 */
-  print(text: string, opts?: { details?: string }): void;
+  /** 在对话里显示一段文字（Text：可以带语义样式）。details：折叠起来的完整内容，终端界面里点击或 ctrl+o 展开，其他前端可以不显示 */
+  print(text: Text, opts?: { details?: Text }): void;
   /**
    * 命令还在跑时临时显示的内容（例如正在执行的程序的输出），可以多行；再调用一次换掉上一次的，undefined 去掉。
    * 显示在对话的最后，只显示末尾几行，命令结束时自动去掉。前端可以不提供
    */
-  progress?(text: string | undefined): void;
+  progress?(text: Text | undefined): void;
 }
 
 export interface CommandEntry {
@@ -112,32 +112,32 @@ export interface Keys {
 export interface ToolRenderer {
   tool: string;
   /** 调用行 "● 工具名(…)" 括号里的摘要，只显示第一行；默认是 path 参数或参数的 JSON */
-  summary?(input: unknown): string | undefined;
+  summary?(input: unknown): Text | undefined;
   /** 摘要省略了的参数（例如很长的命令），展开调用行后显示在最前面，可以多行 */
-  details?(input: unknown): string | undefined;
+  details?(input: unknown): Text | undefined;
   /** 执行时显示的内容，代替默认的 "工具名(摘要)"：第一行跟在 "● " 后面，其余的行原样显示在下面，不折叠 */
-  call?(input: unknown): string | undefined;
+  call?(input: unknown): Text | undefined;
   /**
    * 运行中的进度：工具用 ToolContext.progress 推送的一项换成一行，显示在对话的最后，工具结束时去掉；返回 undefined 不显示。
    * 没有这个函数时，{ text } 形式的进度按输出逐行显示，其他的不显示
    */
-  progress?(update: unknown, call: { toolUseId: string; summary(tool: string, input: unknown): string }): string | undefined;
+  progress?(update: unknown, call: { toolUseId: string; summary(tool: string, input: unknown): string }): Text | undefined;
   /** 请用户批准时显示的预览，可以多行；默认是参数的 JSON */
-  preview?(input: unknown): string | undefined | Promise<string | undefined>;
+  preview?(input: unknown): Text | undefined | Promise<Text | undefined>;
   /** 工具执行之前同步调用（例如记下修改前的文件，好在结果里显示 diff），返回值交给 result 的 before */
   before?(input: unknown): unknown;
   /**
    * 结果：line 接在调用行的 "⎿ " 后面（一行），details 是展开后的内容（可以多行）；
    * 返回 null 时不显示结果；默认显示结果文字的第一行，多出的行折叠起来
    */
-  result?(r: { toolUseId: string; input: unknown; text: string; isError: boolean; before?: unknown }): { line: string; details?: string } | null | undefined;
+  result?(r: { toolUseId: string; input: unknown; text: string; isError: boolean; before?: unknown }): { line: Text; details?: Text } | null | undefined;
 }
 
 /** 插件自己的事件（hook 的 ctx.emit 写入的）怎么显示。只能为自己的事件注册：event 不带 "<插件 id>/" 前缀 */
 export interface EventRenderer {
   event: string;
   /** line 显示成一行，details 是展开后的内容；返回 undefined 时不显示 */
-  render(data: unknown): { line: string; details?: string } | undefined;
+  render(data: unknown): { line: Text; details?: Text } | undefined;
 }
 
 export interface Renderers {

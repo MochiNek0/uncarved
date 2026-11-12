@@ -7,7 +7,7 @@
 // 当作普通消息发出去。
 
 import type { Block, Message } from "uncarved";
-import { definePlugin } from "@uncarved/jade-api";
+import { definePlugin, type Span } from "@uncarved/jade-api";
 import type { Renderers, Steer } from "@uncarved/jade-api/services";
 
 const ID = "jade/steer";
@@ -39,8 +39,9 @@ function changed(): void {
   }
 }
 
-const bold = (s: string) => `\x1b[1m${s}\x1b[22m`;
-const dim = (s: string) => `\x1b[2m${s}\x1b[22m`;
+// 带语义样式的文字（jade-api 的 Text）：怎么画由前端决定
+const bold = (text: string): Span => ({ text, style: "bold" });
+const dim = (text: string): Span => ({ text, style: "dim" });
 
 export default definePlugin({
   process(ctx) {
@@ -81,7 +82,7 @@ export default definePlugin({
       render(data) {
         const text = (data as { text?: unknown } | null)?.text;
         if (typeof text !== "string") return undefined;
-        return { line: `\n${bold(`› ${text.replace(/\n/g, "\n  ")}`)} ${dim("(sent while working)")}` };
+        return { line: ["\n", bold(`› ${text.replace(/\n/g, "\n  ")}`), " ", dim("(sent while working)")] };
       },
     });
   },

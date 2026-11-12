@@ -20,7 +20,8 @@ const APPROVER = {
   code: `export default { process(ctx) {
   const a = () => globalThis.__approver;
   ctx.require("approval@1").addApprover(async (req, signal) => {
-    a().seen.push({ title: req.title, detail: req.detail, options: req.options.map((o) => o.value) });
+    const plain = (t) => (typeof t === "string" ? t : Array.isArray(t) ? t.map(plain).join("") : (t?.text ?? ""));
+    a().seen.push({ title: req.title, detail: req.detail === undefined ? undefined : plain(req.detail), options: req.options.map((o) => o.value) });
     const next = a().answers.shift();
     if (next === "hang") return new Promise((r) => signal.addEventListener("abort", () => { a().aborted++; r(undefined); }, { once: true }));
     if (next === "throw") throw new Error("chat is down");

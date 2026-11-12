@@ -13,7 +13,7 @@ import { definePlugin } from "@uncarved/jade-api";
 import type { Commands, Prompts } from "@uncarved/jade-api/services";
 import { Checkpoints, lastTurnChanges, safe, sha256, turnToolNames, type Checkpoint } from "./checkpoint.ts";
 import { Snapshots, type Change, type Snapshot } from "./snapshot.ts";
-import { dim, green } from "./style.ts";
+import { dim, ok } from "./style.ts";
 
 /** 没有工作区快照（不在 git 仓库里、配置关掉了）时，shell 命令改了什么无从得知，撤销不了；这一轮跑过时提醒一句 */
 const SHELL_NOTE = "This turn also ran shell commands; what they changed is not undone.";
@@ -134,7 +134,7 @@ export default definePlugin({
         if (plan.size > MAX_LISTED) what.push(`and ${plan.size - MAX_LISTED} more files`);
         ctx.service<Prompts>("prompts@1")?.note(s.id, `The user undid your changes from your last turn: ${what.join("; ")}. Read these files again before changing them.`);
         const title = snap ? `Undid the last turn (${plan.size} file${plan.size > 1 ? "s" : ""}):` : `Undid ${cps.length} change${cps.length > 1 ? "s" : ""} from the last turn:`;
-        return green(title) + "\n" + dim(list) + (shellToo ? `\n${dim(SHELL_NOTE)}` : "");
+        return [ok(title), "\n", dim(list), ...(shellToo ? ["\n", dim(SHELL_NOTE)] : [])];
       },
     });
   },

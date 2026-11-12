@@ -10,10 +10,10 @@ import { readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Block } from "uncarved";
-import type { Frontend, OpenOptions, Session, SessionManager, SessionUI, StatusSegment, UI } from "@uncarved/jade-api";
-import type { CommandContext, Commands, Completions, Keys, Models, Renderers, SessionIndex, Steer } from "@uncarved/jade-api/services";
+import type { Frontend, OpenOptions, Session, SessionManager, SessionUI, StatusSegment, Text, UI } from "@uncarved/jade-api";
+import type { CommandContext, Commands, Completions, EventRenderer, Keys, Models, Renderers, SessionIndex, Steer, ToolRenderer } from "@uncarved/jade-api/services";
 import { InputHistory } from "./history.ts";
-import { dim, red, safeScreen, yellow, type CommandInfo, type CompletionInfo, type Screen } from "./screen.ts";
+import { ansi, dim, red, safeScreen, yellow, type CommandInfo, type CompletionInfo, type Screen } from "./screen.ts";
 import { transcript, type Transcript } from "./transcript.ts";
 
 /**
@@ -57,6 +57,40 @@ const KEYS = [
   "  running    esc interrupt (twice to also move queued messages back to the input) · ctrl+c twice to exit",
   "  transcript pgup/pgdn scroll · ctrl+home/end top/bottom · ctrl+o expands the latest item, a click the one under it · drag to select and copy · ctrl+l redraw",
 ].join("\n");
+
+/** Text 画成终端里的样子；没有就是没有 */
+const paint = (v: Text | undefined | null): string | undefined => (v === undefined || v === null ? undefined : ansi(v));
+
+/** 插件的显示方式给的是带样式的文字（Text）：交给对话区之前画成终端里的样子，对话区只管字符串 */
+function ansiTool(r: ToolRenderer): ToolRenderer {
+  const out: ToolRenderer = { tool: r.tool };
+  if (r.summary) out.summary = (i) => paint(r.summary!(i));
+  if (r.details) out.details = (i) => paint(r.details!(i));
+  if (r.call) out.call = (i) => paint(r.call!(i));
+  if (r.progress) out.progress = (u, c) => paint(r.progress!(u, c));
+  if (r.preview) out.preview = async (i) => paint(await r.preview!(i));
+  if (r.before) out.before = (i) => r.before!(i);
+  if (r.result)
+    out.result = (x) => {
+      const o = r.result!(x);
+      return o ? { line: ansi(o.line), ...(o.details !== undefined ? { details: ansi(o.details) } : {}) } : o;
+    };
+  return out;
+}
+
+function ansiEvent(r: EventRenderer): EventRenderer {
+  return {
+    event: r.event,
+    render: (data) => {
+      const o = r.render(data);
+      return o && { line: ansi(o.line), ...(o.details !== undefined ? { details: ansi(o.details) } : {}) };
+    },
+  };
+}
+
+/** 命令返回的是"作为用户消息发给模型"（{ prompt }），不是要显示的文字 */
+const isPrompt = (r: unknown): r is { prompt: string } =>
+  typeof r === "object" && r !== null && !Array.isArray(r) && typeof (r as { prompt?: unknown }).prompt === "string";
 
 /** 退出时最多等正在做的事这么久 */
 const QUIT_WAIT_MS = 3000;
@@ -134,7 +168,7 @@ export class ScreenBridge {
     },
     select: async (req, signal) => {
       if (!this.screen) return undefined;
-      return this.screen.select(req.title, req.options.map((o) => ({ label: o.label, value: o.value, ...(o.hint ? { hint: o.hint } : {}) })), { ...(req.detail ? { body: req.detail } : {}), ...(signal ? { signal } : {}) });
+      return this.screen.select(req.title, req.options.map((o) => ({ label: o.label, value: o.value, ...(o.hint ? { hint: o.hint } : {}) })), { ...(req.detail ? { body: ansi(req.detail) } : {}), ...(signal ? { signal } : {}) });
     },
     input: async (req, signal) => {
       if (!this.screen) return undefined;
@@ -211,7 +245,7 @@ export class ScreenBridge {
     };
     return {
       status: (text) => put(bridge.#segments, text === undefined ? undefined : clipSegment(text)),
-      panel: (text) => put(bridge.#panels, text === undefined ? undefined : clipPanel(text)),
+      panel: (text) => put(bridge.#panels, text === undefined ? undefined : clipPanel(ansi(text))),
       draft: {
         text: () => bridge.screen?.draft?.text() ?? "",
         insert: (text) => bridge.screen?.draft?.insert(text),
@@ -380,8 +414,14 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
     contextWindow: () => models?.current()?.contextWindow ?? 0,
     maxTokens: () => models?.current()?.maxTokens,
     canRetry,
-    renderer: (tool) => renderers.forTool(tool),
-    eventRenderer: (type) => renderers.forEvent(type),
+    renderer: (tool) => {
+      const found = renderers.forTool(tool);
+      return found && { plugin: found.plugin, renderer: ansiTool(found.renderer) };
+    },
+    eventRenderer: (type) => {
+      const found = renderers.forEvent(type);
+      return found && { plugin: found.plugin, renderer: ansiEvent(found.renderer) };
+    },
   });
 
   /** 换成另一个会话：清屏，恢复的会话重新显示之前的对话，然后继续日志里没做完的工作 */
@@ -621,7 +661,8 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
     const ac = new AbortController();
     commandAborts.add(ac);
     // 命令的临时显示：末尾几行，每行占进度区的一行
-    const showLive = (text: string | undefined) => {
+    const showLive = (live: Text | undefined) => {
+      const text = live === undefined ? undefined : ansi(live);
       const lines = text?.replace(/\r\n?/g, "\n").trimEnd().split("\n").slice(-LIVE_ROWS) ?? [];
       for (let i = 0; i < LIVE_ROWS; i++) screen.progress(`command:${i}`, text !== undefined && i < lines.length ? dim(`  │ ${lines[i]}`) : undefined);
     };
@@ -629,16 +670,15 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
       signal: ac.signal,
       ui: bridge.ui,
       sessions: manager,
-      print: (t, o) => screen.log(t, o?.details ? { details: o.details } : undefined),
+      print: (t, o) => screen.log(ansi(t), o?.details ? { details: ansi(o.details) } : undefined),
       progress: showLive,
     };
     try {
       const result = await found.command.run(rest, ctx);
-      if (typeof result === "string") screen.log(result);
-      else if (result && typeof result === "object" && typeof result.prompt === "string") {
+      if (isPrompt(result)) {
         if (found.command.instant) screen.log(yellow(`[warning] /${name} is instant and cannot send a prompt`));
         else await say(result.prompt);
-      }
+      } else if (result !== undefined && result !== null) screen.log(ansi(result));
     } catch (e) {
       if (!ac.signal.aborted) screen.log(red(`[error] /${name}: ${errorText(e)}`));
     } finally {

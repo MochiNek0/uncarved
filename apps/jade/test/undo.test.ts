@@ -13,7 +13,11 @@ import { say, cleanup, scriptedHost, textOf, use } from "./scripted-ui.ts";
 
 afterEach(cleanup);
 
-const plain = (s: unknown) => String(s).replace(/\x1b\[[0-9;]*m/g, "");
+// 插件给的是带样式的文字（Text）：只比文字
+import { plain as plainText } from "../plugins/tui/screen.ts";
+import type { Text } from "@uncarved/jade-api";
+/** 命令的结果（这里都是要显示的文字）只比文字 */
+const plain = (r: unknown) => plainText(r as Text);
 
 describe("turn-level undo", () => {
   const text = (t: string, by: "user" | "plugin" = "user"): Block =>

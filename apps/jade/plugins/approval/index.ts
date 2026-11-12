@@ -10,7 +10,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { EventDataMap, GatedToolCall, Message } from "uncarved";
-import { definePlugin, type Caller, type SelectRequest, type UI } from "@uncarved/jade-api";
+import { definePlugin, type Caller, type SelectRequest, type Text, type UI } from "@uncarved/jade-api";
 import type { Answer, Approval, Approver, Models, Renderers } from "@uncarved/jade-api/services";
 import { describeRule, MODES, policy, type AllowRule, type Mode } from "./policy.ts";
 import { reviewer, type Review } from "./review.ts";
@@ -206,7 +206,7 @@ export default definePlugin({
       const described = allow.map(describeRule).join(", ");
       // "总是允许"的范围只在正文里写一次：写进选项里时，长命令会把两个选项句尾的区别（本会话 / 这个目录）挤出屏幕
       const covers = asked.mine ? `"Always allow" covers: ${allow.length === 1 && allow[0]!.command !== undefined ? `${allow[0]!.tool}, this exact command only` : described}\n\n` : "";
-      const shown = covers + ((await preview(renderers, call)) ?? detail(call));
+      const shown: Text = [covers, (await preview(renderers, call)) ?? detail(call)];
       const expired = new AbortController();
       const timer = setTimeout(() => expired.abort(), askTimeoutMs);
       let got: Got | undefined;
@@ -216,7 +216,7 @@ export default definePlugin({
           {
             title: `Allow ${call.name}?`,
             // 审查转给用户的：先说为什么
-            detail: asked.why ? `${asked.why}\n\n${shown}` : shown,
+            detail: asked.why ? [asked.why, "\n\n", shown] : shown,
             options: [
               { label: "Allow once", value: "once" },
               // 别的插件要问的调用不能"总是允许"：这里的规则管不到它的关卡
@@ -449,7 +449,7 @@ async function addForever(file: string, cwd: string, add: AllowRule[]): Promise<
  * 工具自己登记的审批预览（例如文件修改的 diff）。没有登记、返回的不是文字、或者出错时返回 undefined，
  * 用下面的 detail：预览是别的插件的代码，它坏了不能让审批卡住或失败
  */
-async function preview(renderers: Renderers | undefined, call: AskedCall): Promise<string | undefined> {
+async function preview(renderers: Renderers | undefined, call: AskedCall): Promise<Text | undefined> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     // 预览可能读文件、算 diff；一直不返回时也要能问用户
@@ -457,7 +457,7 @@ async function preview(renderers: Renderers | undefined, call: AskedCall): Promi
       timer = setTimeout(() => resolve(undefined), PREVIEW_TIMEOUT_MS);
     });
     const text = await Promise.race([Promise.resolve(renderers?.forTool(call.name)?.renderer.preview?.(call.input)), late]);
-    return typeof text === "string" ? text : undefined;
+    return typeof text === "string" || (typeof text === "object" && text !== null) ? text : undefined;
   } catch {
     return undefined;
   } finally {

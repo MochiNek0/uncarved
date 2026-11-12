@@ -1,5 +1,6 @@
 // jade/renderers：工具调用和插件事件在对话里怎么显示的注册表。前端查这里；没有登记的用前端的默认显示。
-// 显示的文字可以带 ANSI 颜色，前端负责过滤掉颜色之外的控制序列。
+// 显示的文字是 jade-api 的 Text（带语义样式的片段，也可以是普通字符串），怎么画由前端决定；
+// 前端负责过滤掉字符串里颜色之外的控制序列。
 
 import { definePlugin } from "@uncarved/jade-api";
 import type { EventRenderer, Renderers, ToolRenderer } from "@uncarved/jade-api/services";

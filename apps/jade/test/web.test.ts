@@ -8,6 +8,10 @@ import type { UI } from "../src/index.ts";
 import type { CommandContext, Commands } from "@uncarved/jade-api/services";
 import { htmlToMarkdown, isPrivateHost, parseOrder, parseResults, SEARCH_OFF, SEARCH_PROVIDERS, webTools } from "../plugins/web/web.ts";
 import { msg, say, scripted, turn } from "./scripted-host.ts";
+import { plain as plainText } from "../plugins/tui/screen.ts";
+import type { Text } from "@uncarved/jade-api";
+/** 插件给的是带样式的文字（Text）：只比文字 */
+const shown = (r: unknown) => plainText(r as Text);
 
 const ctx = (): ToolContext => ({ sessionId: "s", toolUseId: "t", signal: new AbortController().signal, parent: { sessionId: "s", eventId: "e" }, progress: () => {} });
 
@@ -265,7 +269,7 @@ describe("jade/web plugin", () => {
 
       const search = host.service<Commands>("commands@1")!.get("search")!.command;
       const c: CommandContext = { signal: new AbortController().signal, ui: scriptedUi(["tavily"], " tvly-secret "), sessions: host.sessions, print: () => {} };
-      expect(await search.run("", c)).toContain("Web search is on with tavily");
+      expect(shown(await search.run("", c))).toContain("Web search is on with tavily");
       expect(await readFile(path.join(home, ".env"), "utf8")).toBe("TAVILY_API_KEY=tvly-secret\n");
 
       // 当前会话立即用上，不用重开
@@ -275,7 +279,7 @@ describe("jade/web plugin", () => {
 
       // 去掉 key
       const off: CommandContext = { ...c, ui: scriptedUi(["tavily", "off"], undefined) };
-      expect(await search.run("", off)).toContain("Web search is off");
+      expect(shown(await search.run("", off))).toContain("Web search is off");
       expect(await readFile(path.join(home, ".env"), "utf8")).toBe("\n");
       await turn(s, msg("once more"));
       expect(tools(2)).not.toContain("web_search");
@@ -293,7 +297,7 @@ describe("jade/web plugin", () => {
     try {
       const search = host.service<Commands>("commands@1")!.get("search")!.command;
       const c: CommandContext = { signal: new AbortController().signal, ui: scriptedUi(["tavily", "set"], "new"), sessions: host.sessions, print: () => {} };
-      expect(await search.run("", c)).toContain("TAVILY_API_KEY is set in your shell environment");
+      expect(shown(await search.run("", c))).toContain("TAVILY_API_KEY is set in your shell environment");
       await expect(readFile(path.join(home, ".env"), "utf8")).rejects.toThrow();
     } finally {
       if (before === undefined) delete process.env.TAVILY_API_KEY;

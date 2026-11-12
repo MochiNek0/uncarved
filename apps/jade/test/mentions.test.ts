@@ -9,7 +9,8 @@ import { say, cleanup, scriptedHost, textOf } from "./scripted-ui.ts";
 
 afterEach(cleanup);
 
-const plain = (s: string | undefined) => s?.replace(/\x1b\[[0-9;]*m/g, "");
+// 插件给的是带样式的文字（Text）：只比文字
+import { plain } from "../plugins/tui/screen.ts";
 
 describe("jade/mentions", () => {
   test("parsing: quoted paths, trailing punctuation, duplicates, e-mail addresses", () => {

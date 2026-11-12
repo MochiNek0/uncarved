@@ -10,6 +10,10 @@ import { shellTool, shellTools } from "../plugins/shell/shell.ts";
 import type { UI } from "../src/index.ts";
 import type { CommandContext, Commands } from "@uncarved/jade-api/services";
 import { cleanup, say, scriptedHost, textOf, use } from "./scripted-ui.ts";
+import { plain as plainText } from "../plugins/tui/screen.ts";
+import type { Text } from "@uncarved/jade-api";
+/** 插件给的是带样式的文字（Text）：只比文字 */
+const shown = (r: unknown) => plainText(r as Text);
 
 let tmp: string[] = [];
 afterEach(async () => {
@@ -203,7 +207,7 @@ describe("jade/shell in a session", () => {
     const sh = w.host.service<Commands>("commands@1")!.get("sh")!.command;
     const printed: unknown[] = [];
     const live: (string | undefined)[] = [];
-    const base = { ui: w.host.service<UI>("ui@1")!, sessions: w.host.sessions, print: (t: string, o?: { details?: string }) => void printed.push([t.replace(/\x1b\[[0-9;]*m/g, ""), o]), progress: (t: string | undefined) => void live.push(t) };
+    const base = { ui: w.host.service<UI>("ui@1")!, sessions: w.host.sessions, print: (t: Text, o?: { details?: Text }) => void printed.push([shown(t), o?.details === undefined ? o : { details: shown(o.details) }]), progress: (t: string | undefined) => void live.push(t) };
     const c: CommandContext = { ...base, signal: new AbortController().signal };
     await sh.run("echo hi", c);
     // 输出一到就交给前端显示

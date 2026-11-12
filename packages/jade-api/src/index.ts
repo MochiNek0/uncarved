@@ -72,6 +72,25 @@ export interface ToolMeta {
 }
 
 /**
+ * 给用户看的文字：普通字符串，或者带语义样式的片段，可以嵌套成数组（[dim("·"), " ", name]）。
+ * 插件只说"这段是次要的、这段是错误"，怎么画由前端决定：终端界面画成颜色，-p 和别的前端可以只取文字。
+ * 字符串里仍可以带 ANSI 颜色（旧的写法），终端界面照常显示，其他前端会去掉
+ */
+export type Text = string | Span | readonly Text[];
+
+/** 一段带样式的文字 */
+export interface Span {
+  text: string;
+  style: TextStyle | readonly TextStyle[];
+}
+
+/**
+ * dim 次要的；bold 强调；ok 成功；warn 警告；error 错误；accent 醒目的另一种（例如标题、名字）；
+ * code 命令、路径一类的字面内容；added、removed 差异里加的、删的行
+ */
+export type TextStyle = "dim" | "bold" | "ok" | "warn" | "error" | "accent" | "code" | "added" | "removed";
+
+/**
  * 状态栏上插件的一段。只给文字时是普通的一段：灰色，窄的时候比较早去掉。
  * tone：语义上的颜色，前端自己决定怎么画（ok 绿、warn 黄、error 红、accent 醒目的另一种颜色）；
  * keep：窄的时候也不去掉（例如当前模式），这时放不下就换成 short
@@ -176,7 +195,7 @@ export interface SessionContext extends ScopeContext {
    * 输入框上方这个插件的一块，可以多行（例如任务清单），一直显示到换掉或去掉；undefined 去掉。
    * 前端没有这个位置时是 undefined。几个插件都有时按调用先后排列
    */
-  readonly panel?: (text: string | undefined) => void;
+  readonly panel?: (text: Text | undefined) => void;
   /** 输入框里的草稿：读、追加、整段替换、灰色提示；只有终端界面有 */
   readonly input?: Draft;
   /** 交给内核的部分，只能在 session() 执行期间注册：会话的内核插件清单在创建时确定 */
@@ -392,7 +411,7 @@ export interface SessionUI {
   /** 状态栏上这个插件的一段（一行）；undefined 去掉 */
   status(text: string | StatusSegment | undefined): void;
   /** 输入框上方这个插件的一块（可以多行）；undefined 去掉。没有这个位置的前端没有 */
-  panel?(text: string | undefined): void;
+  panel?(text: Text | undefined): void;
   /** 输入框；没有输入框的前端（例如 -p）没有 */
   readonly draft?: Draft;
   /** 去掉这个插件在这个会话里留下的一切（状态栏的段落、输入框上方的一块、输入框的提示） */
@@ -410,7 +429,7 @@ export interface InputRequest {
 export interface SelectRequest<T extends string> {
   title: string;
   /** 选项上方的详细内容，例如要执行的命令、要改的文件 */
-  detail?: string;
+  detail?: Text;
   options: { label: string; value: T; /** 选项后面的灰色说明 */ hint?: string }[];
 }
 

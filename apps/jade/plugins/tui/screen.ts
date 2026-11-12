@@ -4,7 +4,7 @@
 
 import { createInterface, type Interface } from "node:readline/promises";
 import { stripVTControlCharacters } from "node:util";
-import type { StatusSegment } from "@uncarved/jade-api";
+import type { Span, StatusSegment, Text, TextStyle } from "@uncarved/jade-api";
 
 export interface Choice<T> {
   label: string;
@@ -112,6 +112,38 @@ export const bold = paint("1", "22");
 export const italic = paint("3", "23");
 export const underline = paint("4", "24");
 export const strike = paint("9", "29");
+const magenta = paint("35", "39");
+
+/** 插件给的带语义样式的文字（jade-api 的 Text）怎么画 */
+const STYLES: Record<TextStyle, (s: string) => string> = {
+  dim,
+  bold,
+  ok: green,
+  warn: yellow,
+  error: red,
+  accent: magenta,
+  code: cyan,
+  added: green,
+  removed: red,
+};
+
+/** 插件给的文字画成终端里的样子：片段按样式上色（字符串里原有的 ANSI 照留），嵌套的数组按顺序接起来 */
+export function ansi(t: Text | undefined): string {
+  if (t === undefined || t === null) return "";
+  if (typeof t === "string") return t;
+  if (Array.isArray(t)) return (t as readonly Text[]).map(ansi).join("");
+  const span = t as Span;
+  const styles = (Array.isArray(span.style) ? span.style : [span.style]) as TextStyle[];
+  return styles.reduce((s, style) => STYLES[style]?.(s) ?? s, String(span.text ?? ""));
+}
+
+/** 只取文字：样式和字符串里的控制序列都去掉（不画颜色的地方用，例如 -p、测试） */
+export function plain(t: Text | undefined): string {
+  if (t === undefined || t === null) return "";
+  if (typeof t === "string") return stripVTControlCharacters(t);
+  if (Array.isArray(t)) return (t as readonly Text[]).map(plain).join("");
+  return stripVTControlCharacters(String((t as Span).text ?? ""));
+}
 
 // ---------- 过滤控制字符 ----------
 

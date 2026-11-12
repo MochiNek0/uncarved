@@ -7,11 +7,11 @@
 // 服务进程退出后，下一次调用它的工具时重新连接一次。
 
 import path from "node:path";
-import { definePlugin, type Cli, type ProcessContext, type Trust, type UI } from "@uncarved/jade-api";
+import { definePlugin, type Cli, type ProcessContext, type Text, type Trust, type UI } from "@uncarved/jade-api";
 import type { Commands, Prompts, Tools } from "@uncarved/jade-api/services";
 import { describeServer, loadMcpConfig, McpClient, mcpTools, mcpTrustHash } from "./mcp.ts";
 import { manageMcp, manageUsage } from "./install.ts";
-import { bold, clip, dim, display, estimateTokens, green, realPath, red, repoRoot, splitArgs, yellow } from "./project.ts";
+import { bold, clip, dim, display, error, estimateTokens, lines as joinLines, ok, realPath, repoRoot, splitArgs, warn } from "./project.ts";
 
 const ID = "jade/mcp";
 /** 第一个会话最多等 MCP 服务连接这么久（能交互时），没连上的在后台接着连 */
@@ -156,47 +156,47 @@ export default definePlugin({
         try {
           words = splitArgs(args);
         } catch (e) {
-          return red(errorText(e));
+          return error(errorText(e));
         }
         // 只改配置文件，不用先连接
         if (words[0] === "add" || words[0] === "remove" || words[0] === "rm") {
           try {
             return await manageMcp(words, { home: ctx.home, cwd: ctx.cwd, cmd: "/mcp" });
           } catch (e) {
-            return red(errorText(e));
+            return error(errorText(e));
           }
         }
         await servers.start();
         const clients = servers.clients;
         if (words[0] === "reconnect") {
           const c = clients.find((x) => x.name === words[1]);
-          if (!c) return red(`usage: /mcp reconnect <name>; servers: ${clients.map((x) => x.name).join(", ") || "(none)"}`);
+          if (!c) return error(`usage: /mcp reconnect <name>; servers: ${clients.map((x) => x.name).join(", ") || "(none)"}`);
           await c.close();
           try {
             await c.connect();
-            return green(`${c.name} connected, ${c.tools.length} tools; new tools are available from the next session (/clear)`);
+            return ok(`${c.name} connected, ${c.tools.length} tools; new tools are available from the next session (/clear)`);
           } catch (err) {
-            return red(`${c.name}: ${errorText(err)}`);
+            return error(`${c.name}: ${errorText(err)}`);
           }
         }
-        if (words.length > 0) return red(`usage: /mcp [reconnect <name>]\n${manageUsage("/mcp")}`);
+        if (words.length > 0) return error(`usage: /mcp [reconnect <name>]\n${manageUsage("/mcp")}`);
         if (clients.length === 0) {
           return dim(`(no MCP servers) add one with /mcp add, or configure them in ${display(ctx.cwd, path.join(ctx.home, "mcp.json"))}, .mcp.json or .jade/mcp.json`);
         }
-        const lines: string[] = [];
+        const lines: Text[] = [];
         let total = 0;
         for (const c of clients) {
-          const state = c.status === "connected" ? green("connected") : c.status === "failed" ? red("failed") : yellow(c.status);
+          const state = c.status === "connected" ? ok("connected") : c.status === "failed" ? error("failed") : warn(c.status);
           const info = c.serverInfo?.name ? ` · ${c.serverInfo.name}${c.serverInfo.version ? ` ${c.serverInfo.version}` : ""}` : "";
           const tokens = serverTokens(c);
           total += tokens;
-          lines.push(`${bold(c.name)} ${state} ${dim(`${c.entry.layer} · ${display(ctx.cwd, c.entry.file)} · ${describeServer(c.entry.config)}${info}${tokens ? ` · ≈${tokens} tokens` : ""}`)}`);
-          if (c.error) lines.push(red(`  ${c.error}`));
-          if (c.tools.length) lines.push(`  tools  ${c.tools.map((t) => `${t.name}${t.annotations?.readOnlyHint ? dim(" (read)") : ""}`).join(", ")}`);
+          lines.push([bold(c.name), " ", state, " ", dim(`${c.entry.layer} · ${display(ctx.cwd, c.entry.file)} · ${describeServer(c.entry.config)}${info}${tokens ? ` · ≈${tokens} tokens` : ""}`)]);
+          if (c.error) lines.push(error(`  ${c.error}`));
+          if (c.tools.length) lines.push(["  tools  ", c.tools.flatMap((t, k) => [...(k ? [", "] : []), t.name, ...(t.annotations?.readOnlyHint ? [dim(" (read)")] : [])])]);
           if (c.status === "failed" && c.stderr.length) lines.push(dim(c.stderr.map((l) => `  │ ${clip(l, 200)}`).join("\n")));
         }
         if (total) lines.push(dim(`≈${total} tokens in every request (tool definitions and server instructions); remove or disable servers you do not use to save them`));
-        return lines.join("\n");
+        return joinLines(lines);
       },
     });
     // 终端里加、删服务：jade mcp add|remove …（cli@1，核心提供）。查看状态要连接服务，只在 /mcp 里有

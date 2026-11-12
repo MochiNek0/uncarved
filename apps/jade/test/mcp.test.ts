@@ -10,6 +10,10 @@ import { manageMcp } from "../plugins/mcp/install.ts";
 import { expandEnv, loadMcpConfig, McpClient, mcpToolName, mcpTools, type McpServerEntry } from "../plugins/mcp/mcp.ts";
 import type { SessionManager, UI } from "../src/index.ts";
 import { featureHost, msg, reply, results, tempDir, textOf, use } from "./feature-host.ts";
+import { plain as plainText } from "../plugins/tui/screen.ts";
+import type { Text } from "@uncarved/jade-api";
+/** 插件给的是带样式的文字（Text）：只比文字 */
+const shown = (r: unknown) => plainText(r as Text);
 
 const SERVER = path.join(import.meta.dir, "fixtures", "mcp-server.ts");
 
@@ -217,7 +221,7 @@ describe("jade/mcp plugin", () => {
       expect(textOf(f!.content)).toBe("it broke");
       // 子 Agent 只拿声明了只读的工具
       expect(state.notes.filter((n) => n.startsWith("task tool mcp__"))).toEqual(["task tool mcp__fake__echo"]);
-      const listed = String(await host.service<Commands>("commands@1")!.get("mcp")!.command.run("", ctxFor(host.sessions)));
+      const listed = shown(await host.service<Commands>("commands@1")!.get("mcp")!.command.run("", ctxFor(host.sessions)));
       expect(listed).toContain("fake");
       expect(listed).toContain("connected");
       expect(listed).toContain("echo");
@@ -385,9 +389,9 @@ describe("/mcp add and remove", () => {
     const { host } = await featureHost({ home });
     try {
       const run = (args: string) => host.service<Commands>("commands@1")!.get("mcp")!.command.run(args, ctxFor(host.sessions));
-      expect(String(await run(`add fake "${process.execPath}" "${SERVER}"`))).toContain("added MCP server fake");
+      expect(shown(await run(`add fake "${process.execPath}" "${SERVER}"`))).toContain("added MCP server fake");
       expect(JSON.parse(await readFile(path.join(home, "mcp.json"), "utf8")).mcpServers.fake).toEqual({ command: process.execPath, args: [SERVER] });
-      expect(String(await run("add"))).toContain("usage: /mcp add");
+      expect(shown(await run("add"))).toContain("usage: /mcp add");
     } finally {
       await host.close();
     }

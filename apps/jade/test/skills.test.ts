@@ -13,6 +13,10 @@ import { loadSkills, parseSkill, skillTool } from "../plugins/skills/skills.ts";
 import { fetchSource } from "../src/fetch.ts";
 import { parseSource, treeHash, type SessionManager, type Sources, type UI } from "../src/index.ts";
 import { featureHost, msg, reply, results, tempDir, textOf, use } from "./feature-host.ts";
+import { plain as plainText } from "../plugins/tui/screen.ts";
+import type { Text } from "@uncarved/jade-api";
+/** 插件给的是带样式的文字（Text）：只比文字 */
+const shown = (r: unknown) => plainText(r as Text);
 
 async function skill(base: string, name: string, text: string, files: Record<string, string> = {}) {
   const dir = path.join(base, name);
@@ -87,11 +91,11 @@ describe("jade/skills plugin", () => {
       expect(state.selects).toEqual([]);
 
       const commands = host.service<Commands>("commands@1")!;
-      const shown = String(await commands.get("skills")!.command.run("", ctxFor(host.sessions)));
-      expect(shown).toContain("cut a release");
+      const skillList = shown(await commands.get("skills")!.command.run("", ctxFor(host.sessions)));
+      expect(skillList).toContain("cut a release");
       // 每个 skill、合计都估算了每次请求占多少 token；合计包括 skill 工具本身
-      const each = Number(/release .*≈(\d+) tokens/.exec(shown)![1]);
-      const total = Number(/≈(\d+) tokens in every request/.exec(shown)![1]);
+      const each = Number(/release .*≈(\d+) tokens/.exec(skillList)![1]);
+      const total = Number(/≈(\d+) tokens in every request/.exec(skillList)![1]);
       expect(each).toBeGreaterThan(0);
       expect(total).toBeGreaterThan(each + 50);
       expect(await commands.get("release")!.command.run("v2", ctxFor(host.sessions))).toEqual({ prompt: 'Use the "release" skill for this: v2' });
@@ -225,9 +229,9 @@ describe("installing skills", () => {
     const { host } = await featureHost({ home });
     try {
       const run = (args: string) => host.service<Commands>("commands@1")!.get("skills")!.command.run(args, ctxFor(host.sessions));
-      expect(String(await run(`add "${dir}"`))).toContain("installed skill notes");
-      expect(String(await run("add"))).toContain("usage: /skills");
-      expect(String(await run('add "unclosed'))).toContain("unclosed");
+      expect(shown(await run(`add "${dir}"`))).toContain("installed skill notes");
+      expect(shown(await run("add"))).toContain("usage: /skills");
+      expect(shown(await run('add "unclosed'))).toContain("unclosed");
     } finally {
       await host.close();
     }

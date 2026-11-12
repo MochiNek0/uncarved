@@ -4,12 +4,14 @@
 // 正是想要的；自己写 progress 反而只能把一次推送（可能是好几行、半行）显示成一行。
 
 import type { ToolRenderer } from "@uncarved/jade-api/services";
+import type { Span, Text } from "@uncarved/jade-api";
 
 // 截断和颜色从旧 jade 的 ui/render.ts、ui/screen.ts 复制：插件之间不共享代码，fs 插件也有一份
 const clip = (s: string, n: number) => (s.length > n ? s.slice(0, n) + "…" : s);
-// 设了 NO_COLOR（非空）或标准输出不是终端时不输出颜色，见 https://no-color.org
-const colors = Boolean(process.stdout.isTTY) && !process.env.NO_COLOR;
-const dim = (s: string) => (colors ? `\x1b[2m${s.replaceAll("\x1b[22m", "\x1b[22m\x1b[2m")}\x1b[22m` : s);
+// 带语义样式的文字（jade-api 的 Text）：怎么画由前端决定
+const dim = (text: string): Span => ({ text, style: "dim" });
+/** 几行接成一段，行之间换行 */
+const joinLines = (rows: readonly Text[]): Text => rows.flatMap((r, i) => (i ? ["\n", r] : [r]));
 
 type Args = Record<string, unknown>;
 const args = (input: unknown) => (input !== null && typeof input === "object" ? input : {}) as Args;
@@ -19,11 +21,11 @@ const command = (input: unknown) => String(args(input).command ?? "");
 const MAX_SUMMARY = 120;
 
 /** 预览里的多行文字：每行前面加上标记，最多 max 行 */
-function marked(s: string, mark: string, max = 30): string {
+function marked(s: string, mark: string, max = 30): Text {
   const all = s.split("\n");
-  const shown = all.slice(0, max).map((l) => `${mark} ${l}`);
+  const shown: Text[] = all.slice(0, max).map((l) => `${mark} ${l}`);
   if (all.length > max) shown.push(dim(`  … ${all.length - max} more lines`));
-  return shown.join("\n");
+  return joinLines(shown);
 }
 
 export const shellRenderers: ToolRenderer[] = [
@@ -36,7 +38,7 @@ export const shellRenderers: ToolRenderer[] = [
       if (lines.length === 1 && lines[0]!.length <= MAX_SUMMARY) return undefined;
       const shown = lines.slice(0, 200).map((l, i) => dim(`${i === 0 ? "$" : " "} ${l}`));
       if (lines.length > 200) shown.push(dim(`… ${lines.length - 200} more lines`));
-      return shown.join("\n");
+      return joinLines(shown);
     },
     preview: (input) => marked(command(input), "$"),
   },

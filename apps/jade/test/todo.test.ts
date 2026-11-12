@@ -6,7 +6,8 @@ import { latestTodos, renderTodos, todoPanel, todoRenderer, todoTool } from "../
 import { msg, resultText, say, scripted, turn, use } from "./scripted-host.ts";
 
 const ctx: ToolContext = { sessionId: "s", toolUseId: "t", signal: new AbortController().signal, parent: { sessionId: "s", eventId: "e" }, progress: () => {} };
-const plain = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
+// 插件给的是带样式的文字（Text）：只比文字
+import { plain } from "../plugins/tui/screen.ts";
 
 describe("todo_write", () => {
   test("replaces the list and warns about more than one item in progress", async () => {

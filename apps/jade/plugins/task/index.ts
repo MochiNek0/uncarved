@@ -7,7 +7,7 @@ import type { Usage } from "uncarved";
 import { definePlugin, type UI } from "@uncarved/jade-api";
 import type { Approval, Models, Prompts, Renderers, Tools } from "@uncarved/jade-api/services";
 import { taskTool, type ApproveSubagent, type TaskProgress } from "./subagent.ts";
-import { clip, dim, red } from "./style.ts";
+import { clip, dim, error, lines as joinLines } from "./style.ts";
 
 const DEFAULT_MAX_STEPS = 40;
 const MAX_DETAIL_LINES = 40;
@@ -50,11 +50,11 @@ export default definePlugin({
           // 没调用过工具时用默认的显示
           if (!sub.length) return undefined;
           const lines = text.split("\n");
-          const shown = lines.slice(0, MAX_DETAIL_LINES).map((l) => (isError ? red(l) : l));
+          const shown = lines.slice(0, MAX_DETAIL_LINES).map((l) => (isError ? error(l) : l));
           if (lines.length > MAX_DETAIL_LINES) shown.push(dim(`… (${lines.length - MAX_DETAIL_LINES} more lines)`));
           return {
-            line: isError ? red(clip(lines[0] ?? "", 200)) : dim(`${clip(lines[0] ?? "", 160)}${lines.length > 1 ? ` (+${lines.length - 1} lines)` : ""}`),
-            details: [dim(`sub-agent ran ${sub.length} tool call${sub.length > 1 ? "s" : ""}:`), ...sub.map((l) => dim(`  ${l}`)), ...shown].join("\n"),
+            line: isError ? error(clip(lines[0] ?? "", 200)) : dim(`${clip(lines[0] ?? "", 160)}${lines.length > 1 ? ` (+${lines.length - 1} lines)` : ""}`),
+            details: joinLines([dim(`sub-agent ran ${sub.length} tool call${sub.length > 1 ? "s" : ""}:`), ...sub.map((l) => dim(`  ${l}`)), ...shown]),
           };
         },
       });

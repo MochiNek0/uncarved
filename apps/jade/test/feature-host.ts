@@ -52,7 +52,8 @@ const FAKE_UI = `export default { process(ctx) {
     get interactive() { return t().interactive; },
     notify: (m) => t().notes.push(m),
     select: async (r) => {
-      t().selects.push({ title: r.title, detail: r.detail });
+      const plain = (t) => (typeof t === "string" ? t : Array.isArray(t) ? t.map(plain).join("") : (t?.text ?? ""));
+      t().selects.push({ title: r.title, detail: r.detail === undefined ? undefined : plain(r.detail) });
       if (!t().interactive) return undefined;
       return t().answers.length ? t().answers.shift() : r.options[0]?.value;
     },

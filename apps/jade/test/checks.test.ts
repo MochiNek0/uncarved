@@ -12,6 +12,10 @@ import type { CommandContext, Commands, RunCommand } from "@uncarved/jade-api/se
 import { fsTools } from "../plugins/fs/fs.ts";
 import type { SessionManager, UI } from "../src/index.ts";
 import { featureHost, msg, reply, tempDir, textOf, use, type Step } from "./feature-host.ts";
+import { plain as plainText } from "../plugins/tui/screen.ts";
+import type { Text } from "@uncarved/jade-api";
+/** 插件给的是带样式的文字（Text）：只比文字 */
+const shown = (r: unknown) => plainText(r as Text);
 
 const MODEL = { by: "model", provider: "scripted", model: "scripted-1" } as const;
 /** 没有会话可以查工具：直接按 jade/fs 工具的 meta 认写文件的调用 */
@@ -164,10 +168,10 @@ describe("edit-time checks", () => {
 
   test("the checked event is shown as one line with the report as details", () => {
     const r = checksRenderers[0]!;
-    expect(r.render({ summary: [{ name: "tsc", problems: 0 }], report: "" })!.line).toContain("checks passed: tsc");
+    expect(shown(r.render({ summary: [{ name: "tsc", problems: 0 }], report: "" })!.line)).toContain("checks passed: tsc");
     const bad = r.render({ summary: [{ name: "tsc", problems: 2, others: 1 }], report: "header\nline 1\nline 2" })!;
-    expect(bad.line).toContain("tsc: 2 problems in changed files, 1 new elsewhere");
-    expect(bad.details).toBe("line 1\nline 2");
+    expect(shown(bad.line)).toContain("tsc: 2 problems in changed files, 1 new elsewhere");
+    expect(shown(bad.details)).toBe("line 1\nline 2");
   });
 });
 
@@ -202,11 +206,11 @@ describe.skipIf(!hasShell)("jade/checks plugin", () => {
       expect(w.state.selects[0]!.detail).toContain("(from checks.json)");
       const result = w.state.requests[1]!.messages.at(-1)!.content[0] as Extract<Block, { kind: "tool_result" }>;
       expect(textOf(result.content)).toContain("lint: 1 problem in the files you changed:\na.txt:1: lint says no");
-      const listed = String(await w.host.service<Commands>("commands@1")!.get("checks")!.command.run("", ctxFor(w.host.sessions)));
+      const listed = shown(await w.host.service<Commands>("commands@1")!.get("checks")!.command.run("", ctxFor(w.host.sessions)));
       expect(listed).toContain("Edit-time checks are on in this session.");
       expect(listed).toContain("lint");
       expect(listed).not.toContain("not confirmed yet");
-      expect(await w.host.service<Commands>("commands@1")!.get("checks")!.command.run("off", ctxFor(w.host.sessions))).toBe("checks: off");
+      expect(shown(await w.host.service<Commands>("commands@1")!.get("checks")!.command.run("off", ctxFor(w.host.sessions)))).toBe("checks: off");
     } finally {
       await w.host.close();
     }
@@ -241,7 +245,7 @@ describe.skipIf(!hasShell)("jade/checks plugin", () => {
       await (await w.host.sessions.open()).send(msg("go"));
       expect(w.state.selects).toEqual([]);
       expect(textOf((w.state.requests[1]!.messages.at(-1)!.content[0] as Extract<Block, { kind: "tool_result" }>).content)).not.toContain("lint");
-      expect(String(await w.host.service<Commands>("commands@1")!.get("checks")!.command.run("", ctxFor(w.host.sessions)))).toContain("turned off");
+      expect(shown(await w.host.service<Commands>("commands@1")!.get("checks")!.command.run("", ctxFor(w.host.sessions)))).toContain("turned off");
     } finally {
       await w.host.close();
     }

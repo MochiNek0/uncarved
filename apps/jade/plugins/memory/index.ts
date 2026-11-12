@@ -5,7 +5,7 @@
 import { definePlugin } from "@uncarved/jade-api";
 import type { Commands, Prompts, Renderers } from "@uncarved/jade-api/services";
 import { Memory, MEMORY_SCOPES, memoryTool, projectRoot, type MemoryScope } from "./memory.ts";
-import { clip, dim, green, red } from "./style.ts";
+import { clip, dim, error, ok as success } from "./style.ts";
 
 const args = (input: unknown) => (input ?? {}) as { action?: string; scope?: string; text?: string };
 
@@ -21,7 +21,7 @@ export default definePlugin({
       },
       preview: (input) => {
         const i = args(input);
-        return `${i.action === "remove" ? red("- ") : green("+ ")}${String(i.text ?? "")}`;
+        return [i.action === "remove" ? error("- ") : success("+ "), String(i.text ?? "")];
       },
     });
 
@@ -65,7 +65,7 @@ export default definePlugin({
             if (ok !== "yes") return;
             await memory.remove(entry.scope, entry.text);
             note(`The user removed this ${entry.scope} memory, so stop following it: ${entry.text}`);
-            return green(`Removed from ${entry.scope} memory: ${entry.text}`);
+            return success(`Removed from ${entry.scope} memory: ${entry.text}`);
           }
           text = (await ui.input({ title: "What should jade remember?", placeholder: "e.g. Reply in Chinese; run tests with bun test" }, signal)) ?? "";
           if (!text.trim()) return;
@@ -85,7 +85,7 @@ export default definePlugin({
         if (!scope) return;
         const added = await memory.add(scope, text);
         if (added) note(`The user saved a ${scope} memory; follow it from now on: ${text.replace(/\s+/g, " ").trim()}`);
-        return added ? green(`Saved to ${scope} memory.`) : dim(`The ${scope} memory already has this.`);
+        return added ? success(`Saved to ${scope} memory.`) : dim(`The ${scope} memory already has this.`);
       },
     });
   },

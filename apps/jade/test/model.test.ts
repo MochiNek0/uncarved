@@ -10,6 +10,7 @@ import type { Provider } from "uncarved";
 import { PluginHost } from "../src/index.ts";
 import type { CommandContext, Commands, Models } from "@uncarved/jade-api/services";
 import { parseEnv } from "../plugins/models/config.ts";
+import { plain } from "../plugins/tui/screen.ts";
 import { updateEnvFile } from "../plugins/models/saved.ts";
 import type { ModelRequest } from "uncarved";
 
@@ -145,7 +146,7 @@ async function setup(env: string = ENV_A) {
   });
   const printed: string[] = [];
   const ui = host.service<{ select: unknown; input: unknown; notify: unknown; interactive: boolean }>("ui@1")!;
-  const ctx: CommandContext = { signal: new AbortController().signal, ui: ui as never, sessions: host.sessions, print: (t) => printed.push(t) };
+  const ctx: CommandContext = { signal: new AbortController().signal, ui: ui as never, sessions: host.sessions, print: (t) => printed.push(plain(t)) };
   const model = host.service<Commands>("commands@1")!.get("model")!;
   const models = host.service<Models>("models@1")!;
   return { home, cwd, host, shared, reports, printed, ctx, command: model.command, models };

@@ -1,5 +1,8 @@
-import { expect, test } from "bun:test";
-import { safeScreen, terminalSafe, type Screen } from "../plugins/tui/screen.ts";
+import { describe, expect, spyOn, test } from "bun:test";
+import { stripVTControlCharacters } from "node:util";
+import type { Text } from "@uncarved/jade-api";
+import { ui as printUi } from "../plugins/print/index.ts";
+import { ansi, plain, safeScreen, terminalSafe, type Screen } from "../plugins/tui/screen.ts";
 
 test("terminalSafe keeps colors, newlines and tabs, and drops everything else that drives the terminal", () => {
   expect(terminalSafe("\x1b[31mred\x1b[39m\tok\nnext")).toBe("\x1b[31mred\x1b[39m\tok\nnext");
@@ -84,4 +87,37 @@ test("safeScreen puts plain text into the input box: colors are dropped too", ()
   s.draft!.set("\x1b[31mfix\x1b[0m it");
   s.draft!.insert("a\x1b[2J\x1b[1mb\x1b[22m");
   expect(seen).toEqual([["set", "fix it"], ["insert", "ab"]]);
+});
+
+// 插件给的带语义样式的文字（jade-api 的 Text）：终端界面画成颜色，不画颜色的地方只取文字
+describe("styled text from plugins", () => {
+  const t: Text = [{ text: "ok", style: "ok" }, " ", ["a", { text: "b", style: ["bold", "dim"] }], "\n", { text: "x", style: "removed" }];
+
+  test("plain keeps only the text, in order, and drops escape codes inside strings", () => {
+    expect(plain(t)).toBe("ok ab\nx");
+    expect(plain("\x1b[31mred\x1b[39m")).toBe("red");
+    expect(plain(undefined)).toBe("");
+    expect(plain([])).toBe("");
+  });
+
+  test("ansi keeps the same text, adding only colour codes", () => {
+    expect(stripVTControlCharacters(ansi(t))).toBe("ok ab\nx");
+    // 字符串原样（里面的颜色留着）
+    expect(ansi("\x1b[31mred\x1b[39m")).toBe("\x1b[31mred\x1b[39m");
+    expect(ansi(undefined)).toBe("");
+  });
+});
+
+test("-p writes notices without colours or other escape codes", () => {
+  const out: string[] = [];
+  const spy = spyOn(process.stderr, "write").mockImplementation((s: string | Uint8Array) => {
+    out.push(String(s));
+    return true;
+  });
+  try {
+    printUi.notify("\x1b[1mbold\x1b[22m \x1b]0;title\x07done", "warning");
+  } finally {
+    spy.mockRestore();
+  }
+  expect(out).toEqual(["[warning] bold done\n"]);
 });
