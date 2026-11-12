@@ -9,7 +9,7 @@ import { msg, resultText, say, scripted, turn, use } from "./scripted-host.ts";
 
 /** 直接调用 hook：model.before 算一次回复 */
 function hooks(cwd = path.resolve("/work")) {
-  const list = repeatsHooks({ cwd }) as unknown as { kind: string; point: string; fn: (x: unknown) => unknown }[];
+  const list = repeatsHooks({ cwd, shell: (t) => (t === "bash" ? "command" : undefined) }) as unknown as { kind: string; point: string; fn: (x: unknown) => unknown }[];
   const fn = (point: string) => list.find((h) => h.point === point)!.fn;
   return {
     respond: () => fn("model.before")({}),

@@ -76,6 +76,8 @@ export interface ChecksOptions {
   /** 默认在 PATH 里找（由调用方给，见 index.ts 的 shell@1）；测试用 */
   which?: (bin: string) => string | null;
   id?: string;
+  /** 写文件的工具把路径放在输入的哪个字段（工具的 meta.writes）；不写文件的工具返回 undefined */
+  writes(tool: string): string | undefined;
 }
 
 export interface Checks {
@@ -89,7 +91,6 @@ export interface Checks {
   reset(): void;
 }
 
-export const WRITE_TOOLS = new Set(["write_file", "edit_file", "multi_edit"]);
 const DEFAULT_TIMEOUT_MS = 120_000;
 /** 附给模型的文字上限 */
 const MAX_REPORT_CHARS = 6000;
@@ -341,8 +342,9 @@ export function checks(opts: ChecksOptions): Checks {
     const ids: string[] = [];
     const files: string[] = [];
     for (const b of reply.content) {
-      if (b.kind !== "tool_use" || !WRITE_TOOLS.has(b.name) || !ok.has(b.id)) continue;
-      const p = (b.input as { path?: unknown } | null)?.path;
+      const field = b.kind === "tool_use" && ok.has(b.id) ? opts.writes(b.name) : undefined;
+      if (field === undefined || b.kind !== "tool_use") continue;
+      const p = (b.input as Record<string, unknown> | null)?.[field];
       if (typeof p !== "string") continue;
       ids.push(b.id);
       // 和 root 一样解析符号链接、短文件名，否则判断不出文件在不在某个目录里
@@ -402,15 +404,16 @@ export function checks(opts: ChecksOptions): Checks {
   return self;
 }
 
-/** 会话里成功改过的文件（/checks 显示用）：所有写入调用里结果不是错误的 */
-export function changedFiles(messages: readonly Message[], cwd: string): string[] {
+/** 会话里成功改过的文件（/checks 显示用）：所有写入调用里结果不是错误的；writes 同 ChecksOptions.writes */
+export function changedFiles(messages: readonly Message[], cwd: string, writes: (tool: string) => string | undefined): string[] {
   const ok = new Set(messages.flatMap((m) => (m.role === "user" ? m.content.flatMap((b) => (b.kind === "tool_result" && !b.isError ? [b.toolUseId] : [])) : [])));
   const files: string[] = [];
   for (const m of messages) {
     if (m.role !== "assistant") continue;
     for (const b of m.content) {
-      if (b.kind !== "tool_use" || !WRITE_TOOLS.has(b.name) || !ok.has(b.id)) continue;
-      const p = (b.input as { path?: unknown } | null)?.path;
+      const field = b.kind === "tool_use" && ok.has(b.id) ? writes(b.name) : undefined;
+      if (field === undefined || b.kind !== "tool_use") continue;
+      const p = (b.input as Record<string, unknown> | null)?.[field];
       if (typeof p !== "string") continue;
       const full = canonical(path.resolve(cwd, p));
       if (!files.some((f) => sameFile(f, full))) files.push(full);

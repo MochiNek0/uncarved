@@ -25,10 +25,10 @@ export const COMPACT_KEY = "jade/compact";
 /** 只打开一个文件或网址的命令：start "" x、start x、xdg-open x、open x、explorer x */
 const OPEN = /^\s*(?:start\s+""|start|xdg-open|open|explorer(?:\.exe)?)\s+(?:"([^"]+)"|'([^']+)'|([^\s"'&|;<>]+))\s*$/i;
 
-/** bash 调用打开的目标（规范化后），不是打开命令时是 undefined */
-export function openTarget(call: { name: string; input: unknown }, cwd: string): string | undefined {
-  if (call.name !== "bash") return undefined;
-  const command = (call.input as { command?: unknown } | null)?.command;
+/** 执行命令的调用（shell 是命令所在的字段，见工具的 meta.shell）打开的目标（规范化后），不是打开命令时是 undefined */
+export function openTarget(call: { name: string; input: unknown }, cwd: string, shell: string | undefined): string | undefined {
+  if (shell === undefined) return undefined;
+  const command = (call.input as Record<string, unknown> | null)?.[shell];
   if (typeof command !== "string") return undefined;
   const m = OPEN.exec(command);
   const target = m && (m[1] ?? m[2] ?? m[3]);
@@ -56,7 +56,7 @@ function replacements(call: { name: string; input: unknown }): { old_string: str
 const hash = (content: Block[]) => createHash("sha1").update(JSON.stringify(content.map((b) => (b.kind === "text" ? b.text : b)))).digest("hex");
 
 /** 会话里的 hook：model.before 数回复次数，tool.gate 拒绝重复，tool.after 加提醒，event 在用户发消息、压缩后重新计 */
-export function repeatsHooks(opts: { cwd: string; id?: string }): LocalHookSpec[] {
+export function repeatsHooks(opts: { cwd: string; id?: string; /** 执行命令的工具把命令放在哪个字段（ctx.session.tool 的 meta.shell） */ shell: (tool: string) => string | undefined }): LocalHookSpec[] {
   const id = opts.id ?? ID;
   const cwd = opts.cwd;
   /** 模型调用的次数，每次调用模型前加一 */
@@ -99,7 +99,7 @@ export function repeatsHooks(opts: { cwd: string; id?: string }): LocalHookSpec[
           return { decision: "deny", reason: "This call is identical to an earlier call in the same response and was not run; use that call's result." };
         }
         current.keys.add(k);
-        const target = openTarget(call, cwd);
+        const target = openTarget(call, cwd, opts.shell(call.name));
         // 同一次回复里排在前面的调用可能改了它，还没执行，不拒绝
         if (target !== undefined && opened.get(target) === changes && !current.mutates) {
           return {
@@ -123,7 +123,7 @@ export function repeatsHooks(opts: { cwd: string; id?: string }): LocalHookSpec[
         readOnly.delete(outcome.call.toolUseId);
         if (!outcome.isError) {
           failures.delete(k);
-          const target = openTarget(outcome.call, cwd);
+          const target = openTarget(outcome.call, cwd, opts.shell(outcome.call.name));
           if (target !== undefined) opened.set(target, changes);
           else if (!read) changes++;
           const file = (outcome.call.input as { path?: unknown } | null)?.path;
@@ -190,6 +190,6 @@ export function repeatsHooks(opts: { cwd: string; id?: string }): LocalHookSpec[
 
 export default definePlugin({
   session(ctx) {
-    for (const h of repeatsHooks({ cwd: ctx.cwd, id: ctx.plugin })) ctx.kernel.hook(h);
+    for (const h of repeatsHooks({ cwd: ctx.cwd, id: ctx.plugin, shell: (t) => ctx.session.tool(t)?.meta?.shell })) ctx.kernel.hook(h);
   },
 });

@@ -3,7 +3,7 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Block, Message } from "uncarved";
 import type { UI } from "../src/index.ts";
@@ -177,5 +177,57 @@ describe("jade/undo in a session", () => {
     const s = await host.sessions.open();
     await send(s, "edit it");
     expect(plain(await run())).toBe("Nothing to undo.");
+  });
+});
+
+// 认工具靠注册时给的 meta，不认名字：换掉 jade/fs（比如换成别的写文件工具）/undo 照样能用
+describe("tools are recognised by their meta, not their name", () => {
+  /** 一个用户层插件，注册一个写文件的工具：名字是 put，路径在 file 字段里 */
+  const PATCHER = (meta: string) => `import { writeFileSync } from "node:fs";
+import path from "node:path";
+export default { session(ctx) {
+  ctx.kernel.tool({
+    name: "put", description: "write text to a file", effect: "write", concurrency: "exclusive", idempotent: true,
+    inputSchema: { type: "object", properties: { file: { type: "string" }, text: { type: "string" } }, required: ["file", "text"] },
+    meta: ${meta},
+    execute: async (input) => { writeFileSync(path.resolve(ctx.cwd, input.file), input.text); return { content: "written" }; },
+  });
+} };`;
+
+  async function withPatcher(meta: string) {
+    const w = await scriptedHost();
+    const dir = path.join(w.home, "plugins", "patcher");
+    await mkdir(dir, { recursive: true });
+    await writeFile(path.join(dir, "plugin.json"), JSON.stringify({ id: "test/patcher", version: "1.0.0", api: "^1", entry: "index.mjs" }));
+    await writeFile(path.join(dir, "index.mjs"), PATCHER(meta));
+    await w.host.close();
+    const host = await w.restart();
+    return { ...w, host };
+  }
+
+  test("/undo restores a file written by a tool with another name that declares meta.writes", async () => {
+    const { cwd, host, shared, send } = await withPatcher(`{ writes: "file" }`);
+    const b = path.join(cwd, "b.txt");
+    await writeFile(b, "old");
+    shared.script.push(use("u1", "put", { file: "b.txt", text: "new" }), say("done"));
+    const s = await host.sessions.open();
+    expect(s.tool("put")?.meta).toEqual({ writes: "file" });
+    expect(s.tool("bash")?.meta).toEqual({ shell: "command" });
+    expect(s.tool("write_file")?.meta).toEqual({ writes: "path" });
+    expect(s.tool("missing")).toBeUndefined();
+    await send(s, "change b");
+    expect(await readFile(b, "utf8")).toBe("new");
+    const undo = host.service<Commands>("commands@1")!.get("undo")!.command;
+    const c: CommandContext = { signal: new AbortController().signal, ui: host.service<UI>("ui@1")!, sessions: host.sessions, print: () => {} };
+    expect(plain(await undo.run("", c))).toContain("restore b.txt");
+    expect(await readFile(b, "utf8")).toBe("old");
+  });
+
+  test("a tool with malformed meta keeps its plugin out of the session and says why", async () => {
+    const { host, reports } = await withPatcher(`{ writes: 3 }`);
+    const s = await host.sessions.open();
+    expect(s.tool("put")).toBeUndefined();
+    expect(reports.join(" ")).toContain("plugin test/patcher did not join session");
+    expect(reports.join(" ")).toContain("tool put: meta.writes must be the name of an input field");
   });
 });

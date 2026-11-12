@@ -8,6 +8,7 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { GatedToolCall, GateResult, Message, ModelRequest, Usage } from "uncarved";
+import type { ToolMeta } from "@uncarved/jade-api";
 import type { Models } from "@uncarved/jade-api/services";
 
 /** 审查的结论，加上这次审查用掉的 token（计入会话用量） */
@@ -21,6 +22,8 @@ export interface ReviewOptions {
   writeRoots?: () => readonly string[];
   /** 当前会话的消息：从里面取用户最近的请求 */
   messages: () => readonly Message[];
+  /** 工具的 meta（ctx.session.tool）：哪些调用写了文件、命令在哪个字段 */
+  meta: (tool: string) => ToolMeta | undefined;
   /** 审查最多等多久，默认 60 秒；超时后转给用户 */
   timeoutMs?: number;
   /** 第一次请求多久还没有任何输出就放弃、重发一次，默认 20 秒 */
@@ -68,7 +71,6 @@ function context(messages: readonly Message[]): { user: string[]; agent: string 
   return { user, agent: last ? clip(textOf(last, "model"), 1000) : "" };
 }
 
-const WRITE_TOOLS = new Set(["write_file", "edit_file", "multi_edit"]);
 const MAX_FILES = 3;
 const MAX_FILE_CHARS = 4000;
 
@@ -76,12 +78,13 @@ const MAX_FILE_CHARS = 4000;
  * 命令提到的、模型本会话用文件工具写过的文件，以及它们现在的内容。
  * 不给的话审查只看到 "node tmp_check.mjs"，不知道脚本做什么，只能转给用户，模型刚写的临时脚本每次都要用户点
  */
-async function agentFiles(messages: readonly Message[], cwd: string, command: string): Promise<string[]> {
+async function agentFiles(messages: readonly Message[], cwd: string, command: string, meta: ReviewOptions["meta"]): Promise<string[]> {
   const written = new Set<string>();
   for (const m of messages) {
     if (m.role !== "assistant") continue;
     for (const b of m.content) {
-      const p = b.kind === "tool_use" && WRITE_TOOLS.has(b.name) ? (b.input as { path?: unknown } | null)?.path : undefined;
+      const field = b.kind === "tool_use" ? meta(b.name)?.writes : undefined;
+      const p = b.kind === "tool_use" && field !== undefined ? (b.input as Record<string, unknown> | null)?.[field] : undefined;
       if (typeof p === "string") written.add(path.resolve(cwd, p));
     }
   }
@@ -118,8 +121,9 @@ export function reviewer(opts: ReviewOptions): (call: GatedToolCall, signal: Abo
   return async (call, signal) => {
     const messages = opts.messages();
     const { user, agent } = context(messages);
-    const command = (call.input as { command?: unknown } | null)?.command;
-    const files = typeof command === "string" ? await agentFiles(messages, opts.cwd, command) : [];
+    const field = opts.meta(call.name)?.shell;
+    const command = field === undefined ? undefined : (call.input as Record<string, unknown> | null)?.[field];
+    const files = typeof command === "string" ? await agentFiles(messages, opts.cwd, command, opts.meta) : [];
     const origin = { by: "plugin" as const, id: "jade/approval" };
     const prompt = [
       `Working directory: ${opts.cwd}`,

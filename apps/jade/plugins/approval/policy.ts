@@ -50,6 +50,8 @@ export interface PolicyOptions {
   readRoots?: string[];
   /** 工作目录之外、和工作目录同样对待的目录（读、写、命令参数），例如会话的临时目录 */
   writeRoots?: string[];
+  /** 执行 shell 命令的工具把命令放在输入的哪个字段（工具的 meta.shell，例如 bash 的 command）；别的工具返回 undefined */
+  shell(tool: string): string | undefined;
 }
 
 export interface Policy {
@@ -515,7 +517,8 @@ export function policy(opts: PolicyOptions): Policy {
       return { ...input, path: path.resolve(opts.cwd, (input as { path: string }).path) };
     },
     rulesFor(call) {
-      if (call.name === "bash") return bashRules(String((call.input as { command?: unknown }).command ?? ""));
+      const field = opts.shell(call.name);
+      if (field !== undefined) return bashRules(String((call.input as Record<string, unknown> | null)?.[field] ?? "")).map((r) => ({ ...r, tool: call.name }));
       const input = call.input as { path?: unknown; url?: unknown } | null;
       if (typeof input?.url === "string") {
         const host = hostOf(input.url);
@@ -538,7 +541,11 @@ export function policy(opts: PolicyOptions): Policy {
       const problem = validate(tool.inputSchema, call.input);
       if (problem) return { decision: "deny", reason: `Invalid input for ${call.name}: ${problem}. Fix the arguments and try again.` };
 
-      const input = call.input as { path?: string; command?: string; pattern?: string; url?: string };
+      const input = call.input as { path?: string; pattern?: string; url?: string };
+      const field = opts.shell(call.name);
+      /** 执行 shell 命令的工具（meta.shell）：按命令判断 */
+      const isShell = field !== undefined;
+      const command = isShell ? String((call.input as Record<string, unknown>)[field] ?? "") : "";
       const outside =
         (typeof input.path === "string" && !inside(input.path)) ||
         (call.name === "glob" && typeof input.pattern === "string" && globEscapes(input.pattern));
@@ -546,8 +553,8 @@ export function policy(opts: PolicyOptions): Policy {
       const network = typeof input.url === "string" && !isLoopback(hostOf(input.url));
       const covers = (r: AllowRule) => {
         if (r.tool !== call.name) return false;
-        if (r.command !== undefined) return (input.command ?? "").trim() === r.command;
-        if (r.prefix !== undefined) return matchesPrefix(input.command ?? "", r.prefix);
+        if (r.command !== undefined) return isShell && command.trim() === r.command;
+        if (r.prefix !== undefined) return isShell && matchesPrefix(command, r.prefix);
         // glob 的 pattern 越界时路径本身说明不了范围，目录规则不算
         if (r.dir !== undefined) return typeof input.path === "string" && within(r.dir, input.path) && !(call.name === "glob" && globEscapes(input.pattern ?? ""));
         if (r.host !== undefined) return network && hostOf(input.url!) === r.host;
@@ -555,15 +562,13 @@ export function policy(opts: PolicyOptions): Policy {
       };
       const allRules = rules;
       const ruled = allRules.some(covers);
-      /** 复合命令里的一条简单命令被 bash 规则覆盖 */
+      /** 复合命令里的一条简单命令被这个工具的命令规则覆盖 */
       const ruledWords = (words: Word[]) =>
         allRules.some(
           (r) =>
-            r.tool === "bash" &&
+            r.tool === call.name &&
             ((r.command !== undefined && joined(words) === r.command) || (r.prefix !== undefined && prefixCovers(words, r.prefix))),
         );
-      const isBash = call.name === "bash";
-      const command = input.command ?? "";
 
       if (tool.effect === "read") {
         const readable =
@@ -575,7 +580,7 @@ export function policy(opts: PolicyOptions): Policy {
       // plan：和 readonly 一样不改任何东西，只是拒绝的理由告诉模型先给出计划
       if (mode === "readonly" || mode === "plan") {
         // 只读命令也要和 read_file 一样：读工作目录之外的东西先问
-        const gate = isBash ? bashGate(classifyBash(command, { edits: false })) : undefined;
+        const gate = isShell ? bashGate(classifyBash(command, { edits: false })) : undefined;
         if (gate) return gate;
         return {
           decision: "deny",
@@ -588,7 +593,7 @@ export function policy(opts: PolicyOptions): Policy {
       if (mode === "yolo" || ruled) return { decision: "allow" };
       if (tool.effect === "write") return { decision: mode === "auto" && !outside ? "allow" : "ask" };
       // external
-      const gate = isBash ? bashGate(classifyBash(command, { edits: mode === "auto", ruled: ruledWords })) : undefined;
+      const gate = isShell ? bashGate(classifyBash(command, { edits: mode === "auto", ruled: ruledWords })) : undefined;
       return gate ?? { decision: "ask" };
     },
   };

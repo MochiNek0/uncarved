@@ -33,7 +33,9 @@ import {
   type Session,
   type SessionContext,
   type SessionManager,
+  type SessionTool,
   type SessionUI,
+  type ToolMeta,
   type UI,
 } from "./api.ts";
 import { ambient, invoke, Scope, type Owner } from "./membrane.ts";
@@ -115,6 +117,16 @@ class LiveSession implements Session {
 
   history(): Promise<LogEvent[]> {
     return readAll(this.#store, this.id);
+  }
+
+  tool(name: string): SessionTool | undefined {
+    for (const p of this.parts) {
+      const t = p.kernel.tools?.find((x) => x.name === name) as (Tool & { meta?: ToolMeta }) | undefined;
+      if (!t) continue;
+      const { name: n, description, inputSchema, effect, concurrency, idempotent, meta } = t;
+      return { name: n, description, inputSchema, effect, concurrency, idempotent, ...(meta ? { meta: { ...meta } } : {}) };
+    }
+    return undefined;
   }
 
   get state(): State {
@@ -441,11 +453,15 @@ export class Sessions implements SessionManager {
           scope.add(off);
           return off;
         },
+        tool: (name) => {
+          if (scope.closed) throw new StaleContext(id);
+          return s.tool(name);
+        },
       },
       kernel: {
         tool: (t) => {
           if (!open) throw new Error(`plugin ${id}: tools can only be registered while session() runs`);
-          tools.push(t);
+          tools.push({ ...t, ...toolMeta(id, t) });
         },
         hook: (h) => {
           if (!open) throw new Error(`plugin ${id}: hooks can only be registered while session() runs`);
@@ -559,6 +575,20 @@ function compatProblem(id: string, version: string, hooks: (LocalHookSpec | Remo
   } catch (e) {
     return e instanceof Error ? e.message : String(e);
   }
+}
+
+/** 工具的 meta 只留认得的字段（字段名都是字符串），写错了抛错：插件加入会话失败，比别的插件悄悄认不出这个工具好查 */
+function toolMeta(plugin: string, t: { name: string; meta?: unknown }): { meta?: ToolMeta } {
+  if (t.meta === undefined) return {};
+  const m = t.meta as Record<string, unknown> | null;
+  if (typeof m !== "object" || m === null) throw new Error(`plugin ${plugin}: tool ${t.name}: meta must be an object`);
+  const meta: ToolMeta = {};
+  for (const k of ["writes", "shell"] as const) {
+    if (m[k] === undefined) continue;
+    if (typeof m[k] !== "string" || !m[k]) throw new Error(`plugin ${plugin}: tool ${t.name}: meta.${k} must be the name of an input field`);
+    meta[k] = m[k];
+  }
+  return { meta };
 }
 
 /** 插件的工具：以插件身份执行；插件被隔离后返回错误结果（由内核转成 tool_result） */

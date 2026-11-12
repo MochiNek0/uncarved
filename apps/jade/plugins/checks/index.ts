@@ -76,7 +76,7 @@ export default definePlugin({
           return `checks: ${arg}`;
         }
         if (arg) return yellow("usage: /checks [on|off]");
-        const files = changedFiles(session.state.messages, realPath(ctx.cwd));
+        const files = changedFiles(session.state.messages, realPath(ctx.cwd), (t) => session.tool(t)?.meta?.writes);
         const found = await checks.resolve(files);
         const lines = [`Edit-time checks are ${checks.enabled ? "on" : "off"} in this session.`];
         if (found.length > 0) {
@@ -139,7 +139,7 @@ export default definePlugin({
         return turn;
       };
       const cwd = realPath(s.cwd);
-      const c = checks({ cwd, root: realPath(repoRoot(cwd)), home: s.home, run: shell.run, which: (bin) => shell.which(bin) ?? null, approve });
+      const c = checks({ cwd, root: realPath(repoRoot(cwd)), home: s.home, run: shell.run, which: (bin) => shell.which(bin) ?? null, approve, writes: (t) => s.session.tool(t)?.meta?.writes });
       const id = s.session.id;
       bySession.set(id, c);
       await s.effect(() => () => {

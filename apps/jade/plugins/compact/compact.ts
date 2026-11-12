@@ -32,6 +32,8 @@ export interface CompactorOptions {
   /** 压缩后保留最近大约这么多 token 的原始消息，默认阈值的 30% */
   keepTokens?: number;
   id?: string;
+  /** 写文件的工具把路径放在输入的哪个字段（工具的 meta.writes）；摘要后面列出改过的文件用 */
+  writes(tool: string): string | undefined;
 }
 
 export interface Compactor {
@@ -222,7 +224,7 @@ export function compactor(opts: CompactorOptions): Compactor {
     const todos = latestTodos(messages.slice(cut)) ? undefined : latestTodos(messages.slice(0, cut));
     if (todos?.length) summary += `\n\nTodo list at the time of compaction:\n${renderTodos(todos)}`;
     // 用户的原话和改过的文件也原样带上：只靠总结，压缩几轮后要求和约束容易走样
-    summary += appendix(messages.slice(0, cut));
+    summary += appendix(messages.slice(0, cut), opts.writes);
 
     // 保留部分里已经清理过的输出继续保持清理，否则投影反而变大
     const next: CompactState = { upTo: cut, summary, ...(prev?.trimUpTo && prev.trimUpTo > cut ? { trimUpTo: prev.trimUpTo } : {}) };
@@ -288,13 +290,12 @@ function renderTodos(todos: Todo[]): string {
   return todos.map((t) => `${MARK[t.status] ?? "[ ]"} ${t.content}`).join("\n");
 }
 
-const WRITE_TOOLS = new Set(["write_file", "edit_file", "multi_edit"]);
 /** 摘要后面附的用户原话的总长度上限 */
 const MAX_USER_CHARS = 6000;
 const MAX_USER_MESSAGE_CHARS = 1500;
 
 /** 被压缩部分里用户的原话（第一条和最近的几条）和成功修改过的文件 */
-function appendix(messages: Message[]): string {
+function appendix(messages: Message[], writes: (tool: string) => string | undefined): string {
   const said: string[] = [];
   const ok = new Set<string>();
   const files: string[] = [];
@@ -305,8 +306,9 @@ function appendix(messages: Message[]): string {
     const text = m.content.flatMap((b) => (b.kind === "text" && b.origin.by === "user" ? [b.text.trim()] : [])).join("\n");
     if (text) said.push(text.length > MAX_USER_MESSAGE_CHARS ? `${text.slice(0, MAX_USER_MESSAGE_CHARS)}…` : text);
     for (const b of m.content) {
-      if (b.kind !== "tool_use" || !WRITE_TOOLS.has(b.name) || !ok.has(b.id)) continue;
-      const p = (b.input as { path?: unknown } | null)?.path;
+      const field = b.kind === "tool_use" && ok.has(b.id) ? writes(b.name) : undefined;
+      if (field === undefined || b.kind !== "tool_use") continue;
+      const p = (b.input as Record<string, unknown> | null)?.[field];
       if (typeof p === "string" && !files.includes(p)) files.push(p);
     }
   }

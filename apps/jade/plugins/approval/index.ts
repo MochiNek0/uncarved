@@ -87,7 +87,7 @@ export default definePlugin({
   },
 
   async session(ctx) {
-    const rules = policy({ cwd: ctx.cwd, readRoots, writeRoots });
+    const rules = policy({ cwd: ctx.cwd, readRoots, writeRoots, shell: (t) => ctx.session.tool(t)?.meta?.shell });
     const ui = ctx.service<UI>("ui@1");
     if (badMode !== undefined) {
       ui?.notify(`jade/approval: mode must be one of ${MODES.join(", ")}, got ${badMode}; using ask`, "warning");
@@ -113,7 +113,7 @@ export default definePlugin({
         },
       });
     }
-    const review = reviewing ? reviewer({ models: models!, cwd: ctx.cwd, writeRoots: () => writeRoots, messages: () => recent.messages }) : undefined;
+    const review = reviewing ? reviewer({ models: models!, cwd: ctx.cwd, writeRoots: () => writeRoots, messages: () => recent.messages, meta: (t) => ctx.session.tool(t)?.meta }) : undefined;
     /** 本会话里审查过一次、放行了的调用 */
     const reviewedCalls = new Set<string>();
     let warned = false;

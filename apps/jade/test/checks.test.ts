@@ -14,6 +14,8 @@ import type { SessionManager, UI } from "../src/index.ts";
 import { featureHost, msg, reply, tempDir, textOf, use, type Step } from "./feature-host.ts";
 
 const MODEL = { by: "model", provider: "scripted", model: "scripted-1" } as const;
+/** 没有会话可以查工具：直接按 jade/fs 工具的 meta 认写文件的调用 */
+const writes = (tool: string) => fsTools(os.tmpdir()).find((t) => t.name === tool)?.meta?.writes;
 
 function scripted(script: Step[]) {
   const requests: ModelRequest[] = [];
@@ -74,7 +76,7 @@ describe("edit-time checks", () => {
   test("detects tsc from the nearest tsconfig.json; configured checks replace detection for their files", async () => {
     const { root, home } = await tsProject();
     const run: RunCommand = async () => ({ code: 0, output: "", timedOut: false });
-    const c = checks({ cwd: root, root, home, run, approve: async () => true, which: (b) => (b === "ruff" ? "/bin/ruff" : null) });
+    const c = checks({ writes, cwd: root, root, home, run, approve: async () => true, which: (b) => (b === "ruff" ? "/bin/ruff" : null) });
     const [tsc] = await c.resolve([path.join(root, "src", "a.ts")]);
     expect(tsc!.name).toBe("tsc");
     expect(tsc!.cwd).toBe(root);
@@ -84,7 +86,7 @@ describe("edit-time checks", () => {
 
     await mkdir(path.join(root, ".jade"), { recursive: true });
     await writeFile(path.join(root, ".jade", "checks.json"), JSON.stringify({ checks: [{ name: "eslint", command: "eslint {files}", extensions: ["ts"] }] }));
-    const fresh = checks({ cwd: root, root, home, run, approve: async () => true, which: () => null });
+    const fresh = checks({ writes, cwd: root, root, home, run, approve: async () => true, which: () => null });
     expect((await fresh.resolve([path.join(root, "a.ts")])).map((x) => x.name)).toEqual(["eslint"]);
     expect((await fresh.resolve([path.join(root, "a.py")])).map((x) => x.name)).toEqual([]);
   });
@@ -102,7 +104,7 @@ describe("edit-time checks", () => {
       return { code: output ? 2 : 0, output, timedOut: false };
     };
     const approvals: Check[] = [];
-    const make = () => kernelPlugins(root, checks({ cwd: root, root, home, run, approve: async (check) => (approvals.push(check), true), which: () => null }));
+    const make = () => kernelPlugins(root, checks({ writes, cwd: root, root, home, run, approve: async (check) => (approvals.push(check), true), which: () => null }));
     const s = scripted([
       { content: [use("w1", "write_file", { path: "src/a.ts", content: "x" }), use("w2", "write_file", { path: "src/b.ts", content: "y" })], stopReason: "tool_use" },
       { content: [use("w3", "write_file", { path: "src/a.ts", content: "z" })], stopReason: "tool_use" },
@@ -141,7 +143,7 @@ describe("edit-time checks", () => {
     const run: RunCommand = async () => (runs++, { code: 1, output: "error TS5058: The specified path does not exist", timedOut: false });
     let answer = false;
     let asked = 0;
-    const c = checks({ cwd: root, root, home, run, approve: async () => (asked++, answer), which: () => null });
+    const c = checks({ writes, cwd: root, root, home, run, approve: async () => (asked++, answer), which: () => null });
     const edit = (id: string) => ({ content: [use(id, "write_file", { path: "a.ts", content: id })], stopReason: "tool_use" as const });
     const end = reply("ok");
     const s = scripted([edit("e1"), end, edit("e2"), end, edit("e3"), end, edit("e4"), end]);

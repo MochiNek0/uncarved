@@ -10,7 +10,7 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { HookContext, RemoteHookSpec, ToolResult } from "uncarved";
-import { API_VERSION, type Caller, type PluginModule, type PluginSource, type ProcessContext, type ScopeContext, type SessionContext } from "./api.ts";
+import { API_VERSION, type Caller, type PluginModule, type PluginSource, type ProcessContext, type ScopeContext, type SessionContext, type ToolMeta } from "./api.ts";
 import { ambient, type Owner } from "./membrane.ts";
 import { Rpc } from "./rpc.ts";
 
@@ -191,6 +191,7 @@ export async function startRemote(source: PluginSource, owner: Owner, opts: Remo
           effect: t.effect,
           concurrency: t.concurrency === "safe" ? "safe" : "exclusive",
           idempotent: t.idempotent === true,
+          ...(t.meta !== undefined && t.meta !== null ? { meta: t.meta as ToolMeta } : {}),
           execute: async (input, tctx) => {
             const r = await rpc.request("call", { scope, target: { $fn: fn }, args: [input, { sessionId: tctx.sessionId, toolUseId: tctx.toolUseId }] }, tctx.signal);
             return (typeof r === "string" ? { content: r } : r) as ToolResult;

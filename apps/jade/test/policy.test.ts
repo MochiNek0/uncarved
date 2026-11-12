@@ -6,6 +6,7 @@ import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { ToolInfo } from "uncarved";
+import type { ToolMeta } from "@uncarved/jade-api";
 import { bashRules, isSafeCommand, nativePath, policy, shellWords, type Mode } from "../plugins/approval/policy.ts";
 import { validate } from "../plugins/approval/schema.ts";
 import { fsTools } from "../plugins/fs/fs.ts";
@@ -29,9 +30,11 @@ const webFetch: ToolInfo = {
 
 describe("policy", () => {
   const cwd = path.resolve("/work");
-  const tools: ToolInfo[] = [...fsTools(cwd), shellTool({ cwd }), webFetch];
-  const gated = (name: string, input: unknown) => ({ toolUseId: "t", name, input, tool: tools.find((t) => t.name === name)! });
-  const decide = (mode: Mode, name: string, input: unknown) => policy({ cwd }).decide(gated(name, input), { mode, rules: [] }).decision;
+  const tools: (ToolInfo & { meta?: ToolMeta })[] = [...fsTools(cwd), shellTool({ cwd }), webFetch];
+  /** 会话里由 ctx.session.tool 查：这里直接看工具的 meta */
+  const shell = (name: string) => tools.find((t) => t.name === name)?.meta?.shell;
+  const gated =(name: string, input: unknown) => ({ toolUseId: "t", name, input, tool: tools.find((t) => t.name === name)! });
+  const decide = (mode: Mode, name: string, input: unknown) => policy({ shell, cwd }).decide(gated(name, input), { mode, rules: [] }).decision;
   const inside = path.join(cwd, "a.ts");
   const outside = path.resolve("/etc/passwd");
 
@@ -52,7 +55,7 @@ describe("policy", () => {
 
   // 旧版本在 tool.before hook 里把路径换成绝对路径，日志里记下的是确定的路径；现在是 absolutePath
   test("edit needs approval in ask mode; absolutePath resolves the path against the working directory", () => {
-    const p = policy({ cwd });
+    const p = policy({ shell, cwd });
     const input = p.absolutePath({ path: "a.txt", old_string: "x", new_string: "y" });
     expect(input).toEqual({ path: path.join(cwd, "a.txt"), old_string: "x", new_string: "y" });
     expect(p.decide(gated("edit_file", input), { mode: "ask", rules: [] }).decision).toBe("ask");
@@ -66,14 +69,14 @@ describe("policy", () => {
   test("plan mode allows reads and read-only commands, and denies changes with a plan-mode reason", () => {
     expect(decide("plan", "bash", { command: "git log -5" })).toBe("allow");
     expect(decide("plan", "read_file", { path: inside })).toBe("allow");
-    const reason = policy({ cwd }).decide(gated("edit_file", { path: inside, old_string: "a", new_string: "b" }), { mode: "plan", rules: [] });
+    const reason = policy({ shell, cwd }).decide(gated("edit_file", { path: inside, old_string: "a", new_string: "b" }), { mode: "plan", rules: [] });
     expect(reason.decision === "deny" && reason.reason).toContain("plan mode");
   });
 
   // 旧版本里 skill 目录经 readRoots 传入：ask 模式下读里面的文件不用问
   test("files under a read root can be read without asking, but not changed", () => {
     const root = path.resolve("/skills/release");
-    const p = policy({ cwd, readRoots: [root] });
+    const p = policy({ shell, cwd, readRoots: [root] });
     const d = (mode: Mode, name: string, input: unknown) => p.decide(gated(name, input), { mode, rules: [] }).decision;
     expect(d("ask", "read_file", { path: path.join(root, "notes.md") })).toBe("allow");
     expect(d("ask", "read_file", { path: path.resolve("/skills/other/notes.md") })).toBe("ask");
@@ -83,7 +86,7 @@ describe("policy", () => {
   // 会话的临时目录（jade/scratch 经 allowWrite 传入）：和工作目录同样对待
   test("files under a write root are treated like the working directory", () => {
     const root = path.resolve("/scratch/s1");
-    const p = policy({ cwd, writeRoots: [root] });
+    const p = policy({ shell, cwd, writeRoots: [root] });
     const d = (mode: Mode, name: string, input: unknown) => p.decide(gated(name, input), { mode, rules: [] }).decision;
     const file = path.join(root, "try.py");
     expect(d("auto", "write_file", { path: file, content: "" })).toBe("allow");
@@ -130,7 +133,7 @@ describe("policy", () => {
   });
 
   test("always-allow rules match bash by prefix", () => {
-    const p = policy({ cwd });
+    const p = policy({ shell, cwd });
     const c = gated("bash", { command: "bun test apps" });
     const settings = { mode: "ask" as const, rules: p.rulesFor(c) };
     expect(settings.rules).toEqual([{ tool: "bash", prefix: "bun test" }]);
@@ -154,7 +157,7 @@ describe("policy", () => {
       { tool: "bash", prefix: "bun test" },
       { tool: "bash", prefix: "tee log" },
     ]);
-    const p = policy({ cwd });
+    const p = policy({ shell, cwd });
     const exact = { mode: "ask" as const, rules: bashRules("rm -rf build") };
     expect(p.decide(gated("bash", { command: "rm -rf build" }), exact).decision).toBe("allow");
     expect(p.decide(gated("bash", { command: "rm -rf build /" }), exact).decision).toBe("ask");
@@ -163,8 +166,22 @@ describe("policy", () => {
     expect(p.decide(gated("bash", { command: "git push --force origin main" }), push).decision).toBe("ask");
   });
 
+  // 认的是工具的 meta.shell，不是名字：换一个执行命令的工具，按命令判断照样有效，规则记在它自己的名字下
+  test("a shell tool with another name is judged by its command, and its rules carry its own name", () => {
+    const pwsh = { ...shellTool({ cwd }), name: "pwsh" } as ToolInfo & { meta?: ToolMeta };
+    const p = policy({ cwd, shell: (t) => (t === "pwsh" ? pwsh.meta?.shell : undefined) });
+    const call = (command: string) => ({ toolUseId: "t", name: "pwsh", input: { command }, tool: pwsh });
+    const ask = (rules: { tool: string; prefix: string }[] = []) => ({ mode: "ask" as const, rules });
+    expect(p.decide(call("git status"), ask()).decision).toBe("allow");
+    expect(p.decide(call("bun test apps"), ask()).decision).toBe("ask");
+    expect(p.rulesFor(call("bun test apps"))).toEqual([{ tool: "pwsh", prefix: "bun test" }]);
+    expect(p.decide(call("bun test"), ask([{ tool: "pwsh", prefix: "bun test" }])).decision).toBe("allow");
+    // bash 的规则不替它放行
+    expect(p.decide(call("bun test"), ask([{ tool: "bash", prefix: "bun test" }])).decision).toBe("ask");
+  });
+
   test("always-allow rules for files stay inside the working directory unless they name a directory", () => {
-    const p = policy({ cwd });
+    const p = policy({ shell, cwd });
     const write = (file: string) => gated("write_file", { path: file, content: "" });
     const plain = { mode: "ask" as const, rules: p.rulesFor(write(inside)) };
     expect(plain.rules).toEqual([{ tool: "write_file" }]);
@@ -182,7 +199,7 @@ describe("policy", () => {
   });
 
   test("read tools with a url ask per host, even in read-only mode", () => {
-    const p = policy({ cwd });
+    const p = policy({ shell, cwd });
     const docs = gated("web_fetch", { url: "https://docs.example.com/a?q=1" });
     expect(p.decide(docs, { mode: "ask", rules: [] }).decision).toBe("ask");
     expect(p.decide(docs, { mode: "readonly", rules: [] }).decision).toBe("ask");
@@ -194,7 +211,7 @@ describe("policy", () => {
   });
 
   test("a url on this machine is not asked about; a name that only looks local is", () => {
-    const p = policy({ cwd });
+    const p = policy({ shell, cwd });
     const ask = (url: string) => p.decide(gated("web_fetch", { url }), { mode: "ask", rules: [] }).decision;
     for (const url of ["http://localhost:3000/products?v=2", "http://127.0.0.1:5173/", "http://[::1]:8080/", "http://app.localhost/"]) expect(ask(url)).toBe("allow");
     for (const url of ["http://localhost.example.com/", "http://127.0.0.1.nip.io/", "http://192.168.1.5/"]) expect(ask(url)).toBe("ask");
@@ -291,7 +308,7 @@ describe("policy", () => {
   });
 
   test("always-allow rules cover their command inside a compound command", () => {
-    const p = policy({ cwd });
+    const p = policy({ shell, cwd });
     const command = "bun test apps 2>&1 | tail -20";
     expect(bashRules(command)).toEqual([{ tool: "bash", prefix: "bun test" }]);
     const settings = { mode: "ask" as const, rules: bashRules(command) };
@@ -304,7 +321,7 @@ describe("policy", () => {
   });
 
   test("a compound command gets one always-allow rule per command that is not read-only", () => {
-    const p = policy({ cwd });
+    const p = policy({ shell, cwd });
     const first = "git add -A && git commit -m 'one'";
     const rules = bashRules(first);
     expect(rules).toEqual([
@@ -350,8 +367,8 @@ describe("policy", () => {
     expect(decide("ask", "bash", { command: "git log -5 --stat" })).toBe("allow");
     // 前缀规则同样按分词判断
     const rules = [{ tool: "bash", prefix: "bun test" }];
-    expect(policy({ cwd }).decide(gated("bash", { command: "bun test {a,b}" }), { mode: "ask", rules }).decision).toBe("ask");
-    expect(policy({ cwd }).decide(gated("bash", { command: `bun test "a; b"` }), { mode: "ask", rules }).decision).toBe("allow");
+    expect(policy({ shell, cwd }).decide(gated("bash", { command: "bun test {a,b}" }), { mode: "ask", rules }).decision).toBe("ask");
+    expect(policy({ shell, cwd }).decide(gated("bash", { command: `bun test "a; b"` }), { mode: "ask", rules }).decision).toBe("allow");
   });
 
   test("a symlink inside the working directory that points outside counts as outside", async () => {
@@ -363,7 +380,7 @@ describe("policy", () => {
     // Windows 上创建目录联接不需要管理员权限
     await symlink(other, path.join(real, "link"), "junction");
     const local: ToolInfo[] = [...fsTools(real), shellTool({ cwd: real })];
-    const p = policy({ cwd: real });
+    const p = policy({ shell, cwd: real });
     const ask = (name: string, input: unknown) =>
       p.decide({ toolUseId: "t", name, input, tool: local.find((t) => t.name === name)! }, { mode: "ask", rules: [] }).decision;
     expect(ask("read_file", { path: path.join(real, "link", "secret") })).toBe("ask");

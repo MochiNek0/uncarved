@@ -163,12 +163,15 @@ class Context:
             self._conn.services[name] = impl
         self._conn.request("provide", {"scope": self.scope, "service": name, "methods": methods, "perCaller": factory is not None})
 
-    def tool(self, name: str, description: str, input_schema: dict, *, effect: str, execute: Callable[[Any, dict], Any], concurrency: str = "exclusive", idempotent: bool = False) -> None:
+    def tool(self, name: str, description: str, input_schema: dict, *, effect: str, execute: Callable[[Any, dict], Any], concurrency: str = "exclusive", idempotent: bool = False, meta: dict | None = None) -> None:
         """
         注册一个工具，只能在 session 里调用。effect："read"、"write" 或 "external"。
-        execute(input, ctx) 返回文字，或 {"content": 文字或 block 列表, "isError": bool}
+        execute(input, ctx) 返回文字，或 {"content": 文字或 block 列表, "isError": bool}。
+        meta：别的插件据此认出工具做什么，{"writes": "path"} 表示写输入里 path 字段给的文件，{"shell": "command"} 表示执行 command 字段里的命令
         """
         tool = {"name": name, "description": description, "inputSchema": input_schema, "effect": effect, "concurrency": concurrency, "idempotent": idempotent}
+        if meta is not None:
+            tool["meta"] = meta
         self._conn.request("kernel/tool", {"scope": self.scope, "tool": tool, "execute": self._conn.handle(execute, self.scope)})
 
     def hook(self, kind: str, point: str, fn: Callable[[dict], Any], *, reads: list[str], writes: list[str] | None = None, timeout_ms: int = 30_000, order: int | None = None) -> None:

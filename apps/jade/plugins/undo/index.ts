@@ -1,9 +1,10 @@
 // jade/undo：/undo 把模型上一轮改过的文件恢复原样（再执行一次撤销更早的一轮）。
 //
-// jade/fs 不再保存检查点，这里自己观察：tool.before 在 write_file / edit_file / multi_edit 执行前记下文件原来的内容，
+// jade/fs 不再保存检查点，这里自己观察：tool.before 在写文件的工具（meta.writes，例如 write_file）执行前记下文件原来的内容，
 // tool.after 在执行成功后记下新内容的哈希，存成快照（checkpoint.ts）。tool.before 在审批之前执行，
 // 所以等用户批准期间别人对文件的改动会算进"原来的内容"。
-// shell 命令改的文件：在 git 仓库里，每轮第一次 bash 之前给工作区拍一张快照（snapshot.ts），撤销时把之后变了的文件恢复回去。
+// shell 命令改的文件：在 git 仓库里，每轮第一次执行命令（meta.shell，例如 bash）之前给工作区拍一张快照（snapshot.ts），撤销时把之后变了的文件恢复回去。
+// 认工具靠它注册时给的 meta，不认工具名：换掉提供文件工具的插件照样能撤销。
 
 import { readFile } from "node:fs/promises";
 import { realpathSync } from "node:fs";
@@ -13,9 +14,6 @@ import type { Commands, Prompts } from "@uncarved/jade-api/services";
 import { Checkpoints, lastTurnChanges, safe, sha256, turnToolNames, type Checkpoint } from "./checkpoint.ts";
 import { Snapshots, type Change, type Snapshot } from "./snapshot.ts";
 import { dim, green } from "./style.ts";
-
-/** 会改文件、参数里有 path 的工具 */
-export const WRITE_TOOLS = new Set(["write_file", "edit_file", "multi_edit"]);
 
 /** 没有工作区快照（不在 git 仓库里、配置关掉了）时，shell 命令改了什么无从得知，撤销不了；这一轮跑过时提醒一句 */
 const SHELL_NOTE = "This turn also ran shell commands; what they changed is not undone.";
@@ -84,9 +82,10 @@ export default definePlugin({
           await checkpoints.markUndone(s.id, [snap.toolUseId]);
         }
         // 这个会话里拍到过快照，说明命令的改动撤销得了，不用提醒
-        if (cps.length === 0 && !snap) return dim(snaps.length === 0 && turnToolNames(s.state.messages).has("bash") ? `Nothing to undo. ${SHELL_NOTE}` : "Nothing to undo.");
+        const ranShell = (names: Set<string>) => [...names].some((n) => s.tool(n)?.meta?.shell !== undefined);
+        if (cps.length === 0 && !snap) return dim(snaps.length === 0 && ranShell(turnToolNames(s.state.messages)) ? `Nothing to undo. ${SHELL_NOTE}` : "Nothing to undo.");
         // 没拍到快照（不在 git 仓库里、配置关掉了）的那一轮跑过命令时提醒一句
-        const shellToo = !snap && turnToolNames(s.state.messages, cps[0]!.toolUseId).has("bash");
+        const shellToo = !snap && ranShell(turnToolNames(s.state.messages, cps[0]!.toolUseId));
         // 工作区快照覆盖到的文件按快照恢复（那是命令动它之前的内容）：拍快照之后文件工具对它的修改不再单独恢复
         const inTree = new Set(tree.map((c) => same(c.path)));
         const fileCps = cps.filter((cp) => !(snap && cp.at > snap.at && inTree.has(same(cp.path))));
@@ -158,15 +157,16 @@ export default definePlugin({
       // 第一次给大仓库拍快照要把每个文件算一遍哈希
       timeoutMs: SNAPSHOT_TIMEOUT_MS,
       fn: async (call) => {
+        const meta = ctx.session.tool(call.name)?.meta;
         // 每轮第一次跑命令之前给工作区拍一张快照：命令改了什么，/undo 时和它一比就知道
-        if (call.name === "bash" && ctx.config.shell !== false && !snapped) {
+        if (meta?.shell !== undefined && ctx.config.shell !== false && !snapped) {
           snapped = true;
           const tree = await snapshots.take();
           if (tree) await snapshots.save({ toolUseId: call.toolUseId, tree, at: performance.timeOrigin + performance.now() });
           return;
         }
-        if (!WRITE_TOOLS.has(call.name)) return;
-        const p = (call.input as { path?: unknown } | null)?.path;
+        if (meta?.writes === undefined) return;
+        const p = (call.input as Record<string, unknown> | null)?.[meta.writes];
         if (typeof p !== "string") return;
         const full = path.resolve(ctx.cwd, p);
         before.set(call.toolUseId, { tool: call.name, path: full, before: await contentOf(full) });

@@ -6,6 +6,7 @@
 import { existsSync } from "node:fs";
 import path from "node:path";
 import type { Tool } from "uncarved";
+import type { ToolMeta } from "@uncarved/jade-api";
 import { runSync, spawn as spawnProc, which, type Proc } from "./sys.ts";
 import type { RunCommand, RunResult } from "@uncarved/jade-api/services";
 
@@ -104,8 +105,9 @@ export function shellTools(opts: ShellOptions): ShellTools {
     await bg.proc.exited;
   };
 
-  const bash: Tool = {
+  const bash: Tool & { meta: ToolMeta } = {
     name: "bash",
+    meta: { shell: "command" },
     description:
       `Run a shell command with ${shell} -c in the working directory and return its exit code, stdout and stderr. ` +
       `Each call starts a fresh shell: cd and environment variables do not persist. ` +

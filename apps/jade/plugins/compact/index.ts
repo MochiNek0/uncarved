@@ -62,7 +62,7 @@ export default definePlugin({
     const configured = parseTokens(ctx.config.thresholdTokens);
     const keepTokens = parseTokens(ctx.config.keepTokens);
     const threshold = thresholdFor(ctx.config, models);
-    const c = compactor({ complete: (req, o) => models.complete(req, o), threshold, keepTokens, id: ctx.plugin });
+    const c = compactor({ complete: (req, o) => models.complete(req, o), threshold, keepTokens, id: ctx.plugin, writes: (t) => ctx.session.tool(t)?.meta?.writes });
     const id = ctx.session.id;
 
     ctx.kernel.hook({

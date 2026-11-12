@@ -10,6 +10,7 @@ import type { Stats } from "node:fs";
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Block, Message, Tool } from "uncarved";
+import type { ToolMeta } from "@uncarved/jade-api";
 import { grepTool } from "./grep.ts";
 import { globMatcher, run } from "./sys.ts";
 
@@ -94,7 +95,7 @@ export class SeenFiles {
   }
 }
 
-export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
+export function fsTools(cwd: string, opts: FsOptions = {}): (Tool & { meta?: ToolMeta })[] {
   const at = (p: unknown) => resolveIn(cwd, p as string);
   const tracked = opts.seen ?? new SeenFiles();
   const seen = tracked.files;
@@ -201,8 +202,9 @@ export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
     },
   };
 
-  const writeFileTool: Tool = {
+  const writeFileTool: Tool & { meta: ToolMeta } = {
     name: "write_file",
+    meta: { writes: "path" },
     description:
       "Create a file or overwrite it with the complete new content. Missing parent directories are created. " +
       "An existing file must have been read with read_file first. Prefer edit_file for changing part of an existing file.",
@@ -262,8 +264,9 @@ export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
     return { content: `Edited ${shown} (${total} replacement${total === 1 ? "" : "s"})` };
   };
 
-  const editFileTool: Tool = {
+  const editFileTool: Tool & { meta: ToolMeta } = {
     name: "edit_file",
+    meta: { writes: "path" },
     description:
       "Replace exact text in a file. old_string must match the file exactly (including whitespace and indentation) " +
       "and must be unique unless replace_all is true. The file must have been read with read_file first, " +
@@ -284,8 +287,9 @@ export function fsTools(cwd: string, opts: FsOptions = {}): Tool[] {
     },
   };
 
-  const multiEditTool: Tool = {
+  const multiEditTool: Tool & { meta: ToolMeta } = {
     name: "multi_edit",
+    meta: { writes: "path" },
     description:
       "Make several exact-text replacements in one file at once. The edits are applied in order, each to the result of the previous one, " +
       "with the same rules as edit_file. Either all edits succeed or the file is left unchanged.",

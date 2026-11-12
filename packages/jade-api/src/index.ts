@@ -3,8 +3,8 @@
 // 和 jade 用的不是同一份模块也没有关系。错误类（PluginError 等）因此不在这里：跨模块副本 instanceof 不成立，
 // 插件按 error.name 判断。
 
-import type { LocalHookSpec, LogEvent, RemoteHookSpec, RuntimeNotice, State, Tool, UserInput } from "uncarved";
-export type { LocalHookSpec, LogEvent, RemoteHookSpec, RuntimeNotice, State, Tool, UserInput } from "uncarved";
+import type { LocalHookSpec, LogEvent, RemoteHookSpec, RuntimeNotice, State, Tool, ToolInfo, UserInput } from "uncarved";
+export type { LocalHookSpec, LogEvent, RemoteHookSpec, RuntimeNotice, State, Tool, ToolInfo, UserInput } from "uncarved";
 
 /** 来源层级，后面的层级更高（3.3） */
 export type PluginLayer = "bundled" | "user" | "project";
@@ -58,6 +58,21 @@ export interface Secrets {
   /** 写一个密钥；value 为 undefined 时删除它 */
   set(key: string, value: string | undefined): Promise<void>;
 }
+
+/**
+ * 工具的附加说明，注册工具时随工具给出（ctx.kernel.tool）。别的插件按它判断一个工具做什么，不认工具名：
+ * 换掉提供文件工具的插件（比如换成 apply_patch），/undo、检查、压缩照样认得出哪些调用改了文件。
+ * 值是输入里的字段名
+ */
+export interface ToolMeta {
+  /** 写一个文件，路径在输入的这个字段里（例如 "path"）：/undo 写之前记下文件，检查、压缩据此知道改了哪些文件 */
+  writes?: string;
+  /** 执行一条 shell 命令，命令在输入的这个字段里（例如 "command"）：审批按命令判断，/undo 在第一条命令之前给工作区拍快照 */
+  shell?: string;
+}
+
+/** 会话里的一个工具：内核看到的信息，加上注册时给的 meta */
+export type SessionTool = ToolInfo & { meta?: ToolMeta };
 
 /** 进程级和会话级 ctx 共有的部分 */
 export interface ScopeContext {
@@ -134,6 +149,8 @@ export interface SessionControl {
    * 例如审批插件用 awaiting 知道有调用在等回答，包括恢复一个上次停在等审批的会话时
    */
   subscribe(fn: (n: RuntimeNotice) => void): () => void;
+  /** 这个会话里叫这个名字的工具；没有时 undefined（例如历史里的调用来自一个现在没加载的插件） */
+  tool(name: string): SessionTool | undefined;
 }
 
 export interface SessionContext extends ScopeContext {
@@ -152,7 +169,7 @@ export interface SessionContext extends ScopeContext {
   readonly input?: Draft;
   /** 交给内核的部分，只能在 session() 执行期间注册：会话的内核插件清单在创建时确定 */
   readonly kernel: {
-    tool(tool: Tool): void;
+    tool(tool: Tool & { meta?: ToolMeta }): void;
     /** 进程内的 hook，或进程外插件的 RemoteHookSpec（字段裁剪、超时由内核保证） */
     hook(hook: LocalHookSpec | RemoteHookSpec): void;
   };
@@ -190,6 +207,8 @@ export interface Session {
   subscribe(fn: (n: RuntimeNotice) => void): () => void;
   /** 日志里的全部事件（恢复会话时前端用它重新显示对话） */
   history(): Promise<LogEvent[]>;
+  /** 这个会话里叫这个名字的工具，同 SessionControl.tool */
+  tool(name: string): SessionTool | undefined;
 }
 
 export interface OpenOptions {

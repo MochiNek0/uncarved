@@ -193,6 +193,7 @@ pi 后来才补上"agent 停下来之后再执行"和延迟 reload。jade 从一
 - `session.afterTurn(fn)`：本轮完全结束（`turn.ended` 已落盘、没有在途工具）后执行一次。续写、溢出重试、建议提示都用它，不再需要旧 jade 只给内置插件的 `TurnParticipant`。
 - 插件想发起新一轮：`session.send(input)`。如果当前正在跑，排到本轮之后。想停下正在跑的这一轮（例如用户在聊天机器人里喊停）：`session.abort(reason?)`。两者都只有用户层插件能用；项目层插件不能替用户说话、不能替用户喊停（第 7 节）。
 - 看会话：`session.state()` 是会话现在的状态（阶段、消息、还没做完的工具调用、derived）的一份拷贝，`session.subscribe(fn)` 订阅运行时的通知（事件、增量、工具进度、停下来等人工审批的 `awaiting`），和前端拿到的 `Session.state`、`Session.subscribe` 是同一份东西（2026-11-10 加：原来只有前端有）。只读，项目层插件也能用。`session()` 执行期间可以订阅，但还读不到状态（Runtime 在全部插件加入之后才建）。
+- 认工具：`session.tool(name)`（前端是 `Session.tool`）返回会话里这个工具的声明和注册时给的 `meta`。`meta` 说明工具做什么，值是输入里的字段名：`{ writes: "path" }` 写一个文件，`{ shell: "command" }` 执行一条 shell 命令（jade/fs 的 write_file、edit_file、multi_edit 和 jade/shell 的 bash 都这样声明）。/undo、jade/checks、jade/compact、jade/approval（命令规则、审查）、jade/repeats 按 `meta` 判断，不认工具名，所以换掉 jade/fs、jade/shell 不会让它们悄悄失效（2026-11-12 加）。`meta` 写错（不是对象、字段名不是字符串）时这个插件加入不了会话。只描述现在有人用的两种；按名字认的还剩几处，是本来就针对那个工具的：jade/repeats 对 `edit_file` 来回改同一处、`read_file` 读回刚写的文件的提醒，jade/approval 对 `glob` 的 pattern 越界检查，jade/compact 和 jade/todo 读 `todo_write`，jade/prompts 按工具在不在决定写哪几条提示。
 - 会话里的界面：`ctx.status(text)` 在状态栏上占一段，`ctx.panel(text)` 在输入框上方占一块（可以多行），`ctx.input` 改输入框（读、插入、整段替换、灰色提示）。两者来自前端 `ui@1.session`（3.4），每个插件一份，作用域关闭时自动收掉；前端不提供时都是 `undefined`。
 
 ## 5. 膜与故障隔离
