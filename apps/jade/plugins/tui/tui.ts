@@ -14,7 +14,6 @@ import {
   useCursor,
   useInput,
   usePaste,
-  useWindowSize,
   createContext,
   createElement as h,
   useContext,
@@ -43,9 +42,23 @@ import {
  * 紧跟的 ESC[K 会把最后一个字符擦掉，输入框之类的右边框就缺了一块。留出最后一列就不会这样
  */
 function useScreenSize(): { columns: number; rows: number } {
-  const { columns, rows } = useWindowSize();
+  const { columns, rows } = useContext(SizeContext);
   return { columns: Math.max(1, columns - 1), rows };
 }
+
+/** 终端尺寸：由 store 在窗口停止缩放之后才更新（见 tuiScreen 里的 onResize），不用 Ink 的 useWindowSize */
+const SizeContext = createContext<Size>({ columns: 80, rows: 24 });
+type Size = { columns: number; rows: number };
+
+/** 最后一个 resize 事件之后等这么久才按新尺寸重画；拖动窗口时一连串的事件只画一次 */
+const RESIZE_SETTLE_MS = 100;
+/**
+ * 整帧重画之前先停这么久不画：要比 Ink 的帧间隔（30fps，约 33ms）长，
+ * 重画那次提交才会马上画出来（节流的第一下），而不是被推迟、和下一次提交合并掉
+ */
+const REPAINT_GAP_MS = 40;
+/** 宽度变了之后在后台重新折行，每批折这么多项 */
+const REWRAP_BATCH = 1000;
 
 export interface TuiHandlers {
   /** 用户在输入框里提交了一行（消息或命令） */
@@ -110,6 +123,9 @@ interface UiState {
   status: StatusInfo;
   /** 插件设置的灰色提示（ctx.input.hint）：输入框为空时显示，Tab 或 → 接受 */
   hint?: string;
+  size: Size;
+  /** 这一帧比终端高，让 Ink 清屏从左上角整帧重画（见 Store.repaint） */
+  repaint?: boolean;
 }
 
 /** 对话最多保留这么多行（折行前），超出时丢掉最早的一段 */
@@ -234,9 +250,18 @@ class Store {
   /** 带名字的项，amend 用 */
   #named = new Map<string, Line>();
   #width = 0;
+  /** #lines 里前这么多项还没按 #width 折行：宽度变了先折看得见的最后一段，前面的在后台分批补上 */
+  #unwrapped = 0;
+  #rewrap: ReturnType<typeof setTimeout> | undefined;
+  #repaintTimer: ReturnType<typeof setTimeout> | undefined;
+  /**
+   * 先不通知界面重画：窗口正在缩放（等停下来按新尺寸画一次；按旧尺寸画的帧在终端里会错位，
+   * Windows 上还会每帧清屏，拖动窗口时就是一直在闪），或者整帧重画之前的空档（见 REPAINT_GAP_MS）
+   */
+  paused = false;
 
-  constructor(status: StatusInfo) {
-    this.state = { version: 0, scroll: 0, progress: [], queued: [], dialogs: [], status };
+  constructor(status: StatusInfo, size: Size) {
+    this.state = { version: 0, scroll: 0, progress: [], queued: [], dialogs: [], status, size };
   }
 
   subscribe = (fn: () => void) => {
@@ -254,7 +279,36 @@ class Store {
   #emit() {
     clearTimeout(this.#timer);
     this.#timer = undefined;
+    if (this.paused) return;
     for (const fn of this.#listeners) fn();
+  }
+
+  /** 窗口正在缩放：停下来之前不画 */
+  resizing() {
+    clearTimeout(this.#repaintTimer);
+    this.paused = true;
+  }
+
+  /** 窗口停止缩放：按新尺寸整帧重画。缩放时已经停了一阵没画，不用再等 */
+  resized(size: Size) {
+    this.#repaintNow({ size });
+  }
+
+  /**
+   * 让一次提交比终端高，Ink 会清屏、从左上角整帧重画（包在同步输出里），下一次提交恢复（见 App）。
+   * Ink 增量渲染只用相对光标移动，起点一旦偏了（窗口缩放、别的输出插进来），之后每帧都会画错行，这样能把它拉回来。
+   * 只能有一次提交是这样：比终端高的帧不管内容变没变，Ink 每画一次就清一次屏
+   */
+  repaint() {
+    clearTimeout(this.#repaintTimer);
+    this.paused = true;
+    this.#repaintTimer = setTimeout(() => this.#repaintNow(), REPAINT_GAP_MS);
+  }
+
+  #repaintNow(patch: Partial<UiState> = {}) {
+    clearTimeout(this.#repaintTimer);
+    this.paused = false;
+    this.update({ ...patch, repaint: true }, true);
   }
 
   /** 追加普通的行；带 item 时 texts 合成一项（可折叠、可以之后补充），texts 是收起时显示的部分 */
@@ -311,15 +365,51 @@ class Store {
     for (const _ of rows) this.#owners.push(l);
   }
 
-  /** 按给定宽度折好的全部输出；宽度变了（终端缩放）才重新折行 */
-  lines(width: number): string[] {
+  /**
+   * 按给定宽度折好的输出，至少有末尾的 need 行（或者全部）。
+   * 宽度变了（终端缩放）才重新折行：同步只折到够 need 行，前面的分批在后台补上，长对话缩放后不用等全部折完才画出来
+   */
+  lines(width: number, need = Infinity): string[] {
     if (width !== this.#width) {
       this.#width = width;
       this.#wrapped = [];
       this.#owners = [];
-      for (const l of this.#lines) this.#push(l);
+      this.#unwrapped = this.#lines.length;
+      clearTimeout(this.#rewrap);
+      this.#rewrap = undefined;
     }
+    this.#wrapEarlier((n) => this.#wrapped.length + n >= need, Infinity);
+    if (this.#unwrapped > 0) this.#rewrap ??= setTimeout(this.#rewrapBatch, 0);
     return this.#wrapped;
+  }
+
+  #rewrapBatch = () => {
+    this.#rewrap = undefined;
+    if (!this.#width || this.#unwrapped === 0) return;
+    const before = this.#wrapped.length;
+    this.#wrapEarlier(() => false, REWRAP_BATCH);
+    if (this.#unwrapped > 0) this.#rewrap = setTimeout(this.#rewrapBatch, 0);
+    // 补上的行在前面，离底部的距离（scroll）不变，看的地方也就不动；只是行号变了，所以要重画
+    if (this.#wrapped.length !== before) this.update({ version: this.state.version + 1 });
+  };
+
+  /** 从后往前折还没折的项，直到 enough(新折出的行数) 或者折了 max 项 */
+  #wrapEarlier(enough: (rows: number) => boolean, max: number) {
+    const rows: string[][] = [];
+    const owners: Line[] = [];
+    let count = 0;
+    while (this.#unwrapped > 0 && rows.length < max && !enough(count)) {
+      const l = this.#lines[--this.#unwrapped]!;
+      const r = wrapLine(l, this.#width);
+      rows.push(r);
+      owners.push(l);
+      count += r.length;
+    }
+    if (rows.length === 0) return;
+    rows.reverse();
+    owners.reverse();
+    this.#wrapped = [...rows.flat(), ...this.#wrapped];
+    this.#owners = [...owners.flatMap((l, i) => rows[i]!.map(() => l)), ...this.#owners];
   }
 
   /**
@@ -355,6 +445,7 @@ class Store {
     this.#lines = [];
     this.#wrapped = [];
     this.#owners = [];
+    this.#unwrapped = 0;
     this.#named.clear();
     this.update(
       { version: this.state.version + 1, live: undefined, progress: [], scroll: 0, hint: undefined },
@@ -454,7 +545,15 @@ function titleBar(stdout: NodeJS.WriteStream, store: Store, env = process.env): 
 
 export function tuiScreen(opts: TuiOptions): Screen {
   const stdout = opts.io?.stdout ?? process.stdout;
-  const store = new Store(opts.status);
+  const size = (): Size => ({ columns: stdout.columns || 80, rows: stdout.rows || 24 });
+  const store = new Store(opts.status, size());
+  let settle: ReturnType<typeof setTimeout> | undefined;
+  const onResize = () => {
+    store.resizing();
+    clearTimeout(settle);
+    settle = setTimeout(() => store.resized(size()), RESIZE_SETTLE_MS);
+  };
+  stdout.on("resize", onResize);
   const draft: DraftBridge = {};
   const notify = notifier(stdout);
   /** 已经工作了很久（见 NOTIFY_AFTER） */
@@ -536,6 +635,7 @@ export function tuiScreen(opts: TuiOptions): Screen {
   /** 接管终端、画界面。界面的内容都在 store 里，所以让出终端（suspend）之后可以再画一个新的 */
   const mount = () => {
     stdout.write("\x1b[?1049h\x1b[2J\x1b[H");
+    const ours = new Set(stdout.listeners("resize"));
     const mounted = render(
       h(App, {
         store,
@@ -556,6 +656,10 @@ export function tuiScreen(opts: TuiOptions): Screen {
           : {}),
       },
     );
+    // Ink 自己也听 resize：每个事件都马上按旧的布局画一帧（变窄时还先逐行擦掉上一帧），
+    // 拖动窗口时就是一连串错位的帧，Windows 上每帧还清屏。尺寸改由上面的 onResize 在停下之后统一处理，
+    // Ink 每次提交都会按终端当前的宽度重新排版，不需要它自己的监听
+    for (const l of stdout.listeners("resize")) if (!ours.has(l)) stdout.off("resize", l as () => void);
     stdout.write(MOUSE_ON + CURSOR_BLINK);
     return mounted;
   };
@@ -719,6 +823,8 @@ export function tuiScreen(opts: TuiOptions): Screen {
       // 等最后一帧画完再卸载；卸载时 Ink 退出备用屏幕
       await new Promise((r) => setTimeout(r, 50));
       closeTitle();
+      clearTimeout(settle);
+      stdout.off("resize", onResize);
       stdout.write(MOUSE_OFF + CURSOR_RESET);
       instance.unmount();
       await instance.waitUntilExit();
@@ -868,11 +974,14 @@ function App({
 }) {
   const state = useSyncExternalStore(store.subscribe, store.get);
   const dialog = state.dialogs[0];
-  const { columns, rows } = useScreenSize();
+  const columns = Math.max(1, state.size.columns - 1);
+  const rows = state.size.rows;
   const compact = rows < COMPACT_ROWS;
   // 运行中每一帧（FRAME_MS）整体重画一次，推动转圈和吉祥物的动画。不能让 Spinner、吉祥物自己重画：
-  // Ink 只在输入框也跟着提交的那一帧保留光标，否则把光标藏起来，运行中光标就不见了
-  const [ticks, tick] = useReducer((n: number) => n + 1, 0);
+  // Ink 只在输入框也跟着提交的那一帧保留光标，否则把光标藏起来，运行中光标就不见了。
+  // 窗口缩放时和整帧重画之前不画（见 Store.paused）
+  const [ticks, tickNow] = useReducer((n: number) => n + 1, 0);
+  const tick = () => store.paused || tickNow();
   const busy = state.busy !== undefined;
   useEffect(() => {
     if (!busy) return;
@@ -891,13 +1000,15 @@ function App({
     if (busy || !showBot) return;
     const t = setTimeout(tick, nextChange(mood, Date.now(), state.doneAt, moving));
     return () => clearTimeout(t);
-  }, [busy, showBot, ticks, mood, moving, state.doneAt]);
+    // 缩放时跳过的那一下靠 state.size 变了再排上
+  }, [busy, showBot, ticks, mood, moving, state.doneAt, state.size]);
 
   // 对话区占掉标题和底部之外的全部高度，只画能看见的那几行
   const ref = useRef<DOMElement>(null);
   const { height, top } = useBoxMetrics(ref);
   const width = Math.max(10, columns - 2);
-  const done = store.lines(width);
+  // 往上翻看时要折到能看见的地方；多要一屏给翻页
+  const done = store.lines(width, state.scroll + 2 * rows);
   // 还没结束的流式块和正在运行的工具的进度：思考只显示最新的一行，进度每个工具一行
   const live = [
     ...(state.live?.pending ?? []).flatMap((l) => mdRows(l, width)),
@@ -948,29 +1059,17 @@ function App({
     copiedTimer.current = setTimeout(() => setCopied(undefined), COPIED_MS);
   };
 
-  // Ink 增量渲染只用相对光标移动，第一帧起点一旦偏了（启动时终端尺寸还没稳定、窗口缩放、别的输出插进来），
-  // 之后每帧都会画错行。尺寸变化后和按 Ctrl+L 时让一帧比终端高，Ink 会清屏从左上角整帧重画（包在同步输出里），下一帧再恢复。
-  // 启动时不重画：第一帧之前已经清屏、光标在左上角；这两次清屏在不支持同步输出的终端上（Windows 上常见）看得出闪一下
-  const [redraws, setRedraws] = useState(0);
-  const [repaint, setRepaint] = useState(false);
-  const mounted = useRef(false);
+  // 窗口停止缩放后和按 Ctrl+L 时整帧重画一次（见 Store.repaint）。
+  // 启动时不重画：第一帧之前已经清屏、光标在左上角；整帧重画在不支持同步输出的终端上（Windows 上常见）看得出闪一下
+  const repaint = state.repaint === true;
+  // 整帧重画那次提交已经马上画出来了（见 Store.repaint），下一次提交就恢复；
+  // 这一轮里别的组件跟着改的状态（量出来的高度）和恢复合在同一次提交里，不会再画一帧比终端高的
   useEffect(() => {
-    if (!mounted.current) {
-      mounted.current = true;
-      return;
-    }
-    const t = setTimeout(() => setRepaint(true), 100);
-    return () => clearTimeout(t);
-  }, [columns, rows, redraws]);
-  useEffect(() => {
-    if (!repaint) return;
-    // 要比 Ink 的帧间隔长，否则这一帧会被合并掉
-    const t = setTimeout(() => setRepaint(false), 50);
-    return () => clearTimeout(t);
+    if (repaint) store.update({ repaint: false });
   }, [repaint]);
 
   useInput((input, key) => {
-    if (key.ctrl && input === "l") return setRedraws((n) => n + 1);
+    if (key.ctrl && input === "l") return store.repaint();
     // 展开或收起最近的一项（工具结果、思考、检查报告），鼠标点不了时也能看完整内容
     if (key.ctrl && input === "o") return store.toggleLatest(start, view);
     const mouse = mouseEvent(input);
@@ -1018,7 +1117,7 @@ function App({
   // 总高度要比终端少一行，否则 Ink 认为输出占满了屏幕，每帧清屏重画。
   // 重画那一帧上下各垫一行空白：终端把顶上那行滚出去后，看到的和平时逐行一样，所以不会闪。
   // 只做纵向裁剪：每行都已按宽度折好或截断，横向裁剪会让 Ink 每帧对每一行再切一遍 ANSI 字符串
-  return h(
+  return h(SizeContext.Provider, { value: state.size }, h(
     SelectionContext.Provider,
     { value: selectionApi },
     h(
@@ -1097,7 +1196,7 @@ function App({
         ),
       ),
     ),
-  );
+  ));
 }
 
 /**

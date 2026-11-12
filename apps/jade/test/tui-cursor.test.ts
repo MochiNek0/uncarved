@@ -141,6 +141,100 @@ test("the terminal cursor stays on the input line after the window is resized", 
   }
 });
 
+/** 接上 Vt 的界面；writes 记下每次写进终端的内容 */
+function mountVt(cols: number, rows: number) {
+  const vt = new Vt(cols, rows);
+  const writes: string[] = [];
+  const stdin = Object.assign(new PassThrough(), { isTTY: true, setRawMode: () => {}, ref: () => {}, unref: () => {} });
+  const stdout = Object.assign(
+    new Writable({
+      write(chunk, _e, done) {
+        writes.push(chunk.toString());
+        vt.write(chunk.toString());
+        done();
+      },
+    }),
+    { isTTY: true, columns: cols, rows },
+  );
+  const screen = tuiScreen({
+    status: { cwd: "~/p", model: "m", mode: "ask", session: "s" },
+    version: "1",
+    commands: [],
+    handlers: { submit() {}, interrupt() {}, exit() {} },
+    io: { stdin: stdin as unknown as NodeJS.ReadStream, stdout: stdout as unknown as NodeJS.WriteStream },
+  });
+  const resize = (c: number, r: number) => {
+    vt.resize(c, r);
+    Object.assign(stdout, { columns: c, rows: r });
+    stdout.emit("resize");
+  };
+  return { vt, writes, stdin, screen, resize };
+}
+
+// 拖动窗口时一连串的 resize 事件：Ink 每个事件都按旧布局画一帧，Windows 上每帧还清屏，画面一直闪
+test("dragging the window draws nothing until it stops, then repaints once", async () => {
+  const { vt, writes, stdin, screen, resize } = mountVt(100, 40);
+  try {
+    stdin.write("hello");
+    // 运行中每 50ms 本来就要重画一帧
+    screen.busy("Working");
+    await sleep(300);
+    writes.length = 0;
+    for (let i = 0; i < 10; i++) {
+      resize(100 - i * 2, 40 - i);
+      await sleep(20);
+    }
+    // 窗口标题（OSC 0）不是界面的帧
+    expect(writes.filter((w) => !w.startsWith("\x1b]0;"))).toEqual([]);
+    await sleep(400);
+    const clears = writes.join("").split("\x1b[2J").length - 1;
+    expect(clears).toBeGreaterThan(0);
+    expect(clears).toBeLessThanOrEqual(2);
+    const input = vt.lines.findIndex((l) => l.includes("› hello"));
+    expect(input).toBeGreaterThan(-1);
+    expect({ cursor: vt.row, col: vt.col }).toEqual({ cursor: input, col: 9 });
+  } finally {
+    await screen.close();
+  }
+});
+
+// 运行中每 50ms 一帧：重画那次提交要是被节流推迟，就会和下一次合并掉（没有重画），或者连画几帧比终端高的（每帧清屏）
+test("ctrl+l repaints the whole screen once, also while busy", async () => {
+  const { writes, stdin, screen } = mountVt(100, 40);
+  try {
+    screen.busy("Working");
+    await sleep(300);
+    for (let i = 0; i < 3; i++) {
+      writes.length = 0;
+      stdin.write("\x0c");
+      await sleep(300);
+      const clears = writes.join("").split("\x1b[2J").length - 1;
+      expect(clears).toBeGreaterThan(0);
+      expect(clears).toBeLessThanOrEqual(2);
+    }
+  } finally {
+    await screen.close();
+  }
+});
+
+// 宽度变了先折看得见的最后一段，前面的在后台补上：底部马上画出来，翻到最上面也还是完整的
+test("after a width change the whole long transcript is still there", async () => {
+  const { vt, stdin, screen, resize } = mountVt(100, 40);
+  try {
+    for (let i = 0; i < 3000; i++) screen.log(`row ${i} ${"x".repeat(i % 120)}`);
+    await sleep(300);
+    resize(70, 40);
+    await sleep(300);
+    expect(vt.lines.some((l) => l.includes("row 2999 "))).toBe(true);
+    stdin.write("\x1b[1;5H"); // ctrl+home
+    await sleep(300);
+    expect(vt.lines.some((l) => /\brow 1\b/.test(l))).toBe(true);
+    expect(vt.lines.some((l) => /\brow 2\b/.test(l))).toBe(true);
+  } finally {
+    await screen.close();
+  }
+});
+
 // 运行中只有转圈的 Spinner 自己每 100ms 重画；输入框没有跟着提交时 Ink 认为没人要光标，把它藏起来
 test("the terminal cursor stays visible while the spinner ticks", async () => {
   const vt = new Vt(100, 40);
