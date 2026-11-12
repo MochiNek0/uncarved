@@ -7,9 +7,13 @@ import type { EventRenderer, Renderers, ToolRenderer } from "@uncarved/jade-api/
 const tools = new Map<string, { renderer: ToolRenderer; plugin: string }>();
 const events = new Map<string, { renderer: EventRenderer; plugin: string }>();
 
-function add<T>(map: Map<string, { renderer: T; plugin: string }>, key: string, renderer: T, plugin: string, what: string, onDispose: (d: () => void) => void): () => void {
+function add<T>(map: Map<string, { renderer: T; plugin: string }>, key: string, renderer: T, plugin: string, what: string, onDispose: (d: () => void) => void, report: (m: string) => void): () => void {
+  // 重名时先登记的留下，后来的跳过并报告（同 commands@1）
   const taken = map.get(key);
-  if (taken) throw new Error(`${what} ${key} already has a renderer from ${taken.plugin}`);
+  if (taken) {
+    report(`the renderer for ${what} ${key} from ${plugin} was skipped: ${taken.plugin} already registered one`);
+    return () => {};
+  }
   const entry = { renderer, plugin };
   map.set(key, entry);
   const revoke = () => {
@@ -24,11 +28,11 @@ export default definePlugin({
     ctx.provide("renderers@1", (caller): Renderers => ({
       tool(renderer) {
         if (typeof renderer?.tool !== "string" || !renderer.tool) throw new Error("a tool renderer needs the tool name");
-        return add(tools, renderer.tool, renderer, caller.plugin, "tool", caller.onDispose);
+        return add(tools, renderer.tool, renderer, caller.plugin, "tool", caller.onDispose, ctx.report);
       },
       event(renderer) {
         if (typeof renderer?.event !== "string" || !renderer.event || typeof renderer.render !== "function") throw new Error("an event renderer needs the event type and render");
-        return add(events, `${caller.plugin}/${renderer.event}`, renderer, caller.plugin, "event", caller.onDispose);
+        return add(events, `${caller.plugin}/${renderer.event}`, renderer, caller.plugin, "event", caller.onDispose, ctx.report);
       },
       forTool: (tool) => tools.get(tool),
       forEvent: (type) => events.get(type),

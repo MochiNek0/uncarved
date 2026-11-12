@@ -169,6 +169,7 @@ export default definePlugin({
 
 - `process` / `session` 函数**只做注册**。需要后台资源（定时器、子进程、socket）的，用 `ctx.effect(start)`：`start` 返回清理函数，作用域关闭时逆序执行。
 - 函数是**事务性**的：中途抛错，已经做的注册全部撤销，插件记为失败。不会留下注册了一半的插件（pi 的 commit/discard）。
+- 所以注册表遇到重名不抛错：先注册的留下，后来的那一项跳过，用 `ctx.report(message)` 告诉用户（前端起来之后是通知，之前打到 stderr）。抛错会让调用方整个激活失败，连它别的功能、它提供的服务一起没了，依赖这些服务的插件也被跳过。名字不合法、保留的名字照旧抛错：那是插件自己写错了，只伤到它自己。
 - 作用域关闭后，旧 `ctx` 和从它拿到的服务句柄都**过期**：再调用会抛 `StaleContext`，错误信息说明是哪个插件、哪个作用域。过期调用也经过膜，所以只会伤到调用者自己。
 - 每个插件在一个会话里的内核部分（`ctx.kernel.tool/hook`）被收集成一个 uncarved `Plugin`，id 和版本就是插件清单里的 id 和版本。这样内核的插件清单（4.6 恢复检查）和 jade 的插件一一对应。
 
@@ -263,6 +264,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
   | 双向 | `$/cancel` | 取消一次调用（宿主在工具被中止、hook 超时时发） |
   | 插件 → 宿主 | `provide`、`kernel/tool`、`kernel/hook` | 注册：`provide` 列出方法名，`perCaller` 为 true 时按调用方创建实例；工具的 `execute`、hook 的 `fn` 是函数句柄 |
   | 插件 → 宿主 | `secrets/get`、`secrets/set` | 读写这个插件自己的密钥（第 8 节）：`{ scope, key, value? }`，`value` 为 null 时删除；宿主按插件 id 取，参数里没有插件 id |
+  | 插件 → 宿主 | `report` | `{ scope, message }`，同 `ctx.report`：告诉用户一个问题（警告） |
 - 值里的函数表示成句柄 `{ "$fn": id }`，对方用 `call` 调用。句柄属于一个作用域，作用域关闭后失效。函数参数照样过膜：插件交给注册表的回调归插件，出错归它，插件关闭后失效。
 - 加一个新服务不需要改协议：只要它的方法参数和返回值能 JSON 序列化（函数用句柄表示）就能跨进程用。不能序列化的服务（例如要传 React 组件的 TUI 扩展）在清单里标 `"local": true`，进程外插件依赖它时直接报不兼容。（`local` 还没实现，等 `jade/tui` 出现时一起做。）
 - 内核 hook 用 uncarved 的 `RemoteHookSpec`：插件声明 `reads`、`writes`、`timeoutMs`，字段裁剪、回复检查、超时都由内核保证。`ctx.kernel.hook` 因此也接受 `RemoteHookSpec`。

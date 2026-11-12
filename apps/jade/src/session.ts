@@ -409,6 +409,10 @@ export class Sessions implements SessionManager {
         const d = await ambient.run(owner, start);
         if (typeof d === "function") scope.add(d);
       },
+      report: (message) => {
+        if (scope.closed) throw new StaleContext(id);
+        host.report(`${id}: ${String(message)}`);
+      },
       session: {
         id: s.id,
         afterTurn: (fn) => {

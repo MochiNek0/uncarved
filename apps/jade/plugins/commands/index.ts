@@ -14,8 +14,12 @@ export default definePlugin({
         if (typeof command?.name !== "string" || !NAME.test(command.name)) throw new Error(`invalid command name ${JSON.stringify(command?.name)}`);
         if (typeof command.run !== "function") throw new Error(`command /${command.name} has no run function`);
         const key = command.name.toLowerCase();
+        // 重名时先注册的留下，后来的这一条跳过并报告：抛错会让调用方整个激活失败，连它别的功能一起没了
         const taken = registry.get(key);
-        if (taken) throw new Error(`command /${command.name} is already registered by ${taken.plugin}`);
+        if (taken) {
+          ctx.report(`/${command.name} from ${caller.plugin} was skipped: ${taken.plugin} already registered it`);
+          return () => {};
+        }
         const entry: CommandEntry = { command, plugin: caller.plugin };
         registry.set(key, entry);
         const revoke = () => {

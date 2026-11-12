@@ -140,6 +140,10 @@ class Context:
 
     require = service
 
+    def report(self, message: str) -> None:
+        """告诉用户一个问题（警告，不是错误），消息前面加上插件 id"""
+        self._conn.request("report", {"scope": self.scope, "message": message})
+
     def provide(self, name: str, impl: Any = None, *, factory: Callable[[Caller], Any] | None = None, methods: list[str] | None = None) -> None:
         """
         提供一个声明在 provides 里的服务，只能在 process 里调用。

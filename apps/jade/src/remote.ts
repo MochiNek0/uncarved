@@ -217,6 +217,10 @@ export async function startRemote(source: PluginSource, owner: Owner, opts: Remo
         (ctx as SessionContext).kernel.hook(spec);
         return null;
       }
+      case "report": {
+        ctx.report(String(p.message));
+        return null;
+      }
       case "secrets/get": {
         if (typeof p.key !== "string") throw new Error("secrets/get: key must be a string");
         return (await ctx.secrets.get(p.key)) ?? null;

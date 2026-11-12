@@ -79,6 +79,11 @@ export interface ScopeContext {
   service<T extends object>(service: string): T | undefined;
   /** 启动一项后台资源，返回的清理函数在作用域关闭时执行 */
   effect(start: () => Disposer | void | Promise<Disposer | void>): Promise<void>;
+  /**
+   * 告诉用户一个问题（警告，不是错误）：前端起来之后显示成通知，之前打到 stderr；消息前面加上本插件的 id。
+   * 例如注册表遇到重名时跳过后来的那一项并报告，而不是抛错让调用方整个激活失败
+   */
+  report(message: string): void;
 }
 
 /** 服务的调用方，交给按调用方创建的服务实例（ProcessContext.provide） */
@@ -217,7 +222,7 @@ export interface Frontend {
  * 核心自己的子命令（plugins、update、help……）不能注册
  */
 export interface Cli {
-  /** 注册一条子命令，返回撤销函数。名字已被占用或保留时抛错 */
+  /** 注册一条子命令，返回撤销函数。名字不合法或保留时抛错；已被占用时跳过并报告（同 commands@1） */
   register(command: CliCommand): () => void;
 }
 

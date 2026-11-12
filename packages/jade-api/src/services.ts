@@ -48,7 +48,7 @@ export interface CommandEntry {
 }
 
 export interface Commands {
-  /** 注册一条命令，返回撤销函数。名字已被占用时抛错 */
+  /** 注册一条命令，返回撤销函数。名字不合法时抛错；已被占用时先注册的留下，这一条跳过并报告给用户（返回的撤销函数什么也不做） */
   register(command: Command): () => void;
   /** 按名字找（不分大小写） */
   get(name: string): CommandEntry | undefined;
@@ -68,7 +68,7 @@ export interface Key {
 }
 
 export interface Keys {
-  /** 注册一个键，返回撤销函数。键不合法、是保留键或已被占用时抛错 */
+  /** 注册一个键，返回撤销函数。键不合法或是保留键时抛错；已被占用时跳过并报告（同 Commands.register） */
   register(key: Key): () => void;
   /** 前端按下一个自己不用的键时查找；找到了由前端执行 run，出错时显示警告 */
   get(key: string): { key: Key; plugin: string } | undefined;
@@ -109,7 +109,7 @@ export interface EventRenderer {
 }
 
 export interface Renderers {
-  /** 为一个工具登记显示方式，返回撤销函数。同一个工具已有登记时抛错 */
+  /** 为一个工具登记显示方式，返回撤销函数。同一个工具已有登记时跳过并报告（同 Commands.register） */
   tool(renderer: ToolRenderer): () => void;
   /** 为自己的一种事件登记显示方式，返回撤销函数 */
   event(renderer: EventRenderer): () => void;
@@ -288,7 +288,7 @@ export interface Shell {
  */
 export interface Tools {
   /**
-   * 登记一个工具，返回撤销函数；登记者的作用域关闭时自动撤销。工具名已被别的插件登记时抛错。
+   * 登记一个工具，返回撤销函数；登记者的作用域关闭时自动撤销。工具名已被别的插件登记时跳过并报告（同 Commands.register）。
    * 登记的工具不经过主会话的关卡（审批、hook），所以只登记嵌套 Agent 用得着的：现在登记的都是只读的，
    * 或者由使用方把关的（jade/shell 的 bash）。
    * opts.when：每次 list 时调用，返回 false 时这次不给（例如没有配置搜索服务时的 web_search）

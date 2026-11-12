@@ -150,8 +150,12 @@ export class PluginHost {
           if (typeof name !== "string" || !CLI_NAME.test(name)) throw new Error(`invalid jade subcommand name ${JSON.stringify(name)}`);
           if (CORE_WORDS.has(name)) throw new Error(`"jade ${name}" belongs to jade itself`);
           if (typeof command.run !== "function") throw new Error(`jade ${name} has no run function`);
+          // 重名时先注册的留下，后来的跳过并报告：抛错会让调用方整个激活失败
           const taken = this.#cli.get(name);
-          if (taken) throw new Error(`"jade ${name}" is already registered by ${taken.plugin}`);
+          if (taken) {
+            this.#report(`"jade ${name}" from ${caller.plugin} was skipped: ${taken.plugin} already registered it`);
+            return () => {};
+          }
           const entry = { command, plugin: caller.plugin };
           this.#cli.set(name, entry);
           const revoke = () => {
@@ -383,6 +387,10 @@ export class PluginHost {
           if (this.#services.get(name)?.provider === owner) this.#services.delete(name);
         });
         this.#services.set(name, { impl, provider: owner });
+      },
+      report: (message: string): void => {
+        if (owner.scope.closed) throw new StaleContext(id);
+        this.#report(`${id}: ${String(message)}`);
       },
       effect: async (start): Promise<void> => {
         if (owner.scope.closed) throw new StaleContext(id);

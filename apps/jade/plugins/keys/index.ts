@@ -20,8 +20,12 @@ export default definePlugin({
         const spec = String(key?.key ?? "").toLowerCase();
         if (!KEY_SPEC.test(spec)) throw new Error(`invalid key ${JSON.stringify(key?.key)}: use ctrl+<letter>, alt+<letter or digit> or shift+tab`);
         if (RESERVED_KEYS.has(spec)) throw new Error(`key ${spec} is reserved by the frontend`);
+        // 重名时先注册的留下，后来的跳过并报告（同 commands@1）
         const taken = registry.get(spec);
-        if (taken) throw new Error(`key ${spec} is already registered by ${taken.plugin}`);
+        if (taken) {
+          ctx.report(`key ${spec} from ${caller.plugin} was skipped: ${taken.plugin} already registered it`);
+          return () => {};
+        }
         const entry = { key, plugin: caller.plugin };
         registry.set(spec, entry);
         const revoke = () => {

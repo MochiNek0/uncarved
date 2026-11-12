@@ -178,7 +178,7 @@ describe("isolation", () => {
 });
 
 describe("cli@1", () => {
-  test("plugins register jade <subcommand>; jade's own words and taken names are refused; a quarantined plugin's subcommands go away", async () => {
+  test("plugins register jade <subcommand>; jade's own words and bad names are refused, a taken name is skipped and reported; a quarantined plugin's subcommands go away", async () => {
     const w = await world();
     await w.plugin("user", { id: "a", optional: ["cli@1"] }, `export default { process(ctx) {
       const cli = ctx.service("cli@1");
@@ -195,8 +195,8 @@ describe("cli@1", () => {
       '"jade plugins" belongs to jade itself',
       '"jade update" belongs to jade itself',
       'invalid jade subcommand name "Bad Name"',
-      '"jade hello" is already registered by a',
     ]);
+    expect(w.reports).toContain('"jade hello" from a was skipped: a already registered it');
     delete g.__cliErrors;
     const hello = host.cliCommand("hello")!;
     expect(hello.plugin).toBe("a");

@@ -76,16 +76,66 @@ describe("registries", () => {
   });
 
   test("commands from plugins are listed, run with the caller's context, and revoked with their plugin", async () => {
-    const { host } = await start();
+    const { host, reports } = await start();
     try {
       const commands = host.service<Commands>("commands@1")!;
       expect(commands.list().map((c) => c.name)).toEqual(expect.arrayContaining(["clear", "hello", "mode", "resume", "retry"]));
       expect(commands.list().find((c) => c.name === "hello")!.plugin).toBe("test/user");
       expect(await commands.get("HELLO")!.command.run("there", ctxFor(host.sessions))).toBe("hello there");
-      expect(() => commands.register({ name: "hello", run: () => {} })).toThrow("already registered by test/user");
+      // 重名：先注册的留下，后来的跳过并报告，不抛错
+      commands.register({ name: "hello", run: () => {} })();
+      expect(reports).toEqual(["jade/commands: /hello from jade was skipped: test/user already registered it"]);
+      expect(commands.get("hello")!.plugin).toBe("test/user");
       await host.quarantine("test/user", "test");
       expect(commands.get("hello")).toBeUndefined();
       expect(host.service<Keys>("keys@1")!.get("ctrl+g")).toBeUndefined();
+    } finally {
+      await host.close();
+    }
+  });
+
+  test("a plugin whose names are taken still activates with everything else it registered", async () => {
+    const { home, host: first } = await start();
+    await first.close();
+    // 和内置插件撞名的命令、键、渲染器，外加一条自己的命令；optional 的 modes@1 让 jade/modes 先激活
+    const dir = path.join(home, "plugins", "copycat");
+    await mkdir(dir, { recursive: true });
+    await writeFile(path.join(dir, "plugin.json"), JSON.stringify({ id: "test/copycat", version: "1.0.0", api: "^1", entry: "index.mjs", requires: ["commands@1", "keys@1", "renderers@1"], optional: ["modes@1"] }));
+    await writeFile(
+      path.join(dir, "index.mjs"),
+      `export default { process(ctx) {
+        ctx.require("commands@1").register({ name: "clear", run: () => "copy" });
+        ctx.require("commands@1").register({ name: "copy-only", run: () => "mine" });
+        ctx.require("keys@1").register({ key: "shift+tab", run: () => {} });
+        ctx.require("renderers@1").tool({ tool: "read_file" });
+      } };`,
+    );
+    const reports: string[] = [];
+    const host = await PluginHost.start({
+      roots: [
+        { layer: "bundled", root: BUNDLED },
+        { layer: "user", root: path.join(home, "plugins") },
+      ],
+      home,
+      cwd: home,
+      report: (m) => reports.push(m),
+    });
+    try {
+      expect(host.status().find((p) => p.id === "test/copycat")!.state).toBe("active");
+      const commands = host.service<Commands>("commands@1")!;
+      expect(commands.get("copy-only")!.plugin).toBe("test/copycat");
+      expect(commands.get("clear")!.plugin).toBe("jade/sessions");
+      expect(host.service<Keys>("keys@1")!.get("shift+tab")!.plugin).toBe("jade/modes");
+      expect(host.service<Renderers>("renderers@1")!.forTool("read_file")!.plugin).toBe("jade/fs");
+      expect(reports).toEqual([
+        "jade/commands: /clear from test/copycat was skipped: jade/sessions already registered it",
+        "jade/keys: key shift+tab from test/copycat was skipped: jade/modes already registered it",
+        "jade/renderers: the renderer for tool read_file from test/copycat was skipped: jade/fs already registered one",
+      ]);
+      // 被跳过的那一项没有登记上，它的插件关闭时不会误撤销别人的
+      await host.quarantine("test/copycat", "test");
+      expect(commands.get("clear")!.plugin).toBe("jade/sessions");
+      expect(commands.get("copy-only")).toBeUndefined();
     } finally {
       await host.close();
     }
@@ -115,7 +165,7 @@ describe("registries", () => {
   });
 
   test("tools for nested agents: any plugin registers them, any plugin lists them, and they are revoked with their plugin", async () => {
-    const { host } = await start();
+    const { host, reports } = await start();
     try {
       // 取用的一方（这里是核心，换成任何插件都一样）不用登记的一方认识它
       const tools = host.service<Tools>("tools@1")!;
@@ -126,7 +176,9 @@ describe("registries", () => {
       const signal = new AbortController().signal;
       const peek = tools.list().find((t) => t.name === "peek")!;
       expect(await peek.execute({}, { sessionId: "s", toolUseId: "t", signal, parent: { sessionId: "s", eventId: "e" }, progress() {} })).toEqual({ content: "peeked" });
-      expect(() => tools.register({ ...peek, name: "read_file" })).toThrow("already registered by jade/fs");
+      tools.register({ ...peek, name: "read_file" });
+      expect(reports).toEqual(["jade/tools: read_file from jade was skipped: jade/fs already registered it"]);
+      expect(tools.list().find((t) => t.name === "read_file")!.description).not.toBe("peeks");
       await host.quarantine("test/user", "test");
       expect(names()).not.toContain("peek");
       expect(names()).toContain("read_file");

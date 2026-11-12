@@ -66,10 +66,16 @@ export default definePlugin({
     };
     // 键被别的插件占了不算这个插件坏了：只是没有这个键，换一个就行
     noKey = undefined;
-    try {
-      ctx.require<Keys>("keys@1").register(binding);
-    } catch (e) {
-      noKey = `${e instanceof Error ? e.message : String(e)}; set {"jade/editor": {"key": "ctrl+<letter>"}} in config.json to use another key`;
+    const keys = ctx.require<Keys>("keys@1");
+    const taken = keys.get(binding.key)?.plugin;
+    const fix = `set {"jade/editor": {"key": "ctrl+<letter>"}} in config.json to use another key`;
+    if (taken) noKey = `${binding.key} is already used by ${taken}; ${fix}`;
+    else {
+      try {
+        keys.register(binding);
+      } catch (e) {
+        noKey = `${e instanceof Error ? e.message : String(e)}; ${fix}`;
+      }
     }
   },
 

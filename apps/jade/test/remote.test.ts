@@ -89,6 +89,9 @@ class Greeter:
     def get_secret(self, key):
         return self._ctx.secrets.get(key)
 
+    def report(self, message):
+        self._ctx.report(message)
+
     def crash(self):
         os._exit(3)
 
@@ -187,6 +190,17 @@ describe.skipIf(!PYTHON)("out-of-process plugins", () => {
       // 进程内插件调用 Python 的服务；Python 调用进程内插件交给它的回调
       expect(info(host, "js/user").state).toBe("active");
       expect(g.__fromJs).toEqual(["hi, js!", "callback got from python"]);
+    } finally {
+      await host.close();
+    }
+  });
+
+  test("ctx.report works over the bridge and names the plugin", async () => {
+    const { w } = await setup();
+    const host = await w.start();
+    try {
+      await host.service<{ report(message: string): Promise<void> }>("greeter@1")!.report("something is off");
+      expect(w.reports).toContain("py/greeter: something is off");
     } finally {
       await host.close();
     }

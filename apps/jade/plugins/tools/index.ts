@@ -32,9 +32,13 @@ export default definePlugin({
       register(tool, opts) {
         if (typeof tool?.name !== "string" || typeof tool.execute !== "function") throw new Error("tools.register: a tool needs a name and execute");
         // 同一个插件重复登记是正常的：换会话时新会话先登记，旧会话随后撤销它的那份；取最后登记的
-        const taken = registry.find((r) => r.tool.name === tool.name && r.plugin !== caller.plugin);
-        if (taken) throw new Error(`tools.register: ${tool.name} is already registered by ${taken.plugin}`);
         if (opts?.when !== undefined && typeof opts.when !== "function") throw new Error("tools.register: when must be a function");
+        // 别的插件已经登记了这个名字：先登记的留下，后来的跳过并报告（同 commands@1）
+        const taken = registry.find((r) => r.tool.name === tool.name && r.plugin !== caller.plugin);
+        if (taken) {
+          ctx.report(`${tool.name} from ${caller.plugin} was skipped: ${taken.plugin} already registered it`);
+          return () => {};
+        }
         const entry = { tool, plugin: caller.plugin, ...(opts?.when ? { when: opts.when } : {}) };
         registry.push(entry);
         const revoke = () => {
