@@ -49,8 +49,14 @@ const OWN: CommandInfo[] = [
   { name: "exit", about: "quit (the session stays resumable)" },
 ];
 
-const KEYS =
-  "Keys: enter send · !<command> runs a shell command yourself · ctrl+j, alt+enter or \\ then enter: new line · ↑↓ history · esc interrupt (twice to also move queued messages back to the input) · ↑ on the first line edits queued messages · ctrl+o expand · ctrl+c twice to exit";
+const KEYS = [
+  "Keys:",
+  "  send       enter send · ctrl+j, alt+enter or \\ then enter: new line · !<command> runs a shell command yourself · tab completes /commands and @files",
+  "  input      ↑↓ history · ctrl+r search history · ↑ on the first line edits queued messages · esc twice or ctrl+c clears the input",
+  "  editing    ctrl+←/→ or alt+b/f move by words · ctrl+w or alt+backspace delete a word · ctrl+a/e line start/end · ctrl+u/k delete to start/end",
+  "  running    esc interrupt (twice to also move queued messages back to the input) · ctrl+c twice to exit",
+  "  transcript pgup/pgdn scroll · ctrl+home/end top/bottom · ctrl+o expands the latest item, a click the one under it · drag to select and copy · ctrl+l redraw",
+].join("\n");
 
 /** 退出时最多等正在做的事这么久 */
 const QUIT_WAIT_MS = 3000;
@@ -96,6 +102,8 @@ export interface FrontendServices {
 
 /** 状态栏上插件的一段最多显示这么多字符（超出的截断，换行并成空格） */
 const MAX_SEGMENT = 80;
+/** 输入框上方插件的一块最多占几行 */
+const MAX_PANEL_LINES = 10;
 
 /**
  * ui@1：界面出来之前的提示先攒着，出来之后显示；界面关掉之后写到 stderr。
@@ -109,6 +117,8 @@ export class ScreenBridge {
   #closed = false;
   /** 状态栏上各插件的一段：会话 id → 插件 id → 文字 */
   #segments = new Map<string, Map<string, string>>();
+  /** 输入框上方各插件的一块：会话 id → 插件 id → 文字 */
+  #panels = new Map<string, Map<string, string>>();
   /** 界面现在显示哪个会话；换会话时由前端调用 show */
   #session: string | undefined;
 
@@ -173,7 +183,11 @@ export class ScreenBridge {
   #apply(): void {
     if (!this.screen) return;
     const segments = this.#session === undefined ? undefined : this.#segments.get(this.#session);
-    this.screen.status({ plugins: [...(segments ?? [])].map(([plugin, text]) => ({ plugin, text })) });
+    const panels = this.#session === undefined ? undefined : this.#panels.get(this.#session);
+    this.screen.status({
+      plugins: [...(segments ?? [])].map(([plugin, text]) => ({ plugin, text })),
+      panels: [...(panels ?? [])].map(([plugin, text]) => ({ plugin, text })),
+    });
   }
 
   /** 一个插件在一个会话里的界面。作用域关闭时核心调用 dispose，这里把它的段落去掉 */
@@ -183,18 +197,20 @@ export class ScreenBridge {
     const apply = () => {
       if (bridge.#session === session) bridge.#apply();
     };
+    const put = (all: Map<string, Map<string, string>>, text: string | undefined) => {
+      if (gone) return;
+      // 每次现取：别的插件 dispose 可能已经把空的 map 删了
+      let mine = all.get(session);
+      if (text === undefined) mine?.delete(plugin);
+      else {
+        if (!mine) all.set(session, (mine = new Map()));
+        mine.set(plugin, text);
+      }
+      apply();
+    };
     return {
-      status(text) {
-        if (gone) return;
-        // 每次现取：别的插件 dispose 可能已经把空的 map 删了
-        let segments = bridge.#segments.get(session);
-        if (text === undefined) segments?.delete(plugin);
-        else {
-          if (!segments) bridge.#segments.set(session, (segments = new Map()));
-          segments.set(plugin, clipSegment(text));
-        }
-        apply();
-      },
+      status: (text) => put(bridge.#segments, text === undefined ? undefined : clipSegment(text)),
+      panel: (text) => put(bridge.#panels, text === undefined ? undefined : clipPanel(text)),
       draft: {
         text: () => bridge.screen?.draft?.text() ?? "",
         insert: (text) => bridge.screen?.draft?.insert(text),
@@ -203,13 +219,21 @@ export class ScreenBridge {
       },
       dispose() {
         gone = true;
-        const segments = bridge.#segments.get(session);
-        segments?.delete(plugin);
-        if (segments?.size === 0) bridge.#segments.delete(session);
+        for (const all of [bridge.#segments, bridge.#panels]) {
+          const mine = all.get(session);
+          mine?.delete(plugin);
+          if (mine?.size === 0) all.delete(session);
+        }
         apply();
       },
     };
   }
+}
+
+/** 输入框上方的一块最多这么多行，多出的最后一行写成还有几行；每行在界面里按宽度截断 */
+function clipPanel(text: string): string {
+  const lines = String(text).replace(/\r\n?/g, "\n").replace(/\n+$/, "").split("\n");
+  return lines.length > MAX_PANEL_LINES ? [...lines.slice(0, MAX_PANEL_LINES - 1), `  … ${lines.length - MAX_PANEL_LINES + 1} more`].join("\n") : lines.join("\n");
 }
 
 /** 状态栏的一段是一行：空白并成一个空格，长的截断 */
@@ -391,7 +415,8 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
       bridge.hold();
       try {
         const s = await sessions.open(o);
-        await adopt(s, o?.resume !== undefined);
+        // 复制出的会话（/rewind）和恢复的一样：重新显示已有的对话
+        await adopt(s, o?.resume !== undefined || o?.fork !== undefined);
         return s;
       } finally {
         bridge.release();
@@ -553,12 +578,13 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
     const rest = input.slice(1).replace(/^\S+\s*/, "");
     if (name === "exit" || name === "quit") return false;
     if (name === "help") {
-      const all = commandList();
-      const width = Math.max(...all.map((c) => `/${c.name}${c.args ? ` ${c.args}` : ""}`.length)) + 2;
-      screen.log(all.map((c) => `${`/${c.name}${c.args ? ` ${c.args}` : ""}`.padEnd(width)}${dim(c.about)}`).join("\n"));
+      // 快捷键在前、命令在后：屏幕放不下时，紧挨着输入框的命令列表还看得见
       screen.log(dim(KEYS));
       const pluginKeys = keys.list();
       if (pluginKeys.length > 0) screen.log(dim(`Plugin keys: ${pluginKeys.map((k) => `${k.key}${k.description ? ` ${k.description}` : ""} (${k.plugin})`).join(" · ")}`));
+      const all = commandList();
+      const width = Math.max(...all.map((c) => `/${c.name}${c.args ? ` ${c.args}` : ""}`.length)) + 2;
+      screen.log(all.map((c) => `${`/${c.name}${c.args ? ` ${c.args}` : ""}`.padEnd(width)}${dim(c.about)}`).join("\n"));
       return true;
     }
     if (name === "copy") {

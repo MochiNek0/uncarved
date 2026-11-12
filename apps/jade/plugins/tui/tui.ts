@@ -1064,6 +1064,12 @@ function App({
           Box,
           { flexDirection: "column", flexShrink: 0 },
           state.busy && !dialog ? h(Spinner, { label: state.busy.label, since: state.busy.since }) : null,
+          // 插件的块（例如任务清单）：对话框占着地方时先不显示
+          dialog
+            ? null
+            : (state.status.panels ?? []).flatMap((p) =>
+                p.text.split("\n").map((l, i) => h(Text, { key: `${p.plugin}:${i}`, wrap: "truncate-end" }, " ", l || " ")),
+              ),
           state.queued.map((q, i) =>
             h(Text, { key: i, dimColor: true, wrap: "truncate-end" }, "  ↳ queued: ", q.replace(/\s+/g, " ")),
           ),
@@ -1655,8 +1661,15 @@ function Prompt({
     ].slice(-100);
     browsing.current = -1;
   };
-  const submit = (text: string) => {
-    if (!text.trim()) return;
+  /**
+   * 大段粘贴在输入框里只占一个占位符，发送（和放进历史、给插件读）时换回原文。
+   * 占位符被删掉一部分时认不出来，按打出来的样子发送
+   */
+  const pastes = useRef(new Map<string, string>());
+  const unfold = (text: string) => (pastes.current.size ? text.replace(PASTED, (m) => pastes.current.get(m) ?? m) : text);
+  const submit = (folded: string) => {
+    if (!folded.trim()) return;
+    const text = unfold(folded);
     if (hint !== undefined) onHintDone();
     remember(text);
     set(empty);
@@ -1667,7 +1680,7 @@ function Prompt({
   };
   /** 清空输入；清掉的内容放进（本次运行的）历史，按 ↑ 能找回来 */
   const discard = () => {
-    const text = current().value;
+    const text = unfold(current().value);
     if (text.trim()) remember(text);
     set(empty);
   };
@@ -1683,7 +1696,7 @@ function Prompt({
       cursor: mention!.start + text.length,
     });
   };
-  bridge.current = { get: () => current().value, apply: (f) => set(f(current())) };
+  bridge.current = { get: () => unfold(current().value), apply: (f) => set(f(current())) };
   const recall = (i: number) => {
     browsing.current = i;
     const value =
@@ -1701,7 +1714,14 @@ function Prompt({
           query: search.query + text.replace(/\s+/g, " "),
           index: 0,
         });
-      else set(edit.insert(current(), text.replace(/\r\n?/g, "\n")));
+      else {
+        const pasted = text.replace(/\r\n?/g, "\n");
+        const lines = pasted.replace(/\n$/, "").split("\n").length;
+        if (lines <= FOLD_PASTE_LINES && pasted.length <= FOLD_PASTE_CHARS) return set(edit.insert(current(), pasted));
+        const tag = `[Pasted text #${pastes.current.size + 1} ${lines > 1 ? `+${lines} lines` : `${pasted.length} chars`}]`;
+        pastes.current.set(tag, pasted);
+        set(edit.insert(current(), tag));
+      }
     },
     { isActive: active },
   );
@@ -2020,6 +2040,10 @@ const hintLine = (hint: string) => {
 
 /** @ 补全最多显示几项 */
 const MENTION_ROWS = 8;
+/** 粘贴超过这么多行或这么多字符时，输入框里只放一个占位符 */
+const FOLD_PASTE_LINES = 10;
+const FOLD_PASTE_CHARS = 2000;
+const PASTED = /\[Pasted text #\d+ (?:\+\d+ lines|\d+ chars)\]/g;
 
 /** 长列表只显示 size 项时，为了让第 selected 项在中间附近，从第几项开始显示 */
 function around(selected: number, total: number, size: number): number {

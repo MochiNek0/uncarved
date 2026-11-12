@@ -15,6 +15,8 @@ export interface Choice<T> {
 export interface StatusInfo {
   /** 插件用 ctx.status 设置的段落（已经是一行、截断过） */
   plugins?: { plugin: string; text: string }[];
+  /** 插件用 ctx.panel 设置的、显示在输入框上方的块（可以多行，已经限制过行数） */
+  panels?: { plugin: string; text: string }[];
   cwd: string;
   branch?: string;
   model: string;
@@ -155,6 +157,7 @@ export function safeScreen(screen: Screen): Screen {
       const out: Partial<StatusInfo> = { ...info };
       for (const k of ["cwd", "branch", "model", "mode", "session"] as const) if (typeof info[k] === "string") out[k] = s(info[k]);
       if (info.plugins) out.plugins = info.plugins.map((p) => ({ plugin: p.plugin, text: s(p.text) }));
+      if (info.panels) out.panels = info.panels.map((p) => ({ plugin: p.plugin, text: s(p.text) }));
       screen.status(out);
     },
     queued: (items) => screen.queued(items.map(s)),

@@ -58,6 +58,8 @@ export interface Shared {
   saved: string[];
   /** models@1.list 返回的模型名 */
   listed: string[];
+  /** 插件经 ctx.input.set 放进输入框的文字，按先后 */
+  drafts: string[];
 }
 
 const FAKE_MODEL = `export default { process(ctx) {
@@ -90,7 +92,7 @@ const FAKE_FRONTEND = `export default { process(ctx) {
     input: async () => undefined,
     session: () => ({
       status: () => {},
-      draft: { text: () => "", insert: () => {}, set: () => {}, hint: (t) => void g().hints.push(t) },
+      draft: { text: () => "", insert: () => {}, set: (t) => void g().drafts.push(t), hint: (t) => void g().hints.push(t) },
       dispose: () => {},
     }),
   });
@@ -115,6 +117,7 @@ export async function scriptedHost(opts: { config?: Record<string, Record<string
     hints: [],
     saved: [],
     listed: [],
+    drafts: [],
   };
   (globalThis as { __jadeScriptedUi?: Shared }).__jadeScriptedUi = shared;
   const plugin = async (name: string, manifest: object, code: string) => {

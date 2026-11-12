@@ -2,7 +2,7 @@
 
 import { describe, expect, test } from "bun:test";
 import type { Message, ToolContext } from "uncarved";
-import { latestTodos, renderTodos, todoRenderer, todoTool } from "../plugins/todo/index.ts";
+import { latestTodos, renderTodos, todoPanel, todoRenderer, todoTool } from "../plugins/todo/index.ts";
 import { msg, resultText, say, scripted, turn, use } from "./scripted-host.ts";
 
 const ctx: ToolContext = { sessionId: "s", toolUseId: "t", signal: new AbortController().signal, parent: { sessionId: "s", eventId: "e" }, progress: () => {} };
@@ -30,13 +30,28 @@ describe("todo_write", () => {
     expect(latestTodos([])).toBeUndefined();
   });
 
-  test("shows the list when called and hides a successful result", () => {
-    const input = { todos: [{ content: "edit", status: "in_progress" }] };
-    expect(todoRenderer.summary!(input)).toBe("1 items");
-    expect(plain(todoRenderer.call!(input)!)).toBe("Todos\n  [~] edit");
+  test("each update is one line in the transcript, the full list folded under it; a successful result is hidden", () => {
+    const input = { todos: [{ content: "read", status: "completed" }, { content: "edit  the\nfile", status: "in_progress" }, { content: "test", status: "pending" }] };
+    expect(todoRenderer.summary!(input)).toBe("1/3 · now: edit the file");
+    expect(plain(todoRenderer.call!(input)!)).toBe("Todos 1/3 · now: edit the file");
+    expect(todoRenderer.details!(input)).toBe("[x] read\n[~] edit  the\nfile\n[ ] test");
     expect(todoRenderer.result!({ toolUseId: "t", input, text: "ok", isError: false })).toBeNull();
     expect(todoRenderer.result!({ toolUseId: "t", input, text: "bad", isError: true })).toBeUndefined();
-    expect(todoRenderer.summary!(null)).toBe("0 items");
+    expect(todoRenderer.summary!(null)).toBe("0/0");
+  });
+
+  test("the panel above the input shows the list until everything is done", () => {
+    expect(plain(todoPanel([{ content: "read", status: "completed" }, { content: "edit", status: "in_progress" }])!)).toBe("Todos 1/2\n  [x] read\n  [~] edit");
+    expect(todoPanel([{ content: "read", status: "completed" }])).toBeUndefined();
+    expect(todoPanel([])).toBeUndefined();
+  });
+
+  test("a successful call updates the panel; a bad one leaves it alone", async () => {
+    const seen: unknown[] = [];
+    const tool = todoTool((t) => seen.push(t));
+    await tool.execute({ todos: [{ content: "one", status: "pending" }] }, ctx);
+    await tool.execute({ todos: "nope" }, ctx);
+    expect(seen).toEqual([[{ content: "one", status: "pending" }]]);
   });
 
   test("runs in a session without asking, and the prompt mentions it", async () => {

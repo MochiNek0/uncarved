@@ -55,6 +55,9 @@ export interface Transcript {
 
 /** 工具结果折叠起来的完整内容最多这么多行 */
 const MAX_DETAIL_LINES = 2000;
+/** 用户的输入超过这么多行时只显示开头 ECHO_HEAD_LINES 行，其余折叠 */
+const MAX_ECHO_LINES = 12;
+const ECHO_HEAD_LINES = 6;
 
 /** 插件事件里的用量：只取数字字段 */
 function usageOf(u: unknown): Usage | undefined {
@@ -215,7 +218,15 @@ export function transcript(opts: TranscriptOptions): Transcript {
       const p = await custom(c.name, (r) => r.preview?.(c.input));
       return typeof p === "string" ? p : preview(c.input);
     },
-    echo: (text) => screen.log(text.startsWith("/") ? cyan(`› ${text}`) : `\n${bold(`› ${text.replace(/\n/g, "\n  ")}`)}`),
+    echo: (text) => {
+      const shown = (t: string) => (t.startsWith("/") ? cyan(`› ${t}`) : `\n${bold(`› ${t.replace(/\n/g, "\n  ")}`)}`);
+      // 很长的输入（粘贴的日志）只显示开头几行，其余折叠起来，点击或 ctrl+o 展开
+      const lines = text.split("\n");
+      if (lines.length <= MAX_ECHO_LINES) return screen.log(shown(text));
+      // 展开时接着显示其余的行
+      const rest = lines.slice(ECHO_HEAD_LINES);
+      screen.log(`${shown(lines.slice(0, ECHO_HEAD_LINES).join("\n"))}\n  ${dim(`… +${rest.length} lines`)}`, { details: rest.map((l) => `  ${l}`).join("\n") });
+    },
     reset() {
       for (const k of Object.keys(usage) as (keyof Usage)[]) usage[k] = 0;
       reportsCache = undefined;

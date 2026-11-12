@@ -229,6 +229,26 @@ describe("asking through the kernel", () => {
     }
   }, 30_000);
 
+  test("esc on the approval request ends the turn instead of letting the model carry on", async () => {
+    const w = await world();
+    w.state.answers = [undefined];
+    w.state.script.push({ content: [write("a", "one.txt")], stopReason: "tool_use" }, reply("trying something else"));
+    try {
+      const s = await w.host.sessions.open();
+      await expect(s.send(msg("write it"))).rejects.toThrow("the user cancelled the approval request");
+      expect(existsSync(path.join(w.cwd, "one.txt"))).toBe(false);
+      expect(w.state.requests).toHaveLength(1);
+      expect(trail(await s.history())).toEqual(["decided a ask by jade/approval", "ended aborted"]);
+      // 这一轮结束了，可以接着说话
+      w.state.script.splice(0);
+      w.state.script.push(reply("ok"));
+      await s.send(msg("never mind"));
+      expect(s.state.phase).toBe("idle");
+    } finally {
+      await w.host.close();
+    }
+  }, 30_000);
+
   test("a call another plugin's gate wants asked is asked here, without the always option", async () => {
     const CAREFUL = { manifest: { id: "test/careful" }, code: `export default { session(ctx) {
       ctx.kernel.hook({ kind: "gate", point: "tool.gate", fn: (call) => ({ decision: call.name === "read_file" ? "ask" : "abstain" }) });

@@ -273,3 +273,15 @@ test("a sub-agent's usage is read from its own log when readLog is given, and sk
   // 读不到子会话的日志时不算，也不抛
   expect(await run({ readLog: async () => Promise.reject(new Error("gone")) })).toMatchObject({ inputTokens: 0 });
 });
+
+test("a long user message is echoed as its first lines, the rest folded under them", () => {
+  const logged: { text: string; details?: string }[] = [];
+  const plain = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
+  const screen = { log: (text: string, o?: { details?: string }) => logged.push({ text: plain(text), ...(o?.details ? { details: plain(o.details) } : {}) }) } as unknown as Screen;
+  const t = transcript({ screen, cwd: "/", contextWindow: () => 100_000, canRetry: () => false });
+  t.echo("short\nmessage");
+  t.echo(Array.from({ length: 30 }, (_, i) => `line-${i}`).join("\n"));
+  expect(logged[0]).toEqual({ text: "\n› short\n  message" });
+  expect(logged[1]!.text).toBe(`\n› ${Array.from({ length: 6 }, (_, i) => `line-${i}`).join("\n  ")}\n  … +24 lines`);
+  expect(logged[1]!.details).toBe(Array.from({ length: 24 }, (_, i) => `  line-${i + 6}`).join("\n"));
+});

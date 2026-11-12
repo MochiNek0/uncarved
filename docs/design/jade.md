@@ -111,7 +111,7 @@
 | `cli@1` | 核心自己提供（不是插件）：插件注册的 `jade <子命令>`。命令行的第一个参数是注册过的名字时，核心启动宿主后把剩下的参数交给它，不进前端 | 核心 |
 | `sources@1` | 核心自己提供（不是插件）：核心装插件用的下载器（`parse` 识别来源、`fetch` 下载到 staging、`hash` 算内容哈希）。`jade/skills` 装 skill 用它 | 核心 |
 | `update@1` | 核心自己提供（不是插件）：jade 本身的版本和升级（`version`、`install`、`newer`、`autoEnabled`、`upgrade`），和 `jade update` 同一套代码。`jade/update` 用它 | 核心 |
-| `ui@1`（可选） | 前端起来之后把要告诉用户的事交给 `notify`；每个插件加入会话时调用 `session` 取它的状态栏段落和输入框。没有时消息打到 stderr，插件的 `ctx.status`、`ctx.input` 是 `undefined` | 前端插件 |
+| `ui@1`（可选） | 前端起来之后把要告诉用户的事交给 `notify`；每个插件加入会话时调用 `session` 取它的状态栏段落、输入框上方的一块和输入框。没有时消息打到 stderr，插件的 `ctx.status`、`ctx.panel`、`ctx.input` 是 `undefined` | 前端插件 |
 | `approval@1`（可选） | 不调用它，只看它的提供者是谁：这个插件没有在会话里注册 `tool.gate` 时兜底关卡生效（第 7 节） | `jade/approval` |
 
 由核心提供、给插件用的服务只有 `jade@1`、`cli@1`、`sources@1`、`update@1` 四个。`jade@1`：核心知道自己加载了哪些插件，第三方插件拿不到这份信息，而"哪个插件坏了、为什么"是用户该看到的；它只读，没有副作用。`cli@1`：命令行由核心解析，插件要加 `jade <子命令>` 只能经核心；核心只查名字、转交参数，不认识子命令做什么（`jade skills`、`jade mcp` 分别来自 `jade/skills`、`jade/mcp`）。核心自己的词（`plugins`、`update`、`help`，以及 `jade plugins` 的子命令名）不能注册：它们在宿主启动之前就被核心处理了。和救援 CLI 不同，插件的子命令要启动宿主，插件坏了时不保证能用。`sources@1`、`update@1`：救援 CLI（`jade plugins add`、`jade update`）必须在不启动插件的情况下工作，所以这两段代码只能在核心里；插件要做同样的事（装 skill、启动时查新版本）时经服务用同一份，而不是 import 核心的模块（3.5），这样第三方插件也拿得到。
@@ -123,7 +123,7 @@
 - `Frontend.run({ argv, sessions, signal })` 返回退出码。`argv` 是核心去掉自己的参数（`plugins`、`--safe`）之后的命令行，`sessions` 是核心的会话管理器（`SessionManager`：`open`、`close`、`current`）。
 - `UI`：`interactive`、`notify(message, level)`、`select({ title, detail, options }, signal)`、`input({ title, initial, placeholder, mask }, signal)`。不能提问的前端（`jade/print`）`interactive` 为 false，`select`、`input` 总是返回 `undefined`。
 - `UI.copy(text)`、`UI.suspend(fn)`（都可选，2026-11-10 加）：把文字放进系统剪贴板；把终端让出来执行 `fn`（例如启动 `$EDITOR`），结束后重新接管。`jade/tui` 的 `suspend` 卸载界面（退出备用屏幕、关掉 raw mode 和鼠标上报），`fn` 结束后重新画：界面的内容都在界面之外的状态里，输入框里打了一半的字先记下再放回去。期间会话照常运行。`jade/editor`（Ctrl+G 用 `$EDITOR` 编辑输入）就是靠它做成插件的。
-- `UI.session({ session, plugin })`（可选）：一个插件在一个会话里的界面——状态栏上它的一段（`status(text)`，一行，undefined 去掉）和输入框（`draft`：读、插入、整段替换、灰色提示）。核心为每个加入会话的插件调用一次，插件的作用域关闭时调用返回值的 `dispose()` 收掉它的段落。前端没有这些东西时返回 `undefined`，插件的 `ctx.status`、`ctx.input` 也就是 `undefined`。`jade/tui` 提供它；`jade/print` 没有。
+- `UI.session({ session, plugin })`（可选）：一个插件在一个会话里的界面——状态栏上它的一段（`status(text)`，一行，undefined 去掉）、输入框上方的一块（`panel(text)`，可选，可以多行，例如 `jade/todo` 的任务清单）和输入框（`draft`：读、插入、整段替换、灰色提示）。核心为每个加入会话的插件调用一次，插件的作用域关闭时调用返回值的 `dispose()` 收掉它的段落。前端没有这些东西时返回 `undefined`，插件的 `ctx.status`、`ctx.input` 也就是 `undefined`。`jade/tui` 提供它；`jade/print` 没有。
 - `Session.history()` 返回会话日志里的全部事件：前端恢复会话时用它重新显示对话（日志存储归核心，前端拿不到）。
 
 命令行入口（`src/main.ts`）只做：处理 `jade plugins …`、`--safe`、`--version`；第一个参数是插件经 `cli@1` 注册的子命令时交给它；把以 `-` 开头的参数作为选前端的开关；项目层插件存在且在终端里运行时提供确认方式（记录在 `$JADE_HOME/state/trust.json`）；前端起来之前的消息打到 stderr，之后交给 `ui@1`；连续两次 Ctrl+C 直接退出。
@@ -181,7 +181,7 @@ preparing ──commit──▶ active ──close──▶ closing ──▶ cl
     └──rollback──▶ closed
 ```
 
-`sessions.open / resume / switch` 都走同一条路径：新作用域在 `preparing` 里激活全部插件的 `session`、建好 Runtime，成功才 commit 并关闭旧作用域；任何一步失败就回滚新作用域，旧作用域不受影响。
+`sessions.open / resume / switch` 都走同一条路径（`open({ fork })` 先把原会话日志里某条消息之前的事件复制成新会话的日志，再按恢复打开，原会话不动；`/rewind` 用它）：新作用域在 `preparing` 里激活全部插件的 `session`、建好 Runtime，成功才 commit 并关闭旧作用域；任何一步失败就回滚新作用域，旧作用域不受影响。
 
 发起换会话的那次调用（例如 `/resume` 命令）的 signal 不随旧作用域关闭而中止；换会话之后它不能再用旧 ctx（会抛 `StaleContext`，而不是悄悄运行旧代码）。
 
@@ -192,7 +192,7 @@ pi 后来才补上"agent 停下来之后再执行"和延迟 reload。jade 从一
 - `session.afterTurn(fn)`：本轮完全结束（`turn.ended` 已落盘、没有在途工具）后执行一次。续写、溢出重试、建议提示都用它，不再需要旧 jade 只给内置插件的 `TurnParticipant`。
 - 插件想发起新一轮：`session.send(input)`。如果当前正在跑，排到本轮之后。想停下正在跑的这一轮（例如用户在聊天机器人里喊停）：`session.abort(reason?)`。两者都只有用户层插件能用；项目层插件不能替用户说话、不能替用户喊停（第 7 节）。
 - 看会话：`session.state()` 是会话现在的状态（阶段、消息、还没做完的工具调用、derived）的一份拷贝，`session.subscribe(fn)` 订阅运行时的通知（事件、增量、工具进度、停下来等人工审批的 `awaiting`），和前端拿到的 `Session.state`、`Session.subscribe` 是同一份东西（2026-11-10 加：原来只有前端有）。只读，项目层插件也能用。`session()` 执行期间可以订阅，但还读不到状态（Runtime 在全部插件加入之后才建）。
-- 会话里的界面：`ctx.status(text)` 在状态栏上占一段，`ctx.input` 改输入框（读、插入、整段替换、灰色提示）。两者来自前端 `ui@1.session`（3.4），每个插件一份，作用域关闭时自动收掉；前端不提供时都是 `undefined`。
+- 会话里的界面：`ctx.status(text)` 在状态栏上占一段，`ctx.panel(text)` 在输入框上方占一块（可以多行），`ctx.input` 改输入框（读、插入、整段替换、灰色提示）。两者来自前端 `ui@1.session`（3.4），每个插件一份，作用域关闭时自动收掉；前端不提供时都是 `undefined`。
 
 ## 5. 膜与故障隔离
 
@@ -305,7 +305,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 | `jade/approval` | `approval@1`（`mode`、`setMode`、`allowRead`：登记不用问就能读的目录；`allowWrite`：登记和工作目录同样对待的目录；`addApprover`：登记审批渠道（例如聊天机器人），要问时问题同时交给终端和渠道，先回答的算数、其余的经 signal 中止，渠道不回答或出错不算拒绝，有渠道时 `-p` 也会问；这三项项目层插件都不能用）、gate；auto 模式下判断不了的调用先由模型审查（`review.ts`） | `ui@1`、`models@1`（都可选：没有 `ui@1` 时，要问的调用一律拒绝；没有 `models@1` 或 `review: false` 时不审查） | `plugins/policy.ts`、`plugins/review.ts` |
 | `jade/modes` | `modes@1`（`current`、`set`、`cycle`、`subscribe`），Shift+Tab、`/mode`；计划模式：往系统提示词里加"先给计划"的段落，`propose_plan` 工具（只在计划模式、能问用户时发给模型）问"执行这个计划？"，批准了就换模式，工具结果让模型开始做 | `approval@1`；可选 `keys@1`、`commands@1`、`prompts@1`、`ui@1` | Shift+Tab、`/mode`、计划模式的批准流程（`test/modes.test.ts`） |
 | `jade/plugins` | `/plugins [id]`：每个插件的状态和原因、每个服务的提供者（来自核心的 `jade@1`） | `commands@1`、`jade@1` | — |
-| `jade/sessions` | 命令 `/clear` `/resume` `/retry`；会话索引 `$JADE_HOME/state/sessions.jsonl` | `commands@1` | `plugins/sessions.ts`、`session-lifecycle.ts` |
+| `jade/sessions` | 命令 `/clear` `/resume` `/rewind` `/retry`；会话索引 `$JADE_HOME/state/sessions.jsonl` | `commands@1` | `plugins/sessions.ts`、`session-lifecycle.ts` |
 | `jade/prompts` | `prompts@1`（`add`：其他插件往系统提示词里加段落；项目层插件加的、或标了 `untrusted` 的段落为不可信。`note(会话, 文字)`：给模型留一句说明，下一次请求时以 `[Note from jade]` 附在最后一条用户消息后面并记进日志，不发起新的一轮。`instructions(会话)`：这个会话读到的指令文件，给自己另起模型对话的插件用） | `models@1`（可选，写上当前模型） | `plugins/prompts.ts` |
 | `jade/fs`、`jade/shell` | 工具；shell 还提供 `shell@1`（`executable`、`unavailable`、`run(command, { cwd, timeoutMs, signal })`、`which`）：其他插件执行命令的入口，找 shell、补 Git Bash 的 PATH、连子进程一起杀只有这一份 | `renderers@1`、`prompts@1`（可选）；fs、shell 可选 `tools@1`（fs 把只读工具、shell 把不能在后台跑的 `bash` 另建一套登记给嵌套 Agent） | `tools/*` |
 | `jade/web` | `web_fetch`、`web_search`、`/search`；只读工具另建一套经 `tools@1` 给嵌套 Agent（`web_search` 只在配置了搜索服务时给） | 可选 `ui@1`、`prompts@1`、`commands@1`、`renderers@1`、`tools@1` | `tools/web.ts` |

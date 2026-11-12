@@ -501,6 +501,13 @@ describe("terminal UI", () => {
     await until(output, "CI passing");
   });
 
+  test("plugins' panels are shown above the input", async () => {
+    const { screen, output } = setup();
+    screen.status({ panels: [{ plugin: "todo", text: "Todos 1/2\n  [x] read\n  [~] edit" }] });
+    await until(output, "[~] edit");
+    expect(output()).toContain("[x] read");
+  });
+
   test("long choice lists scroll with the selection", async () => {
     const { screen, type, output, clear } = setup();
     const picked = screen.select(
@@ -822,8 +829,9 @@ describe("terminal UI", () => {
     const { screen, type, output, clear } = setup();
     screen.log("conversation-line");
     await sleep(80);
-    // 100×40 时输入框最多 10 行
-    await type(`\x1b[200~${Array.from({ length: 20 }, (_, i) => `row-${i}`).join("\n")}\x1b[201~`);
+    // 100×40 时输入框最多 10 行。分两次粘贴：一次超过 10 行会折成占位符
+    await type(`\x1b[200~${Array.from({ length: 10 }, (_, i) => `row-${i}`).join("\n")}\n\x1b[201~`);
+    await type(`\x1b[200~${Array.from({ length: 10 }, (_, i) => `row-${i + 10}`).join("\n")}\x1b[201~`);
     expect(output()).toContain("row-19");
     expect(output()).not.toContain("row-5\n");
     clear();
@@ -835,6 +843,20 @@ describe("terminal UI", () => {
     clear();
     await type("X");
     expect(output()).toContain("row-19X");
+  });
+
+  test("a long paste is one placeholder in the input and is sent in full", async () => {
+    const { type, output, calls } = setup();
+    const log = Array.from({ length: 30 }, (_, i) => `log-${i}`).join("\r\n");
+    await type("see ");
+    await type(`\x1b[200~${log}\x1b[201~`);
+    await type(" and ");
+    await type(`\x1b[200~${"x".repeat(3000)}\x1b[201~`);
+    await sleep(50);
+    expect(output()).toContain("see [Pasted text #1 +30 lines] and [Pasted text #2 3000 chars]");
+    expect(output()).not.toContain("log-29");
+    await type("\r");
+    expect(calls.submit).toEqual([`see ${log.replaceAll("\r\n", "\n")} and ${"x".repeat(3000)}`]);
   });
 
   test("ctrl+o expands and collapses the latest foldable item", async () => {

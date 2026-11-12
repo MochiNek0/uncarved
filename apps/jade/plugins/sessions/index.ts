@@ -1,11 +1,11 @@
-// jade/sessions：/clear、/resume、/retry，以及 /resume 用的会话索引。
+// jade/sessions：/clear、/resume、/rewind、/retry，以及 /resume 用的会话索引。
 // 索引是 $JADE_HOME/state/sessions.jsonl，每行 { id, cwd, title, at }：会话在本进程里第一次收到消息时追加一行。
 // 读的时候按 id 合并：标题取最早的一行，时间取最晚的一行；目录按 cwdKey 比较。
 
 import { appendFile, mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import type { UserInput } from "uncarved";
-import { definePlugin } from "@uncarved/jade-api";
+import { definePlugin, type Draft } from "@uncarved/jade-api";
 import type { Commands, SessionIndex, SessionSummary } from "@uncarved/jade-api/services";
 
 const TITLE_CHARS = 80;
@@ -69,6 +69,20 @@ function titleOf(input: UserInput): string | undefined {
   return text.length > TITLE_CHARS ? `${text.slice(0, TITLE_CHARS)}…` : text;
 }
 
+/** 用户自己写的那部分文字（插件附上的内容不算）；不是消息、或者没有时为空 */
+function userText(input: UserInput): string {
+  if (input.kind !== "message") return "";
+  return input.content.flatMap((b) => (b.kind === "text" && b.origin.by === "user" ? [b.text] : [])).join("\n").trim();
+}
+
+const oneLine = (text: string) => {
+  const one = text.replace(/\s+/g, " ");
+  return one.length > TITLE_CHARS ? `${one.slice(0, TITLE_CHARS)}…` : one;
+};
+
+/** 最近打开的会话的输入框（/rewind 把消息放回去）；前端没有输入框时为 undefined */
+let input: Draft | undefined;
+
 export default definePlugin({
   process(ctx) {
     const file = path.join(ctx.home, "state", "sessions.jsonl");
@@ -103,6 +117,35 @@ export default definePlugin({
     });
 
     commands.register({
+      name: "rewind",
+      description: "go back to before one of your messages, in a copy of this session (files stay as they are; /undo restores them)",
+      async run(_args, c) {
+        const s = c.sessions.current;
+        if (!s) return "There is no open session.";
+        const sent = (await s.history()).flatMap((e) => {
+          const text = e.type === "input.received" ? userText(e.data as UserInput) : "";
+          return text ? [{ seq: e.seq, text }] : [];
+        });
+        if (sent.length === 0) return "Nothing to rewind to: you have not sent a message in this session.";
+        const recent = sent.slice(-50).reverse();
+        const picked = await c.ui.select(
+          {
+            title: "Rewind to before which message?",
+            options: recent.map((m, i) => ({ label: oneLine(m.text), value: String(m.seq), hint: i === 0 ? "your last message" : `${i + 1} messages ago` })),
+          },
+          c.signal,
+        );
+        const to = recent.find((m) => String(m.seq) === picked);
+        if (!to) return;
+        // 原会话不动：复制出它在这条消息之前的部分，作为新会话打开。前端在会话换掉之后重新显示它的对话
+        await c.sessions.open({ fork: { session: s.id, before: to.seq } });
+        // 那条消息放回输入框，改一改再发
+        input?.set(to.text);
+        return `Rewound to before that message${input ? "; it is back in the input" : ""}. Files were not changed (/undo restores them). The session before rewinding: jade --resume ${s.id}`;
+      },
+    });
+
+    commands.register({
       name: "retry",
       description: "ask the model again after a failed request",
       async run(_args, c) {
@@ -114,6 +157,7 @@ export default definePlugin({
   },
 
   session(ctx) {
+    input = ctx.input;
     const file = path.join(ctx.home, "state", "sessions.jsonl");
     let indexed = false;
     ctx.kernel.hook({

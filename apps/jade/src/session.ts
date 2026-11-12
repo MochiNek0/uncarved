@@ -324,11 +324,14 @@ export class Sessions implements SessionManager {
     if (!provider) throw new ServiceUnavailable("provider@1", "(none): no active plugin provides a model");
     const store = host.service<LogStore>("store@1", host.core) ?? (this.#store ??= new JsonlLogStore(path.join(host.home, "sessions")));
 
+    if (opts.fork && opts.resume !== undefined) throw new Error("sessions.open: resume and fork cannot be used together");
     const s: LiveSession = new LiveSession(opts.resume ?? crypto.randomUUID(), store, host.report, () => this.#guarded(s));
+    // 复制出的会话：先写好日志，再和恢复一样打开。打开失败时留下的日志没人引用，不影响原会话
+    if (opts.fork) await copyLog(store, opts.fork.session, opts.fork.before, s.id);
     try {
       for (const p of host.active()) if (p.module.session) await this.#join(s, p);
       const plugins = [this.#corePlugin(s), ...s.parts.map((p) => p.kernel)];
-      s.rt = opts.resume
+      s.rt = opts.resume !== undefined || opts.fork
         ? await Runtime.resume({ store, provider, plugins, sessionId: s.id })
         : await Runtime.create({ store, provider, plugins, sessionId: s.id });
     } catch (e) {
@@ -386,6 +389,7 @@ export class Sessions implements SessionManager {
       ...(sessionUI
         ? {
             status: (text: string | undefined) => uiCall(() => sessionUI.status(text === undefined ? undefined : String(text))),
+            ...(sessionUI.panel ? { panel: (text: string | undefined) => uiCall(() => sessionUI.panel!(text === undefined ? undefined : String(text))) } : {}),
             // 项目层插件拿不到输入框（第 7 节）：克隆的仓库不能替用户写字
             ...(sessionUI.draft && layer !== "project" ? { input: sessionUI.draft } : {}),
           }
@@ -575,4 +579,17 @@ function liveHook(h: LocalHookSpec | RemoteHookSpec, owner: Owner): LocalHookSpe
     return ambient.run(owner, () => fn(payload, ctx));
   };
   return { ...h, fn: wrapped } as LocalHookSpec;
+}
+
+/**
+ * 把 from 的日志里 seq 小于 before 的事件写成新会话 to 的日志（OpenOptions.fork）。before 要是一条消息输入的 seq：
+ * 这样复制出的会话停在一轮结束之后、下一条消息之前，恢复时没有没做完的一轮
+ */
+async function copyLog(store: LogStore, from: string, before: number, to: string): Promise<void> {
+  const events = await readAll(store, from);
+  const at = events.find((e) => e.seq === before);
+  if (!at || at.type !== "input.received" || (at.data as UserInput).kind !== "message") {
+    throw new Error(`sessions.open: seq ${before} of session ${from} is not a message from the user`);
+  }
+  await store.append(to, events.filter((e) => e.seq < before));
 }

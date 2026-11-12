@@ -209,7 +209,7 @@ export default definePlugin({
       const shown = covers + ((await preview(renderers, call)) ?? detail(call));
       const expired = new AbortController();
       const timer = setTimeout(() => expired.abort(), askTimeoutMs);
-      let got: { answer: Answer; by: string; said?: string } | undefined;
+      let got: Got | undefined;
       try {
         got = await ask(
           ui,
@@ -237,6 +237,8 @@ export default definePlugin({
       if (expired.signal.aborted) {
         return { approved: false, answer: "deny", by: "timeout", reason: `Nobody answered the approval request for ${call.name} in time. Do not retry it; tell the user what you wanted to do.` };
       }
+      // 终端里按 Esc 取消：用户要的是停下，不是让模型换个办法接着做
+      if (got?.cancelled) return { approved: false, answer: "deny", by: "terminal", stop: true };
       if (got?.answer === "always" && asked.mine) {
         added.push(...allow);
         return { approved: true, answer: "always", by: got.by };
@@ -267,6 +269,8 @@ export default definePlugin({
       }
       // 这一轮已经结束（被中断）：回答作废
       if (signal.aborted) return;
+      // 结束这一轮（内核的 endTurn）：等待中的调用记为错误，不再请求模型
+      if (verdict.stop) return ctx.session.abort("the user cancelled the approval request");
       answered.set(toolUseId, { answer: verdict.answer, by: verdict.by });
       // 不等它：它要到内核再次停下才 resolve，后面排着的问题可能就是内核在等的
       void Promise.resolve()
@@ -342,6 +346,8 @@ interface Verdict {
   answer: "allow" | Answer;
   by: string;
   reason?: string;
+  /** 不回答，结束这一轮（用户在终端里按了 Esc） */
+  stop?: boolean;
 }
 
 /** allowRead、allowWrite：把目录登记进 roots，调用方的作用域关闭时撤销 */
@@ -360,20 +366,21 @@ function allow(caller: Caller, name: string, roots: string[], dir: string): () =
 
 /**
  * 把问题同时交给终端（能提问时）和所有审批渠道，返回先到的回答和回答的人（"terminal" 或渠道的插件 id），然后中止其余的。
- * 终端里取消（undefined）算拒绝；渠道返回 undefined、不认识的值或出错算它不回答。都不回答时返回 undefined（拒绝）
+ * 终端里取消（undefined）算拒绝并标上 cancelled；渠道返回 undefined、不认识的值或出错算它不回答。都不回答时返回 undefined（拒绝）
  */
-async function ask(ui: UI | undefined, request: SelectRequest<Answer>, signal: AbortSignal): Promise<{ answer: Answer; by: string; said?: string } | undefined> {
+async function ask(ui: UI | undefined, request: SelectRequest<Answer>, signal: AbortSignal): Promise<Got | undefined> {
   const done = new AbortController();
   const stop = () => done.abort(signal.reason);
   signal.addEventListener("abort", stop, { once: true });
   try {
-    return await new Promise<{ answer: Answer; by: string; said?: string } | undefined>((resolve, reject) => {
-      const channels: Promise<{ answer: Answer; by: string; said?: string } | typeof NONE>[] = [];
+    return await new Promise<Got | undefined>((resolve, reject) => {
+      const channels: Promise<Got | typeof NONE>[] = [];
       if (ui?.interactive) {
         // 终端里多一项：拒绝并说明。选了它再问一句话，取消或什么都没写就是普通的拒绝
         const options = [...request.options, { label: "Deny, and say what to do instead", value: EXPLAIN }];
         channels.push(
           ui.select<string>({ ...request, options }, done.signal).then(async (a) => {
+            if (a === undefined && !done.signal.aborted) return { answer: "deny" as const, by: "terminal", cancelled: true };
             if (a !== EXPLAIN) return { answer: a !== undefined && ANSWERS.includes(a) ? (a as Answer) : "deny", by: "terminal" };
             const said = (await ui.input({ title: "What should the agent do instead?" }, done.signal))?.trim();
             return { answer: "deny" as const, by: "terminal", ...(said ? { said } : {}) };
@@ -405,6 +412,14 @@ async function ask(ui: UI | undefined, request: SelectRequest<Answer>, signal: A
   }
 }
 const NONE = Symbol("no answer");
+
+/** 拿到的回答：said 是"拒绝并说明"时用户写的话；cancelled 是用户在终端里按了 Esc */
+interface Got {
+  answer: Answer;
+  by: string;
+  said?: string;
+  cancelled?: boolean;
+}
 
 /** approvals.json：工作目录 → 在这个目录里总是允许的规则。读不了或格式不对时当作没有 */
 async function readForever(file: string): Promise<Record<string, AllowRule[]>> {

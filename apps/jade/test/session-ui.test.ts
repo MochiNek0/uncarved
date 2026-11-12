@@ -25,6 +25,7 @@ const FAKE_UI = `export default { process(ctx) {
       g().handles.push(h);
       return {
         status(text) { h.status = text; g().shown.push({ plugin, text }); },
+        panel(text) { h.panel = text; },
         draft: {
           text: () => g().draft,
           insert: (t) => { g().draft += t; g().inserted.push(t); },
@@ -39,6 +40,7 @@ const FAKE_UI = `export default { process(ctx) {
 
 const USER = `export default { session(ctx) {
   ctx.status("hello\\nworld");
+  ctx.panel("a\\nb");
   ctx.input.hint("try @file");
   ctx.input.insert("@a.ts");
 } };`;
@@ -48,7 +50,7 @@ const PLAIN_UI = `export default { process(ctx) {
 } };`;
 
 interface Recorded {
-  handles: { session: string; plugin: string; status?: string; hint?: string; disposed: boolean }[];
+  handles: { session: string; plugin: string; status?: string; panel?: string; hint?: string; disposed: boolean }[];
   shown: { plugin: string; text?: string }[];
   disposed: string[];
   draft: string;
@@ -73,6 +75,7 @@ describe("session UI", () => {
     const handle = recorded.handles.find((h) => h.plugin === "notes")!;
     expect(handle.session).toBe(one.id);
     expect(handle.status).toBe("hello\nworld");
+    expect(handle.panel).toBe("a\nb");
     expect(handle.hint).toBe("try @file");
     expect(recorded.draft).toBe("@a.ts");
 
@@ -139,21 +142,21 @@ describe("ScreenBridge status segments", () => {
     expect(statuses).toEqual([]);
 
     bridge.show("s1");
-    expect(statuses.at(-1)).toEqual({ plugins: [{ plugin: "p/a", text: "3 notes" }] });
+    expect(statuses.at(-1)).toEqual({ plugins: [{ plugin: "p/a", text: "3 notes" }], panels: [] });
     bridge.show("s2");
-    expect(statuses.at(-1)).toEqual({ plugins: [{ plugin: "p/b", text: "watching" }] });
+    expect(statuses.at(-1)).toEqual({ plugins: [{ plugin: "p/b", text: "watching" }], panels: [] });
 
     // 回到 s1：它的段落还在
     bridge.show("s1");
-    expect(statuses.at(-1)).toEqual({ plugins: [{ plugin: "p/a", text: "3 notes" }] });
+    expect(statuses.at(-1)).toEqual({ plugins: [{ plugin: "p/a", text: "3 notes" }], panels: [] });
 
     // 关闭界面的会话：段落去掉，dispose 之后再调用也不显示
     a.dispose();
-    expect(statuses.at(-1)).toEqual({ plugins: [] });
+    expect(statuses.at(-1)).toEqual({ plugins: [], panels: [] });
     a.status("late");
-    expect(statuses.at(-1)).toEqual({ plugins: [] });
+    expect(statuses.at(-1)).toEqual({ plugins: [], panels: [] });
     bridge.show(undefined);
-    expect(statuses.at(-1)).toEqual({ plugins: [] });
+    expect(statuses.at(-1)).toEqual({ plugins: [], panels: [] });
   });
 
   test("another plugin leaving the session does not lose a later segment", () => {
@@ -166,7 +169,7 @@ describe("ScreenBridge status segments", () => {
     // b 离开时会话里还没有段落
     b.dispose();
     a.status("building");
-    expect(statuses.at(-1)).toEqual({ plugins: [{ plugin: "p/a", text: "building" }] });
+    expect(statuses.at(-1)).toEqual({ plugins: [{ plugin: "p/a", text: "building" }], panels: [] });
   });
 
   test("a segment is one clipped line, and the draft is forwarded to the input box", () => {
@@ -176,9 +179,18 @@ describe("ScreenBridge status segments", () => {
     bridge.show("s1");
     const ui = bridge.ui.session!({ session: "s1", plugin: "p/a" })!;
     ui.status("  two\nlines\there ");
-    expect(statuses.at(-1)).toEqual({ plugins: [{ plugin: "p/a", text: "two lines here" }] });
+    expect(statuses.at(-1)).toEqual({ plugins: [{ plugin: "p/a", text: "two lines here" }], panels: [] });
     ui.status(undefined);
-    expect(statuses.at(-1)).toEqual({ plugins: [] });
+    expect(statuses.at(-1)).toEqual({ plugins: [], panels: [] });
+
+    // 输入框上方的一块：多行原样保留，太长的只留前几行；dispose 时和段落一起去掉
+    ui.panel!(`Todos\n${Array.from({ length: 12 }, (_, i) => `  item ${i}`).join("\n")}\n`);
+    const panel = statuses.at(-1)!.panels![0]!;
+    expect(panel.plugin).toBe("p/a");
+    expect(panel.text.split("\n")).toEqual(["Todos", ...Array.from({ length: 8 }, (_, i) => `  item ${i}`), "  … 4 more"]);
+    ui.status("busy");
+    ui.dispose();
+    expect(statuses.at(-1)).toEqual({ plugins: [], panels: [] });
 
     ui.draft!.set("hello");
     ui.draft!.insert("!");

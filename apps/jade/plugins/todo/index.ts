@@ -20,7 +20,20 @@ export function renderTodos(todos: Todo[]): string {
   return todos.length ? todos.map((t) => `${MARK[t.status] ?? "[ ]"} ${t.content}`).join("\n") : "(empty)";
 }
 
-export function todoTool(): Tool {
+/** 完成了几项、一共几项、正在做的那一项 */
+function progressOf(todos: Todo[]): { done: number; total: number; now?: string } {
+  const now = todos.find((t) => t?.status === "in_progress")?.content;
+  return { done: todos.filter((t) => t?.status === "completed").length, total: todos.length, ...(typeof now === "string" ? { now } : {}) };
+}
+
+/** "3/7 · now: 写测试"：对话里的一行 */
+function progressLine(todos: Todo[]): string {
+  const p = progressOf(todos);
+  return `${p.done}/${p.total}${p.now !== undefined ? ` · now: ${p.now.replace(/\s+/g, " ")}` : ""}`;
+}
+
+/** onChange：清单换了（工具执行成功）时调用，给出新的清单 */
+export function todoTool(onChange?: (todos: Todo[]) => void): Tool {
   return {
     name: "todo_write",
     description:
@@ -55,6 +68,7 @@ export function todoTool(): Tool {
       if (!Array.isArray(todos)) return { content: "todos must be an array", isError: true };
       const active = (todos as Todo[]).filter((t) => t?.status === "in_progress").length;
       const note = active > 1 ? "\nNote: keep only one item in_progress at a time." : "";
+      onChange?.(todos as Todo[]);
       return { content: `Todo list updated:\n${renderTodos(todos as Todo[])}${note}` };
     },
   };
@@ -75,19 +89,29 @@ const bold = (s: string) => (colors ? `\x1b[1m${s}\x1b[22m` : s);
 const args = (input: unknown) => (input !== null && typeof input === "object" ? input : {}) as Record<string, unknown>;
 const list = (input: unknown) => (Array.isArray(args(input).todos) ? (args(input).todos as Todo[]) : []);
 
+// 完整的清单常驻在输入框上方（ctx.panel），对话里每次更新只占一行，展开（ctrl+o、点击）看当时的完整清单。
+// 前端没有那个位置时，对话里的一行照样能展开
 export const todoRenderer: ToolRenderer = {
   tool: "todo_write",
-  summary: (input) => `${list(input).length} items`,
-  // 清单本身就是参数：执行时直接显示，结果不再显示（出错时照常显示）
-  call: (input) => `${bold("Todos")}\n${renderTodos(list(input)).replace(/^/gm, "  ")}`,
+  summary: (input) => progressLine(list(input)),
+  call: (input) => `${bold("Todos")} ${progressLine(list(input))}`,
+  details: (input) => renderTodos(list(input)),
+  // 清单就是参数，结果不再显示（出错时照常显示）
   result: ({ isError }) => (isError ? undefined : null),
 };
+
+/** 输入框上方的一块：还有没做完的项时显示，全部做完或清空时去掉 */
+export function todoPanel(todos: Todo[]): string | undefined {
+  if (todos.every((t) => t?.status === "completed")) return undefined;
+  const p = progressOf(todos);
+  return `${bold("Todos")} ${p.done}/${p.total}\n${renderTodos(todos).replace(/^/gm, "  ")}`;
+}
 
 export default definePlugin({
   process(ctx) {
     ctx.service<Renderers>("renderers@1")?.tool(todoRenderer);
   },
   session(ctx) {
-    ctx.kernel.tool(todoTool());
+    ctx.kernel.tool(todoTool((todos) => ctx.panel?.(todoPanel(todos))));
   },
 });

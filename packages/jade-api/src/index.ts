@@ -138,6 +138,11 @@ export interface SessionContext extends ScopeContext {
    * 状态栏同时显示几个插件的段落时按调用先后排列（4.3）
    */
   readonly status?: (text: string | undefined) => void;
+  /**
+   * 输入框上方这个插件的一块，可以多行（例如任务清单），一直显示到换掉或去掉；undefined 去掉。
+   * 前端没有这个位置时是 undefined。几个插件都有时按调用先后排列
+   */
+  readonly panel?: (text: string | undefined) => void;
   /** 输入框里的草稿：读、追加、整段替换、灰色提示；只有终端界面有 */
   readonly input?: Draft;
   /** 交给内核的部分，只能在 session() 执行期间注册：会话的内核插件清单在创建时确定 */
@@ -185,6 +190,11 @@ export interface Session {
 export interface OpenOptions {
   /** 恢复这个会话；不写就新建 */
   resume?: string;
+  /**
+   * 从一个会话复制出一个新会话：新会话的日志是原会话 seq 小于 before 的那些事件，原会话不动（例如回退到某条消息之前）。
+   * before 要是一条消息输入（input.received）的 seq，复制出的会话才停在两轮之间。和 resume 不能同时用
+   */
+  fork?: { session: string; before: number };
 }
 
 /** 会话管理器：新建、恢复、切换（4.2） */
@@ -333,9 +343,11 @@ export interface SessionRequest {
 export interface SessionUI {
   /** 状态栏上这个插件的一段（一行）；undefined 去掉 */
   status(text: string | undefined): void;
+  /** 输入框上方这个插件的一块（可以多行）；undefined 去掉。没有这个位置的前端没有 */
+  panel?(text: string | undefined): void;
   /** 输入框；没有输入框的前端（例如 -p）没有 */
   readonly draft?: Draft;
-  /** 去掉这个插件在这个会话里留下的一切（状态栏的段落、输入框的提示） */
+  /** 去掉这个插件在这个会话里留下的一切（状态栏的段落、输入框上方的一块、输入框的提示） */
   dispose(): void;
 }
 
