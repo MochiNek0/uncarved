@@ -1329,8 +1329,9 @@ function useLive<T>(initial: T): [get: () => T, set: (v: T) => void] {
 
 /** 编辑按键的通用处理；返回编辑后的状态，不是编辑键时返回 undefined */
 function editKey(s: EditState, input: string, key: Key): EditState | undefined {
-  if (key.leftArrow) return edit.left(s);
-  if (key.rightArrow) return edit.right(s);
+  // Ctrl+←/→ 按词移动（Windows 上的习惯），同 Alt+B / Alt+F
+  if (key.leftArrow) return key.ctrl ? edit.wordLeft(s) : edit.left(s);
+  if (key.rightArrow) return key.ctrl ? edit.wordRight(s) : edit.right(s);
   if (key.home || (key.ctrl && input === "a")) return edit.home(s);
   if (key.end || (key.ctrl && input === "e")) return edit.end(s);
   if (key.backspace) return key.meta ? edit.deleteWord(s) : edit.backspace(s);

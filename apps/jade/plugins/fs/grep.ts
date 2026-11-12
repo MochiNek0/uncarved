@@ -175,7 +175,13 @@ const enough = (s: Search, files: FileHits[], matches: number) =>
 
 /** ripgrep 不存在时返回 "missing"；正则语法 ripgrep 不支持时返回 undefined，由调用方改用 JS 搜索 */
 async function ripgrep(rg: string, s: Search): Promise<Found | undefined | "missing"> {
-  const args = ["--json", "--sort", "path", "--hidden", "--glob", "!.git", "--glob", "!node_modules", "--max-filesize", `${MAX_FILE_BYTES}`];
+  // 不用 --sort path：它让 ripgrep 只用一个线程（几万个文件的仓库慢好几倍），文件的先后在收完之后自己排。
+  // 代价：结果多到提前停下时，留下的是先搜到的那些文件，不一定是路径最靠前的
+  const args = ["--hidden", "--glob", "!.git", "--glob", "!node_modules", "--max-filesize", `${MAX_FILE_BYTES}`];
+  // files、count 模式用不到每一行的内容：让 ripgrep 只报文件名（和行数），不用逐条解析 JSON
+  if (s.mode === "content") args.push("--json");
+  else if (s.mode === "files") args.push("--files-with-matches", "--null");
+  else args.push("--count", "--with-filename", "--null");
   if (s.ignoreCase) args.push("--ignore-case");
   if (s.context > 0) args.push("--context", String(s.context));
   if (s.include) args.push("--glob", s.include);
@@ -214,15 +220,32 @@ async function ripgrep(rg: string, s: Search): Promise<Found | undefined | "miss
         hits.count++;
         matches++;
       }
-      if (s.mode === "content") hits.lines.push({ n: ev.data.line_number, text: text.replace(/\r?\n$/, ""), match });
+      hits.lines.push({ n: ev.data.line_number, text: text.replace(/\r?\n$/, ""), match });
+    };
+    /** files、count 模式的一个文件；不是合法 UTF-8 的路径跳过（同上） */
+    const add = (file: string, count: number) => {
+      if (!file.includes("�")) files.push({ file: path.resolve(file), count, lines: [] });
+    };
+    /** 取走 buf 里已经完整的记录。content：一行一个 JSON；files：路径后面一个 NUL；count：路径、NUL、行数、换行 */
+    const drain = () => {
+      for (;;) {
+        const end = buf.indexOf(s.mode === "content" ? "\n" : "\0");
+        if (end < 0) return;
+        let next = end + 1;
+        if (s.mode === "content") handle(buf.slice(0, end));
+        else if (s.mode === "files") add(buf.slice(0, end), 1);
+        else {
+          const nl = buf.indexOf("\n", end);
+          if (nl < 0) return;
+          add(buf.slice(0, end), Number(buf.slice(end + 1, nl)));
+          next = nl + 1;
+        }
+        buf = buf.slice(next);
+      }
     };
     for await (const chunk of proc.stdout) {
       buf += decoder.decode(chunk, { stream: true });
-      let nl: number;
-      while ((nl = buf.indexOf("\n")) >= 0) {
-        handle(buf.slice(0, nl));
-        buf = buf.slice(nl + 1);
-      }
+      drain();
       // count 模式要数完每个文件，只有文件数超了才停
       if (enough(s, files, matches)) {
         stopped = true;
@@ -230,11 +253,13 @@ async function ripgrep(rg: string, s: Search): Promise<Found | undefined | "miss
         break;
       }
     }
-    if (!stopped) handle(buf);
+    if (!stopped && s.mode === "content") handle(buf);
     const [code, err] = await Promise.all([proc.exited, stderr]);
     s.signal.throwIfAborted();
     // 1：没有命中；2：出错，但部分文件出错（例如没有权限）时其余结果仍然有效
     if (!stopped && code === 2 && /regex parse error|error parsing regex|look-?around|backreference/i.test(err)) return undefined;
+    // 和 JS 搜索一样按路径排
+    files.sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
     return { files, truncated: stopped };
   } finally {
     s.signal.removeEventListener("abort", kill);

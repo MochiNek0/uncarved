@@ -386,7 +386,8 @@ export class Sessions implements SessionManager {
       ...(sessionUI
         ? {
             status: (text: string | undefined) => uiCall(() => sessionUI.status(text === undefined ? undefined : String(text))),
-            ...(sessionUI.draft ? { input: sessionUI.draft } : {}),
+            // 项目层插件拿不到输入框（第 7 节）：克隆的仓库不能替用户写字
+            ...(sessionUI.draft && layer !== "project" ? { input: sessionUI.draft } : {}),
           }
         : {}),
       require: <T extends object>(name: string): T => {

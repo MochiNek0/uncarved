@@ -297,6 +297,16 @@ describe.each(variants)("grep (%s)", (_name, rg) => {
     expect((await exec(tools, "grep", { pattern: "foo", include: "*.ts", output_mode: "files" })).text).toBe(["a.ts", "src/deep/c.ts"].join("\n"));
   });
 
+  test("files come out sorted by path, however many there are", async () => {
+    const { cwd, tools } = await repo();
+    const names = Array.from({ length: 60 }, (_, i) => `f${String(i).padStart(2, "0")}.txt`);
+    await Promise.all(names.map((n) => writeFile(path.join(cwd, n), "foo\nbar foo\n")));
+    const all = ["a.ts", "b.md", ...names];
+    expect((await exec(tools, "grep", { pattern: "foo", output_mode: "files" })).text).toBe(all.join("\n"));
+    expect((await exec(tools, "grep", { pattern: "foo", output_mode: "count" })).text).toBe(all.map((n) => `${n}:${n === "b.md" ? 1 : 2}`).join("\n"));
+    expect((await exec(tools, "grep", { pattern: "bar" })).text).toBe(names.map((n) => `${n}:2:bar foo`).join("\n"));
+  });
+
   test("JavaScript-only syntax such as lookbehind still works", async () => {
     const { tools } = await repo();
     expect((await exec(tools, "grep", { pattern: "(?<=foo )six" })).text).toBe("a.ts:6:foo six");

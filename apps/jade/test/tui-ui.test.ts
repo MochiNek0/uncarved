@@ -207,6 +207,19 @@ describe("terminal UI", () => {
     expect(calls.submit).toEqual(["你好 jade"]);
   });
 
+  test("ctrl+left / ctrl+right move by words", async () => {
+    const { calls, type } = setup();
+    await type("git status");
+    await type("\x1b[1;5D"); // ctrl+left
+    await type("X");
+    await type("\x1b[1;5D");
+    await type("\x1b[1;5D");
+    await type("\x1b[1;5C"); // ctrl+right
+    await type("Y");
+    await type("\r");
+    expect(calls.submit).toEqual(["gitY Xstatus"]);
+  });
+
   test("plugin keys reach the handler, and plugins can read and change the input", async () => {
     const { screen, calls, type } = setup();
     await type("ab");

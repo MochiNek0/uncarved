@@ -6,7 +6,7 @@ import { info, world } from "./helpers.ts";
 
 // 项目层插件：经内核的 importProjectModule 确认后才执行（第 7 节）
 
-const g = globalThis as { __runs?: number; __ctx?: { session: { send(i: unknown): Promise<void>; abort(reason?: string): void } } };
+const g = globalThis as { __runs?: number; __ctx?: { input?: unknown; status?: unknown; session: { send(i: unknown): Promise<void>; abort(reason?: string): void } } };
 beforeEach(() => {
   g.__runs = 0;
 });
@@ -83,6 +83,25 @@ test("a confirmed project plugin works in sessions, and a change asks again", as
   expect(no.asked).toEqual([dir]);
   expect(info(again, "repo/x").state).toBe("untrusted");
   await again.close();
+});
+
+test("a project plugin gets a status segment but not the input box", async () => {
+  const w = await world();
+  await w.plugin("bundled", { id: "models", provides: ["provider@1"] }, PROVIDER);
+  await w.plugin(
+    "bundled",
+    { id: "ui", provides: ["ui@1"] },
+    `export default { process(ctx) {
+      const draft = { text: () => "", insert() {}, set() {}, hint() {} };
+      ctx.provide("ui@1", { interactive: true, notify() {}, select: async () => undefined, input: async () => undefined, session: () => ({ status() {}, draft, dispose() {} }) });
+    } };`,
+  );
+  await w.plugin("project", { id: "repo/x" }, PROJECT);
+  const host = await w.start({ trust: { trust: new MemoryTrustStore(), confirm: confirmer(true).confirm } });
+  await host.sessions.open();
+  expect(typeof g.__ctx!.status).toBe("function");
+  expect(g.__ctx!.input).toBeUndefined();
+  await host.close();
 });
 
 test("a project plugin importing code outside its directory is refused before asking", async () => {
