@@ -54,6 +54,8 @@ type Size = { columns: number; rows: number };
 
 /** 最后一个 resize 事件之后等这么久才按新尺寸重画；拖动窗口时一连串的事件只画一次 */
 const RESIZE_SETTLE_MS = 100;
+/** 拖动窗口时最多隔这么久按新尺寸整帧重画一次：每次都画会一直闪（Windows 上每帧清屏），一直不画就只剩终端折乱的旧画面 */
+const RESIZE_FRAME_MS = 200;
 /**
  * 整帧重画之前先停这么久不画：要比 Ink 的帧间隔（30fps，约 33ms）长，
  * 重画那次提交才会马上画出来（节流的第一下），而不是被推迟、和下一次提交合并掉
@@ -291,7 +293,7 @@ class Store {
     this.paused = true;
   }
 
-  /** 窗口停止缩放：按新尺寸整帧重画。缩放时已经停了一阵没画，不用再等 */
+  /** 窗口停止缩放，或者拖动中隔一段的那次：按新尺寸整帧重画。之前已经停了一阵没画，不用再等 */
   resized(size: Size) {
     this.#repaintNow({ size });
   }
@@ -550,10 +552,20 @@ export function tuiScreen(opts: TuiOptions): Screen {
   const size = (): Size => ({ columns: stdout.columns || 80, rows: stdout.rows || 24 });
   const store = new Store(opts.status, size());
   let settle: ReturnType<typeof setTimeout> | undefined;
+  let lastResizeFrame = 0;
   const onResize = () => {
-    store.resizing();
     clearTimeout(settle);
-    settle = setTimeout(() => store.resized(size()), RESIZE_SETTLE_MS);
+    // 终端已经按新宽度把画着的那一帧重新折过行（边框断成两截、两行拼成一行）：拖动时每隔一段按新尺寸整帧重画一次，
+    // 中间不画（Ink 增量画的帧在折乱的屏幕上会错位）；停下后再画最后一次
+    const now = Date.now();
+    if (now - lastResizeFrame >= RESIZE_FRAME_MS) {
+      lastResizeFrame = now;
+      store.resized(size());
+    } else store.resizing();
+    settle = setTimeout(() => {
+      lastResizeFrame = Date.now();
+      store.resized(size());
+    }, RESIZE_SETTLE_MS);
   };
   stdout.on("resize", onResize);
   const draft: DraftBridge = {};
@@ -1021,7 +1033,8 @@ function App({
   // 往上翻看时最后一行用来提示
   const scrolled = state.scroll > 0 && total > height;
   const view = Math.max(0, scrolled ? height - 1 : height);
-  const max = Math.max(0, total - view);
+  // 最多能翻多远按翻上去之后的可见行数算：还在底部时按 height 算，翻到顶会少一行，第一行看不见
+  const max = total > height ? total - Math.max(0, height - 1) : 0;
   const scroll = Math.min(state.scroll, max);
   const end = total - scroll;
   const start = Math.max(0, end - view);

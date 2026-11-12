@@ -556,18 +556,32 @@ describe("/model", () => {
   test("adds a model on another provider and makes it current", async () => {
     const { home, shared, host, ctx, command, models } = await setup();
     try {
-      // 主菜单 → 加一个模型 → 另一个服务 → Anthropic → 密钥 → 模型名
+      // 主菜单 → 加一个模型 → 另一个服务 → Anthropic → 地址（留空用官方的）→ 密钥 → 模型名
       shared.selects.push("add", "provider", "anthropic");
-      shared.inputs.push("sk-ant-test", "claude-sonnet-4");
+      shared.inputs.push("", "sk-ant-test", "claude-sonnet-4");
       await command.run("", ctx);
-      expect(shared.inputsAsked).toEqual(["API key", "Model name"]);
+      expect(shared.inputsAsked).toEqual(["Base URL", "API key", "Model name"]);
       const env = await readEnvFile(home);
       expect(env).toContain("JADE_PROVIDER=anthropic");
+      expect(env).not.toContain("ANTHROPIC_BASE_URL");
       expect(env).toContain("ANTHROPIC_MODEL=claude-sonnet-4");
       expect(env).toContain("ANTHROPIC_API_KEY=sk-ant-test");
       expect(models.current()).toMatchObject({ kind: "anthropic", model: "claude-sonnet-4" });
       const saved = JSON.parse(await readFile(path.join(home, "models.json"), "utf8")) as { services: { models: { name: string }[] }[] };
       expect(saved.services.map((s) => s.models[0]!.name)).toEqual(["claude-sonnet-4", "m1", "m2"]);
+    } finally {
+      await host.close();
+    }
+  });
+
+  test("an Anthropic service can use its own base URL", async () => {
+    const { home, shared, host, ctx, command } = await setup();
+    try {
+      shared.selects.push("add", "provider", "anthropic");
+      shared.inputs.push("https://proxy.example", "sk-ant-test", "claude-sonnet-4");
+      await command.run("", ctx);
+      const env = parseEnv(await readEnvFile(home));
+      expect(env.ANTHROPIC_BASE_URL).toBe("https://proxy.example");
     } finally {
       await host.close();
     }
@@ -580,10 +594,10 @@ describe("/model", () => {
       const { home, shared, host, ctx, command } = await setup(ENV_A + SETTINGS);
       try {
         shared.selects.push("add", "provider", "anthropic");
-        shared.inputs.push("sk-ant-test", "claude-sonnet-4");
+        shared.inputs.push("", "sk-ant-test", "claude-sonnet-4");
         await command.run("", ctx);
         // Claude 不问输出上限（默认 64000）
-        expect(shared.inputsAsked).toEqual(["API key", "Model name"]);
+        expect(shared.inputsAsked).toEqual(["Base URL", "API key", "Model name"]);
         const env = parseEnv(await readEnvFile(home));
         expect(env.ANTHROPIC_MODEL).toBe("claude-sonnet-4");
         expect([env.JADE_MAX_TOKENS, env.JADE_RPM, env.JADE_VISION]).toEqual([undefined, undefined, undefined]);

@@ -172,7 +172,8 @@ function mountVt(cols: number, rows: number) {
 }
 
 // 拖动窗口时一连串的 resize 事件：Ink 每个事件都按旧布局画一帧，Windows 上每帧还清屏，画面一直闪
-test("dragging the window draws nothing until it stops, then repaints once", async () => {
+// 拖动时终端会按新宽度把旧的一帧重新折行（边框断开、错位）：每隔一段按新尺寸整帧重画，但不是每个事件都画（Windows 上每帧清屏）
+test("dragging the window repaints at the new size now and then, not on every event", async () => {
   const { vt, writes, stdin, screen, resize } = mountVt(100, 40);
   try {
     stdin.write("hello");
@@ -180,19 +181,23 @@ test("dragging the window draws nothing until it stops, then repaints once", asy
     screen.busy("Working");
     await sleep(300);
     writes.length = 0;
-    for (let i = 0; i < 10; i++) {
-      resize(100 - i * 2, 40 - i);
-      await sleep(20);
+    // 20 个事件、每 10ms 一个
+    for (let i = 0; i < 20; i++) {
+      resize(100 - i, 40 - Math.floor(i / 2));
+      await sleep(10);
     }
-    // 窗口标题（OSC 0）不是界面的帧
-    expect(writes.filter((w) => !w.startsWith("\x1b]0;"))).toEqual([]);
+    const during = writes.join("").split("\x1b[2J").length - 1;
+    expect(during).toBeGreaterThan(0);
+    // 每次整帧重画最多两次清屏（重画那帧和恢复那帧），远少于事件数
+    expect(during).toBeLessThanOrEqual(8);
     await sleep(400);
-    const clears = writes.join("").split("\x1b[2J").length - 1;
-    expect(clears).toBeGreaterThan(0);
-    expect(clears).toBeLessThanOrEqual(2);
     const input = vt.lines.findIndex((l) => l.includes("› hello"));
     expect(input).toBeGreaterThan(-1);
     expect({ cursor: vt.row, col: vt.col }).toEqual({ cursor: input, col: 9 });
+    // 停下之后恢复正常：运行中的帧不再每帧清屏
+    writes.length = 0;
+    await sleep(300);
+    expect(writes.join("")).not.toContain("\x1b[2J");
   } finally {
     await screen.close();
   }
@@ -230,6 +235,21 @@ test("after a width change the whole long transcript is still there", async () =
     await sleep(300);
     expect(vt.lines.some((l) => /\brow 1\b/.test(l))).toBe(true);
     expect(vt.lines.some((l) => /\brow 2\b/.test(l))).toBe(true);
+  } finally {
+    await screen.close();
+  }
+});
+
+// 翻上去之后最后一行用来提示，能看见的少一行：最上面那行也要能翻到
+test("ctrl+home shows the very first line", async () => {
+  const { vt, stdin, screen } = mountVt(100, 40);
+  try {
+    for (let i = 0; i < 200; i++) screen.log(`row ${i}`);
+    await sleep(300);
+    stdin.write("\x1b[1;5H"); // ctrl+home
+    await sleep(300);
+    expect(vt.lines.some((l) => /\brow 0\b/.test(l))).toBe(true);
+    expect(vt.lines.some((l) => l.includes("more lines"))).toBe(true);
   } finally {
     await screen.close();
   }

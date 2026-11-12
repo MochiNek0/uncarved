@@ -484,6 +484,36 @@ test("工具结果里的图片：toolResultImages 时放进紧跟 function_call_
   });
 });
 
+test("有的兼容服务端把思考放在 reasoning 的 content 里（summary 为空）：照样取到思考原文", async () => {
+  const mossReasoning = {
+    type: "reasoning",
+    id: "rs_1",
+    summary: [],
+    content: [{ type: "reasoning_text", text: "raw thought" }],
+    encrypted_content: "ENC",
+  };
+  const { fetchFn } = fakeServer([
+    [
+      created,
+      { type: "response.reasoning_text.delta", delta: "raw " },
+      { type: "response.reasoning_text.delta", delta: "thought" },
+      itemDone(0, mossReasoning),
+      itemDone(1, message("msg_1", "answer")),
+      completed(),
+    ],
+  ]);
+  const provider = openaiResponsesProvider({ baseURL: "https://example.test/v1", apiKey: "k", model: "m", fetch: fetchFn });
+  const deltas: string[] = [];
+  const onDelta = (d: import("uncarved").Delta) => deltas.push(`${d.kind}:${"text" in d ? d.text : ""}`);
+  const res = await provider.complete(
+    { system: [], tools: [], messages: [{ role: "user", content: userSays("hi").content }] as unknown as import("uncarved").Message[] },
+    { signal: new AbortController().signal, onDelta },
+  );
+  expect(deltas).toEqual(["thinking:raw ", "thinking:thought"]);
+  expect(res.content.map((b) => b.kind)).toEqual(["thinking", "text"]);
+  expect(res.content[0]).toMatchObject({ kind: "thinking", text: "raw thought" });
+});
+
 test("api.openai.com 上每个 provider 实例用固定的 prompt_cache_key；其他地址不发，除非指定", async () => {
   const messages = [{ role: "user", content: userSays("hi").content }] as unknown as import("uncarved").Message[];
   const run = async (baseURL: string, promptCacheKey?: string | null) => {

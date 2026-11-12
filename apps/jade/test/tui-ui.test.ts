@@ -634,24 +634,21 @@ describe("terminal UI", () => {
     screen.log("● bash(npm test)", { id: "t1" });
     screen.progress("t1", "  │ running 1");
     screen.progress("t1", "  │ running 2");
-    await sleep(80);
-    expect(output()).toContain("running 2");
+    await until(output, "running 2");
     expect(output()).not.toContain("running 1");
     clear();
     screen.progress("t1", undefined);
     screen.amend("t1", "⎿ ok (+2 lines)", { details: "    out-1\n    out-2" });
-    await sleep(80);
-    expect(output()).toContain("● bash(npm test) ⎿ ok (+2 lines) ▸");
+    await until(output, "● bash(npm test) ⎿ ok (+2 lines) ▸");
     expect(output()).not.toContain("running 2");
     expect(output()).not.toContain("out-1");
     clear();
     await type("\x1b[<0;5;6M");
     await type("\x1b[<0;5;6m");
-    expect(output()).toContain("out-1");
+    await until(output, "out-1");
     // 找不到那一项时另起一行
     screen.amend("missing", "⎿ orphan");
-    await sleep(80);
-    expect(output()).toContain("  ⎿ orphan");
+    await until(output, "  ⎿ orphan");
   });
 
   test("runs fullscreen with a header showing the version, model and directory", async () => {
@@ -837,17 +834,17 @@ describe("terminal UI", () => {
     // 100×40 时输入框最多 10 行。分两次粘贴：一次超过 10 行会折成占位符
     await type(`\x1b[200~${Array.from({ length: 10 }, (_, i) => `row-${i}`).join("\n")}\n\x1b[201~`);
     await type(`\x1b[200~${Array.from({ length: 10 }, (_, i) => `row-${i + 10}`).join("\n")}\x1b[201~`);
-    expect(output()).toContain("row-19");
+    await until(output, "row-19");
     expect(output()).not.toContain("row-5\n");
     clear();
     // 输入框文字占第 28 到 37 行
     await type("\x1b[<64;10;30M");
     await type("\x1b[<64;10;30M");
-    expect(output()).toContain("row-4");
+    await until(output, "row-4");
     expect(output()).not.toContain("more lines");
     clear();
     await type("X");
-    expect(output()).toContain("row-19X");
+    await until(output, "row-19X");
   });
 
   test("a long paste is one placeholder in the input and is sent in full", async () => {

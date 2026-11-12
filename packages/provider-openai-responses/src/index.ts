@@ -146,6 +146,8 @@ export function openaiResponsesProvider(opts: OpenAIResponsesOptions): Provider 
                 if (ev.delta) onDelta?.({ kind: "text", text: ev.delta });
                 break;
               case "response.reasoning_summary_text.delta":
+              // 规范里的思考原文：OpenAI 自己的模型不给，开源权重模型和不少兼容服务端（例如 Nex）只给这个
+              case "response.reasoning_text.delta":
                 if (ev.delta) onDelta?.({ kind: "thinking", text: ev.delta });
                 break;
               case "response.function_call_arguments.delta":
@@ -306,8 +308,11 @@ function toBlocks(item: Item, origin: Origin): Block[] {
   const base = { origin, trust: "trusted" as const, ext };
   switch (item.type) {
     case "reasoning": {
-      const summary = (item.summary as Array<{ text?: string }> | undefined) ?? [];
-      return [{ ...base, kind: "thinking", text: summary.map((s) => s.text ?? "").join("\n\n") }];
+      // 规范里 reasoning 有两处：summary 是思考摘要（OpenAI 自己的模型只给这个，还要请求时带 reasoning.summary），
+      // content 是 reasoning_text 思考原文（开源权重模型和不少兼容服务端，例如 Nex，只给这个）。
+      // 两处都读：都有时摘要和原文一起显示
+      const parts = [...((item.summary as Array<{ text?: string }> | undefined) ?? []), ...((item.content as Array<{ text?: string }> | undefined) ?? [])];
+      return [{ ...base, kind: "thinking", text: parts.map((s) => s.text ?? "").join("\n\n") }];
     }
     case "message": {
       const parts = (item.content as Array<{ type: string; text?: string; refusal?: string }> | undefined) ?? [];

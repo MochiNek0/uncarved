@@ -252,16 +252,17 @@ export function configurator(opts: ConfigureOptions): Configure {
     const same = kind === current?.kind;
 
     let baseURL: string | undefined = env[URL_KEY[kind]];
-    if (kind !== "anthropic") {
-      const fallback = kind === "openai" ? "https://api.openai.com/v1" : "";
-      const answer = await ui.input({ title: "Base URL", initial: baseURL ?? fallback, placeholder: "https://example.com/v1" }, opts.signal);
-      if (answer === undefined) return false;
-      if (kind === "openai-compat" && !answer) {
-        report("A base URL is required.");
-        return false;
-      }
-      baseURL = answer || undefined;
+    // Anthropic 也能改地址（代理、兼容服务）：留空用官方地址。不预填官方地址：预填了回车就会把它写进
+    // ANTHROPIC_BASE_URL，和以前没写地址时保存的同一个服务对不上（找不到保存过的密钥，models.json 里多出一份）
+    const fallback = kind === "openai" ? "https://api.openai.com/v1" : "";
+    const placeholder = kind === "anthropic" ? "empty for https://api.anthropic.com (SDK adds /v1)" : "https://example.com/v1";
+    const url = await ui.input({ title: "Base URL", initial: baseURL ?? fallback, placeholder }, opts.signal);
+    if (url === undefined) return false;
+    if (kind === "openai-compat" && !url) {
+      report("A base URL is required.");
+      return false;
     }
+    baseURL = url || undefined;
 
     // 已知的密钥：当前服务的，或者保存过的同一个地址的服务的（最近用过的那个）
     const sameAddress = (e: Env) => {

@@ -18,6 +18,8 @@ const READY_MS = 10_000;
 const LOAD_MS = 15_000;
 /** load 之后等网络安静下来（脚本、图片、字体）的最长时间 */
 const SETTLE_MS = 3000;
+/** 让浏览器自己关的最长时间，过了就直接结束进程 */
+const CLOSE_MS = 5000;
 /** 滚动之后给懒加载的图片、滚动触发的动画的时间 */
 const SCROLL_SETTLE_MS = 400;
 
@@ -214,7 +216,14 @@ export const capture: Capture = async (browser, req, signal) => {
     return await Promise.race([work(), aborted]);
   } finally {
     signal.removeEventListener("abort", abort);
-    cdp?.close();
+    // 先让浏览器自己关：直接结束主进程时，Windows 上它的子进程还会占着 profile 好几秒，临时目录删不掉
+    if (cdp) {
+      void cdp.send("Browser.close").catch(() => {});
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([proc.exited, new Promise((r) => (timer = setTimeout(r, CLOSE_MS)))]);
+      clearTimeout(timer);
+      cdp.close();
+    }
     proc.kill();
     await proc.exited;
   }
