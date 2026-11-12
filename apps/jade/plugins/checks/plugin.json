@@ -3,7 +3,7 @@
   "version": "0.3.0",
   "api": "^1",
   "entry": "./index.ts",
-  "requires": ["shell@1"],
+  "requires": ["shell@1", "trust@1"],
   "optional": ["ui@1", "approval@1", "renderers@1", "commands@1"],
   "config": {
     "enabled": {

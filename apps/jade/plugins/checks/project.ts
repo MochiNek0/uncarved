@@ -1,7 +1,6 @@
 // 仓库目录、确认记录、显示用的小工具。插件之间不共享代码（只能共享类型），jade/mcp、jade/skills 各有一份。
 
 import { existsSync, realpathSync } from "node:fs";
-import { appendFile, mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
 
 export function realPath(p: string): string {
@@ -28,46 +27,6 @@ export function display(cwd: string, full: string): string {
   const rel = path.relative(cwd, full);
   const shown = rel && rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel) ? rel : full;
   return shown.split(path.sep).join("/");
-}
-
-/**
- * 用户确认过的东西（检查命令），每行一条 { hash, path, at }。
- * 和旧 jade 的 $JADE_HOME/trust.jsonl 同一个文件、同一种格式，旧 jade 里确认过的不用再确认
- */
-export class TrustFile {
-  readonly file: string;
-  #known = new Set<string>();
-
-  constructor(file: string) {
-    this.file = file;
-  }
-
-  async has(hash: string): Promise<boolean> {
-    if (this.#known.has(hash)) return true;
-    let text = "";
-    try {
-      text = await readFile(this.file, "utf8");
-    } catch {
-      return false;
-    }
-    for (const line of text.split("\n")) {
-      try {
-        if ((JSON.parse(line) as { hash?: unknown }).hash === hash) {
-          this.#known.add(hash);
-          return true;
-        }
-      } catch {
-        // 写到一半的行
-      }
-    }
-    return false;
-  }
-
-  async add(hash: string, where: string): Promise<void> {
-    await mkdir(path.dirname(this.file), { recursive: true });
-    await appendFile(this.file, `${JSON.stringify({ hash, path: where, at: new Date().toISOString() })}\n`);
-    this.#known.add(hash);
-  }
 }
 
 export const clip = (s: string, n: number) => (s.length > n ? s.slice(0, n) + "…" : s);

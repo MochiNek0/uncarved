@@ -19,6 +19,7 @@ import {
   type ProcessContext,
   type Secrets,
   type Sources,
+  type Trust,
 } from "./api.ts";
 import { pluginConfig, readConfigFile, type ConfigFile } from "./config.ts";
 import { fetchSource } from "./fetch.ts";
@@ -30,7 +31,7 @@ import { resolve, type Plan, type PlanState } from "./resolve.ts";
 import { scopedSecrets, SecretsStore } from "./secrets.ts";
 import { Sessions } from "./session.ts";
 import { parseSource } from "./source.ts";
-import { countFault, readFaults, readPluginsConfig, writeFaults, type Faults } from "./state.ts";
+import { countFault, FileTrustStore, readFaults, readPluginsConfig, writeFaults, type Faults } from "./state.ts";
 import { updater } from "./update.ts";
 
 /** untrusted：项目层插件没有得到用户确认，没有执行它的任何代码 */
@@ -72,7 +73,9 @@ export const CLI_SERVICE = "cli@1";
 export const SOURCES_SERVICE = "sources@1";
 /** jade 本身的版本和升级（3.4），名字要和 api.ts 的 Updater 一致 */
 export const UPDATE_SERVICE = "update@1";
-const CORE_SERVICES = [JADE_SERVICE, CLI_SERVICE, SOURCES_SERVICE, UPDATE_SERVICE];
+/** 用户确认过的东西（3.4），名字要和 api.ts 的 Trust 一致 */
+export const TRUST_SERVICE = "trust@1";
+const CORE_SERVICES = [JADE_SERVICE, CLI_SERVICE, SOURCES_SERVICE, UPDATE_SERVICE, TRUST_SERVICE];
 
 /** main.ts 在启动宿主之前自己处理的第一个参数：插件注册了也轮不到，所以不让注册 */
 const CORE_WORDS: ReadonlySet<string> = new Set(["plugins", "update", "upgrade", "help", "list", "ls", "add", "install", "remove", "rm", "uninstall", "enable", "disable"]);
@@ -142,6 +145,28 @@ export class PluginHost {
     // 核心自己装插件、升级自己用的代码，插件经服务用同一份，不 import 核心的模块（3.5）
     this.#services.set(SOURCES_SERVICE, { impl: { parse: parseSource, fetch: fetchSource, hash: treeHash } satisfies Sources, provider: this.#core });
     this.#services.set(UPDATE_SERVICE, { impl: updater(opts.home), provider: this.#core });
+    // 插件要用户确认的东西（检查命令、项目里的 MCP 服务）记在同一处，每个调用方一份：记录的键带着插件 id，查不到别的插件的。
+    // 和项目层插件的确认（state/trust.json）分开放：那份由内核的确认流程写
+    const confirmed = new FileTrustStore(path.join(opts.home, "state", "confirmed.json"));
+    /** 写入排队：FileTrustStore 每次读出整份再写回，并发的两次写会丢一条 */
+    let writing: Promise<unknown> = Promise.resolve();
+    this.#services.set(TRUST_SERVICE, {
+      impl: (caller: Caller): Trust => {
+        const key = (hash: string) => `${caller.plugin}\0${String(hash)}`;
+        return {
+          has: async (hash) => {
+            await writing;
+            return confirmed.has(key(hash));
+          },
+          add: (hash, where) => {
+            const run = writing.then(() => confirmed.add({ hash: key(hash), path: String(where), at: new Date().toISOString() }));
+            writing = run.catch(() => {});
+            return run;
+          },
+        };
+      },
+      provider: this.#core,
+    });
     // jade <子命令> 的注册表：每个调用方一个实例，调用方关闭（停用、被隔离）时撤销它注册的
     this.#services.set(CLI_SERVICE, {
       impl: (caller: Caller): Cli => ({

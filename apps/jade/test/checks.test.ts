@@ -210,7 +210,7 @@ describe.skipIf(!hasShell)("jade/checks plugin", () => {
     } finally {
       await w.host.close();
     }
-    expect(await readFile(path.join(home, "trust.jsonl"), "utf8")).toContain("hash");
+    expect(await readFile(path.join(home, "state", "confirmed.json"), "utf8")).toContain("jade/checks");
 
     // 下次启动不再问
     w = await featureHost({ home, cwd, config: { "jade/approval": { mode: "auto" } } });

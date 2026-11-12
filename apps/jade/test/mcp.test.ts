@@ -264,8 +264,8 @@ describe("jade/mcp plugin", () => {
     const cwd = await tempDir("jade-mcp-repo-");
     await mkdir(path.join(cwd, ".git"));
     await writeFile(path.join(cwd, ".mcp.json"), JSON.stringify({ mcpServers: { repo: fakeServer } }));
-    // trust.jsonl 写不进去（这里是个目录）：确认之后记录失败
-    await mkdir(path.join(home, "trust.jsonl"));
+    // 确认记录写不进去（这里是个目录）：确认之后记录失败
+    await mkdir(path.join(home, "state", "confirmed.json"), { recursive: true });
     const w = await featureHost({ home, cwd });
     try {
       w.state.answers.push("yes", "yes");
@@ -273,7 +273,7 @@ describe("jade/mcp plugin", () => {
       await (await w.host.sessions.open()).send(msg("hi"));
       expect(w.state.requests[0]!.tools.some((t) => t.name.startsWith("mcp__"))).toBe(false);
 
-      await rm(path.join(home, "trust.jsonl"), { recursive: true });
+      await rm(path.join(home, "state", "confirmed.json"), { recursive: true });
       await (await w.host.sessions.open()).send(msg("again"));
       expect(w.state.requests[1]!.tools.map((t) => t.name)).toContain("mcp__repo__echo");
     } finally {
@@ -325,7 +325,7 @@ describe("jade/mcp plugin", () => {
         await w.host.close();
       }
     }
-    expect(await readFile(path.join(home, "trust.jsonl"), "utf8")).toContain(".mcp.json");
+    expect(await readFile(path.join(home, "state", "confirmed.json"), "utf8")).toContain(".mcp.json");
 
     // 配置变了：重新确认
     await writeFile(path.join(cwd, ".mcp.json"), JSON.stringify({ mcpServers: { repo: { ...fakeServer, env: { X: "1" } } } }));

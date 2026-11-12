@@ -111,10 +111,11 @@
 | `cli@1` | 核心自己提供（不是插件）：插件注册的 `jade <子命令>`。命令行的第一个参数是注册过的名字时，核心启动宿主后把剩下的参数交给它，不进前端 | 核心 |
 | `sources@1` | 核心自己提供（不是插件）：核心装插件用的下载器（`parse` 识别来源、`fetch` 下载到 staging、`hash` 算内容哈希）。`jade/skills` 装 skill 用它 | 核心 |
 | `update@1` | 核心自己提供（不是插件）：jade 本身的版本和升级（`version`、`install`、`newer`、`autoEnabled`、`upgrade`），和 `jade update` 同一套代码。`jade/update` 用它 | 核心 |
+| `trust@1` | 核心自己提供（不是插件）：用户确认过的东西（`has`、`add`），哈希由调用方算，按插件分开存在 `$JADE_HOME/state/confirmed.json`。`jade/checks`（检查命令）、`jade/mcp`（项目里的 MCP 服务）用它 | 核心 |
 | `ui@1`（可选） | 前端起来之后把要告诉用户的事交给 `notify`；每个插件加入会话时调用 `session` 取它的状态栏段落、输入框上方的一块和输入框。没有时消息打到 stderr，插件的 `ctx.status`、`ctx.panel`、`ctx.input` 是 `undefined` | 前端插件 |
 | `approval@1`（可选） | 不调用它，只看它的提供者是谁：这个插件没有在会话里注册 `tool.gate` 时兜底关卡生效（第 7 节） | `jade/approval` |
 
-由核心提供、给插件用的服务只有 `jade@1`、`cli@1`、`sources@1`、`update@1` 四个。`jade@1`：核心知道自己加载了哪些插件，第三方插件拿不到这份信息，而"哪个插件坏了、为什么"是用户该看到的；它只读，没有副作用。`cli@1`：命令行由核心解析，插件要加 `jade <子命令>` 只能经核心；核心只查名字、转交参数，不认识子命令做什么（`jade skills`、`jade mcp` 分别来自 `jade/skills`、`jade/mcp`）。核心自己的词（`plugins`、`update`、`help`，以及 `jade plugins` 的子命令名）不能注册：它们在宿主启动之前就被核心处理了。和救援 CLI 不同，插件的子命令要启动宿主，插件坏了时不保证能用。`sources@1`、`update@1`：救援 CLI（`jade plugins add`、`jade update`）必须在不启动插件的情况下工作，所以这两段代码只能在核心里；插件要做同样的事（装 skill、启动时查新版本）时经服务用同一份，而不是 import 核心的模块（3.5），这样第三方插件也拿得到。
+由核心提供、给插件用的服务只有 `jade@1`、`cli@1`、`sources@1`、`update@1`、`trust@1` 五个。`jade@1`：核心知道自己加载了哪些插件，第三方插件拿不到这份信息，而"哪个插件坏了、为什么"是用户该看到的；它只读，没有副作用。`cli@1`：命令行由核心解析，插件要加 `jade <子命令>` 只能经核心；核心只查名字、转交参数，不认识子命令做什么（`jade skills`、`jade mcp` 分别来自 `jade/skills`、`jade/mcp`）。核心自己的词（`plugins`、`update`、`help`，以及 `jade plugins` 的子命令名）不能注册：它们在宿主启动之前就被核心处理了。和救援 CLI 不同，插件的子命令要启动宿主，插件坏了时不保证能用。`sources@1`、`update@1`：救援 CLI（`jade plugins add`、`jade update`）必须在不启动插件的情况下工作，所以这两段代码只能在核心里；插件要做同样的事（装 skill、启动时查新版本）时经服务用同一份，而不是 import 核心的模块（3.5），这样第三方插件也拿得到。`trust@1`：要用户确认才执行的东西（检查命令、项目里的 MCP 服务）原来是两个插件各复制一份信任文件的代码；记录按插件分开，一个插件查不到、也伪造不了另一个插件的确认（2026-11-12 加；以前在 `$JADE_HOME/trust.jsonl` 里确认过的要重新确认一次）。
 
 前端的选择：清单里 `"frontend": { "name": "tui", "default": true }` 或 `{ "name": "print", "flag": "-p" }`。核心按命令行选定一个前端，只激活被选中的那个前端插件提供的 `frontend@1`。
 
@@ -318,10 +319,10 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 | `jade/tools` | `tools@1`：给嵌套 Agent（子 Agent 之类）用的工具的注册表。`register(tool, { when })`：提供工具的插件另登记一套实例（主会话里的工具对象是各插件私有的），`when` 每次取用时决定给不给；`list()`：另起 Agent 的插件来取，自己筛选、自己把关（这些工具执行时没有主会话的关卡守着）。登记的一方不用知道谁在用 | — | 2026-11-11 从 `jade/task` 的 `task@1` 拆出来（见 jade-log"架构挡了路"） |
 | `jade/task` | `task` 工具；子 Agent 的工具每次启动时从 `tools@1` 取；子 Agent 的系统提示词里带上主会话的指令文件（经 `prompts@1.instructions`，仓库里的保持不可信，配置 `instructions: false` 关掉） | `models@1`；可选 `tools@1`、`prompts@1` | `tools/task.ts`。子 Agent 是嵌套的 `Runtime`，日志在内存里，不关联到父会话 |
 | `jade/compact` | `context.project` 里清理旧输出、总结；`/compact`；上下文溢出后压缩并经 `afterTurn` 重试 | `models@1` | `plugins/compact.ts` |
-| `jade/mcp` | MCP 服务的工具、`/mcp`；`/mcp add\|remove` 和 `jade mcp add\|remove` 改配置文件；项目层服务启动前确认（`$JADE_HOME/trust.jsonl`） | 可选 `ui@1`、`commands@1`、`prompts@1`、`tools@1`、`cli@1` | `mcp.ts`。插件自带的 MCP 配置（旧的 PluginBundle）没有了 |
+| `jade/mcp` | MCP 服务的工具、`/mcp`；`/mcp add\|remove` 和 `jade mcp add\|remove` 改配置文件；项目层服务启动前确认（记在 `trust@1`） | `trust@1`；可选 `ui@1`、`commands@1`、`prompts@1`、`tools@1`、`cli@1` | `mcp.ts`。插件自带的 MCP 配置（旧的 PluginBundle）没有了 |
 | `jade/skills` | `skill` 工具、`/skills`、`/<skill 名>`；`/skills add\|update\|remove` 和 `jade skills …` 从 git、npm 或本地目录安装（下载经核心的 `sources@1`）；每次调用模型前重新查找 skill，会话中途装的马上能用（`skill` 工具因此总是注册、名字不写成 enum，列表变了才改提示词）；工具说明告诉模型用 `jade skills add` 装到 `.jade`；skill 目录经 `approval@1.allowRead` 可直接读 | 可选 | `skills.ts` |
 | `jade/scratch` | 每个会话一个临时目录（系统临时目录下的 `jade-scratch/<会话 id>`，恢复会话时还是同一个，不主动删除），经 `prompts@1` 告诉模型临时文件放这里，经 `approval@1.allowWrite` 和工作目录同样对待 | 可选 `approval@1`、`prompts@1` | 新功能，参考 Claude Code 的 scratchpad（`test/scratch.test.ts`） |
-| `jade/checks` | 改文件后在 `context.project` 里跑项目检查、`/checks`；命令第一次运行前确认 | `shell@1`（运行检查）；可选 `ui@1`、`approval@1`、`renderers@1`、`commands@1` | `plugins/checks.ts` |
+| `jade/checks` | 改文件后在 `context.project` 里跑项目检查、`/checks`；命令第一次运行前确认（记在 `trust@1`） | `shell@1`（运行检查）、`trust@1`；可选 `ui@1`、`approval@1`、`renderers@1`、`commands@1` | `plugins/checks.ts` |
 | `jade/memory`、`jade/undo` | `memory` 工具和 `/memory`；`/undo`（`tool.before`/`tool.after` 记快照）；用户在命令里做的事经 `prompts@1.note` 告诉模型 | 可选 | `memory.ts`、`tools/checkpoint.ts` |
 | `jade/mentions` | 在 `context.project` 里把 `@` 引用的文件附到那条用户消息上；经 `completions@1` 给输入框 `@` 补全的候选（工作目录里的文件，git 仓库里只看版本控制的） | 可选 `renderers@1`、`completions@1` | `mentions.ts`。附上的内容不算 `read_file` 读过 |
 | `jade/continue`、`jade/repeats`、`jade/budget` | 截断后续写（`afterTurn`）；重复调用；每轮步数上限 | — | `plugins/turns.ts`、`repeats.ts`、`budget.ts` |

@@ -5,15 +5,15 @@
 // 自己刚引入的错误并改掉；轮次结束后才检查就得再发起一轮（session.send），等于替用户多说一句话。
 //
 // 检查会执行仓库里的代码（node_modules 里的 tsc、.jade/checks.json 里的命令），每条命令第一次运行前请用户确认，
-// 记在 $JADE_HOME/trust.jsonl（和旧 jade 同一个文件、同一种记录，旧 jade 里确认过的不用再确认）。
+// 确认记在核心的 trust@1（$JADE_HOME/state/confirmed.json）。
 // yolo 模式不问；不能提问时不运行没确认过的命令。
 
 import { createHash } from "node:crypto";
 import path from "node:path";
-import { definePlugin, type SessionContext, type UI } from "@uncarved/jade-api";
+import { definePlugin, type SessionContext, type Trust, type UI } from "@uncarved/jade-api";
 import type { Approval, Commands, EventRenderer, Renderers, Shell } from "@uncarved/jade-api/services";
 import { changedFiles, checks, type Check, type Checks } from "./checks.ts";
-import { bold, dim, display, realPath, repoRoot, TrustFile, yellow } from "./project.ts";
+import { bold, dim, display, realPath, repoRoot, yellow } from "./project.ts";
 
 /** 确认记录：同一个目录里的同一条命令只问一次。和旧 jade 的算法相同 */
 const checkHash = (c: Check) => createHash("sha256").update(`jade-check\0${c.cwd}\0${c.command}`).digest("hex");
@@ -53,7 +53,7 @@ export const checksRenderers: EventRenderer[] = [
 export default definePlugin({
   process(ctx) {
     const off = ctx.config.enabled === false || process.env.JADE_CHECKS === "off";
-    const trust = new TrustFile(path.join(ctx.home, "trust.jsonl"));
+    const trust = ctx.require<Trust>("trust@1");
     const renderers = ctx.service<Renderers>("renderers@1");
     if (renderers) for (const r of checksRenderers) renderers.event(r);
 

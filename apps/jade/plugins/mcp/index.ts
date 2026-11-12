@@ -7,11 +7,11 @@
 // 服务进程退出后，下一次调用它的工具时重新连接一次。
 
 import path from "node:path";
-import { definePlugin, type Cli, type ProcessContext, type UI } from "@uncarved/jade-api";
+import { definePlugin, type Cli, type ProcessContext, type Trust, type UI } from "@uncarved/jade-api";
 import type { Commands, Prompts, Tools } from "@uncarved/jade-api/services";
 import { describeServer, loadMcpConfig, McpClient, mcpTools, mcpTrustHash } from "./mcp.ts";
 import { manageMcp, manageUsage } from "./install.ts";
-import { bold, clip, dim, display, estimateTokens, green, realPath, red, repoRoot, splitArgs, TrustFile, yellow } from "./project.ts";
+import { bold, clip, dim, display, estimateTokens, green, realPath, red, repoRoot, splitArgs, yellow } from "./project.ts";
 
 const ID = "jade/mcp";
 /** 第一个会话最多等 MCP 服务连接这么久（能交互时），没连上的在后台接着连 */
@@ -62,7 +62,7 @@ class Servers {
     const ctx = this.#ctx;
     const cwd = realPath(ctx.cwd);
     const root = realPath(repoRoot(cwd));
-    const trust = new TrustFile(path.join(ctx.home, "trust.jsonl"));
+    const trust = ctx.require<Trust>("trust@1");
     const { servers, warnings } = await loadMcpConfig({ home: ctx.home, root, cwd });
     for (const w of warnings) this.notify(`${ID}: ${w}`, "warning");
     const ui = this.ui();

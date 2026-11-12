@@ -289,6 +289,18 @@ export interface PluginStatus {
 }
 
 /**
+ * trust@1：用户确认过的东西（项目里的检查命令、MCP 服务……），由核心提供（不是插件，见 3.4）。
+ * hash 由调用方算（把要确认的内容都算进去，内容一变就要重新确认）；按插件分开存，别的插件的确认查不到。
+ * 存在 $JADE_HOME/state/confirmed.json
+ */
+export interface Trust {
+  /** 用户确认过这一项 */
+  has(hash: string): Promise<boolean>;
+  /** 记下用户确认了这一项；where 是给人看的位置（目录、文件） */
+  add(hash: string, where: string): Promise<void>;
+}
+
+/**
  * sources@1：核心自己的下载器，由核心提供（不是插件，见 3.4）。`jade plugins add` 用的就是它；
  * 插件要从 git、npm 或本地目录装东西（例如 jade/skills 装 skill）时用同一份，不用自己再写一遍。
  * 只下载，不执行下载下来的任何代码，也不装依赖

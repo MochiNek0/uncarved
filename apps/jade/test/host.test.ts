@@ -272,3 +272,26 @@ describe("rescue CLI", () => {
     expect(() => pluginsCommand(["frobnicate"], opts)).toThrow("usage");
   });
 });
+
+describe("trust@1", () => {
+  test("confirmations are kept per plugin and survive a restart", async () => {
+    const w = await world();
+    const code = (name: string) => `export default { process(ctx) { globalThis.__trust ??= {}; globalThis.__trust[${JSON.stringify(name)}] = ctx.require("trust@1"); } };`;
+    await w.plugin("user", { id: "a", requires: ["trust@1"] }, code("a"));
+    await w.plugin("user", { id: "b", requires: ["trust@1"] }, code("b"));
+    const g = globalThis as { __trust?: Record<string, { has(h: string): Promise<boolean>; add(h: string, where: string): Promise<void> }> };
+    let host = await w.start();
+    await Promise.all([g.__trust!.a!.add("h1", "/repo"), g.__trust!.a!.add("h2", "/repo")]);
+    expect(await g.__trust!.a!.has("h1")).toBe(true);
+    expect(await g.__trust!.a!.has("h2")).toBe(true);
+    // 别的插件查不到
+    expect(await g.__trust!.b!.has("h1")).toBe(false);
+    await host.close();
+    delete g.__trust;
+    host = await w.start();
+    expect(await g.__trust!.a!.has("h1")).toBe(true);
+    expect(await g.__trust!.b!.has("h2")).toBe(false);
+    await host.close();
+    delete g.__trust;
+  });
+});

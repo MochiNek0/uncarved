@@ -3,5 +3,6 @@
   "version": "0.2.0",
   "api": "^1",
   "entry": "./index.ts",
+  "requires": ["trust@1"],
   "optional": ["ui@1", "commands@1", "prompts@1", "tools@1", "cli@1"]
 }
