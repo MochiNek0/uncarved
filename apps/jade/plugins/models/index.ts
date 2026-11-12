@@ -14,12 +14,19 @@ import { configurator } from "./configure.ts";
 import { isBuiltinKind, listModels, MODEL_KEY, providerFromEnv, providerInfo, providerKind, RateGate, rpmFromEnv, visionFromEnv, withRetry, type RetriedResponse } from "./provider.ts";
 import { MODEL_SETTINGS, readSavedServices, type Env } from "./saved.ts";
 
+/** 进程级的配置交给会话里的提示用：有没有配好模型、有没有 /model、.env 在哪 */
+let setup: { configured(): boolean; command: boolean; envFile: string } | undefined;
+/** 没配模型的提示一个进程只说一次 */
+let hinted = false;
+
 export default definePlugin({
   async process(ctx) {
     const envFile = path.join(ctx.home, ".env");
     const modelsFile = path.join(ctx.home, "models.json");
     // 当前的模型配置。改配置时整份换掉（updateEnvFile 改的是这一份，apply 再从文件读一遍）
     let env = await envWithFile(envFile);
+    hinted = false;
+    setup = { configured: () => hasProvider(env), command: false, envFile };
     // 用的时候再取：jade/tui 也依赖这个插件（models@1），它在这之后才激活，这里取到的是 undefined，重试的提示就没人显示
     const ui = () => ctx.service<UI>("ui@1");
     const watchers = new Set<() => void>();
@@ -157,7 +164,9 @@ export default definePlugin({
       notify();
     };
 
-    ctx.service<Commands>("commands@1")?.register({
+    const commands = ctx.service<Commands>("commands@1");
+    setup.command = commands !== undefined;
+    commands?.register({
       name: "model",
       args: "[name]",
       description: "switch models, or add one with its provider, API key and limits",
@@ -179,6 +188,23 @@ export default definePlugin({
   },
 
   session(ctx) {
+    const ui = ctx.service<UI>("ui@1");
+    // 还没配模型：告诉用户怎么配。/model 当场就能配好，不用重启；没有这条命令时只能改文件
+    if (setup && !setup.configured() && !hinted && ui?.interactive) {
+      hinted = true;
+      const file = `put ANTHROPIC_API_KEY=... (or OPENAI_API_KEY=...) in ${setup.envFile}, then restart jade`;
+      ui.notify(setup.command ? `No model is configured yet. Type /model to set one up, or ${file}.` : `No model is configured yet. To set one up, ${file}.`, "warning");
+    }
+    // 回复被输出上限截断：上限是这里的配置（JADE_MAX_TOKENS），只有这里知道怎么改
+    ctx.kernel.hook({
+      kind: "observe",
+      point: "event",
+      fn: (e) => {
+        if (e.type === "turn.ended" && (e.data as { reason?: string }).reason === "max_tokens" && setup?.command) {
+          ui?.notify("if replies keep getting cut off, raise the output limit with /model", "info");
+        }
+      },
+    });
     // 重试过的请求：把每次失败写进会话日志，事后能查到为什么慢、为什么重新输出（插件事件，不进上下文）
     ctx.kernel.hook({
       kind: "observe",

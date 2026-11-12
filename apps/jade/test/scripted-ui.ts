@@ -60,6 +60,8 @@ export interface Shared {
   listed: string[];
   /** 插件经 ctx.input.set 放进输入框的文字，按先后 */
   drafts: string[];
+  /** 插件经 ctx.status 设置过的状态栏段落，按先后 */
+  statuses: { plugin: string; segment: unknown }[];
 }
 
 const FAKE_MODEL = `export default { process(ctx) {
@@ -90,8 +92,8 @@ const FAKE_FRONTEND = `export default { process(ctx) {
     notify: (m) => void g().notes.push(m),
     select: async (r) => { g().asked.push(r.title); g().dialogs.push({ title: r.title, ...(r.detail ? { detail: r.detail } : {}) }); const a = g().answers.shift(); return a === undefined ? r.options[0]?.value : a === "" ? undefined : a; },
     input: async () => undefined,
-    session: () => ({
-      status: () => {},
+    session: ({ plugin }) => ({
+      status: (segment) => void g().statuses.push({ plugin, segment }),
       draft: { text: () => "", insert: () => {}, set: (t) => void g().drafts.push(t), hint: (t) => void g().hints.push(t) },
       dispose: () => {},
     }),
@@ -118,6 +120,7 @@ export async function scriptedHost(opts: { config?: Record<string, Record<string
     saved: [],
     listed: [],
     drafts: [],
+    statuses: [],
   };
   (globalThis as { __jadeScriptedUi?: Shared }).__jadeScriptedUi = shared;
   const plugin = async (name: string, manifest: object, code: string) => {

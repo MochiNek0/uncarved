@@ -7,7 +7,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PluginHost, type SessionManager, type UI } from "../src/index.ts";
-import type { Approval, CommandContext, Commands, Keys, Modes, Renderers, Tools } from "@uncarved/jade-api/services";
+import type { Approval, CommandContext, Commands, Completions, Keys, Modes, Renderers, Tools } from "@uncarved/jade-api/services";
 
 const BUNDLED = path.resolve(import.meta.dir, "../plugins");
 
@@ -136,6 +136,43 @@ describe("registries", () => {
       await host.quarantine("test/copycat", "test");
       expect(commands.get("clear")!.plugin).toBe("jade/sessions");
       expect(commands.get("copy-only")).toBeUndefined();
+    } finally {
+      await host.close();
+    }
+  });
+
+  test("a command can have a one-character shortcut; a taken shortcut is skipped, the command still registers", async () => {
+    const { host, reports } = await start();
+    try {
+      const commands = host.service<Commands>("commands@1")!;
+      // jade/shell 的 /sh 用 !
+      expect(commands.byPrefix("!")!.command.name).toBe("sh");
+      expect(commands.list().find((c) => c.name === "sh")).toMatchObject({ prefix: "!", prefixHint: "shell command · you run it, not the agent" });
+      commands.register({ name: "bang", prefix: "!", run: () => "mine" });
+      expect(reports).toEqual(["jade/commands: the ! shortcut for /bang from jade was skipped: /sh already uses it"]);
+      expect(commands.get("bang")).toBeDefined();
+      expect(commands.list().find((c) => c.name === "bang")!.prefix).toBeUndefined();
+      expect(commands.byPrefix("!")!.command.name).toBe("sh");
+      expect(() => commands.register({ name: "bad", prefix: "a", run: () => {} })).toThrow("prefix must be one character");
+      expect(() => commands.register({ name: "bad2", prefix: "/", run: () => {} })).toThrow("prefix must be one character");
+      expect(() => commands.register({ name: "bad3", prefix: "!!", run: () => {} })).toThrow("prefix must be one character");
+    } finally {
+      await host.close();
+    }
+  });
+
+  test("completions: jade/mentions registers @; a taken trigger is skipped and reported", async () => {
+    const { host, reports } = await start();
+    try {
+      const completions = host.service<Completions>("completions@1")!;
+      expect(completions.list().map((c) => [c.completion.trigger, c.completion.label, c.plugin])).toEqual([["@", "files", "jade/mentions"]]);
+      completions.register({ trigger: "@", label: "people", candidates: async () => [] });
+      expect(reports).toEqual(["jade/completions: completion @ from jade was skipped: jade/mentions already registered it"]);
+      expect(() => completions.register({ trigger: "ab", label: "x", candidates: async () => [] })).toThrow("invalid completion trigger");
+      const revoke = completions.register({ trigger: "#", label: "issues", candidates: async () => ["1/"] });
+      expect(await completions.list().find((c) => c.completion.trigger === "#")!.completion.candidates()).toEqual(["1/"]);
+      revoke();
+      expect(completions.list().some((c) => c.completion.trigger === "#")).toBe(false);
     } finally {
       await host.close();
     }

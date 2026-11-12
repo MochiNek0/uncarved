@@ -17,8 +17,6 @@ export interface TranscriptOptions {
   readLog?(sessionId: string): Promise<LogEvent[]>;
   /** 模型的上下文窗口（状态栏显示用） */
   contextWindow(): number;
-  /** 自动压缩的阈值（状态栏显示用） */
-  compactAt?(): number;
   /** 每次回复的输出上限（回复被截断时的提示用）；没有时说是服务的默认值 */
   maxTokens?(): number | undefined;
   /** 上一轮失败后能否用 /retry 重新请求 */
@@ -106,7 +104,7 @@ export function transcript(opts: TranscriptOptions): Transcript {
     const by = e.origin.by === "model" ? `${e.origin.provider}/${e.origin.model}` : "";
     if (u.cacheReadTokens !== undefined) reportsCache = by;
     screen.status({
-      context: { used: u.inputTokens + (u.outputTokens ?? 0), limit: opts.contextWindow(), compactAt: opts.compactAt?.() },
+      context: { used: u.inputTokens + (u.outputTokens ?? 0), limit: opts.contextWindow() },
       cache: reportsCache === by && u.inputTokens > 0 ? (u.cacheReadTokens ?? 0) / u.inputTokens : undefined,
     });
   }
@@ -416,13 +414,14 @@ export function transcript(opts: TranscriptOptions): Transcript {
         for (const id of [...running]) doneProgress(id);
         self.lastError = d.error;
         self.turnFailed = d.reason === "error" || d.reason === "aborted";
-        if (d.reason === "stopped") screen.log(yellow("[stopped: step budget for this turn used up; send a message to continue]"));
+        // 停下它的插件自己说明原因（例如 jade/budget 的 notice）
+        if (d.reason === "stopped") screen.log(yellow("[stopped before the turn finished; send a message to continue]"));
         else if (d.reason === "aborted") screen.log(yellow("[interrupted]"));
         else if (d.reason === "max_tokens") {
-          // 不读 process.env：写在 $JADE_HOME/.env 里的只有 models 插件知道
+          // 不读 process.env：写在 $JADE_HOME/.env 里的只有 models 插件知道；怎么调高也由它说
           const max = opts.maxTokens?.();
           const limit = max ? `${max} tokens` : "the provider's default";
-          screen.log(yellow(`[reply cut off at the output limit (${limit}); raise it with /model if this keeps happening]`));
+          screen.log(yellow(`[reply cut off at the output limit (${limit})]`));
         } else if (d.reason !== "end") screen.log(yellow(`[turn ended: ${d.reason}${d.error ? ` — ${d.error}` : ""}]`));
         if (self.turnFailed && !replaying && opts.canRetry()) screen.log(dim("[send /retry to request again without adding a message]"));
         return;

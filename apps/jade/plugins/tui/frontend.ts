@@ -1,19 +1,19 @@
 // jade/tui 的前端：把会话接到终端界面上。旧 jade 的 main.ts 里属于界面的部分：
 // 输入排队、斜杠命令、esc 中断、换会话后重新显示对话、状态栏。
 //
-// 这里不认识任何具体功能：命令来自 commands@1，快捷键来自 keys@1，工具和事件怎么显示来自 renderers@1，
-// 模式来自 modes@1，模型名来自 models@1。
+// 这里不认识任何具体功能：命令和它们的简写（例如 jade/shell 的 !）来自 commands@1，快捷键来自 keys@1，
+// 输入框的补全（例如 jade/mentions 的 @）来自 completions@1，工具和事件怎么显示来自 renderers@1，模型名来自 models@1；
+// 状态栏上的模式、压缩阈值是 jade/modes、jade/compact 自己的段落（ctx.status）。
 
 import { execFile } from "node:child_process";
 import { readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Block } from "uncarved";
-import type { Frontend, OpenOptions, Session, SessionManager, SessionUI, UI } from "@uncarved/jade-api";
-import type { CommandContext, Commands, Compact, Keys, Models, Modes, Renderers, SessionIndex, Steer } from "@uncarved/jade-api/services";
+import type { Frontend, OpenOptions, Session, SessionManager, SessionUI, StatusSegment, UI } from "@uncarved/jade-api";
+import type { CommandContext, Commands, Completions, Keys, Models, Renderers, SessionIndex, Steer } from "@uncarved/jade-api/services";
 import { InputHistory } from "./history.ts";
-import { mentionCandidates } from "./mentions.ts";
-import { dim, red, safeScreen, yellow, type CommandInfo, type Screen } from "./screen.ts";
+import { dim, red, safeScreen, yellow, type CommandInfo, type CompletionInfo, type Screen } from "./screen.ts";
 import { transcript, type Transcript } from "./transcript.ts";
 
 /**
@@ -51,7 +51,7 @@ const OWN: CommandInfo[] = [
 
 const KEYS = [
   "Keys:",
-  "  send       enter send · ctrl+j, alt+enter or \\ then enter: new line · !<command> runs a shell command yourself · tab completes /commands and @files",
+  "  send       enter send · ctrl+j, alt+enter or \\ then enter: new line · tab completes /commands",
   "  input      ↑↓ history · ctrl+r search history · ↑ on the first line edits queued messages · esc twice or ctrl+c clears the input",
   "  editing    ctrl+←/→ or alt+b/f move by words · ctrl+w or alt+backspace delete a word · ctrl+a/e line start/end · ctrl+u/k delete to start/end",
   "  running    esc interrupt (twice to also move queued messages back to the input) · ctrl+c twice to exit",
@@ -90,10 +90,9 @@ export interface FrontendServices {
   commands: Commands;
   keys: Keys;
   renderers: Renderers;
-  modes?: Modes;
   models?: Models;
-  /** 自动压缩的阈值，状态栏显示 */
-  compact?: Compact;
+  /** 输入框的补全（completions@1） */
+  completions?: Completions;
   /** 会话索引（jade/sessions），--continue 用 */
   index?: SessionIndex;
   /** 一轮中途说的话（jade/steer）：有它时，模型工作中提交的消息在下一次请求模型时就交给它，不等这一轮结束 */
@@ -102,6 +101,8 @@ export interface FrontendServices {
 
 /** 状态栏上插件的一段最多显示这么多字符（超出的截断，换行并成空格） */
 const MAX_SEGMENT = 80;
+/** 状态栏的一段（文字或带颜色、优先级的 StatusSegment） */
+type Segment = string | StatusSegment;
 /** 输入框上方插件的一块最多占几行 */
 const MAX_PANEL_LINES = 10;
 
@@ -115,8 +116,8 @@ export class ScreenBridge {
   /** 会话打开期间的提示：打开之后要清屏，先攒着，清屏之后再显示 */
   #held: string[] | undefined;
   #closed = false;
-  /** 状态栏上各插件的一段：会话 id → 插件 id → 文字 */
-  #segments = new Map<string, Map<string, string>>();
+  /** 状态栏上各插件的一段：会话 id → 插件 id → 段落 */
+  #segments = new Map<string, Map<string, Segment>>();
   /** 输入框上方各插件的一块：会话 id → 插件 id → 文字 */
   #panels = new Map<string, Map<string, string>>();
   /** 界面现在显示哪个会话；换会话时由前端调用 show */
@@ -197,7 +198,7 @@ export class ScreenBridge {
     const apply = () => {
       if (bridge.#session === session) bridge.#apply();
     };
-    const put = (all: Map<string, Map<string, string>>, text: string | undefined) => {
+    const put = <T>(all: Map<string, Map<string, T>>, text: T | undefined) => {
       if (gone) return;
       // 每次现取：别的插件 dispose 可能已经把空的 map 删了
       let mine = all.get(session);
@@ -237,9 +238,13 @@ function clipPanel(text: string): string {
 }
 
 /** 状态栏的一段是一行：空白并成一个空格，长的截断 */
-function clipSegment(text: string): string {
-  const one = String(text).replace(/\s+/g, " ").trim();
-  return one.length > MAX_SEGMENT ? `${one.slice(0, MAX_SEGMENT - 1)}…` : one;
+function clipSegment(segment: Segment): Segment {
+  const clip = (text: string) => {
+    const one = String(text).replace(/\s+/g, " ").trim();
+    return one.length > MAX_SEGMENT ? `${one.slice(0, MAX_SEGMENT - 1)}…` : one;
+  };
+  if (typeof segment === "string") return clip(segment);
+  return { ...segment, text: clip(segment.text), ...(segment.short !== undefined ? { short: clip(segment.short) } : {}) };
 }
 
 export function tuiFrontend(services: FrontendServices, bridge: ScreenBridge): Frontend {
@@ -283,7 +288,7 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
     return 2;
   }
 
-  const { cwd, home, commands, keys, renderers, modes, models, compact, index, steer } = services;
+  const { cwd, home, commands, keys, renderers, models, completions, index, steer } = services;
   const sessions = opts.sessions;
   // --continue：这个目录里最近用过的会话（索引由 jade/sessions 在收到第一条消息时写）
   if (args.cont && !index) {
@@ -304,8 +309,16 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
     ...commands
       .list()
       .filter((c) => !OWN.some((o) => o.name === c.name))
-      .map((c) => ({ name: c.name, ...(c.args ? { args: c.args } : {}), about: `${c.description ?? ""}${c.plugin.startsWith("jade/") ? "" : ` (plugin ${c.plugin})`}`.trim() })),
+      .map((c) => ({
+        name: c.name,
+        ...(c.args ? { args: c.args } : {}),
+        ...(c.prefix ? { prefix: c.prefix, ...(c.prefixHint ? { prefixHint: c.prefixHint } : {}) } : {}),
+        about: `${c.description ?? ""}${c.plugin.startsWith("jade/") ? "" : ` (plugin ${c.plugin})`}`.trim(),
+      })),
   ];
+  /** 输入框的补全：每次渲染时取（插件可能刚登记或撤销） */
+  const completionList = (): CompletionInfo[] =>
+    (completions?.list() ?? []).map(({ completion: c }) => ({ trigger: c.trigger, label: c.label, ...(c.hint ? { hint: c.hint } : {}) }));
 
   let ready = false;
   const early: string[] = [];
@@ -315,7 +328,7 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
   // 插件、工具输出和模型的文字都经过 safeScreen 显示：只留颜色，去掉能搅乱终端的控制序列
   const screen: Screen = safeScreen(
     tuiScreen({
-      status: { cwd: shortPath(cwd), ...(branch ? { branch } : {}), model: models?.current()?.model ?? "(no model)", mode: modes?.current() ?? "" },
+      status: { cwd: shortPath(cwd), ...(branch ? { branch } : {}), model: models?.current()?.model ?? "(no model)" },
       version: VERSION,
       commands: commandList,
       history: past,
@@ -326,12 +339,12 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
           if (ready) onSubmit(text);
           else early.push(text);
         },
-        // 输入 @ 时列工作目录里的文件
-        files: () => mentionCandidates(cwd),
+        // 打了补全的触发字符（例如 @）时向登记它的插件要候选
+        completions: completionList,
+        complete: async (trigger) => (await completions?.list().find((c) => c.completion.trigger === trigger)?.completion.candidates()) ?? [],
         interrupt: () => ready && interrupt(),
         unqueue: () => takeBack(),
         exit: () => void quit(0),
-        cycleMode: () => void key("shift+tab"),
         key: (spec) => key(spec),
       },
     }),
@@ -352,7 +365,6 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
     return true;
   }
 
-  const offMode = modes?.subscribe((mode) => screen.status({ mode }));
   // /model 换了配置：状态栏跟着换
   const offModel = models?.subscribe?.(() => screen.status({ model: models.current()?.model ?? "(no model)" }));
 
@@ -367,7 +379,6 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
     cwd,
     contextWindow: () => models?.current()?.contextWindow ?? 0,
     maxTokens: () => models?.current()?.maxTokens,
-    ...(compact ? { compactAt: () => compact.threshold() } : {}),
     canRetry,
     renderer: (tool) => renderers.forTool(tool),
     eventRenderer: (type) => renderers.forEvent(type),
@@ -543,7 +554,6 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
     for (const ac of commandAborts) ac.abort(new Error("exiting"));
     await Promise.race([work?.catch(() => {}), new Promise((r) => setTimeout(r, QUIT_WAIT_MS))]);
     keyAbort.abort(new Error("exiting"));
-    offMode?.();
     offModel?.();
     offSteer?.();
     unsubscribe?.();
@@ -579,7 +589,12 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
     if (name === "exit" || name === "quit") return false;
     if (name === "help") {
       // 快捷键在前、命令在后：屏幕放不下时，紧挨着输入框的命令列表还看得见
-      screen.log(dim(KEYS));
+      // 命令的简写、输入框的补全来自插件，跟着列出来
+      const extras = [
+        ...commands.list().flatMap((c) => (c.prefix ? [`${c.prefix}${c.args ?? ""} is /${c.name}`] : [])),
+        ...completionList().map((c) => `${c.trigger} completes ${c.label}`),
+      ];
+      screen.log(dim(extras.length ? `${KEYS}\n  plugins    ${extras.join(" · ")}` : KEYS));
       const pluginKeys = keys.list();
       if (pluginKeys.length > 0) screen.log(dim(`Plugin keys: ${pluginKeys.map((k) => `${k.key}${k.description ? ` ${k.description}` : ""} (${k.plugin})`).join(" · ")}`));
       const all = commandList();
@@ -635,8 +650,10 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
 
   function onSubmit(text: string) {
     if (quitting) return;
-    // !<命令> 是 /sh <命令> 的简写（jade/shell 提供）：用户自己执行，不经过模型
-    if (/^!\s*\S/.test(text)) text = `/sh ${text.slice(1).trim()}`;
+    // 命令的简写（例如 jade/shell 的 !<命令> 就是 /sh <命令>）
+    const short = [...text][0];
+    const byPrefix = short === undefined ? undefined : commands.byPrefix(short);
+    if (byPrefix && text.slice(short!.length).trim()) text = `/${byPrefix.command.name} ${text.slice(short!.length).trim()}`;
     const name = commandName(text);
     if (name !== undefined && instant(name)) {
       // 不碰会话的命令运行中也直接执行
@@ -707,12 +724,8 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
   } catch (e) {
     screen.log(red(`[error] ${errorText(e)}`));
   }
-  if (!models?.current()) {
-    // /model（jade/models 提供）当场就能配好，不用重启；没有这条命令时只能改文件
-    const file = `put ANTHROPIC_API_KEY=... (or OPENAI_API_KEY=...) in ${path.join(home, ".env")}, then restart jade`;
-    screen.log(yellow(commands.list().some((c) => c.name === "model") ? `No model is configured yet. Type /model to set one up, or ${file}.` : `No model is configured yet. To set one up, ${file}.`));
-  }
-  else if (!resumed) screen.log(dim("Type / for commands, esc to interrupt."));
+  // 没配模型时怎么配由模型插件自己说（jade/models 在会话打开时提示）
+  if (models?.current() && !resumed) screen.log(dim("Type / for commands, esc to interrupt."));
   ready = true;
   for (const text of [...(args.prompt ? [args.prompt] : []), ...early.splice(0)]) onSubmit(text);
 

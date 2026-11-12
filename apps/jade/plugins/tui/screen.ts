@@ -4,6 +4,7 @@
 
 import { createInterface, type Interface } from "node:readline/promises";
 import { stripVTControlCharacters } from "node:util";
+import type { StatusSegment } from "@uncarved/jade-api";
 
 export interface Choice<T> {
   label: string;
@@ -14,16 +15,15 @@ export interface Choice<T> {
 
 export interface StatusInfo {
   /** 插件用 ctx.status 设置的段落（已经是一行、截断过） */
-  plugins?: { plugin: string; text: string }[];
+  plugins?: { plugin: string; text: string | StatusSegment }[];
   /** 插件用 ctx.panel 设置的、显示在输入框上方的块（可以多行，已经限制过行数） */
   panels?: { plugin: string; text: string }[];
   cwd: string;
   branch?: string;
   model: string;
-  mode: string;
   session?: string;
   /** 上一次请求的上下文用量，limit 是模型的上下文窗口 */
-  context?: { used: number; limit: number; /** 超过这个 token 数会自动压缩 */ compactAt?: number };
+  context?: { used: number; limit: number };
   /** 本会话累计的用量（含子 Agent 和压缩） */
   spent?: { input: number; output: number };
   /** 上一次请求的输入中命中缓存的比例（0–1）；服务不报告缓存用量时为 undefined */
@@ -36,6 +36,17 @@ export interface CommandInfo {
   name: string;
   args?: string;
   about: string;
+  /** 输入的简写（Command.prefix），例如 "!" */
+  prefix?: string;
+  /** 打了简写时输入框上写的说明 */
+  prefixHint?: string;
+}
+
+/** 输入框的一种补全（completions@1） */
+export interface CompletionInfo {
+  trigger: string;
+  label: string;
+  hint?: string;
 }
 
 export interface Screen {
@@ -155,8 +166,12 @@ export function safeScreen(screen: Screen): Screen {
     busy: (label) => screen.busy(opt(label)),
     status: (info) => {
       const out: Partial<StatusInfo> = { ...info };
-      for (const k of ["cwd", "branch", "model", "mode", "session"] as const) if (typeof info[k] === "string") out[k] = s(info[k]);
-      if (info.plugins) out.plugins = info.plugins.map((p) => ({ plugin: p.plugin, text: s(p.text) }));
+      for (const k of ["cwd", "branch", "model", "session"] as const) if (typeof info[k] === "string") out[k] = s(info[k]);
+      if (info.plugins)
+        out.plugins = info.plugins.map((p) => ({
+          plugin: p.plugin,
+          text: typeof p.text === "string" ? s(p.text) : { ...p.text, text: s(p.text.text), ...(p.text.short !== undefined ? { short: s(p.text.short) } : {}) },
+        }));
       if (info.panels) out.panels = info.panels.map((p) => ({ plugin: p.plugin, text: s(p.text) }));
       screen.status(out);
     },

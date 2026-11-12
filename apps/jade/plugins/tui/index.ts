@@ -1,7 +1,7 @@
 // jade/tui：终端界面，默认的前端。提供 frontend@1 和 ui@1；命令、快捷键、显示方式都来自注册表插件。
 
 import { definePlugin } from "@uncarved/jade-api";
-import type { Commands, Compact, Keys, Models, Modes, Renderers, SessionIndex, Steer } from "@uncarved/jade-api/services";
+import type { Commands, Completions, Keys, Models, Renderers, SessionIndex, Steer } from "@uncarved/jade-api/services";
 import { ScreenBridge, tuiFrontend } from "./frontend.ts";
 
 export default definePlugin({
@@ -17,9 +17,8 @@ export default definePlugin({
           commands: ctx.require<Commands>("commands@1"),
           keys: ctx.require<Keys>("keys@1"),
           renderers: ctx.require<Renderers>("renderers@1"),
-          ...optional("modes", ctx.service<Modes>("modes@1")),
           ...optional("models", ctx.service<Models>("models@1")),
-          ...optional("compact", ctx.service<Compact>("compact@1")),
+          ...optional("completions", ctx.service<Completions>("completions@1")),
           ...optional("index", ctx.service<SessionIndex>("sessions@1")),
           ...optional("steer", ctx.service<Steer>("steer@1")),
         },

@@ -5,12 +5,13 @@
 // 文件之后变了也不影响已经发出的消息（提示缓存不失效），恢复会话后也一样。
 // 每条消息的附件单独记一个 key（attachedKey）：derived.recorded 是整值替换，记成一张表的话，
 // 每次有新的 @ 都要把之前附过的全部内容再写一遍，日志按平方增长。
-// 输入框里 @ 的补全不在这里，在 jade/tui。
+// 输入框里 @ 的补全：经 completions@1 交给前端候选（candidates.ts），前端只管排序和插入。
 
 import type { Block, Message } from "uncarved";
 import { definePlugin } from "@uncarved/jade-api";
-import type { Renderers } from "@uncarved/jade-api/services";
+import type { Completions, Renderers } from "@uncarved/jade-api/services";
 import { attachMentions } from "./attach.ts";
+import { mentionCandidates } from "./candidates.ts";
 import { clip, dim, yellow } from "./style.ts";
 
 export interface MentionsState {
@@ -31,6 +32,12 @@ const userText = (m: Message) => (m.role === "user" ? m.content.flatMap((b) => (
 
 export default definePlugin({
   process(ctx) {
+    ctx.service<Completions>("completions@1")?.register({
+      trigger: "@",
+      label: "files",
+      hint: "the file's content is sent with the message",
+      candidates: () => mentionCandidates(ctx.cwd),
+    });
     const renderers = ctx.service<Renderers>("renderers@1");
     renderers?.event({
       event: "attached",

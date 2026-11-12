@@ -756,3 +756,29 @@ describe("retries", () => {
     }
   }, 10_000);
 });
+
+// 没配模型时怎么配由 jade/models 自己说（原来写在 jade/tui 里，换掉这个插件时前端还会提 /model）
+describe("the no-model hint", () => {
+  test("without a model, opening a session says how to set one up, once per process", async () => {
+    const { host, shared } = await setup("");
+    try {
+      await host.sessions.open();
+      await host.sessions.open();
+      const hints = shared.notes.filter((n) => n.includes("No model is configured yet"));
+      expect(hints).toHaveLength(1);
+      expect(hints[0]).toContain("Type /model to set one up");
+    } finally {
+      await host.close();
+    }
+  });
+
+  test("with a model there is no hint", async () => {
+    const { host, shared } = await setup();
+    try {
+      await host.sessions.open();
+      expect(shared.notes.some((n) => n.includes("No model is configured yet"))).toBe(false);
+    } finally {
+      await host.close();
+    }
+  });
+});

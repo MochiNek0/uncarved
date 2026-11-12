@@ -111,7 +111,7 @@ test("the terminal cursor stays on the input line after the window is resized", 
     { isTTY: true, columns: 100, rows: 40 },
   );
   const screen = tuiScreen({
-    status: { cwd: "~/p", model: "m", mode: "ask", session: "s" },
+    status: { cwd: "~/p", model: "m", session: "s" },
     version: "1",
     commands: [],
     handlers: { submit() {}, interrupt() {}, exit() {} },
@@ -157,7 +157,7 @@ function mountVt(cols: number, rows: number) {
     { isTTY: true, columns: cols, rows },
   );
   const screen = tuiScreen({
-    status: { cwd: "~/p", model: "m", mode: "ask", session: "s" },
+    status: { cwd: "~/p", model: "m", session: "s" },
     version: "1",
     commands: [],
     handlers: { submit() {}, interrupt() {}, exit() {} },
@@ -249,7 +249,7 @@ test("the terminal cursor stays visible while the spinner ticks", async () => {
     { isTTY: true, columns: 100, rows: 40 },
   );
   const screen = tuiScreen({
-    status: { cwd: "~/p", model: "m", mode: "ask", session: "s" },
+    status: { cwd: "~/p", model: "m", session: "s" },
     version: "1",
     commands: [],
     handlers: { submit() {}, interrupt() {}, exit() {} },
@@ -280,7 +280,7 @@ test("the terminal cursor sits in an input dialog while it is open", async () =>
     { isTTY: true, columns: 100, rows: 40 },
   );
   const screen = tuiScreen({
-    status: { cwd: "~/p", model: "m", mode: "ask", session: "s" },
+    status: { cwd: "~/p", model: "m", session: "s" },
     version: "1",
     commands: [],
     handlers: { submit() {}, interrupt() {}, exit() {} },

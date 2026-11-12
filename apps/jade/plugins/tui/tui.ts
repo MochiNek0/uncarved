@@ -6,6 +6,7 @@
 
 import { writeSync } from "node:fs";
 import type { DOMElement, Key } from "ink";
+import type { StatusSegment } from "@uncarved/jade-api";
 import {
   Box,
   render,
@@ -32,6 +33,7 @@ import {
   dim,
   type Choice,
   type CommandInfo,
+  type CompletionInfo,
   type Screen,
   type StatusInfo,
 } from "./screen.ts";
@@ -69,11 +71,11 @@ export interface TuiHandlers {
   unqueue?(): boolean;
   /** 空闲时连按两次 Ctrl+C */
   exit(): void;
-  /** 输入 @ 时补全用的路径（目录以 / 结尾）；每次开始输入一个新的 @ 引用时取一次 */
-  files?(): Promise<string[]>;
-  /** Shift+Tab：切换到下一个权限模式 */
-  cycleMode?(): void;
-  /** 输入框有焦点时按下 jade 自己不用的 ctrl+<字母>、alt+<字母或数字>（见 keySpec）；返回 true 表示有插件处理了 */
+  /** 登记了的补全（completions@1）：触发字符、占位提示里的说明、候选菜单下的说明；每次渲染时取 */
+  completions?(): CompletionInfo[];
+  /** 打了触发字符时的候选（像路径一样用 / 分层，目录以 / 结尾）；每次开始输入一段新的补全时取一次 */
+  complete?(trigger: string): Promise<string[]>;
+  /** 输入框有焦点时按下 jade 自己不用的 ctrl+<字母>、alt+<字母或数字>、shift+tab（见 keySpec）；返回 true 表示有插件处理了 */
   key?(spec: string): boolean;
 }
 
@@ -1133,7 +1135,7 @@ function App({
       h(
         Box,
         { flexDirection: "column", flexGrow: 1, overflowY: "hidden" },
-        h(Header, { status: state.status, version, compact, bot }),
+        h(Header, { status: state.status, version, compact, bot, completions: handlers.completions?.() ?? [] }),
         h(
           Box,
           {
@@ -1217,6 +1219,7 @@ function Bot({ pixels }: { pixels: (string | undefined)[][] }) {
 }
 
 function Header({
+  completions,
   status,
   version,
   compact,
@@ -1228,6 +1231,7 @@ function Header({
   bot?: (string | undefined)[][];
   /** 终端很矮时只占一行，把高度留给对话和输入框 */
   compact: boolean;
+  completions: CompletionInfo[];
 }) {
   // 模型 · 目录 (分支)
   const where = [
@@ -1258,7 +1262,7 @@ function Header({
         status.session ? h(Text, { dimColor: true }, `  ·  session ${status.session}`) : null,
       ),
       h(Text, { wrap: "truncate-end" }, ...where),
-      h(Text, { dimColor: true, wrap: "truncate-end" }, "/help for commands · @ to attach files"),
+      h(Text, { dimColor: true, wrap: "truncate-end" }, ["/help for commands", ...completions.map((c) => `${c.trigger} ${c.label}`)].join(" · ")),
     ),
   );
 }
@@ -1302,6 +1306,9 @@ interface Segment {
   dim?: boolean;
 }
 
+/** 插件段落的语义颜色怎么画 */
+const TONE: Record<NonNullable<StatusSegment["tone"]>, string> = { ok: "green", warn: "yellow", error: "red", accent: "magenta" };
+
 /** 在 width 列里放下尽量多的内容（保持原来的顺序） */
 export function fitSegments(segments: Segment[], width: number): Segment[] {
   const kept = segments.map((s) => ({ ...s }));
@@ -1326,32 +1333,30 @@ export function fitSegments(segments: Segment[], width: number): Segment[] {
 function StatusBar({ status, width }: { status: StatusInfo; width: number }) {
   const ctx = status.context;
   const pct = ctx ? Math.round((ctx.used / ctx.limit) * 100) : 0;
-  /** 离自动压缩还有多远：到阈值的 85% 起变黄 */
-  const nearCompact = ctx?.compactAt ? ctx.used >= ctx.compactAt * 0.85 : pct >= 80;
-  const modeColor =
-    status.mode === "yolo"
-      ? "red"
-      : status.mode === "auto"
-        ? "yellow"
-        : status.mode === "plan"
-          ? "magenta"
-          : "green";
+  const nearFull = pct >= 80;
   const speed = status.speed;
+  // 插件的段落：要一直留着的（keep，例如 jade/modes 的当前模式）放在最前，窄的时候换成短写法；其余的比提示晚、比缓存早去掉
+  const plugin = (p: { text: string | StatusSegment }, keep: boolean): Segment => {
+    const seg = typeof p.text === "string" ? { text: p.text } : p.text;
+    return {
+      text: seg.text,
+      ...(seg.short !== undefined ? { short: seg.short, shortAt: keep ? 6 : 7.6 } : {}),
+      ...(keep ? {} : { dropAt: 7.5 }),
+      ...(seg.tone ? { color: TONE[seg.tone] } : { dim: true }),
+    };
+  };
+  const kept = (status.plugins ?? []).filter((p) => typeof p.text !== "string" && p.text.keep);
+  const others = (status.plugins ?? []).filter((p) => !kept.includes(p));
   // 窄的时候依次：提示变短、去掉提示、用量变短、去掉缓存、模式变短、去掉用量、上下文变短、去掉速度
   const segments: Segment[] = [
-    {
-      text: `${status.mode} (shift+tab)`,
-      short: status.mode,
-      shortAt: 6,
-      color: modeColor,
-    },
+    ...kept.map((p) => plugin(p, true)),
     ctx
       ? {
-          text: `ctx ${tokens(ctx.used)}/${tokens(ctx.limit)} (${pct}%)${ctx.compactAt ? `, compacts at ${tokens(ctx.compactAt)}` : ""}`,
+          text: `ctx ${tokens(ctx.used)}/${tokens(ctx.limit)} (${pct}%)`,
           short: `ctx ${pct}%`,
           shortAt: 4,
-          color: nearCompact ? "yellow" : undefined,
-          dim: !nearCompact,
+          color: nearFull ? "yellow" : undefined,
+          dim: !nearFull,
         }
       : { text: "ctx —", dim: true },
     ...(speed
@@ -1377,8 +1382,7 @@ function StatusBar({ status, width }: { status: StatusInfo; width: number }) {
           },
         ]
       : []),
-    // 插件的段落：比提示晚、比缓存早去掉
-    ...(status.plugins ?? []).map((p) => ({ text: p.text, dropAt: 7.5, dim: true })),
+    ...others.map((p) => plugin(p, false)),
     {
       text: "PgUp/PgDn scroll · click ▸ or ctrl+o to expand · drag to select and copy",
       short: "ctrl+o to expand",
@@ -1667,6 +1671,8 @@ function Prompt({
   >(undefined);
 
   const usageOf = (c: CommandInfo) => `/${c.name}${c.args ? ` ${c.args}` : ""}`;
+  const completions = handlers.completions?.() ?? [];
+  const triggers = completions.map((c) => c.trigger);
   const column = Math.max(...commands().map((c) => usageOf(c).length)) + 2;
 
   /** 由最新的输入算出补全菜单和搜索结果；渲染和按键处理都用它 */
@@ -1687,7 +1693,7 @@ function Prompt({
     const pick = matches[Math.min(selected, matches.length - 1)];
     // @ 引用：光标处正在输入的路径和补全候选
     const mention =
-      naming || recalled ? undefined : mentionAt(state.value, state.cursor);
+      naming || recalled ? undefined : mentionAt(state.value, state.cursor, triggers);
     let found: string[] = [];
     if (mention) {
       const paths = getPaths();
@@ -1726,12 +1732,13 @@ function Prompt({
     derive();
   const notice = getNotice();
 
-  const mentioning = mention !== undefined;
-  // 每次开始输入一个新的 @ 引用时重新取一次：文件可能已经变了
+  const mentioning = mention?.trigger;
+  // 每次开始输入一段新的补全时重新取一次：候选可能已经变了（例如文件）
   useEffect(() => {
-    if (!mentioning || !handlers.files) return;
+    if (mentioning === undefined || !handlers.complete) return;
     let live = true;
-    handlers.files().then(
+    setPaths([]);
+    handlers.complete(mentioning).then(
       (p) => void (live && setPaths(p)),
       () => {},
     );
@@ -1739,6 +1746,7 @@ function Prompt({
       live = false;
     };
   }, [mentioning]);
+  const completion = completions.find((c) => c.trigger === mentioning);
   // 结果多时只显示选中项附近的几条
   const first = around(hit, results.length, menuRows);
   const firstMatch = around(Math.max(0, matches.indexOf(pick!)), matches.length, menuRows);
@@ -1786,7 +1794,7 @@ function Prompt({
   /** 用选中的路径替换正在输入的 @ 引用；目录不加空格，接着补全里面的文件 */
   const complete = (p: string) => {
     const { state, mention } = derive();
-    const text = mentionText(p) + (p.endsWith("/") ? "" : " ");
+    const text = mentionText(mention!.trigger, p) + (p.endsWith("/") ? "" : " ");
     set({
       value:
         state.value.slice(0, mention!.start) +
@@ -1957,7 +1965,8 @@ function Prompt({
         browsing.current = -1;
         return set({ value: hint!, cursor: hint!.length });
       }
-      if (key.tab && key.shift) return handlers.cycleMode?.();
+      // shift+tab 交给插件的快捷键（例如 jade/modes 切换模式）
+      if (key.tab && key.shift) return void handlers.key?.("shift+tab");
       if (key.tab) {
         const { pick, file } = derive();
         if (pick)
@@ -2012,8 +2021,17 @@ function Prompt({
       ? [Math.min(drag.anchor, drag.focus), Math.max(drag.anchor, drag.focus)]
       : undefined;
 
-  // ! 开头：这一行是用户自己执行的 shell 命令（/sh），边框换个颜色、上边框的右边写一行说明
-  const bang = !search && state.value.startsWith("!");
+  // 以命令的简写开头（例如 jade/shell 的 !）：这一行是那条命令，边框换个颜色、上边框的右边写一行说明
+  const prefixed = search ? undefined : commands().find((c) => c.prefix !== undefined && state.value.startsWith(c.prefix));
+  const bang = prefixed !== undefined;
+  const prefixLabel = (() => {
+    if (!prefixed) return "";
+    const hint = prefixed.prefixHint ?? `/${prefixed.name}`;
+    const head = hint.split(" · ")[0]!;
+    // 窄的时候只留第一句；运行中排队，说明这一点
+    return columns >= 70 ? (busy ? `${head} · runs after this turn · esc stops it` : `${hint} · esc stops it`) : head;
+  })();
+  const placeholder = ["Message jade", "/ commands", ...completions.map((c) => `${c.trigger} ${c.label}`)].join(" · ");
 
   // 对话框打开时隐藏但不卸载，输入到一半的内容和历史都保留
   return h(
@@ -2042,8 +2060,8 @@ function Prompt({
                 : busy
                   ? "Type to queue a message · esc to interrupt"
                   : columns >= 70
-                    ? "Message jade · / commands · @ files · ↑ or ctrl+r for history"
-                    : "Message jade · / commands · @ files",
+                    ? `${placeholder} · ↑ or ctrl+r for history`
+                    : placeholder,
             active,
             maxRows: inputRows,
             place,
@@ -2108,8 +2126,8 @@ function Prompt({
               h(Hint, {
                 width: hintWidth,
                 variants: [
-                  " ↑↓ select · enter/tab insert the path · the file's content is sent with the message",
-                  " ↑↓ select · enter/tab insert the path",
+                  ...(completion?.hint ? [` ↑↓ select · enter/tab insert · ${completion.hint}`] : []),
+                  " ↑↓ select · enter/tab insert",
                   " ↑↓ · enter insert",
                 ],
               }),
@@ -2118,14 +2136,14 @@ function Prompt({
             ? h(Text, { color: "yellow" }, ` ${notice}`)
             : null,
     // 压在输入框上边框的右边，不占行，出现和消失时下面的内容不跳
-    // ! 开头时同一个位置写这一行是什么（刚复制的提示优先）
+    // 以命令的简写开头时同一个位置写这一行是什么（刚复制的提示优先）
     flash
       ? h(Box, { position: "absolute", top: 0, right: 2 }, h(Text, { color: "green" }, ` ${flash} `))
       : bang
         ? h(
             Box,
             { position: "absolute", top: 0, right: 2 },
-            h(Text, { color: "magenta" }, columns >= 70 ? (busy ? " shell command · runs after this turn · esc stops it " : " shell command · you run it, not the agent · esc stops it ") : " shell command "),
+            h(Text, { color: "magenta" }, ` ${prefixLabel} `),
           )
         : null,
   );

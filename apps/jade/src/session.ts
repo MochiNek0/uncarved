@@ -35,6 +35,7 @@ import {
   type SessionManager,
   type SessionTool,
   type SessionUI,
+  type StatusSegment,
   type ToolMeta,
   type UI,
 } from "./api.ts";
@@ -400,7 +401,7 @@ export class Sessions implements SessionManager {
       secrets: scopedSecrets(host.secrets(id), () => scope.closed, id),
       ...(sessionUI
         ? {
-            status: (text: string | undefined) => uiCall(() => sessionUI.status(text === undefined ? undefined : String(text))),
+            status: (text: string | StatusSegment | undefined) => uiCall(() => sessionUI.status(statusSegment(text))),
             ...(sessionUI.panel ? { panel: (text: string | undefined) => uiCall(() => sessionUI.panel!(text === undefined ? undefined : String(text))) } : {}),
             // 项目层插件拿不到输入框（第 7 节）：克隆的仓库不能替用户写字
             ...(sessionUI.draft && layer !== "project" ? { input: sessionUI.draft } : {}),
@@ -575,6 +576,18 @@ function compatProblem(id: string, version: string, hooks: (LocalHookSpec | Remo
   } catch (e) {
     return e instanceof Error ? e.message : String(e);
   }
+}
+
+/** 状态栏的一段只留认得的字段：文字都换成字符串，不认得的 tone 去掉 */
+function statusSegment(s: string | StatusSegment | undefined): string | StatusSegment | undefined {
+  if (s === undefined || typeof s !== "object" || s === null) return s === undefined ? undefined : String(s);
+  const tones = ["ok", "warn", "error", "accent"];
+  return {
+    text: String(s.text ?? ""),
+    ...(s.short !== undefined ? { short: String(s.short) } : {}),
+    ...(tones.includes(s.tone as string) ? { tone: s.tone } : {}),
+    ...(s.keep === true ? { keep: true } : {}),
+  };
 }
 
 /** 工具的 meta 只留认得的字段（字段名都是字符串），写错了抛错：插件加入会话失败，比别的插件悄悄认不出这个工具好查 */

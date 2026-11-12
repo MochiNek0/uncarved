@@ -4,7 +4,7 @@
 import type { LogEvent } from "uncarved";
 import { definePlugin, type UI } from "@uncarved/jade-api";
 import type { Commands, Compact, Models, Renderers } from "@uncarved/jade-api/services";
-import { compactor, compactThreshold, isContextOverflow, parseTokens } from "./compact.ts";
+import { compactor, compactThreshold, estimateTokens, isContextOverflow, parseTokens } from "./compact.ts";
 import { dim } from "./style.ts";
 
 /** 认不出窗口时的阈值 */
@@ -64,6 +64,16 @@ export default definePlugin({
     const threshold = thresholdFor(ctx.config, models);
     const c = compactor({ complete: (req, o) => models.complete(req, o), threshold, keepTokens, id: ctx.plugin, writes: (t) => ctx.session.tool(t)?.meta?.writes });
     const id = ctx.session.id;
+    /** 状态栏上的一段：多少 token 时自动压缩，投影离它不远（85%）时变黄 */
+    const show = (projected?: number) => {
+      const at = threshold();
+      if (!at) return ctx.status?.(undefined);
+      ctx.status?.({ text: `compacts at ${tokens(at)}`, ...(projected !== undefined && projected >= at * 0.85 ? { tone: "warn" as const } : {}) });
+    };
+    show();
+    // 换了模型，窗口和阈值跟着变
+    const offModel = models.subscribe?.(() => show());
+    if (offModel) void ctx.effect(() => offModel);
 
     ctx.kernel.hook({
       kind: "transform",
@@ -71,13 +81,15 @@ export default definePlugin({
       // 排在其他改投影的插件（例如 jade/mentions 附上引用的文件）之后：估算的是最终的投影
       order: 100,
       timeoutMs: SUMMARY_TIMEOUT_MS,
-      fn: (messages, hook) => {
+      fn: async (messages, hook) => {
         const focus = requested.get(id);
         if (focus !== undefined) {
           requested.delete(id);
           c.request(focus || undefined);
         }
-        return c.project(messages, hook);
+        const out = await c.project(messages, hook);
+        show(estimateTokens(out));
+        return out;
       },
     });
 
@@ -110,3 +122,6 @@ export default definePlugin({
   },
 });
 
+/** 状态栏上的 token 数：12.3k、160k、1.2M */
+const tokens = (n: number) =>
+  n >= 1_000_000 ? `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M` : n >= 1000 ? `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k` : String(n);

@@ -194,7 +194,7 @@ pi 后来才补上"agent 停下来之后再执行"和延迟 reload。jade 从一
 - 插件想发起新一轮：`session.send(input)`。如果当前正在跑，排到本轮之后。想停下正在跑的这一轮（例如用户在聊天机器人里喊停）：`session.abort(reason?)`。两者都只有用户层插件能用；项目层插件不能替用户说话、不能替用户喊停（第 7 节）。
 - 看会话：`session.state()` 是会话现在的状态（阶段、消息、还没做完的工具调用、derived）的一份拷贝，`session.subscribe(fn)` 订阅运行时的通知（事件、增量、工具进度、停下来等人工审批的 `awaiting`），和前端拿到的 `Session.state`、`Session.subscribe` 是同一份东西（2026-11-10 加：原来只有前端有）。只读，项目层插件也能用。`session()` 执行期间可以订阅，但还读不到状态（Runtime 在全部插件加入之后才建）。
 - 认工具：`session.tool(name)`（前端是 `Session.tool`）返回会话里这个工具的声明和注册时给的 `meta`。`meta` 说明工具做什么，值是输入里的字段名：`{ writes: "path" }` 写一个文件，`{ shell: "command" }` 执行一条 shell 命令（jade/fs 的 write_file、edit_file、multi_edit 和 jade/shell 的 bash 都这样声明）。/undo、jade/checks、jade/compact、jade/approval（命令规则、审查）、jade/repeats 按 `meta` 判断，不认工具名，所以换掉 jade/fs、jade/shell 不会让它们悄悄失效（2026-11-12 加）。`meta` 写错（不是对象、字段名不是字符串）时这个插件加入不了会话。只描述现在有人用的两种；按名字认的还剩几处，是本来就针对那个工具的：jade/repeats 对 `edit_file` 来回改同一处、`read_file` 读回刚写的文件的提醒，jade/approval 对 `glob` 的 pattern 越界检查，jade/compact 和 jade/todo 读 `todo_write`，jade/prompts 按工具在不在决定写哪几条提示。
-- 会话里的界面：`ctx.status(text)` 在状态栏上占一段，`ctx.panel(text)` 在输入框上方占一块（可以多行），`ctx.input` 改输入框（读、插入、整段替换、灰色提示）。两者来自前端 `ui@1.session`（3.4），每个插件一份，作用域关闭时自动收掉；前端不提供时都是 `undefined`。
+- 会话里的界面：`ctx.status(text)` 在状态栏上占一段（也可以给 `{ text, short?, tone?, keep? }`：`tone` 是语义颜色 ok/warn/error/accent，`keep` 的段落窄的时候也不去掉、放不下换成 `short`；jade/modes 的当前模式就是这样），`ctx.panel(text)` 在输入框上方占一块（可以多行），`ctx.input` 改输入框（读、插入、整段替换、灰色提示）。两者来自前端 `ui@1.session`（3.4），每个插件一份，作用域关闭时自动收掉；前端不提供时都是 `undefined`。
 
 ## 5. 膜与故障隔离
 
@@ -299,10 +299,11 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 
 | 插件 | 提供 | 依赖 | 来自旧 jade |
 |---|---|---|---|
-| `jade/tui` | `frontend@1`（默认）、`ui@1`（含 `session`：状态栏段落、输入框）；启动参数 `--resume <id>`、`-c/--continue`；`@` 路径补全 | `commands@1`、`keys@1`、`renderers@1`；可选 `modes@1`、`models@1` | `ui/*`、`main.ts` 的界面部分（`frontend.ts`）。`tui@1`（local）等第一个要扩展界面的插件出现时再做 |
+| `jade/tui` | `frontend@1`（默认）、`ui@1`（含 `session`：状态栏段落、输入框）；启动参数 `--resume <id>`、`-c/--continue`；输入框里的补全（候选来自 `completions@1`）和命令简写（`Command.prefix`）。不认识具体功能：模式、压缩阈值是 jade/modes、jade/compact 自己的状态栏段落，没配模型的提示由 jade/models 给 | `commands@1`、`keys@1`、`renderers@1`；可选 `models@1`、`completions@1`、`sessions@1`、`steer@1` | `ui/*`、`main.ts` 的界面部分（`frontend.ts`）。`tui@1`（local）等第一个要扩展界面的插件出现时再做 |
 | `jade/print` | `frontend@1`（`-p`）、`ui@1` | — | `-p` 模式 |
-| `jade/commands` | `commands@1`：`register`、`get`、`list`。只登记不执行，前端带着 `{ signal, ui, sessions, print }` 调用 `run` | — | 插件命令（`PluginCommand`）。自定义命令（Markdown 文件）以后由单独的插件注册进来 |
+| `jade/commands` | `commands@1`：`register`、`get`、`list`、`byPrefix`。只登记不执行，前端带着 `{ signal, ui, sessions, print }` 调用 `run`。命令可以带一个字符的简写 `prefix`（jade/shell 的 `/sh` 是 `!`）和输入框里的说明 `prefixHint`；简写被占了时命令照常注册、没有简写 | — | 插件命令（`PluginCommand`）。自定义命令（Markdown 文件）以后由单独的插件注册进来 |
 | `jade/keys` | `keys@1`：`register`、`get`、`list`；`shift+tab` 也可以注册 | — | 快捷键 |
+| `jade/completions` | `completions@1`：`register`、`list`。输入框补全的注册表：触发字符、占位提示里的说明、候选菜单下的说明、候选（像路径一样用 / 分层）。前端只管列、排序、插入 | — | 原来写死在 jade/tui 里的 `@` 补全（2026-11-12 拆出） |
 | `jade/renderers` | `renderers@1`：`tool`、`event`、`forTool`、`forEvent` | — | `ToolRenderer`、`EventRenderer`。`jade/fs`、`jade/shell` 为自己的工具登记，`jade/approval` 用工具的 `preview` 作审批对话框的内容 |
 | `jade/models` | `provider@1`、`models@1`（`current`、`complete`（可选 `model`：用 `/model` 保存过的某个模型和它的设置，或者当前服务上的另一个模型（用服务的默认设置），不切换当前模型）、`list`、`saved`（`/model` 保存过的模型名）、`subscribe`）；`/model`：列出全部模型，选中一个出子菜单（切换到它、配置它的设置、删掉它；当前的模型只能配置；openai-compat 模型的设置里还有它自己的额外请求参数 `OPENAI_COMPAT_EXTRA_BODY`），不用先切到它；加一个模型；用过的模型记在 `$JADE_HOME/models.json` | 可选 `ui@1`、`commands@1` | `provider.ts`、`configure.ts` |
 | `jade/approval` | `approval@1`（`mode`、`setMode`、`allowRead`：登记不用问就能读的目录；`allowWrite`：登记和工作目录同样对待的目录；`addApprover`：登记审批渠道（例如聊天机器人），要问时问题同时交给终端和渠道，先回答的算数、其余的经 signal 中止，渠道不回答或出错不算拒绝，有渠道时 `-p` 也会问；这三项项目层插件都不能用）、gate；auto 模式下判断不了的调用先由模型审查（`review.ts`） | `ui@1`、`models@1`（都可选：没有 `ui@1` 时，要问的调用一律拒绝；没有 `models@1` 或 `review: false` 时不审查） | `plugins/policy.ts`、`plugins/review.ts` |
@@ -322,7 +323,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 | `jade/scratch` | 每个会话一个临时目录（系统临时目录下的 `jade-scratch/<会话 id>`，恢复会话时还是同一个，不主动删除），经 `prompts@1` 告诉模型临时文件放这里，经 `approval@1.allowWrite` 和工作目录同样对待 | 可选 `approval@1`、`prompts@1` | 新功能，参考 Claude Code 的 scratchpad（`test/scratch.test.ts`） |
 | `jade/checks` | 改文件后在 `context.project` 里跑项目检查、`/checks`；命令第一次运行前确认 | `shell@1`（运行检查）；可选 `ui@1`、`approval@1`、`renderers@1`、`commands@1` | `plugins/checks.ts` |
 | `jade/memory`、`jade/undo` | `memory` 工具和 `/memory`；`/undo`（`tool.before`/`tool.after` 记快照）；用户在命令里做的事经 `prompts@1.note` 告诉模型 | 可选 | `memory.ts`、`tools/checkpoint.ts` |
-| `jade/mentions` | 在 `context.project` 里把 `@` 引用的文件附到那条用户消息上 | — | `mentions.ts`。附上的内容不算 `read_file` 读过 |
+| `jade/mentions` | 在 `context.project` 里把 `@` 引用的文件附到那条用户消息上；经 `completions@1` 给输入框 `@` 补全的候选（工作目录里的文件，git 仓库里只看版本控制的） | 可选 `renderers@1`、`completions@1` | `mentions.ts`。附上的内容不算 `read_file` 读过 |
 | `jade/continue`、`jade/repeats`、`jade/budget` | 截断后续写（`afterTurn`）；重复调用；每轮步数上限 | — | `plugins/turns.ts`、`repeats.ts`、`budget.ts` |
 | `jade/suggest` | 一轮正常结束后预测用户的下一条消息，经 `ctx.input.hint` 灰色显示在输入框里，Tab 或 → 接受；下一次请求模型时作废。默认关着（`enabled`），`model` 选 `/model` 保存过的模型或当前服务提供的模型（不用先保存），不设时用会话的模型。`/suggest on|off`、`/suggest model [name]`（不带名字时弹出选择，列出保存过的和服务提供的模型）马上生效，记在 `$JADE_HOME/state/suggest.json`，盖过 `config.json` | `models@1`；可选 `ui@1`、`commands@1` | 旧 jade 的 `examples/plugins/suggest`；提示词、对话的整理和截取（只算用户自己打的字、工具调用只留名字、从最新的往前取 8000 字）、回复的清理（`NONE`、前缀和引号）、第一行完整就停参考 dsh-ghost-prompt（`test/suggest.test.ts`）。服务和密钥不再由插件自己存 |
 | `jade/update` | 经核心的 `update@1`：启动时查 npm 上有没有更新的 jade（每天最多一次，缓存在 `$JADE_HOME/update-check.json`），有就在后台升级、下次启动生效；配置 `auto: false` 或 `JADE_AUTO_UPDATE=off` 时只提示，`JADE_UPDATE_CHECK=off` 不查。开发版和不能提问的前端（`-p`）既不提示也不升级 | `update@1`；可选 `ui@1` | `update.ts` 的 `checkForUpdate`（`test/update.test.ts`） |

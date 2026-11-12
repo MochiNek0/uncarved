@@ -19,6 +19,13 @@ export interface Command {
    * 这种命令返回 { prompt } 无效
    */
   instant?: boolean;
+  /**
+   * 输入的简写：以这个字符开头的输入当作这条命令，例如 jade/shell 的 /sh 用 "!"，`!git status` 就是 `/sh git status`。
+   * 一个不是字母、数字、空白、"/" 的字符；已经被别的命令用了时这条命令照常注册，只是没有简写（并报告）
+   */
+  prefix?: string;
+  /** 输入框里打了简写时显示的说明，例如 "shell command · you run it, not the agent" */
+  prefixHint?: string;
   /** 字符串：显示给用户；{ prompt }：作为用户消息发给模型；不返回：什么也不做 */
   run(args: string, ctx: CommandContext): CommandResult | Promise<CommandResult>;
 }
@@ -53,7 +60,32 @@ export interface Commands {
   /** 按名字找（不分大小写） */
   get(name: string): CommandEntry | undefined;
   /** 全部命令，按名字排序 */
-  list(): { name: string; args?: string; description?: string; instant?: boolean; plugin: string }[];
+  list(): { name: string; args?: string; description?: string; instant?: boolean; prefix?: string; prefixHint?: string; plugin: string }[];
+  /** 用这个简写字符的命令 */
+  byPrefix(prefix: string): CommandEntry | undefined;
+}
+
+// ---------- completions@1（jade/completions） ----------
+
+/**
+ * 输入框里的补全：打了触发字符（例如 "@"）之后列出候选，选中的插进输入框。
+ * 前端只管列、排序和插入；候选是什么、发送时拿它做什么归注册的插件（例如 jade/mentions 发送时附上文件内容）
+ */
+export interface Completion {
+  /** 一个字符，在行首或空白之后打出来时开始补全 */
+  trigger: string;
+  /** 输入框的占位提示里怎么说，例如 "files"（显示成 "@ files"） */
+  label: string;
+  /** 候选菜单下面的说明，例如 "the file's content is sent with the message" */
+  hint?: string;
+  /** 候选，像路径一样用 / 分层，目录以 / 结尾；每次开始输入一个新的触发字符时取一次 */
+  candidates(): Promise<string[]>;
+}
+
+export interface Completions {
+  /** 登记一种补全，返回撤销函数。触发字符不是一个字符时抛错；已经被别的插件用了时跳过并报告（同 Commands.register） */
+  register(completion: Completion): () => void;
+  list(): { completion: Completion; plugin: string }[];
 }
 
 // ---------- keys@1（jade/keys） ----------

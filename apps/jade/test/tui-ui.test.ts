@@ -141,15 +141,15 @@ describe("terminal UI", () => {
       }),
       { isTTY: true, columns: 100, rows: 40 },
     );
-    const calls = { submit: [] as string[], interrupt: 0, exit: 0, cycle: 0, keys: [] as string[] };
+    const calls = { submit: [] as string[], interrupt: 0, exit: 0, keys: [] as string[] };
     const handlers: TuiHandlers = {
       submit: (t) => void calls.submit.push(t),
       interrupt: () => void calls.interrupt++,
       exit: () => void calls.exit++,
-      cycleMode: () => void calls.cycle++,
-      // 只有 ctrl+t、alt+v 有插件处理
-      key: (spec) => (spec === "ctrl+t" || spec === "alt+v") && calls.keys.push(spec) > 0,
-      files: async () => [
+      // 只有 ctrl+t、alt+v、shift+tab 有插件处理
+      key: (spec) => (spec === "ctrl+t" || spec === "alt+v" || spec === "shift+tab") && calls.keys.push(spec) > 0,
+      completions: () => [{ trigger: "@", label: "files", hint: "the file's content is sent with the message" }],
+      complete: async () => [
         "src/",
         "src/main.ts",
         "src/ui/",
@@ -162,8 +162,9 @@ describe("terminal UI", () => {
         cwd: "~/proj",
         branch: "main",
         model: "test-model",
-        mode: "ask",
         session: "s-123",
+        // jade/modes 的段落
+        plugins: [{ plugin: "jade/modes", text: { text: "ask (shift+tab)", short: "ask", tone: "ok", keep: true } }],
       },
       version: "9.9.9",
       commands: commands ?? [
@@ -286,7 +287,7 @@ describe("terminal UI", () => {
     screen.draft!.hint("again");
     await sleep(80);
     await type("\x1b[Z");
-    expect(calls.cycle).toBe(1);
+    expect(calls.keys).toEqual(["shift+tab"]);
     expect(screen.draft!.text()).toBe("");
 
     // 换会话时去掉
@@ -541,18 +542,22 @@ describe("terminal UI", () => {
     expect(calls.exit).toBe(1);
   });
 
-  test("shift+tab cycles the mode; the status bar shows context, compaction and session usage", async () => {
+  test("shift+tab goes to the plugin key; the status bar shows plugin segments, context and session usage", async () => {
     const { screen, calls, type, output } = setup();
     await type("ab");
     await type("\x1b[Z");
-    expect(calls.cycle).toBe(1);
+    expect(calls.keys).toEqual(["shift+tab"]);
     screen.status({
-      mode: "plan",
-      context: { used: 50_000, limit: 200_000, compactAt: 136_000 },
+      plugins: [
+        { plugin: "jade/modes", text: { text: "plan (shift+tab)", short: "plan", tone: "accent", keep: true } },
+        { plugin: "jade/compact", text: { text: "compacts at 136k" } },
+      ],
+      context: { used: 50_000, limit: 200_000 },
       spent: { input: 1_250_000, output: 40_000 },
     });
     await until(output, "plan (shift+tab)");
-    expect(output()).toContain("ctx 50k/200k (25%), compacts at 136k");
+    expect(output()).toContain("ctx 50k/200k (25%)");
+    expect(output()).toContain("compacts at 136k");
     expect(output()).toContain("session 1.3M in / 40k out");
     // shift+tab 不改输入框
     await type("\r");

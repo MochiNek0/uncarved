@@ -41,6 +41,8 @@ export default definePlugin({
       name: "sh",
       args: "<command>",
       description: "run a shell command yourself (short form: !<command>); then the agent continues with its output",
+      prefix: "!",
+      prefixHint: "shell command · you run it, not the agent",
       // 不是 instant：和消息一样排队，前端才把它当作正在做的事（esc 能停掉它）
       async run(args, { sessions: manager, signal, print, progress }) {
         const command = args.trim();

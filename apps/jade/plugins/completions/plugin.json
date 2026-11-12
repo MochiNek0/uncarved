@@ -1,0 +1,7 @@
+{
+  "id": "jade/completions",
+  "version": "0.1.0",
+  "api": "^1",
+  "entry": "./index.ts",
+  "provides": ["completions@1"]
+}

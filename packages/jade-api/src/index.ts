@@ -71,6 +71,18 @@ export interface ToolMeta {
   shell?: string;
 }
 
+/**
+ * 状态栏上插件的一段。只给文字时是普通的一段：灰色，窄的时候比较早去掉。
+ * tone：语义上的颜色，前端自己决定怎么画（ok 绿、warn 黄、error 红、accent 醒目的另一种颜色）；
+ * keep：窄的时候也不去掉（例如当前模式），这时放不下就换成 short
+ */
+export interface StatusSegment {
+  text: string;
+  short?: string;
+  tone?: "ok" | "warn" | "error" | "accent";
+  keep?: boolean;
+}
+
 /** 会话里的一个工具：内核看到的信息，加上注册时给的 meta */
 export type SessionTool = ToolInfo & { meta?: ToolMeta };
 
@@ -159,7 +171,7 @@ export interface SessionContext extends ScopeContext {
    * 状态栏上这个插件的一段（一行）；undefined 去掉。前端没有状态栏时是 undefined。
    * 状态栏同时显示几个插件的段落时按调用先后排列（4.3）
    */
-  readonly status?: (text: string | undefined) => void;
+  readonly status?: (text: string | StatusSegment | undefined) => void;
   /**
    * 输入框上方这个插件的一块，可以多行（例如任务清单），一直显示到换掉或去掉；undefined 去掉。
    * 前端没有这个位置时是 undefined。几个插件都有时按调用先后排列
@@ -366,7 +378,7 @@ export interface SessionRequest {
 /** 一个插件在一个会话里的界面；每个插件一份，所以状态栏的段落不用 key */
 export interface SessionUI {
   /** 状态栏上这个插件的一段（一行）；undefined 去掉 */
-  status(text: string | undefined): void;
+  status(text: string | StatusSegment | undefined): void;
   /** 输入框上方这个插件的一块（可以多行）；undefined 去掉。没有这个位置的前端没有 */
   panel?(text: string | undefined): void;
   /** 输入框；没有输入框的前端（例如 -p）没有 */

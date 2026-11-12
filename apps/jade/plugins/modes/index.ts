@@ -199,8 +199,18 @@ export default definePlugin({
         note = undefined;
       }
     };
+    // 状态栏上的当前模式：窄的时候也留着（去掉 shift+tab 提示），颜色说明它放得多宽
+    const show = () => {
+      const mode = approval.mode();
+      const tone = mode === "yolo" ? "error" : mode === "auto" ? "warn" : mode === "plan" ? "accent" : "ok";
+      ctx.status?.({ text: `${mode} (shift+tab)`, short: mode, tone, keep: true });
+    };
     sync();
-    const onChange = () => sync();
+    show();
+    const onChange = () => {
+      sync();
+      show();
+    };
     listeners.add(onChange);
     ctx.effect(() => () => void listeners.delete(onChange));
   },
