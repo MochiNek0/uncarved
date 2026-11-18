@@ -115,7 +115,7 @@
 | `ui@1`（可选） | 前端起来之后把要告诉用户的事交给 `notify`；每个插件加入会话时调用 `session` 取它的状态栏段落、输入框上方的一块和输入框。没有时消息打到 stderr，插件的 `ctx.status`、`ctx.panel`、`ctx.input` 是 `undefined` | 前端插件 |
 | `approval@1`（可选） | 不调用它，只看它的提供者是谁：这个插件没有在会话里注册 `tool.gate` 时兜底关卡生效（第 7 节） | `jade/approval` |
 
-由核心提供、给插件用的服务只有 `jade@1`、`cli@1`、`sources@1`、`update@1`、`trust@1` 五个。`jade@1`：核心知道自己加载了哪些插件，第三方插件拿不到这份信息，而"哪个插件坏了、为什么"是用户该看到的；它只读，没有副作用。`cli@1`：命令行由核心解析，插件要加 `jade <子命令>` 只能经核心；核心只查名字、转交参数，不认识子命令做什么（`jade skills`、`jade mcp` 分别来自 `jade/skills`、`jade/mcp`）。核心自己的词（`plugins`、`update`、`help`，以及 `jade plugins` 的子命令名）不能注册：它们在宿主启动之前就被核心处理了。和救援 CLI 不同，插件的子命令要启动宿主，插件坏了时不保证能用。`sources@1`、`update@1`：救援 CLI（`jade plugins add`、`jade update`）必须在不启动插件的情况下工作，所以这两段代码只能在核心里；插件要做同样的事（装 skill、启动时查新版本）时经服务用同一份，而不是 import 核心的模块（3.5），这样第三方插件也拿得到。`trust@1`：要用户确认才执行的东西（检查命令、项目里的 MCP 服务）原来是两个插件各复制一份信任文件的代码；记录按插件分开，一个插件查不到、也伪造不了另一个插件的确认（2026-11-12 加；以前在 `$JADE_HOME/trust.jsonl` 里确认过的要重新确认一次）。
+由核心提供、给插件用的服务只有 `jade@1`、`cli@1`、`sources@1`、`update@1`、`trust@1` 五个。`jade@1`：核心知道自己加载了哪些插件，第三方插件拿不到这份信息，而"哪个插件坏了、为什么"是用户该看到的；它只读，没有副作用。`cli@1`：命令行由核心解析，插件要加 `jade <子命令>` 只能经核心；核心只查名字、转交参数，不认识子命令做什么（`jade skills`、`jade mcp` 分别来自 `jade/skills`、`jade/mcp`）。核心自己的词（`plugins`、`update`、`help`，以及 `jade plugins` 的子命令名）不能注册：它们在宿主启动之前就被核心处理了。和救援 CLI 不同，插件的子命令要启动宿主，插件坏了时不保证能用。`sources@1`、`update@1`：救援 CLI（`jade plugins add`、`jade update`）必须在不启动插件的情况下工作，所以这两段代码只能在核心里；插件要做同样的事（装 skill、启动时查新版本）时经服务用同一份，而不是 import 核心的模块（3.5），这样第三方插件也拿得到。`trust@1`：要用户确认才执行的东西（检查命令、项目里的 MCP 服务）原来是两个插件各复制一份信任文件的代码；记录按插件分开，一个插件查不到、也伪造不了另一个插件的确认（2026-11-12 加）。0.3.1 及以前 `jade/checks`、`jade/mcp` 记在 `$JADE_HOME/trust.jsonl` 的确认由这两个插件自己读、用到时迁进 `trust@1`，核心不认识它们（2026-11-18 从核心搬出）。
 
 前端的选择：清单里 `"frontend": { "name": "tui", "default": true }` 或 `{ "name": "print", "flag": "-p" }`。核心按命令行选定一个前端，只激活被选中的那个前端插件提供的 `frontend@1`。
 
@@ -172,7 +172,7 @@ export default definePlugin({
 - 函数是**事务性**的：中途抛错，已经做的注册全部撤销，插件记为失败。不会留下注册了一半的插件（pi 的 commit/discard）。
 - 所以注册表遇到重名不抛错：先注册的留下，后来的那一项跳过，用 `ctx.report(message)` 告诉用户（前端起来之后是通知，之前打到 stderr）。抛错会让调用方整个激活失败，连它别的功能、它提供的服务一起没了，依赖这些服务的插件也被跳过。名字不合法、保留的名字照旧抛错：那是插件自己写错了，只伤到它自己。
 - 作用域关闭后，旧 `ctx` 和从它拿到的服务句柄都**过期**：再调用会抛 `StaleContext`，错误信息说明是哪个插件、哪个作用域。过期调用也经过膜，所以只会伤到调用者自己。
-- 每个插件在一个会话里的内核部分（`ctx.kernel.tool/hook`）被收集成一个 uncarved `Plugin`，id 和版本就是插件清单里的 id 和版本。这样内核的插件清单（4.6 恢复检查）和 jade 的插件一一对应。
+- 每个插件在一个会话里的内核部分（`ctx.kernel.tool/hook`）被收集成一个 uncarved `Plugin`，id 和版本就是插件清单里的 id 和版本。这样内核的插件清单（4.6 恢复检查）和 jade 的插件一一对应。工具可以在 `session()` 返回之后注册、撤销（返回撤销函数），从下一轮起生效：核心在两轮之间 detach 旧的 `Runtime`、按新的工具表 resume 同一个会话（"重挂"），id 和版本不变，内核不当作插件变化；hook 仍只能在 `session()` 里注册。见 [live-tools-and-child-sessions.md](./live-tools-and-child-sessions.md)。
 
 ### 4.2 换会话是一个事务
 
@@ -317,8 +317,8 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 | `jade/web` | `web_fetch`、`web_search`、`/search`；只读工具另建一套经 `tools@1` 给嵌套 Agent（`web_search` 只在配置了搜索服务时给） | 可选 `ui@1`、`prompts@1`、`commands@1`、`renderers@1`、`tools@1` | `tools/web.ts` |
 | `jade/screenshot` | `screenshot` 工具：用本机的 Chrome / Edge / Chromium 无头模式渲染本地文件或网页，把截图交给模型看（`JADE_BROWSER` 可以指定浏览器；没有浏览器时不注册；模型不能看图片时说明原因） | 可选 `renderers@1`、`prompts@1`、`models@1` | `tools/screenshot.ts`（`test/screenshot.test.ts`） |
 | `jade/todo`、`jade/ask` | 工具 | `ask` 需要 `ui@1`，不能提问时不注册工具 | `tools/todo.ts`、`tools/ask.ts` |
-| `jade/tools` | `tools@1`：给嵌套 Agent（子 Agent 之类）用的工具的注册表。`register(tool, { when })`：提供工具的插件另登记一套实例（主会话里的工具对象是各插件私有的），`when` 每次取用时决定给不给；`list()`：另起 Agent 的插件来取，自己筛选、自己把关（这些工具执行时没有主会话的关卡守着）。登记的一方不用知道谁在用 | — | 2026-11-11 从 `jade/task` 的 `task@1` 拆出来（见 jade-log"架构挡了路"） |
-| `jade/task` | `task` 工具；子 Agent 的工具每次启动时从 `tools@1` 取；子 Agent 的系统提示词里带上主会话的指令文件（经 `prompts@1.instructions`，仓库里的保持不可信，配置 `instructions: false` 关掉） | `models@1`；可选 `tools@1`、`prompts@1` | `tools/task.ts`。子 Agent 是嵌套的 `Runtime`，日志在内存里，不关联到父会话 |
+| `jade/tools` | `tools@1`：给嵌套 Agent 用的工具的注册表。**不推荐再用**（2026-11-19）：子 Agent 改用核心开的子会话（`ctx.session.spawn`），内置插件不再往这里登记；保留一个版本给第三方插件，之后删掉 | — | 2026-11-11 从 `jade/task` 的 `task@1` 拆出来（见 jade-log"架构挡了路"） |
+| `jade/task` | `task` 工具：子 Agent 是核心开的子会话（`ctx.session.spawn`），日志存盘、父会话的工具结果带着它的引用。默认只留只读的工具和只放行只读命令的 bash，配置 `write: true` 时全部保留、写操作经过同一套审批，`/undo` 算作打开它的那一轮。步数上限、接近上下文窗口时写报告由本插件在子会话里的那份管；`instructions: false` 去掉指令文件；`model` 换模型 | `models@1`；可选 `approval@1`、`prompts@1`、`renderers@1`、`ui@1` | `tools/task.ts`。设计见 [live-tools-and-child-sessions.md](./live-tools-and-child-sessions.md) |
 | `jade/compact` | `context.project` 里清理旧输出、总结；`/compact`；上下文溢出后压缩并经 `afterTurn` 重试 | `models@1` | `plugins/compact.ts` |
 | `jade/mcp` | MCP 服务的工具、`/mcp`；`/mcp add\|remove` 和 `jade mcp add\|remove` 改配置文件；项目层服务启动前确认（记在 `trust@1`） | `trust@1`；可选 `ui@1`、`commands@1`、`prompts@1`、`tools@1`、`cli@1` | `mcp.ts`。插件自带的 MCP 配置（旧的 PluginBundle）没有了 |
 | `jade/skills` | `skill` 工具、`/skills`、`/<skill 名>`；`/skills add\|update\|remove` 和 `jade skills …` 从 git、npm 或本地目录安装（下载经核心的 `sources@1`）；每次调用模型前重新查找 skill，会话中途装的马上能用（`skill` 工具因此总是注册、名字不写成 enum，列表变了才改提示词）；工具说明告诉模型用 `jade skills add` 装到 `.jade`；skill 目录经 `approval@1.allowRead` 可直接读 | 可选 | `skills.ts` |
@@ -397,7 +397,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
    每做一个插件，再问一句：**有没有改到别的内置插件？改的是"给它的服务加方法"，还是"让它认识我"？** 前者是接口在长，记一笔就行。后者说明依赖的方向反了（第三方插件没法让内置插件认识它），记进 [jade-log.md](./jade-log.md) 的"架构挡了路"，把那个接口改成中立的注册表：提供方只管登记，谁要用谁来取（例子：`task@1` → `tools@1`）。
    大部分已完成：web、todo、ask、task、compact、mcp、skills、checks、memory、undo、mentions、continue、repeats、budget，各有测试（`test/<插件>.test.ts`）。期间核心改了两处：会话队列的竞争（上一条 `send` 刚 resolve 就再 `send`，新输入没人处理），兜底关卡只认 `approval@1` 的提供者（见第 7 节）。
    已完成：从 npm、git 和本地目录安装/更新插件（`test/install.test.ts` 覆盖本地目录、git 提交、npm 包、`--link`、`--project`、`--path`、本地改动保护和更新记录）。
-   移植中发现的缺口，以后再定：子 Agent 的日志不能关联到父会话；`session()` 执行期间（包括 `ctx.effect` 里立即执行的部分）调用 `session.send` 会失败，因为 Runtime 在全部插件加入之后才建（`jade/schedule` 因此等第一次定时再检查）；一个进程同时只有一个会话、工作目录和项目层插件按进程定，所以后台另开会话、桌面端同时开几个对话都要先让 `SessionManager` 能同时挂同一目录的多个会话。已经补上的："给模型留一句说明"的接口（`prompts@1.note`，memory、undo 原来各自在 `context.project` 里附说明；`/undo` 的已撤销记录仍存在 `$JADE_HOME/checkpoints`）；`jade/checks` 不再复制 jade/shell 找 shell、杀进程树的代码，改由 `shell@1` 提供。
+   移植中发现的缺口，以后再定：~~子 Agent 的日志不能关联到父会话~~（2026-11-19 解决：子 Agent 是核心开的子会话，见 [live-tools-and-child-sessions.md](./live-tools-and-child-sessions.md)）；`session()` 执行期间（包括 `ctx.effect` 里立即执行的部分）调用 `session.send` 会失败，因为 Runtime 在全部插件加入之后才建（`jade/schedule` 因此等第一次定时再检查）；一个进程同时只有一个会话、工作目录和项目层插件按进程定，所以后台另开会话、桌面端同时开几个对话都要先让 `SessionManager` 能同时挂同一目录的多个会话。已经补上的："给模型留一句说明"的接口（`prompts@1.note`，memory、undo 原来各自在 `context.project` 里附说明；`/undo` 的已撤销记录仍存在 `$JADE_HOME/checkpoints`）；`jade/checks` 不再复制 jade/shell 找 shell、杀进程树的代码，改由 `shell@1` 提供。
 8. ~~功能对齐后改名为 jade~~：已提前完成（2026-11-05）。旧 jade 归档到 `.archive/jade`，新实现直接占用 `apps/jade` 和 `jade` 命令；功能对齐前，jade 只是开发中的版本。
 
 ## 附录 A：参考调研摘要

@@ -1,10 +1,10 @@
 {
   "id": "jade/task",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "api": "^1",
   "entry": "./index.ts",
   "requires": ["models@1"],
-  "optional": ["tools@1", "ui@1", "renderers@1", "approval@1", "prompts@1"],
+  "optional": ["ui@1", "renderers@1", "approval@1", "prompts@1"],
   "config": {
     "maxSteps": {
       "default": 40,
@@ -16,6 +16,10 @@
     },
     "model": {
       "description": "the model sub-agents use: a model saved by /model, or another model of the current service (for example a cheaper, faster one); default: the session's model"
+    },
+    "write": {
+      "default": false,
+      "description": "let sub-agents use every tool of the session, including ones that change files; their changes go through the same approval as the main agent's"
     }
   }
 }

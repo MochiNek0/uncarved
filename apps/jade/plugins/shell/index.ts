@@ -2,7 +2,7 @@
 // 后台命令自己结束时告诉用户，并给模型留一句说明（不用它一直轮询）；/shells 给用户看和停掉后台命令。
 
 import { definePlugin, type Span, type UI } from "@uncarved/jade-api";
-import type { Commands, Prompts, Renderers, Tools } from "@uncarved/jade-api/services";
+import type { Commands, Prompts, Renderers } from "@uncarved/jade-api/services";
 import { shellRenderers } from "./renderers.ts";
 import { shellService } from "./service.ts";
 import { shellTools, type ShellTools } from "./shell.ts";
@@ -107,25 +107,20 @@ export default definePlugin({
       },
     });
     sessions.set(id, { list, kill });
-    // 嵌套 Agent 的 bash：只收命令和时限，不能在后台跑。它不是只读工具，哪些命令能执行由使用方把关
-    // （jade/task 按审批规则只放行只读的命令，下面的说明文字是按这个写的）
-    const bash = tools.find((t) => t.name === "bash");
-    try {
-      if (bash) {
-        ctx.service<Tools>("tools@1")?.register({
-          ...bash,
-          description:
-            "Run a read-only shell command in the working directory (for example git log, git diff, git status, ls, rg) and return its exit code and output. " +
-            "Commands that could change anything, or that touch paths outside the working directory, are refused.",
-          inputSchema: { type: "object", properties: { command: { type: "string" }, timeout_ms: { type: "integer" } }, required: ["command"], additionalProperties: false },
-          execute: (input, c) => bash.execute({ command: (input as { command: string }).command, timeout_ms: (input as { timeout_ms?: number }).timeout_ms }, c),
-        });
-      }
-    } catch {
-      // jade/tools 被隔离时它的服务已失效：嵌套 Agent 没有 bash，主会话的照常
-    }
-    if (unavailable) ctx.service<UI>("ui@1")?.notify(unavailable, "warning");
-    for (const tool of tools) ctx.kernel.tool(tool);
+    // 子会话（子 Agent）里的 bash 只收命令和时限，不能在后台跑：子 Agent 交了报告会话就结束，后台命令随之被杀掉
+    const child = ctx.session.parent !== undefined;
+    const foreground = (t: (typeof tools)[number]): (typeof tools)[number] =>
+      t.name !== "bash"
+        ? t
+        : {
+            ...t,
+            inputSchema: { type: "object", properties: { command: { type: "string" }, timeout_ms: { type: "integer" } }, required: ["command"], additionalProperties: false },
+            execute: (input, c) => t.execute({ command: (input as { command: string }).command, timeout_ms: (input as { timeout_ms?: number }).timeout_ms }, c),
+          };
+    // 主会话已经说过一次
+    if (unavailable && !child) ctx.service<UI>("ui@1")?.notify(unavailable, "warning");
+    // 管后台命令的工具（bash_output、kill_shell）子会话里用不上
+    for (const tool of tools) if (!(child && (tool.name === "bash_output" || tool.name === "kill_shell"))) ctx.kernel.tool(child ? foreground(tool) : tool);
     if (executable) {
       const lines = [`- Shell for the bash tool: ${executable} (POSIX syntax, also on Windows)`];
       // 模型常用 xdg-open、open 打开文件，Git Bash 里没有；start 是 Git 自带的 /usr/bin/start

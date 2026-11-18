@@ -11,7 +11,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Block, Tool } from "uncarved";
 import { projectDirs } from "./project.ts";
@@ -193,6 +193,73 @@ export function mcpTrustHash(root: string, entry: McpServerEntry): string {
   return createHash("sha256").update(`jade-mcp\0${root}\0${entry.name}\0${spec}`).digest("hex");
 }
 
+// ---------- 上次连上时的工具 ----------
+
+/** 缓存里这么久没连上过的服务删掉（配置改了、服务删了，旧的那条就再也用不到了） */
+const KNOWN_MAX_AGE_MS = 90 * 24 * 3600_000;
+
+/** 同一个配置文件里同名、同样启动方式的服务算同一个；配置改了（包括展开后的环境变量）就不认了 */
+export function mcpCacheKey(entry: McpServerEntry): string {
+  const { command, args, env, cwd, url, headers, type } = entry.config;
+  const spec = JSON.stringify({ type, command, args, env, cwd, url, headers: headers ? Object.keys(headers).sort() : undefined });
+  return createHash("sha256").update(`jade-mcp-tools\0${entry.file}\0${entry.name}\0${spec}`).digest("hex");
+}
+
+/** 两次的工具和说明一样（顺序也算） */
+export function sameKnown(a: McpKnown | undefined, b: McpKnown | undefined): boolean {
+  const pick = (k: McpKnown | undefined) =>
+    k && JSON.stringify({ i: k.instructions, t: k.tools.map((t) => [t.name, t.title, t.description, t.inputSchema, t.annotations]) });
+  return pick(a) === pick(b);
+}
+
+/**
+ * 每个服务上次连上时的工具和说明，存在 $JADE_HOME/state/mcp-tools.json。
+ * 会话的工具列表在会话开始时就定了（改了提示缓存就失效，内核也只在开始时收工具）：
+ * 还没连上的服务先按上次的工具给会话，调用时再等连上，就不用等它启动，也不用开新会话才能用
+ */
+export class McpToolCache {
+  readonly file: string;
+  #entries: Record<string, McpKnown & { at: number }> = {};
+  #writing: Promise<void> = Promise.resolve();
+
+  constructor(home: string) {
+    this.file = path.join(home, "state", "mcp-tools.json");
+  }
+
+  async load(): Promise<void> {
+    try {
+      const raw = JSON.parse(await readFile(this.file, "utf8")) as { version?: number; servers?: Record<string, McpKnown & { at: number }> };
+      if (raw?.version === 1 && raw.servers && typeof raw.servers === "object") this.#entries = raw.servers;
+    } catch {
+      // 没有或坏了：当作没连上过
+    }
+  }
+
+  get(entry: McpServerEntry): McpKnown | undefined {
+    const e = this.#entries[mcpCacheKey(entry)];
+    return e && Array.isArray(e.tools) ? { tools: e.tools, ...(e.instructions ? { instructions: e.instructions } : {}) } : undefined;
+  }
+
+  /** 记下这次连上时的；写盘在后台排队，失败不影响使用 */
+  put(entry: McpServerEntry, known: McpKnown): Promise<void> {
+    const now = Date.now();
+    this.#entries[mcpCacheKey(entry)] = { tools: known.tools, ...(known.instructions ? { instructions: known.instructions } : {}), at: now };
+    for (const [k, e] of Object.entries(this.#entries)) if (!(now - e.at < KNOWN_MAX_AGE_MS)) delete this.#entries[k];
+    const body = `${JSON.stringify({ version: 1, servers: this.#entries })}\n`;
+    this.#writing = this.#writing.then(async () => {
+      try {
+        await mkdir(path.dirname(this.file), { recursive: true });
+        const tmp = `${this.file}.${process.pid}.tmp`;
+        await writeFile(tmp, body);
+        await rename(tmp, this.file);
+      } catch {
+        // 下次连上再写
+      }
+    });
+    return this.#writing;
+  }
+}
+
 /** 给用户看的启动方式 */
 export function describeServer(c: McpServerConfig): string {
   return c.command !== undefined ? [c.command, ...(c.args ?? [])].join(" ") : `${c.url}`;
@@ -206,6 +273,8 @@ interface Transport {
   close(): Promise<void>;
   /** 连接断开时 resolve */
   readonly closed: Promise<string>;
+  /** 服务端发来的通知（例如 notifications/tools/list_changed）。HTTP 只收得到夹在回复流里的 */
+  onNotification?: (method: string) => void;
 }
 
 export class McpError extends Error {
@@ -224,7 +293,15 @@ export interface McpClientOptions {
   cwd: string;
   /** 连接断开（进程退出等），不包括主动关闭 */
   onDisconnect?(client: McpClient, why: string): void;
+  /** 列出了工具：连上时（包括重连），以及服务通知工具列表变了、重新列出之后 */
+  onTools?(client: McpClient): void;
   fetch?: typeof fetch;
+}
+
+/** 上次连上时服务给的工具和说明（见 McpToolCache） */
+export interface McpKnown {
+  tools: McpToolInfo[];
+  instructions?: string;
 }
 
 /** 一个 MCP 服务的连接 */
@@ -236,11 +313,15 @@ export class McpClient {
   instructions?: string;
   tools: McpToolInfo[] = [];
   readonly stderr: string[] = [];
+  /** 上次连上时的工具和说明：还在连接时先拿它们给会话，调用时再等连上 */
+  known?: McpKnown;
 
   #opts: McpClientOptions;
   #transport?: Transport;
   #connecting?: Promise<void>;
   #closing = false;
+  /** 连上之后连接断了（不是连接失败）：工具照常提供，调用时重连 */
+  #dropped = false;
 
   constructor(entry: McpServerEntry, opts: McpClientOptions) {
     this.entry = entry;
@@ -261,17 +342,22 @@ export class McpClient {
     this.status = "connecting";
     this.error = undefined;
     this.#closing = false;
+    this.#dropped = false;
     const c = this.entry.config;
     const signal = AbortSignal.timeout(c.startupTimeoutMs ?? 30_000);
     try {
       const t = c.command !== undefined ? stdioTransport(c, this.#opts.cwd, this.stderr) : httpTransport(c, this.#opts.fetch ?? fetch);
       this.#transport = t;
+      t.onNotification = (method) => {
+        if (method === "notifications/tools/list_changed" && this.#transport === t && this.status === "connected") void this.#relist(t);
+      };
       void t.closed.then((why) => {
         if (this.#transport !== t) return;
         this.#transport = undefined;
         if (this.#closing) return;
         this.status = "failed";
         this.error = why;
+        this.#dropped = this.tools.length > 0;
         this.#opts.onDisconnect?.(this, why);
       });
       const init = (await t.request(
@@ -292,6 +378,55 @@ export class McpClient {
       this.status = "failed";
       throw new McpError(why);
     }
+    this.#listed();
+  }
+
+  #listed(): void {
+    try {
+      this.#opts.onTools?.(this);
+    } catch {
+      // 记缓存之类的事出错不影响连接
+    }
+  }
+
+  /** 正在重新列出工具；列的时候又收到通知，列完再列一次 */
+  #relisting?: Promise<void>;
+  #relistAgain = false;
+
+  /** 服务说工具列表变了：重新列出。失败（例如连接正好断了）就留着原来的，下次连上时会重新列出 */
+  #relist(t: Transport): Promise<void> {
+    if (this.#relisting) {
+      this.#relistAgain = true;
+      return this.#relisting;
+    }
+    this.#relisting = (async () => {
+      do {
+        this.#relistAgain = false;
+        try {
+          const tools = await this.#listTools(t, AbortSignal.timeout(this.entry.config.startupTimeoutMs ?? 30_000));
+          if (this.#transport !== t) return;
+          this.tools = tools;
+          this.#listed();
+        } catch {
+          return;
+        }
+      } while (this.#relistAgain);
+    })().finally(() => (this.#relisting = undefined));
+    return this.#relisting;
+  }
+
+  /** 现在给会话的工具：连上了用服务列出的；还在连接（或没开始连）时用上次连上时的；连接断了照旧（调用时重连）；连不上没有 */
+  offered(): McpToolInfo[] {
+    if (this.status === "connected" || this.#dropped) return this.tools;
+    if (this.status === "failed") return [];
+    return this.known?.tools ?? [];
+  }
+
+  /** 同 offered，服务的使用说明 */
+  offeredInstructions(): string | undefined {
+    if (this.status === "connected" || this.#dropped) return this.instructions;
+    if (this.status === "failed") return undefined;
+    return this.known?.instructions;
   }
 
   async #listTools(t: Transport, signal: AbortSignal): Promise<McpToolInfo[]> {
@@ -309,6 +444,8 @@ export class McpClient {
   /** 调用工具。连接断了先重连一次 */
   async callTool(name: string, args: unknown, signal: AbortSignal): Promise<{ content?: unknown[]; isError?: boolean; structuredContent?: unknown }> {
     if (this.status !== "connected" || !this.#transport) await this.connect();
+    // 会话的工具可能来自上次连上时（known），这次连上后服务已经不提供了
+    if (!this.tools.some((x) => x.name === name)) throw new McpError(`the server no longer offers the tool "${name}"; /mcp lists its current tools`);
     const t = this.#transport!;
     const limit = AbortSignal.timeout(this.entry.config.toolTimeoutMs ?? 600_000);
     const both = AbortSignal.any([signal, limit]);
@@ -374,7 +511,7 @@ function stdioTransport(c: McpServerConfig, cwd: string, stderr: string[]): Tran
     child.on("close", (code, sig) => resolve(`exited (${sig ?? `code ${code}`})${stderr.length ? `: ${stderr.at(-1)}` : ""}`));
   });
   void closed.then((why) => rpc.fail(new McpError(`server ${why}`)));
-  return {
+  const t: Transport = {
     request: (method, params, signal) => rpc.request(method, params, signal),
     notify: async (method, params) => rpc.send({ jsonrpc: "2.0", method, ...(params ? { params } : {}) }),
     closed,
@@ -384,6 +521,8 @@ function stdioTransport(c: McpServerConfig, cwd: string, stderr: string[]): Tran
       if (!done) killTree(child);
     },
   };
+  rpc.onNotify = (method) => t.onNotification?.(method);
+  return t;
 }
 
 /**
@@ -466,7 +605,7 @@ function httpTransport(c: McpServerConfig, doFetch: typeof fetch): Transport {
     return res;
   }
 
-  return {
+  const t: Transport = {
     async request(method, params, signal) {
       const id = nextId++;
       const res = await post({ jsonrpc: "2.0", id, method, ...(params ? { params } : {}) }, signal);
@@ -475,7 +614,7 @@ function httpTransport(c: McpServerConfig, doFetch: typeof fetch): Transport {
         throw new McpError(`HTTP ${res.status}${res.status === 401 ? " (unauthorized: check the headers in the MCP config)" : ""}${text ? `: ${text}` : ""}`);
       }
       const type = res.headers.get("content-type") ?? "";
-      const reply = type.includes("text/event-stream") ? await fromSse(res, id, signal) : ((await res.json()) as RpcMessage);
+      const reply = type.includes("text/event-stream") ? await fromSse(res, id, signal, (m) => t.onNotification?.(m)) : ((await res.json()) as RpcMessage);
       const result = unwrap(reply);
       if (method === "initialize") protocol = (result as { protocolVersion?: string })?.protocolVersion ?? PROTOCOL_VERSION;
       return result;
@@ -493,10 +632,11 @@ function httpTransport(c: McpServerConfig, doFetch: typeof fetch): Transport {
       markClosed("closed");
     },
   };
+  return t;
 }
 
-/** 从 SSE 流里找到 id 对应的回复；流里其他的消息（通知、服务端的请求）忽略 */
-async function fromSse(res: Response, id: number, signal: AbortSignal): Promise<RpcMessage> {
+/** 从 SSE 流里找到 id 对应的回复；流里的通知交给 onNotify，服务端的请求忽略 */
+async function fromSse(res: Response, id: number, signal: AbortSignal, onNotify: (method: string) => void): Promise<RpcMessage> {
   const reader = res.body!.pipeThrough(new TextDecoderStream()).getReader();
   let buf = "";
   try {
@@ -517,6 +657,7 @@ async function fromSse(res: Response, id: number, signal: AbortSignal): Promise<
         try {
           const msg = JSON.parse(data) as RpcMessage;
           if (msg.id === id && (msg.result !== undefined || msg.error !== undefined)) return msg;
+          if (msg.id === undefined && typeof msg.method === "string") onNotify(msg.method);
         } catch {
           // 不是 JSON 的事件忽略
         }
@@ -549,6 +690,8 @@ class Rpc {
   #nextId = 1;
   #pending = new Map<number | string, { resolve: (v: unknown) => void; reject: (e: unknown) => void }>();
   #dead?: Error;
+  /** 服务端发来的通知 */
+  onNotify?: (method: string) => void;
 
   constructor(send: (msg: RpcMessage) => void) {
     this.#send = send;
@@ -579,8 +722,15 @@ class Rpc {
 
   receive(msg: RpcMessage): void {
     if (msg.method !== undefined) {
-      // 服务端发来的请求：只支持 ping，其他的回复"不支持"，免得服务端一直等
-      if (msg.id === undefined) return;
+      // 通知交给连接；服务端发来的请求只支持 ping，其他的回复"不支持"，免得服务端一直等
+      if (msg.id === undefined) {
+        try {
+          this.onNotify?.(msg.method);
+        } catch {
+          // 处理通知出错不影响连接
+        }
+        return;
+      }
       if (msg.method === "ping") this.#send({ jsonrpc: "2.0", id: msg.id, result: {} });
       else this.#send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: `jade does not support ${msg.method}` } });
       return;
@@ -611,13 +761,15 @@ export function mcpToolName(server: string, tool: string): string {
   return `${full.slice(0, MAX_TOOL_NAME - 9)}_${hash}`;
 }
 
-/** 把已连接的服务的工具变成 jade 的工具；readOnly 为 true 时只要声明了只读的工具（给子 Agent） */
+/**
+ * 把服务的工具变成 jade 的工具：已连接的用服务列出的，还在连接的用上次连上时的（调用时等连上，见 McpClient.offered）。
+ * readOnly 为 true 时只要声明了只读的工具（给子 Agent）
+ */
 export function mcpTools(clients: McpClient[], opts: { readOnly?: boolean } = {}): Tool[] {
   const out: Tool[] = [];
   const names = new Set<string>();
   for (const client of clients) {
-    if (client.status !== "connected") continue;
-    for (const info of client.tools) {
+    for (const info of client.offered()) {
       const readOnly = info.annotations?.readOnlyHint === true;
       if (opts.readOnly && !readOnly) continue;
       const name = mcpToolName(client.name, info.name);

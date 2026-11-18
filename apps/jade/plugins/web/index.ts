@@ -6,7 +6,7 @@
 
 import path from "node:path";
 import { definePlugin, type ScopeContext, type Span, type UI } from "@uncarved/jade-api";
-import type { Commands, Prompts, Renderers, Tools } from "@uncarved/jade-api/services";
+import type { Commands, Prompts, Renderers } from "@uncarved/jade-api/services";
 import { envWithFile, updateEnvFile, type Env } from "./env.ts";
 import { webRenderers } from "./renderers.ts";
 import { parseOrder, parseResults, SEARCH_PROVIDERS, webTools } from "./web.ts";
@@ -97,17 +97,7 @@ export default definePlugin({
     const web = webTools({ ...opts, env: () => keys ?? env });
     for (const tool of web.tools) ctx.kernel.tool(tool);
 
-    // 嵌套 Agent（例如 jade/task 的子 Agent）也能查网页：另一套实例；web_search 只在配置了搜索服务时给它。
-    // web_fetch 带 url 参数，jade/task 的子 Agent 每次都要问用户（URL 能把读到的内容带出去）。
-    // jade/tools 被隔离时它的服务已失效：嵌套 Agent 没有 web 工具，web 工具本身照常
-    try {
-      const shared = ctx.service<Tools>("tools@1");
-      if (shared) {
-        const sub = webTools({ ...opts, env: () => keys ?? env });
-        for (const tool of sub.tools) shared.register(tool, tool.name === "web_search" ? { when: () => sub.search().length > 0 } : {});
-      }
-    } catch {}
-
+    // 子 Agent 是核心开的子会话，本插件在里面另有一份，web_fetch 经过和主会话同一套审批
     ctx.kernel.hook({
       kind: "transform",
       point: "context.build",

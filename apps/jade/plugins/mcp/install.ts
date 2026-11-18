@@ -25,7 +25,7 @@ export const manageUsage = (cmd: string) => `usage: ${cmd} add <name> [--project
 export const mcpConfigFile = (home: string, cwd: string, project: boolean) => (project ? path.join(cwd, ".jade", "mcp.json") : path.join(home, "mcp.json"));
 
 /** add / remove，参数已经切好；返回给用户看的结果，用法错误或失败时抛错。cmd 用在提示里 */
-export async function manageMcp(argv: readonly string[], env: { home: string; cwd: string; cmd: string }): Promise<string> {
+export async function manageMcp(argv: readonly string[], env: { home: string; cwd: string; cmd: string; /** jade 正在运行，改完配置马上生效（/mcp） */ live?: boolean }): Promise<string> {
   const usage = manageUsage(env.cmd);
   const [sub, ...tail] = argv;
   if (sub === "-h" || sub === "--help") return usage;
@@ -38,7 +38,9 @@ export async function manageMcp(argv: readonly string[], env: { home: string; cw
     });
     return [
       `added MCP server ${name} to ${display(env.cwd, file)}: ${describeServer(config)}`,
-      `restart jade to start it${project ? "; jade asks you to confirm it the first time" : ""}`,
+      env.live
+        ? `jade starts it now${project ? " (after you confirm it)" : ""}; its tools are available from the next turn`
+        : `restart jade to start it${project ? "; jade asks you to confirm it the first time" : ""}`,
     ].join("\n");
   }
   if (sub === "remove" || sub === "rm") {
@@ -51,7 +53,7 @@ export async function manageMcp(argv: readonly string[], env: { home: string; cw
       if (servers[name] === undefined) throw new Error(`${display(env.cwd, file)} has no MCP server named ${name}`);
       delete servers[name];
     });
-    return `removed MCP server ${name} from ${display(env.cwd, file)}; restart jade to stop it`;
+    return `removed MCP server ${name} from ${display(env.cwd, file)}; ${env.live ? "jade stops it and its tools go away from the next turn" : "restart jade to stop it"}`;
   }
   throw new Error(usage);
 }

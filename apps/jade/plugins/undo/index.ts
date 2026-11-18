@@ -43,6 +43,11 @@ function realPath(p: string): string {
   }
 }
 
+/** 打开着的会话：会话 id → 它的 tool.decided 事件 id → toolUseId（子会话的 parent 只给事件 id） */
+const decidedBy = new Map<string, Map<string, string>>();
+/** 打开着的会话：会话 id → 它的改动记在哪个根会话、算作根会话里哪次调用的 */
+const links = new Map<string, () => { root: string; via?: string }>();
+
 /** 文件现在的内容；不存在时 null */
 async function contentOf(file: string): Promise<string | null> {
   try {
@@ -142,6 +147,25 @@ export default definePlugin({
   session(ctx) {
     const checkpoints = new Checkpoints(path.join(ctx.home, "checkpoints"));
     const sessionId = ctx.session.id;
+    const decided = new Map<string, string>();
+    decidedBy.set(sessionId, decided);
+    /**
+     * 子会话（子 Agent）的改动记在根会话里，算作根会话里打开它的那次调用的：父会话 /undo 时和那一轮的改动一起撤销。
+     * 父会话的 tool.decided 在工具执行之前就记下了，所以子会话开好时查得到
+     */
+    const link = (): { root: string; via?: string } => {
+      const p = ctx.session.parent;
+      if (!p) return { root: sessionId };
+      const up = links.get(p.sessionId)?.();
+      if (up?.via) return up;
+      const via = decidedBy.get(p.sessionId)?.get(p.eventId);
+      return { root: up?.root ?? p.sessionId, ...(via ? { via } : {}) };
+    };
+    links.set(sessionId, link);
+    void ctx.effect(() => () => {
+      if (decidedBy.get(sessionId) === decided) decidedBy.delete(sessionId);
+      if (links.get(sessionId) === link) links.delete(sessionId);
+    });
     /** toolUseId → 执行前的内容，执行成功后存成快照 */
     const before = new Map<string, { tool: string; path: string; before: string | null }>();
     const snapshots = new Snapshots(path.join(ctx.home, "checkpoints", safe(sessionId)), ctx.cwd);
@@ -158,8 +182,9 @@ export default definePlugin({
       timeoutMs: SNAPSHOT_TIMEOUT_MS,
       fn: async (call) => {
         const meta = ctx.session.tool(call.name)?.meta;
-        // 每轮第一次跑命令之前给工作区拍一张快照：命令改了什么，/undo 时和它一比就知道
-        if (meta?.shell !== undefined && ctx.config.shell !== false && !snapped) {
+        // 每轮第一次跑命令之前给工作区拍一张快照：命令改了什么，/undo 时和它一比就知道。
+        // 子会话不拍：并行的几个子 Agent 不能同时用根会话的影子仓库（子 Agent 的命令改的文件撤销不了）
+        if (meta?.shell !== undefined && ctx.config.shell !== false && !snapped && !ctx.session.parent) {
           snapped = true;
           const tree = await snapshots.take();
           if (tree) await snapshots.save({ toolUseId: call.toolUseId, tree, at: performance.timeOrigin + performance.now() });
@@ -184,7 +209,8 @@ export default definePlugin({
         const after = await contentOf(snap.path);
         // 内容没变（例如同样的内容重复写入）不算修改
         if (after === snap.before) return;
-        await checkpoints.save(sessionId, { toolUseId: out.call.toolUseId, ...snap, afterHash: sha256(after ?? "") });
+        const { root, via } = link();
+        await checkpoints.save(root, { toolUseId: out.call.toolUseId, ...snap, afterHash: sha256(after ?? ""), ...(via ? { via } : {}) });
       },
     });
     // 被拒绝、被中断的调用不经过 tool.after：一轮结束时还留着的都不会再用到，不然整个文件的内容一直占着内存
@@ -192,6 +218,7 @@ export default definePlugin({
       kind: "observe",
       point: "event",
       fn: (e) => {
+        if (e.type === "tool.decided") decided.set(e.id, (e.data as { toolUseId: string }).toolUseId);
         if (e.type !== "turn.ended") return;
         before.clear();
         snapped = false;

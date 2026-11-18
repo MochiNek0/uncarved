@@ -157,6 +157,8 @@ export default definePlugin({
   },
 
   session(ctx) {
+    // 子会话（子 Agent）不进 /resume 的列表，也没有输入框
+    if (ctx.session.parent) return;
     input = ctx.input;
     const file = path.join(ctx.home, "state", "sessions.jsonl");
     let indexed = false;

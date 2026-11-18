@@ -17,6 +17,7 @@ import {
   type Provider,
   type RemoteHookSpec,
   type RuntimeNotice,
+  type SessionRef,
   type State,
   type Tool,
   type UserInput,
@@ -30,11 +31,13 @@ import {
   type PluginModule,
   type PluginSource,
   type Secrets,
+  type ChildSession,
   type Session,
   type SessionContext,
   type SessionManager,
   type SessionTool,
   type SessionUI,
+  type SpawnOptions,
   type StatusSegment,
   type Text,
   type ToolMeta,
@@ -64,6 +67,8 @@ export interface SessionHost {
   service<T extends object>(name: string, caller: Owner): T | undefined;
   /** 服务的提供者 id */
   provider(name: string): string | undefined;
+  /** 核心自己的配置：用户 config.json 里的 "jade/core"（项目层的配置不能放宽这些上限） */
+  coreConfig(): Readonly<Record<string, unknown>>;
   /** 一个插件的密钥（第 8 节）；会话 ctx 和进程 ctx 共享同一份 */
   secrets(plugin: string): Secrets;
   core: Owner;
@@ -80,8 +85,31 @@ interface Part {
   source: PluginSource;
   owner: Owner;
   gates: number;
-  kernel: Plugin;
+  /** 现在的工具（已包装成以插件身份执行）。session() 返回之后注册、撤销的也改在这里，下一项工作开始前重挂 Runtime 生效 */
+  tools: Tool[];
+  /** 按现在的工具表生成交给内核的插件。插件被隔离后不再交出工具；id、版本不变，所以重挂不算插件变化 */
+  kernel(): Plugin;
 }
+
+/** 子会话：谁开的、开它时要的东西（SpawnOptions） */
+interface Child {
+  session: LiveSession;
+  ref: SessionRef;
+  /** 开它的插件 */
+  by: string;
+  label?: string;
+  tools?: (t: SessionTool) => boolean;
+  system?: string;
+}
+
+/** 核心放在子会话系统提示词最前面的委派说明（设计稿 live-tools-and-child-sessions 7.3） */
+export const DELEGATION =
+  "You are a sub-agent: another agent delegated a task to you. You cannot see its conversation, so the task you are given is all you know about it. " +
+  "Nobody reads your intermediate messages; when you are done, reply with a self-contained report of what you did and found, including anything you could not do.";
+
+/** 子会话的层数、同时数量的默认上限（7.2） */
+export const DEFAULT_MAX_DEPTH = 1;
+export const DEFAULT_MAX_ACTIVE = 8;
 
 interface Turn {
   stop?: { reason: unknown };
@@ -107,16 +135,59 @@ class LiveSession implements Session {
   #attended: () => boolean;
   /** 插件订阅的运行时通知（ctx.session.subscribe） */
   #watchers = new Set<{ fn: (n: RuntimeNotice) => void; owner: Owner }>();
+  /** 前端和核心订阅的运行时通知（Session.subscribe）。由会话自己持有、从当前的 Runtime 转发，重挂时不丢 */
+  #listeners = new Set<(n: RuntimeNotice) => void>();
+  #unsubscribe: (() => void) | undefined;
   /** Runtime 建好了（attach 之后）：session() 里登记的 afterTurn 等到这时才执行，那时 state() 才有 */
   #attached = false;
+  /** 工具表变了，下一项工作开始前要重挂 Runtime */
+  #stale = false;
+  /** 重挂时旧实例已经 detach、新实例没建成：下次重挂不再 detach，离开时也不用 */
+  #loose = false;
+  #provider!: Provider;
+  #plugins!: () => Plugin[];
 
   readonly #store: LogStore;
+  /** 子会话的信息；顶层会话没有 */
+  readonly child: Child | undefined;
+  /** 第几层：顶层会话是 0 */
+  depth = 0;
+  /** 本会话开的、还没结束的子会话 */
+  readonly children = new Set<LiveSession>();
+  /** 子会话结束（Sessions.#end）的结果；结束时调用 onEnd（让出同时数量的名额） */
+  ended: Promise<{ sessionId: string; seq: number }> | undefined;
+  onEnd: (() => void) | undefined;
 
-  constructor(id: string, store: LogStore, report: (m: string) => void, attended: () => boolean) {
+  constructor(id: string, store: LogStore, report: (m: string) => void, attended: () => boolean, child?: Child) {
     this.id = id;
     this.#store = store;
     this.#report = report;
     this.#attended = attended;
+    this.child = child;
+    if (child) this.depth = child.session.depth + 1;
+  }
+
+  get store(): LogStore {
+    return this.#store;
+  }
+
+  get provider(): Provider {
+    return this.#provider;
+  }
+
+  get left(): boolean {
+    return this.#left !== undefined;
+  }
+
+  /** 子会话只保留开它的插件要的工具（SpawnOptions.tools） */
+  keeps(t: Tool): boolean {
+    const keep = this.child?.tools;
+    if (!keep) return true;
+    try {
+      return keep(sessionTool(t)) === true;
+    } catch {
+      return false;
+    }
   }
 
   history(): Promise<LogEvent[]> {
@@ -125,10 +196,10 @@ class LiveSession implements Session {
 
   tool(name: string): SessionTool | undefined {
     for (const p of this.parts) {
-      const t = p.kernel.tools?.find((x) => x.name === name) as (Tool & { meta?: ToolMeta }) | undefined;
-      if (!t) continue;
-      const { name: n, description, inputSchema, effect, concurrency, idempotent, meta } = t;
-      return { name: n, description, inputSchema, effect, concurrency, idempotent, ...(meta ? { meta: { ...meta } } : {}) };
+      if (p.owner.scope.closed) continue;
+      const t = p.tools.find((x) => x.name === name);
+      if (!t || !this.keeps(t)) continue;
+      return sessionTool(t);
     }
     return undefined;
   }
@@ -234,11 +305,27 @@ class LiveSession implements Session {
     return () => void this.#watchers.delete(w);
   }
 
-  /** Runtime 建好之后调用一次：把通知转给订阅的插件，以插件身份执行，出错只报告 */
-  attach(): void {
+  /** Runtime 建好之后调用一次。provider、plugins 留着给重挂用：plugins 每次按现在的工具表生成内核插件 */
+  attach(rt: Runtime, provider: Provider, plugins: () => Plugin[]): void {
+    this.#provider = provider;
+    this.#plugins = plugins;
+    this.#use(rt);
     this.#attached = true;
     if (this.#after.length > 0) this.#kick();
-    this.rt.subscribe((n) => {
+  }
+
+  /** 换上一个 Runtime：通知从它转给订阅者。插件的回调以插件身份执行；出错只报告 */
+  #use(rt: Runtime): void {
+    this.#unsubscribe?.();
+    this.rt = rt;
+    this.#unsubscribe = rt.subscribe((n) => {
+      for (const fn of this.#listeners) {
+        try {
+          fn(n);
+        } catch {
+          // 和内核一样：订阅者的错误不影响运行
+        }
+      }
       for (const w of this.#watchers) {
         if (w.owner.scope.closed) continue;
         try {
@@ -248,6 +335,47 @@ class LiveSession implements Session {
         }
       }
     });
+  }
+
+  /** 工具表变了（会话中途注册、撤销工具，插件被隔离）：下一项工作开始前重挂。几次改动合并成一次 */
+  invalidate(): void {
+    if (this.#attached && !this.#left) this.#stale = true;
+  }
+
+  /**
+   * 重挂：detach 旧实例，按现在的工具表 resume 同一个会话（设计稿 live-tools-and-child-sessions 3.2）。
+   * 只在两项工作之间执行，内核这时不在跑。插件清单（id、版本）不变，内核不写 plugins.changed。
+   * 失败时这项工作失败，下一项工作再试
+   */
+  async #remount(): Promise<void> {
+    this.#stale = false;
+    if (this.rt.phase === "ended") return;
+    try {
+      if (!this.#loose) {
+        await this.rt.detach();
+        this.#loose = true;
+      }
+      const rt = await Runtime.resume({ store: this.#store, provider: this.#provider, plugins: this.#plugins(), sessionId: this.id });
+      this.#loose = false;
+      this.#use(rt);
+    } catch (e) {
+      this.#stale = true;
+      throw new Error(`session ${this.id}: could not update its tools: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  /** 结束会话（session.ended），子会话用完时。重挂到一半（旧实例已经 detach）时先恢复一个实例来写 */
+  async close(): Promise<void> {
+    if (this.#loose) {
+      this.#use(await Runtime.resume({ store: this.#store, provider: this.#provider, plugins: this.#plugins(), sessionId: this.id }));
+      this.#loose = false;
+    }
+    if (this.rt.phase !== "ended") await this.rt.close();
+  }
+
+  /** 宿主离开会话时 detach；重挂到一半（旧实例已经 detach）时不用再写 */
+  async detach(): Promise<void> {
+    if (!this.#loose) await this.rt.detach();
   }
 
   abort(reason?: unknown): void {
@@ -260,7 +388,8 @@ class LiveSession implements Session {
   }
 
   subscribe(fn: (n: RuntimeNotice) => void): () => void {
-    return this.rt.subscribe(fn);
+    this.#listeners.add(fn);
+    return () => void this.#listeners.delete(fn);
   }
 
   #kick(): void {
@@ -278,6 +407,11 @@ class LiveSession implements Session {
       const job = this.#queue.shift();
       if (job) {
         try {
+          if (this.#stale) {
+            await this.#remount();
+            // 重挂期间离开了会话：中止落在旧实例上，这项工作不再开始
+            if (this.#left) throw this.#left;
+          }
           await job.run();
           job.resolve();
         } catch (e) {
@@ -308,6 +442,11 @@ export class Sessions implements SessionManager {
   #store: LogStore | undefined;
   /** 换会话串行进行 */
   #switching: Promise<unknown> = Promise.resolve();
+  /** 正在运行的子会话数，和等着开的 */
+  #running = 0;
+  #waiting: (() => void)[] = [];
+  /** 子会话的对话框排成一队，一次一个（7.4） */
+  #dialogs: Promise<unknown> = Promise.resolve();
 
   constructor(host: SessionHost) {
     this.#host = host;
@@ -346,18 +485,23 @@ export class Sessions implements SessionManager {
     const s: LiveSession = new LiveSession(opts.resume ?? crypto.randomUUID(), store, host.report, () => this.#guarded(s));
     // 复制出的会话：先写好日志，再和恢复一样打开。打开失败时留下的日志没人引用，不影响原会话
     if (opts.fork) await copyLog(store, opts.fork.session, opts.fork.before, s.id);
+    // 直接恢复一个子会话（例如按 id）：层数从日志里的 parent 往上数
+    if (opts.resume !== undefined || opts.fork) s.depth = await depthOf(store, s.id);
+    let rt: Runtime;
+    const core = this.#corePlugin(s);
+    const kernelPlugins = () => [core, ...s.parts.map((p) => p.kernel())];
     try {
       for (const p of host.active()) if (p.module.session) await this.#join(s, p);
-      const plugins = [this.#corePlugin(s), ...s.parts.map((p) => p.kernel)];
-      s.rt = opts.resume !== undefined || opts.fork
+      const plugins = kernelPlugins();
+      rt = opts.resume !== undefined || opts.fork
         ? await Runtime.resume({ store, provider, plugins, sessionId: s.id })
         : await Runtime.create({ store, provider, plugins, sessionId: s.id });
     } catch (e) {
       await this.#closeParts(s);
       throw e;
     }
-    s.attach();
-    s.rt.subscribe((n) => {
+    s.attach(rt, provider, kernelPlugins);
+    s.subscribe((n) => {
       if (n.type === "hook-error") host.report(`plugin ${n.info.plugin} failed at ${n.info.point}: ${n.info.error instanceof Error ? n.info.error.message : String(n.info.error)}`);
     });
     // 提交：新会话成为当前会话，然后旧会话离开
@@ -367,6 +511,131 @@ export class Sessions implements SessionManager {
     return s;
   }
 
+  /** 子会话的上限（7.2）：用户 config.json 的 "jade/core" */
+  #limits(): { maxDepth: number; maxActive: number } {
+    const c = this.#host.coreConfig();
+    const n = (v: unknown, d: number, min: number) => (typeof v === "number" && Number.isInteger(v) && v >= min ? v : d);
+    return { maxDepth: n(c.maxDepth, DEFAULT_MAX_DEPTH, 0), maxActive: n(c.maxActive, DEFAULT_MAX_ACTIVE, 1) };
+  }
+
+  /** 开子会话（ctx.session.spawn）：所有插件照常加入，Runtime.create 带 parent。不会成为当前会话 */
+  async #spawn(parent: LiveSession, opts: SpawnOptions, by: string): Promise<ChildSession> {
+    if (!opts || typeof opts !== "object" || opts.parent?.sessionId !== parent.id || typeof opts.parent.eventId !== "string") {
+      throw new Error(`plugin ${by}: spawn needs parent: the ToolContext.parent of a tool call in this session`);
+    }
+    if (parent.left) throw new Error(`session ${parent.id} was closed`);
+    const { maxDepth, maxActive } = this.#limits();
+    if (parent.depth + 1 > maxDepth) {
+      throw new Error(
+        maxDepth === 0
+          ? `sub-agents are turned off ("jade/core": { "maxDepth": 0 } in config.json)`
+          : `sub-agents can be nested at most ${maxDepth} level${maxDepth > 1 ? "s" : ""} deep; this session is already at level ${parent.depth} (raise "jade/core": { "maxDepth" } in config.json)`,
+      );
+    }
+    // 同时数量的上限：等前面的结束，而不是报错
+    while (this.#running >= maxActive) await new Promise<void>((r) => this.#waiting.push(r));
+    this.#running++;
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      this.#running--;
+      this.#waiting.shift()?.();
+    };
+    if (parent.left) {
+      release();
+      throw new Error(`session ${parent.id} was closed`);
+    }
+    const host = this.#host;
+    const provider = opts.provider ?? parent.provider;
+    const child: Child = {
+      session: parent,
+      ref: { sessionId: opts.parent.sessionId, eventId: opts.parent.eventId },
+      by,
+      ...(typeof opts.label === "string" && opts.label ? { label: opts.label } : {}),
+      ...(typeof opts.tools === "function" ? { tools: opts.tools } : {}),
+      ...(typeof opts.system === "string" && opts.system ? { system: opts.system } : {}),
+    };
+    const s: LiveSession = new LiveSession(crypto.randomUUID(), parent.store, host.report, () => this.#guarded(s), child);
+    parent.children.add(s);
+    const core = this.#corePlugin(s);
+    const delegation = this.#delegation(child);
+    const kernelPlugins = () => [core, ...s.parts.map((p) => p.kernel()), delegation];
+    let rt: Runtime;
+    try {
+      for (const p of host.active()) if (p.module.session) await this.#join(s, p);
+      rt = await Runtime.create({ store: s.store, provider, plugins: kernelPlugins(), sessionId: s.id, parent: child.ref });
+    } catch (e) {
+      parent.children.delete(s);
+      await this.#closeParts(s);
+      release();
+      throw e;
+    }
+    s.attach(rt, provider, kernelPlugins);
+    s.subscribe((n) => {
+      if (n.type === "hook-error") host.report(`plugin ${n.info.plugin} failed at ${n.info.point} in a sub-agent: ${n.info.error instanceof Error ? n.info.error.message : String(n.info.error)}`);
+    });
+    let closing: Promise<{ sessionId: string; seq: number }> | undefined;
+    s.onEnd = release;
+    return {
+      id: s.id,
+      send: (input) => s.send(input),
+      get state() {
+        return s.state;
+      },
+      subscribe: (fn) => s.subscribe(fn),
+      abort: (reason) => s.abort(new Error(reason ?? `stopped by plugin ${by}`)),
+      close: () => (closing ??= this.#end(s)),
+    };
+  }
+
+  /** 结束子会话：先结束它的子会话，中止正在跑的工作，写 session.ended，关闭插件的作用域。返回 ChildRef */
+  async #end(s: LiveSession): Promise<{ sessionId: string; seq: number }> {
+    if (s.ended) return s.ended;
+    s.ended = (async () => {
+      s.leave();
+      for (const c of [...s.children]) await this.#end(c);
+      await s.idle();
+      try {
+        await s.close();
+      } catch (e) {
+        this.#host.report(`sub-agent session ${s.id}: could not end it: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      await this.#closeParts(s);
+      s.child?.session.children.delete(s);
+      s.onEnd?.();
+      return { sessionId: s.id, seq: s.rt.state.lastSeq };
+    })();
+    return s.ended;
+  }
+
+  /**
+   * 子会话里的 ui@1：没有会话界面（状态栏、输入框）；对话框在整个进程里排成一队，一次一个，标题前标上是哪个子 Agent（7.4）
+   */
+  #childUI(ui: UI, s: LiveSession): UI {
+    const name = s.child?.label ?? "sub-agent";
+    const queued = <T>(fn: () => Promise<T>): Promise<T> => {
+      const run = this.#dialogs.then(fn);
+      this.#dialogs = run.catch(() => {});
+      return run;
+    };
+    return new Proxy(ui, {
+      get: (target, prop) => {
+        if (prop === "session") return undefined;
+        if (prop === "select") {
+          return (req: Parameters<UI["select"]>[0], signal?: AbortSignal) =>
+            queued(() => (signal?.aborted ? Promise.resolve(undefined) : target.select({ ...req, title: `[${name}] ${req.title}` }, signal)));
+        }
+        if (prop === "input") {
+          return (req: Parameters<UI["input"]>[0], signal?: AbortSignal) =>
+            queued(() => (signal?.aborted ? Promise.resolve(undefined) : target.input({ ...req, title: `[${name}] ${req.title}` }, signal)));
+        }
+        const v = Reflect.get(target, prop);
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    });
+  }
+
   /** 一个插件加入会话：执行它的 session()，失败就撤销它这次的注册 */
   async #join(s: LiveSession, p: { source: PluginSource; module: PluginModule; owner: Owner; mark?: (p: Plugin) => Plugin }): Promise<void> {
     const host = this.#host;
@@ -374,9 +643,13 @@ export class Sessions implements SessionManager {
     const id = manifest.id;
     const scope = new Scope(id);
     const owner: Owner = { plugin: id, scope };
+    /** 这个插件的工具，已包装；加入成功后就是 part.tools */
     const tools: Tool[] = [];
     const hooks: (LocalHookSpec | RemoteHookSpec)[] = [];
     let open = true;
+    let part: Part | undefined;
+    /** 现在交给内核的工具里叫这个名字的是谁的（被隔离的插件的工具已经不交给内核，不算） */
+    const holder = (name: string) => s.parts.find((x) => !x.owner.scope.closed && x.tools.some((t) => t.name === name));
     const declared = (name: string, lists: (readonly string[] | undefined)[]) => {
       if (scope.closed) throw new StaleContext(id);
       if (!lists.some((l) => l?.includes(name))) throw new Error(`plugin ${id}: ${name} is not declared in plugin.json`);
@@ -390,6 +663,9 @@ export class Sessions implements SessionManager {
         // 作用域已经关了：没有要清理的
       }
     }
+    /** 子会话里的 ui@1 换成排队、标名字的那份 */
+    const forSession = <T extends object>(name: string, h: T | undefined): T | undefined =>
+      h && s.child && name === "ui@1" ? (this.#childUI(h as unknown as UI, s) as unknown as T) : h;
     const uiCall = (fn: () => void) => {
       try {
         fn();
@@ -415,13 +691,13 @@ export class Sessions implements SessionManager {
         : {}),
       require: <T extends object>(name: string): T => {
         declared(name, [manifest.requires]);
-        const h = host.service<T>(name, owner);
+        const h = forSession<T>(name, host.service<T>(name, owner));
         if (!h) throw new ServiceUnavailable(name, "(none)");
         return h;
       },
       service: <T extends object>(name: string): T | undefined => {
         declared(name, [manifest.requires, manifest.optional]);
-        return host.service<T>(name, owner);
+        return forSession<T>(name, host.service<T>(name, owner));
       },
       effect: async (start) => {
         if (scope.closed) throw new StaleContext(id);
@@ -464,11 +740,36 @@ export class Sessions implements SessionManager {
           if (scope.closed) throw new StaleContext(id);
           return s.tool(name);
         },
+        ...(s.child ? { parent: { ...s.child.ref } } : {}),
+        depth: s.depth,
+        canSpawn: layer !== "project" && s.depth < this.#limits().maxDepth,
+        spawn: (opts) => {
+          if (scope.closed) return Promise.reject(new StaleContext(id));
+          if (layer === "project") return Promise.reject(new Error(`plugin ${id}: project plugins cannot open sub-agent sessions`));
+          return this.#spawn(s, opts, id);
+        },
       },
       kernel: {
         tool: (t) => {
-          if (!open) throw new Error(`plugin ${id}: tools can only be registered while session() runs`);
-          tools.push({ ...t, ...toolMeta(id, t) });
+          if (scope.closed) throw new StaleContext(id);
+          const tool = liveTool({ ...t, ...toolMeta(id, t) }, owner);
+          if (!open) {
+            // session() 返回之后注册的从下一项工作起生效（重挂 Runtime）。重名的在这里拒绝，不能让重挂失败
+            if (!part) throw new Error(`plugin ${id}: did not join session ${s.id}`);
+            const other = holder(tool.name);
+            if (other) throw new Error(`plugin ${id}: tool ${tool.name} is already registered by ${other.source.manifest.id}`);
+          }
+          tools.push(tool);
+          if (!open) s.invalidate();
+          let done = false;
+          return () => {
+            if (done) return;
+            done = true;
+            const i = tools.indexOf(tool);
+            if (i < 0) return;
+            tools.splice(i, 1);
+            if (part) s.invalidate();
+          };
         },
         hook: (h) => {
           if (!open) throw new Error(`plugin ${id}: hooks can only be registered while session() runs`);
@@ -490,32 +791,34 @@ export class Sessions implements SessionManager {
     }
     open = false;
     // 内核构造 Runtime 时会因为重名工具、不合法的 hook 拒绝整个会话：提前检查，只排除这一个插件
-    const taken = new Set(s.parts.flatMap((x) => x.kernel.tools?.map((t) => t.name) ?? []));
-    const clash = tools.find((t) => taken.has(t.name));
-    const problem = clash
-      ? `tool ${clash.name} is already registered by ${s.parts.find((x) => x.kernel.tools?.some((t) => t.name === clash.name))!.source.manifest.id}`
-      : compatProblem(id, manifest.version, hooks);
+    const clash = tools.find((t) => holder(t.name));
+    const problem = clash ? `tool ${clash.name} is already registered by ${holder(clash.name)!.source.manifest.id}` : compatProblem(id, manifest.version, hooks);
     if (problem) {
       host.untrack(id, scope);
       await scope.close();
       host.report(`plugin ${id} did not join session ${s.id}: ${problem}`);
       return;
     }
-    const part: Part = {
+    const live = hooks.map((h) => liveHook(h, owner));
+    part = {
       source: p.source,
       owner,
       gates: hooks.filter((h) => h.kind === "gate" && h.point === "tool.gate").length,
-      kernel: this.#confirmed(p, kernelPlugin({
-        id,
-        version: manifest.version,
-        layer: KERNEL_LAYER[layer],
-        // 写日志的能力调用时才检查，推不出来（definePlugin 只补 hook 用到的）；jade 的插件都可以写
-        needs: ["log:record", "log:emit"],
-        tools: tools.map((t) => liveTool(t, owner)),
-        hooks: hooks.map((h) => liveHook(h, owner)),
-      })),
+      tools,
+      kernel: () =>
+        this.#confirmed(p, kernelPlugin({
+          id,
+          version: manifest.version,
+          layer: KERNEL_LAYER[layer],
+          // 写日志的能力调用时才检查，推不出来（definePlugin 只补 hook 用到的）；jade 的插件都可以写
+          needs: ["log:record", "log:emit"],
+          tools: scope.closed ? [] : tools.filter((t) => s.keeps(t)),
+          hooks: live,
+        })),
     };
     s.parts.push(part);
+    // 插件被隔离（作用域关闭）：它的工具从下一项工作起不再给模型看
+    scope.add(() => s.invalidate());
   }
 
   /** 项目层插件交给内核的插件要用确认时拿到的 mark 标记，否则内核拒绝整个会话 */
@@ -530,6 +833,8 @@ export class Sessions implements SessionManager {
    * 获取失败也只当作没有：界面上的东西坏了不该让插件加入不了会话
    */
   #sessionUI(s: LiveSession, plugin: string, owner: Owner): SessionUI | undefined {
+    // 子会话不是当前会话，没有自己的界面（4.2）
+    if (s.child) return undefined;
     try {
       const ui = this.#host.service<UI>("ui@1", owner);
       return ui?.session?.({ session: s.id, plugin });
@@ -549,6 +854,22 @@ export class Sessions implements SessionManager {
     return kernelPlugin({ id: CORE_PLUGIN_ID, version: API_VERSION, layer: "distro", hooks: [{ kind: "gate", point: "tool.gate", fn: gate }] });
   }
 
+  /**
+   * 子会话的委派说明和开它的插件给的系统提示词（7.3）。context.build 按顺序执行，别的插件（jade/prompts）
+   * 把自己的段落放在已有段落之前，最后执行的才能放在最前面：所以单独一个插件，hook 的 order 设得很大
+   */
+  #delegation(child: Child): Plugin {
+    const seg = (text: string, by: string) => ({ text, stability: "stable" as const, origin: { by: "plugin" as const, id: by }, trust: "trusted" as const });
+    const head = [seg(DELEGATION, CORE_PLUGIN_ID), ...(child.system ? [seg(child.system, child.by)] : [])];
+    return kernelPlugin({
+      id: `${CORE_PLUGIN_ID}/delegation`,
+      version: API_VERSION,
+      layer: "distro",
+      // order 大：任何层的插件之后执行
+      hooks: [{ kind: "transform", point: "context.build", order: 1_000_000, fn: (req) => ({ ...req, system: [...head, ...req.system] }) }],
+    });
+  }
+
   /** approval@1 的提供者（不能是项目层插件）在这个会话里有仍然有效的 tool.gate */
   #guarded(s: LiveSession): boolean {
     const approval = this.#host.provider("approval@1");
@@ -558,9 +879,11 @@ export class Sessions implements SessionManager {
   /** 离开会话：中止正在跑的工作，等它停下，detach，关闭插件的会话作用域 */
   async #leave(s: LiveSession): Promise<void> {
     s.leave();
+    // 它开的子会话一并结束：正在等子会话的工具调用随之结束
+    for (const c of [...s.children]) await this.#end(c);
     await s.idle();
     try {
-      await s.rt.detach();
+      await s.detach();
     } catch (e) {
       this.#host.report(`session ${s.id}: detach failed: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -610,6 +933,12 @@ function toolMeta(plugin: string, t: { name: string; meta?: unknown }): { meta?:
   return { meta };
 }
 
+/** 工具的声明部分（给插件看的 SessionTool），meta 是拷贝 */
+function sessionTool(t: Tool & { meta?: ToolMeta }): SessionTool {
+  const { name, description, inputSchema, effect, concurrency, idempotent, meta } = t;
+  return { name, description, inputSchema, effect, concurrency, idempotent, ...(meta ? { meta: { ...meta } } : {}) };
+}
+
 /** 插件的工具：以插件身份执行；插件被隔离后返回错误结果（由内核转成 tool_result） */
 function liveTool(t: Tool, owner: Owner): Tool {
   return { ...t, execute: (input, ctx) => invoke(owner, `tool ${t.name}`, () => t.execute(input, ctx)) };
@@ -632,6 +961,25 @@ function liveHook(h: LocalHookSpec | RemoteHookSpec, owner: Owner): LocalHookSpe
     return ambient.run(owner, () => fn(payload, ctx));
   };
   return { ...h, fn: wrapped } as LocalHookSpec;
+}
+
+/** 会话是第几层子会话：沿着 session.started 里的 parent 往上数（内核保证引用能解析到，宪法 3.4） */
+async function depthOf(store: LogStore, sessionId: string): Promise<number> {
+  let depth = 0;
+  let id: string | undefined = sessionId;
+  const seen = new Set<string>();
+  while (id && !seen.has(id) && depth < 100) {
+    seen.add(id);
+    let parent: string | undefined;
+    for await (const e of store.read(id)) {
+      if (e.type === "session.started") parent = (e.data as { parent?: SessionRef }).parent?.sessionId;
+      break;
+    }
+    if (!parent) break;
+    depth++;
+    id = parent;
+  }
+  return depth;
 }
 
 /**

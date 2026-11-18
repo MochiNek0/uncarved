@@ -181,7 +181,8 @@ export default definePlugin({
     }
 
     // 能问用户时才有 propose_plan；它只在 plan 模式下发给模型
-    const canPropose = !!ui?.interactive;
+    // 子会话（子 Agent）不提交计划：计划由用户的会话提交
+    const canPropose = !!ui?.interactive && ctx.session.parent === undefined;
     if (canPropose) ctx.kernel.tool(proposePlanTool(approval, ui!));
     ctx.kernel.hook({
       kind: "transform",

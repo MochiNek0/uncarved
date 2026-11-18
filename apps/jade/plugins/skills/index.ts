@@ -155,17 +155,11 @@ export default definePlugin({
     /** 这个会话注册过的 /<skill> 命令 */
     const mine = new Set<string>();
 
-    /** 用新找到的 skill 更新提示词里的列表、可读目录和 /<skill> 命令；没变时什么也不做（不让提示缓存失效） */
-    const apply = (skills: Skill[], warnings: string[]) => {
-      for (const w of warnings) {
-        if (warned.has(w)) continue;
-        warned.add(w);
-        ui?.notify(`${ID}: ${w}`, "warning");
-      }
-      current = skills;
-      latest = skills;
+    const child = ctx.session.parent !== undefined;
+    /** 更新提示词里的列表和可读目录；没变时什么也不做（不让提示缓存失效），返回 false */
+    const applyPrompt = (skills: Skill[]): boolean => {
       const key = JSON.stringify(skills.map((s) => [s.name, s.description, s.dir, s.layer]));
-      if (key === shown) return;
+      if (key === shown) return false;
       shown = key;
 
       // 有随仓库分发的 skill 时整段不可信
@@ -176,6 +170,20 @@ export default definePlugin({
       const dirs = new Set(skills.map((s) => s.dir));
       for (const [dir, revoke] of readable) if (!dirs.has(dir)) (revoke(), readable.delete(dir));
       for (const dir of dirs) if (!readable.has(dir) && approval) readable.set(dir, approval.allowRead(dir));
+      return true;
+    };
+    /** 用新找到的 skill 更新提示词里的列表、可读目录和 /<skill> 命令；没变时什么也不做（不让提示缓存失效） */
+    const apply = (skills: Skill[], warnings: string[]) => {
+      for (const w of warnings) {
+        if (warned.has(w)) continue;
+        warned.add(w);
+        ui?.notify(`${ID}: ${w}`, "warning");
+      }
+      current = skills;
+      // 子会话（子 Agent）的 skill 和用户的会话一样，/skills、/<skill> 命令归用户的会话管：子会话关闭时不能把它们带走
+      if (child) return applyPrompt(skills);
+      latest = skills;
+      if (!applyPrompt(skills)) return;
 
       // skill 也可以当命令用：/<skill 名> [要做的事]。
       // 新会话在旧会话关闭之前打开：旧会话注册的同名命令先撤销，换成这个会话的。

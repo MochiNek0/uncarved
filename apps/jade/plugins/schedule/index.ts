@@ -249,6 +249,8 @@ export default definePlugin({
   },
 
   async session(ctx) {
+    // 子会话（子 Agent）不建定时任务，也不接收：到点的任务投到用户的会话里
+    if (ctx.session.parent) return;
     const store = new ScheduleStore(ctx.home);
     for (const t of tools(store, ctx.cwd)) ctx.kernel.tool(t);
 

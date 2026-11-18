@@ -8,8 +8,7 @@
     "ui@1",
     "prompts@1",
     "renderers@1",
-    "commands@1",
-    "tools@1"
+    "commands@1"
   ],
   "config": {
     "shell": {

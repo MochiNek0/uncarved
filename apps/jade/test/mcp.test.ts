@@ -7,7 +7,7 @@ import path from "node:path";
 import type { Block } from "uncarved";
 import type { CommandContext, Commands } from "@uncarved/jade-api/services";
 import { manageMcp } from "../plugins/mcp/install.ts";
-import { expandEnv, loadMcpConfig, McpClient, mcpToolName, mcpTools, type McpServerEntry } from "../plugins/mcp/mcp.ts";
+import { expandEnv, loadMcpConfig, McpClient, McpToolCache, mcpToolName, mcpTools, type McpServerEntry } from "../plugins/mcp/mcp.ts";
 import type { SessionManager, UI } from "../src/index.ts";
 import { featureHost, msg, reply, results, tempDir, textOf, use } from "./feature-host.ts";
 import { plain as plainText } from "../plugins/tui/screen.ts";
@@ -32,6 +32,11 @@ function fake(cwd: string, env: Record<string, string> = {}): McpClient {
 const fakeServer = { command: process.execPath, args: [SERVER] };
 const ui: UI = { interactive: false, notify: () => {}, select: async () => undefined, input: async () => undefined };
 const ctxFor = (sessions: SessionManager): CommandContext => ({ signal: new AbortController().signal, ui, sessions, print: () => {} });
+type Host = Awaited<ReturnType<typeof featureHost>>["host"];
+/** 执行 /mcp */
+const mcp = (host: Host, args: string) => host.service<Commands>("commands@1")!.get("mcp")!.command.run(args, ctxFor(host.sessions));
+/** /mcp 显示有服务连上了 */
+const mcpConnected = async (host: Host) => /connected/.test(shown(await mcp(host, "")));
 
 describe("MCP config", () => {
   test("user, .mcp.json and .jade/mcp.json are merged with nearer files winning; ${VAR} is expanded", async () => {
@@ -204,9 +209,7 @@ describe("jade/mcp plugin", () => {
     const home = await tempDir("jade-mcp-home-");
     const mark = path.join(home, "mark.txt");
     await writeFile(path.join(home, "mcp.json"), JSON.stringify({ mcpServers: { fake: { ...fakeServer, env: { MCP_MARK: mark } } } }));
-    // 假的 tools@1：记下登记给嵌套 Agent 的工具
-    const task = { manifest: { id: "test/tools", provides: ["tools@1"], replaces: ["jade/tools"] }, code: `export default { process(ctx) { ctx.provide("tools@1", { list: () => [], register: (t) => { globalThis.__jadeTest.notes.push("task tool " + t.name); return () => {}; } }); } };` };
-    const { host, state } = await featureHost({ home, config: { "jade/approval": { mode: "yolo" } }, plugins: [task] });
+    const { host, state } = await featureHost({ home, config: { "jade/approval": { mode: "yolo" } } });
     try {
       state.script.push({ content: [use("e", "mcp__fake__echo", { text: "hi" }), use("p", "mcp__fake__picture", {}), use("f", "mcp__fake__fail", {})], stopReason: "tool_use" }, reply("ok"));
       const s = await host.sessions.open();
@@ -219,8 +222,6 @@ describe("jade/mcp plugin", () => {
       expect(p!.content.map((b) => b.kind)).toEqual(["image", "text"]);
       expect(f!.isError).toBe(true);
       expect(textOf(f!.content)).toBe("it broke");
-      // 子 Agent 只拿声明了只读的工具
-      expect(state.notes.filter((n) => n.startsWith("task tool mcp__"))).toEqual(["task tool mcp__fake__echo"]);
       const listed = shown(await host.service<Commands>("commands@1")!.get("mcp")!.command.run("", ctxFor(host.sessions)));
       expect(listed).toContain("fake");
       expect(listed).toContain("connected");
@@ -282,6 +283,146 @@ describe("jade/mcp plugin", () => {
       expect(w.state.requests[1]!.tools.map((t) => t.name)).toContain("mcp__repo__echo");
     } finally {
       await w.host.close();
+    }
+  }, 30_000);
+
+  test("a server jade connected to before is not waited for: the session starts with its tools from last time and calls wait for it", async () => {
+    const home = await tempDir("jade-mcp-home-");
+    const delay = path.join(home, "delay.txt");
+    await writeFile(path.join(home, "mcp.json"), JSON.stringify({ mcpServers: { fake: { ...fakeServer, env: { MCP_DELAY_FILE: delay } } } }));
+    const config = { "jade/approval": { mode: "yolo" } };
+    // 第一次：没连上过，照常等它连上，记下它的工具
+    const first = await featureHost({ home, config });
+    try {
+      first.state.script.push(reply("ok"));
+      await (await first.host.sessions.open()).send(msg("hi"));
+      expect(first.state.requests[0]!.tools.map((t) => t.name)).toContain("mcp__fake__echo");
+    } finally {
+      await first.host.close();
+    }
+    const cached = JSON.parse(await readFile(path.join(home, "state", "mcp-tools.json"), "utf8")) as { servers: Record<string, { tools: unknown[] }> };
+    expect(Object.values(cached.servers).map((e) => e.tools.length)).toEqual([6]);
+
+    // 第二次：服务要 7 秒才启动好（超过等待的 5 秒），会话不等它，工具和说明照样有，调用时等它连上
+    await writeFile(delay, "7000");
+    const second = await featureHost({ home, config });
+    try {
+      second.state.script.push({ content: [use("e", "mcp__fake__echo", { text: "late" })], stopReason: "tool_use" }, reply("ok"));
+      const started = Date.now();
+      const s = await second.host.sessions.open();
+      expect(Date.now() - started).toBeLessThan(4000);
+      await s.send(msg("go"));
+      expect(second.state.requests[0]!.tools.map((t) => t.name)).toContain("mcp__fake__echo");
+      expect(second.state.requests[0]!.system.some((x) => x.text.includes("Use echo for testing."))).toBe(true);
+      expect(textOf(results(second.state.requests[1]!)[0]!.content)).toBe("echo: late");
+      // 工具没变：不用提示开新会话
+      expect(second.state.notes.join("\n")).not.toContain("/clear");
+    } finally {
+      await second.host.close();
+    }
+  }, 60_000);
+
+  test("a server used for the first time that takes longer than the startup wait gets its tools from the next turn after it connects, without /clear", async () => {
+    const home = await tempDir("jade-mcp-home-");
+    const delay = path.join(home, "delay.txt");
+    // 比第一次用时等的 5 秒长
+    await writeFile(delay, "6500");
+    await writeFile(path.join(home, "mcp.json"), JSON.stringify({ mcpServers: { fake: { ...fakeServer, env: { MCP_DELAY_FILE: delay } } } }));
+    const { host, state } = await featureHost({ home, config: { "jade/approval": { mode: "yolo" } } });
+    try {
+      state.script.push(reply("one"), reply("two"));
+      const started = Date.now();
+      const s = await host.sessions.open();
+      expect(Date.now() - started).toBeLessThan(6400);
+      await s.send(msg("right away"));
+      expect(state.requests[0]!.tools.map((t) => t.name).filter((n) => n.startsWith("mcp__"))).toEqual([]);
+      for (let i = 0; i < 100 && !(await mcpConnected(host)); i++) await new Promise((r) => setTimeout(r, 100));
+      await s.send(msg("later"));
+      expect(state.requests[1]!.tools.map((t) => t.name)).toContain("mcp__fake__echo");
+      expect(state.requests[1]!.system.some((x) => x.text.includes("Use echo for testing."))).toBe(true);
+      // 同一个会话
+      expect(state.requests[1]!.messages.length).toBeGreaterThan(state.requests[0]!.messages.length);
+      expect(state.notes.join("\n")).not.toContain("/clear");
+    } finally {
+      await host.close();
+    }
+  }, 30_000);
+
+  test("notifications/tools/list_changed updates the session's tools from the next turn", async () => {
+    const home = await tempDir("jade-mcp-home-");
+    await writeFile(path.join(home, "mcp.json"), JSON.stringify({ mcpServers: { fake: { ...fakeServer, env: { MCP_GROW: "1" } } } }));
+    const { host, state } = await featureHost({ home, config: { "jade/approval": { mode: "yolo" } } });
+    try {
+      state.script.push({ content: [use("g", "mcp__fake__grow", {})], stopReason: "tool_use" }, reply("grown"), { content: [use("x", "mcp__fake__extra", {})], stopReason: "tool_use" }, reply("ok"));
+      const s = await host.sessions.open();
+      await s.send(msg("grow"));
+      expect(state.requests[0]!.tools.map((t) => t.name)).not.toContain("mcp__fake__extra");
+      // 服务重新列出工具是异步的：等它记进缓存
+      for (let i = 0; i < 50; i++) {
+        const c = new McpToolCache(home);
+        await c.load();
+        const { servers } = await loadMcpConfig({ home, root: home, cwd: home });
+        if (c.get(servers[0]!)?.tools.some((t) => t.name === "extra")) break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      await s.send(msg("use it"));
+      expect(state.requests[2]!.tools.map((t) => t.name)).toContain("mcp__fake__extra");
+      expect(textOf(results(state.requests[3]!)[0]!.content)).toBe("called extra");
+    } finally {
+      await host.close();
+    }
+  }, 30_000);
+
+  test("/mcp add starts the server and /mcp remove stops it, both from the next turn and without restarting jade", async () => {
+    const home = await tempDir("jade-mcp-home-");
+    const { host, state } = await featureHost({ home, config: { "jade/approval": { mode: "yolo" } } });
+    try {
+      state.script.push(reply("one"), reply("two"), reply("three"));
+      const s = await host.sessions.open();
+      await s.send(msg("before"));
+      expect(state.requests[0]!.tools.map((t) => t.name).filter((n) => n.startsWith("mcp__"))).toEqual([]);
+      const added = shown(await mcp(host, `add fake -- "${process.execPath}" "${SERVER}"`));
+      expect(added).toContain("its tools are available from the next turn");
+      for (let i = 0; i < 100 && !(await mcpConnected(host)); i++) await new Promise((r) => setTimeout(r, 100));
+      await s.send(msg("added"));
+      expect(state.requests[1]!.tools.map((t) => t.name)).toContain("mcp__fake__echo");
+      expect(shown(await mcp(host, "remove fake"))).toContain("jade stops it");
+      await s.send(msg("removed"));
+      expect(state.requests[2]!.tools.map((t) => t.name).filter((n) => n.startsWith("mcp__"))).toEqual([]);
+    } finally {
+      await host.close();
+    }
+  }, 30_000);
+
+  test("when a server's tools changed since last time, a tool it no longer offers fails clearly and the session gets the new list from the next turn", async () => {
+    const home = await tempDir("jade-mcp-home-");
+    const delay = path.join(home, "delay.txt");
+    await writeFile(delay, "1500");
+    await writeFile(path.join(home, "mcp.json"), JSON.stringify({ mcpServers: { fake: { ...fakeServer, env: { MCP_DELAY_FILE: delay } } } }));
+    // 上次连上时它还有一个 gone 工具
+    const { servers } = await loadMcpConfig({ home, root: home, cwd: home });
+    const cache = new McpToolCache(home);
+    await cache.put(servers[0]!, { tools: [{ name: "gone", description: "Removed since.", inputSchema: { type: "object" } }, { name: "echo", inputSchema: { type: "object" }, annotations: { readOnlyHint: true } }] });
+    const { host, state } = await featureHost({ home, config: { "jade/approval": { mode: "yolo" } } });
+    try {
+      state.script.push({ content: [use("g", "mcp__fake__gone", {})], stopReason: "tool_use" }, reply("ok"));
+      const s = await host.sessions.open();
+      await s.send(msg("go"));
+      expect(state.requests[0]!.tools.map((t) => t.name).filter((n) => n.startsWith("mcp__"))).toEqual(["mcp__fake__gone", "mcp__fake__echo"]);
+      const [g] = results(state.requests[1]!);
+      expect(g!.isError).toBe(true);
+      expect(textOf(g!.content)).toContain('no longer offers the tool "gone"');
+      // 下一轮起是服务现在的工具，不用 /clear
+      state.script.push(reply("again"));
+      await s.send(msg("again"));
+      expect(state.requests[2]!.tools.map((t) => t.name).filter((n) => n.startsWith("mcp__"))).toEqual(["mcp__fake__echo", "mcp__fake__picture", "mcp__fake__fail", "mcp__fake__crash", "mcp__fake__slow", "mcp__fake__weird_name_with_chars"]);
+      expect(state.notes.join("\n")).not.toContain("/clear");
+      // 记下了新的工具：下一个会话用新的
+      const next = new McpToolCache(home);
+      await next.load();
+      expect(next.get(servers[0]!)!.tools.map((t) => t.name)).toEqual(["echo", "picture", "fail", "crash", "slow", "weird.name/with:chars"]);
+    } finally {
+      await host.close();
     }
   }, 30_000);
 

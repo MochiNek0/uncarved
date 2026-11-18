@@ -6,7 +6,7 @@ import { PassThrough, Writable } from "node:stream";
 import { InputHistory } from "../plugins/tui/history.ts";
 import { edit, layout, moveRow, offsetAt } from "../plugins/tui/editor.ts";
 import type { Screen } from "../plugins/tui/screen.ts";
-import { fitSegments, tail, tuiScreen, type TuiHandlers } from "../plugins/tui/tui.ts";
+import { fitSegments, Store, tail, tuiScreen, type TuiHandlers } from "../plugins/tui/tui.ts";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** 等到输出里出现 text（或匹配正则），最多 ms 毫秒：界面按定时器刷新，机器忙时固定等一小段时间不一定够 */
@@ -95,6 +95,30 @@ describe("editor", () => {
     expect(offsetAt("ab\ncd", 10, 1, 1)).toBe(4);
     expect(offsetAt("ab\ncd", 10, 1, 9)).toBe(5);
     expect(offsetAt("ab\ncd", 10, 2, 0)).toBeUndefined();
+  });
+});
+
+describe("transcript rows", () => {
+  test("rows wrapped later in front shift row numbers by Store.front, so a remembered row still finds its line; a trim starts a new generation", async () => {
+    const store = new Store({ cwd: "~", model: "m", session: "s" } as never, { columns: 80, rows: 24 });
+    store.append(Array.from({ length: 3000 }, (_, i) => `line-${i}`));
+    store.lines(40);
+    // 宽度变了：只先折末尾的一段，前面的在后台分批补上
+    store.lines(50, 30);
+    const generation = store.generation;
+    const before = store.lines(50, 30);
+    expect(before.length).toBeLessThan(3000);
+    const row = before.length - 5;
+    const text = before[row];
+    const stable = row - store.front;
+    await sleep(100);
+    const after = store.lines(50, 30);
+    expect(after.length).toBe(3000);
+    expect(after[stable + store.front]).toBe(text);
+    expect(store.generation).toBe(generation);
+    // 超过上限裁掉最早的行：行号整体重来
+    store.append(Array.from({ length: 8000 }, (_, i) => `more-${i}`));
+    expect(store.generation).toBe(generation + 1);
   });
 });
 
@@ -745,6 +769,37 @@ describe("terminal UI", () => {
     await type("\x1b[<0;5;7m");
     expect(raw()).toContain("hidden-1");
     expect(copied()).toEqual([]);
+  });
+
+  test("dragging above or below the conversation keeps scrolling and extends the selection until released", async () => {
+    const { screen, type, raw, output, clear } = setup();
+    screen.log(Array.from({ length: 200 }, (_, i) => `line-${i}`).join("\n"));
+    await sleep(80);
+    const copied = () => [...raw().matchAll(/\x1b\]52;c;([A-Za-z0-9+/=]*)\x07/g)].map((m) => Buffer.from(m[1]!, "base64").toString("utf8"));
+    const numbers = (text: string) => text.split("\n").map((l) => Number(/^line-(\d+)$/.exec(l)?.[1]));
+    // 往上：按在对话区第 5 行，拖到标题上停住不动，终端不再发事件也要接着滚
+    await type("\x1b[<0;80;10M");
+    await type("\x1b[<32;2;2M");
+    await sleep(600);
+    await type("\x1b[<0;2;2m");
+    const up = numbers(copied()[0]!);
+    expect(up.every((n, i) => i === 0 || n === up[i - 1]! + 1)).toBe(true);
+    // 一屏大约 30 行；停住不动时也一直在滚，选中的超过一屏
+    expect(up.length).toBeGreaterThan(40);
+    // 往下：现在翻在上面，按在对话区第 1 行，拖到输入框上
+    clear();
+    await type("\x1b[<0;2;6M");
+    await type("\x1b[<32;80;39M");
+    await sleep(600);
+    await type("\x1b[<0;80;39m");
+    const down = numbers(copied()[0]!);
+    expect(down[0]).toBe(up[0]);
+    expect(down.every((n, i) => i === 0 || n === down[i - 1]! + 1)).toBe(true);
+    expect(down.length).toBeGreaterThan(40);
+    // 松开之后不再滚（标题里的吉祥物还会眨眼，只看对话区）
+    clear();
+    await sleep(200);
+    expect(output()).not.toMatch(/line-\d+/);
   });
 
   test("clicks still land on the right line during the full repaint after startup", async () => {

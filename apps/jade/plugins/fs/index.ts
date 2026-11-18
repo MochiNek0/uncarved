@@ -1,7 +1,7 @@
 // jade/fs：文件工具 read_file、write_file、edit_file、multi_edit、list_dir、glob、grep。
 
 import { definePlugin } from "@uncarved/jade-api";
-import type { Renderers, Tools } from "@uncarved/jade-api/services";
+import type { Renderers } from "@uncarved/jade-api/services";
 import { fsTools, SeenFiles } from "./fs.ts";
 import { fsRenderers } from "./renderers.ts";
 
@@ -25,12 +25,7 @@ export default definePlugin({
         seen.prune(request.messages);
       },
     });
+    // 子 Agent 是核心开的子会话，本插件在里面另有一份（读过的文件各算各的），不用再经 tools@1 另登记
     for (const tool of fsTools(ctx.cwd, { responses, seen })) ctx.kernel.tool(tool);
-    // 嵌套 Agent（例如 jade/task 的子 Agent）的只读工具：另一套实例，它读过的文件不算主会话读过
-    // jade/tools 被隔离时它的服务已失效：嵌套 Agent 没有文件工具，文件工具本身照常
-    try {
-      const shared = ctx.service<Tools>("tools@1");
-      if (shared) for (const tool of fsTools(ctx.cwd)) if (tool.effect === "read") shared.register(tool);
-    } catch {}
   },
 });

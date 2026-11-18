@@ -4,8 +4,8 @@
 // 插件按 error.name 判断。
 
 import { stripVTControlCharacters } from "node:util";
-import type { LocalHookSpec, LogEvent, RemoteHookSpec, RuntimeNotice, State, Tool, ToolInfo, UserInput } from "uncarved";
-export type { LocalHookSpec, LogEvent, RemoteHookSpec, RuntimeNotice, State, Tool, ToolInfo, UserInput } from "uncarved";
+import type { ChildRef, LocalHookSpec, LogEvent, Provider, RemoteHookSpec, RuntimeNotice, SessionRef, State, Tool, ToolInfo, UserInput } from "uncarved";
+export type { ChildRef, LocalHookSpec, LogEvent, Provider, RemoteHookSpec, RuntimeNotice, SessionRef, State, Tool, ToolInfo, UserInput } from "uncarved";
 
 /** 来源层级，后面的层级更高（3.3） */
 export type PluginLayer = "bundled" | "user" | "project";
@@ -191,6 +191,46 @@ export interface SessionControl {
   subscribe(fn: (n: RuntimeNotice) => void): () => void;
   /** 这个会话里叫这个名字的工具；没有时 undefined（例如历史里的调用来自一个现在没加载的插件） */
   tool(name: string): SessionTool | undefined;
+  /** 子会话的父会话（打开它的那次工具调用）；顶层会话没有。插件可以据此在子会话里少做一些事（例如不预测用户的下一条消息） */
+  readonly parent?: SessionRef;
+  /** 第几层子会话：顶层会话是 0 */
+  readonly depth: number;
+  /** 本会话还能不能开子会话（层数上限，见 spawn）。不能时开子会话的工具就不必注册了 */
+  readonly canSpawn: boolean;
+  /**
+   * 开一个子会话（子 Agent）：一个真正的会话，日志存盘、记着父会话，所有插件照常加入（审批、/undo、hook、检查都生效）。
+   * 只在本会话的工具执行期间用：opts.parent 是那次调用的 ToolContext.parent。子会话不会成为当前会话，
+   * 本会话离开（/clear、/resume、退出）时一并结束。层数、同时数量有上限（$JADE_HOME/config.json 的 "jade/core"：
+   * maxDepth 默认 1，maxActive 默认 8）：超过层数时抛错，超过数量时等前面的结束。项目层插件不能用
+   */
+  spawn(opts: SpawnOptions): Promise<ChildSession>;
+}
+
+/** ctx.session.spawn 的参数 */
+export interface SpawnOptions {
+  /** 打开子会话的工具调用：ToolContext.parent，必须属于本会话 */
+  parent: SessionRef;
+  /** 给用户看的名字，例如任务的描述；子会话弹出对话框时标在标题前面 */
+  label?: string;
+  /** 子会话里保留哪些工具：返回 true 的保留，不给时保留全部。被去掉的工具对子会话的模型不存在 */
+  tools?: (tool: SessionTool) => boolean;
+  /** 子会话用的模型；不给时和本会话相同 */
+  provider?: Provider;
+  /** 给子会话的系统提示词（它的角色和任务的做法），放在核心的委派说明之后、其他插件给的之前 */
+  system?: string;
+}
+
+/** 子会话：打开它的插件拿着，用完 close */
+export interface ChildSession {
+  readonly id: string;
+  /** 同 Session.send：这一轮跑完时 resolve */
+  send(input: UserInput): Promise<void>;
+  readonly state: State;
+  subscribe(fn: (n: RuntimeNotice) => void): () => void;
+  /** 中止正在跑的这一轮 */
+  abort(reason?: string): void;
+  /** 结束子会话（写 session.ended），返回给父会话的工具结果用的引用（ToolResult.child）。可以重复调用 */
+  close(): Promise<ChildRef>;
 }
 
 export interface SessionContext extends ScopeContext {
@@ -207,10 +247,18 @@ export interface SessionContext extends ScopeContext {
   readonly panel?: (text: Text | undefined) => void;
   /** 输入框里的草稿：读、追加、整段替换、灰色提示；只有终端界面有 */
   readonly input?: Draft;
-  /** 交给内核的部分，只能在 session() 执行期间注册：会话的内核插件清单在创建时确定 */
+  /** 交给内核的部分 */
   readonly kernel: {
-    tool(tool: Tool & { meta?: ToolMeta }): void;
-    /** 进程内的 hook，或进程外插件的 RemoteHookSpec（字段裁剪、超时由内核保证） */
+    /**
+     * 注册工具，返回撤销。session() 里注册的会话一开始就有；session() 返回之后注册、撤销的从下一轮起生效
+     * （核心在两轮之间按新的工具表重挂会话，对话不受影响，只是下一次请求的提示缓存失效）。
+     * 和已有工具重名时抛错。作用域关闭时它的工具随之去掉
+     */
+    tool(tool: Tool & { meta?: ToolMeta }): () => void;
+    /**
+     * 进程内的 hook，或进程外插件的 RemoteHookSpec（字段裁剪、超时由内核保证）。
+     * 只能在 session() 执行期间注册：关卡和顺序在会话开始时确定
+     */
     hook(hook: LocalHookSpec | RemoteHookSpec): void;
   };
 }

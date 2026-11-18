@@ -55,6 +55,8 @@ const writeRoots: string[] = [];
 const approvers = new Map<Approver, string>();
 /** 打开着的会话：会话 id → 判断只读调用能不能不问就执行（allows） */
 const sessionChecks = new Map<string, (call: GatedToolCall) => boolean>();
+/** 打开着的会话：会话 id → 它现在的"总是允许"规则。子会话（子 Agent）照父会话的规则办：主会话里选过"总是允许"的，子 Agent 不再问 */
+const sessionRules = new Map<string, () => AllowRule[]>();
 
 export default definePlugin({
   process(ctx) {
@@ -127,7 +129,10 @@ export default definePlugin({
     /** "在这个目录里总是允许"的规则：会话打开时从文件读，本会话里新选的也加进来 */
     const foreverFile = path.join(ctx.home, "state", "approvals.json");
     const forever: AllowRule[] = (await readForever(foreverFile))[ctx.cwd] ?? [];
-    const saved = () => [...forever, ...merged(logged)];
+    /** 父会话现在的规则（子会话才有） */
+    const parent = ctx.session.parent?.sessionId;
+    const inherited = () => (parent ? (sessionRules.get(parent)?.() ?? []) : []);
+    const saved = () => [...forever, ...merged(logged), ...inherited()];
     /** 这一轮里关卡看过、还没有决定的调用 */
     const seen = new Map<string, Asked>();
     /** 已经交给会话的回答：在日志里看到那条 approval 输入时记一条 answered 事件 */
@@ -141,10 +146,12 @@ export default definePlugin({
 
     const id = ctx.session.id;
     const check = (call: GatedToolCall) =>
-      rules.decide(call, { mode: mode === "yolo" && call.tool.effect === "read" ? "yolo" : "readonly", rules: [...forever, ...logged, ...added] }).decision === "allow";
+      rules.decide(call, { mode: mode === "yolo" && call.tool.effect === "read" ? "yolo" : "readonly", rules: [...forever, ...logged, ...added, ...inherited()] }).decision === "allow";
     sessionChecks.set(id, check);
+    sessionRules.set(id, saved);
     await ctx.effect(() => () => {
       if (sessionChecks.get(id) === check) sessionChecks.delete(id);
+      if (sessionRules.get(id) === saved) sessionRules.delete(id);
     });
 
     ctx.kernel.hook({

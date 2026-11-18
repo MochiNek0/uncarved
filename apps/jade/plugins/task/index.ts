@@ -1,19 +1,19 @@
-// jade/task：task 工具，把调研交给只读的子 Agent（见 subagent.ts）。
+// jade/task：task 工具，把一件事交给子 Agent（见 subagent.ts）。
 //
-// 子 Agent 用哪些工具：其他插件登记在 tools@1（jade/tools）里的那些（jade/fs 登记 read_file、list_dir、glob、grep），
-// 每次启动子 Agent 时取。主会话里的工具对象是各插件私有的，子 Agent 拿到的是登记者另给的一份。
+// 子 Agent 是核心开的子会话（ctx.session.spawn）：工具就是会话里的工具，默认只留只读的（加上只放行只读命令的 bash），
+// 配置 write 为 true 时全部保留，写操作和主会话一样经过审批。子会话的日志存盘，父会话的工具结果带着它的引用。
 
 import type { Usage } from "uncarved";
-import { definePlugin, type UI } from "@uncarved/jade-api";
-import type { Approval, Models, Prompts, Renderers, Tools } from "@uncarved/jade-api/services";
-import { taskTool, type ApproveSubagent, type TaskProgress } from "./subagent.ts";
+import { definePlugin, type SessionContext } from "@uncarved/jade-api";
+import type { Approval, Models, Renderers } from "@uncarved/jade-api/services";
+import { CHARS_PER_TOKEN, FALLBACK_WINDOW, fitToolResults, READ_ONLY_REASON, REPORT_TOOL_SHARE, stepsThisTurn, subagentPrompt, taskTool, WRAP_UP_AT, type Control, type TaskProgress } from "./subagent.ts";
 import { clip, dim, error, lines as joinLines } from "./style.ts";
 
 const DEFAULT_MAX_STEPS = 40;
 const MAX_DETAIL_LINES = 40;
 
-/** 子 Agent 的审批一次问一个：并行的几个子 Agent 不同时弹对话框 */
-let asking: Promise<unknown> = Promise.resolve();
+/** task 开的、还在跑的子会话 → 它的运行状态（子会话里本插件的 hook 用） */
+const controls = new Map<string, Control>();
 
 export default definePlugin({
   process(ctx) {
@@ -63,52 +63,41 @@ export default definePlugin({
 
   session(ctx) {
     const models = ctx.require<Models>("models@1");
-    /** 跑完、还没记进日志的子 Agent 用量，按 task 调用的 toolUseId */
-    const usage = new Map<string, Usage>();
     const configured = ctx.config.maxSteps;
     const maxSteps = typeof configured === "number" && Number.isInteger(configured) && configured > 0 ? configured : DEFAULT_MAX_STEPS;
+    const write = ctx.config.write === true;
+    const window = () => models.current()?.contextWindow ?? FALLBACK_WINDOW;
+
+    // 本插件在子会话里的那份：task 开的子会话的步数上限、写报告、只读的限制。别的插件开的子会话（controls 里没有）不管
+    if (ctx.session.parent) childHooks(ctx, () => controls.get(ctx.session.id), window);
+
+    // 层数到了上限的会话（默认子 Agent 不能再开子 Agent）不给 task 工具
+    if (!ctx.session.canSpawn) return;
+    /** 跑完、还没记进日志的子 Agent 用量，按 task 调用的 toolUseId */
+    const usage = new Map<string, Usage>();
     // 子 Agent 用的模型：/model 保存过的名字，或当前服务上的另一个模型；不设时用会话的模型
     const model = typeof ctx.config.model === "string" && ctx.config.model ? ctx.config.model : undefined;
-    const approve: ApproveSubagent = (call, signal) => {
-      const ui = ctx.service<UI>("ui@1");
-      if (!ui?.interactive) return Promise.resolve({ approved: false, reason: "Nobody can approve this action for a sub-agent. Report what you need instead." });
-      const ask = asking.then(async () => {
-        const choice = await ui.select(
-          {
-            title: `A sub-agent wants to ${call.why}. Allow it?`,
-            detail: `${call.name} ${clip(JSON.stringify(call.input), 2000)}`,
-            options: [
-              { label: "Yes", value: "yes" },
-              { label: "No", value: "no" },
-            ],
-          },
-          signal,
-        );
-        return choice === "yes" ? { approved: true } : { approved: false, reason: "The user denied this action." };
-      });
-      asking = ask.catch(() => {});
-      return ask;
-    };
+    const provider = model ? { id: ctx.plugin, complete: (req: Parameters<Models["complete"]>[0], o: Parameters<Models["complete"]>[1]) => models.complete(req, { ...o, model }) } : undefined;
+    const system = subagentPrompt(maxSteps, write);
     ctx.kernel.tool(
       taskTool({
-        cwd: ctx.cwd,
-        provider: { id: ctx.plugin, complete: (req, o) => models.complete(req, model ? { ...o, model } : o) },
-        // 没有 jade/tools、或者它被隔离了（服务已失效，调用会抛错）：子 Agent 没有工具
-        tools: () => {
-          try {
-            return ctx.service<Tools>("tools@1")?.list() ?? [];
-          } catch {
-            return [];
-          }
-        },
         maxSteps,
-        approve,
-        allowed: (call) => ctx.service<Approval>("approval@1")?.allows(ctx.session.id, call) ?? false,
-        // 用到的时候再取：prompts@1 的提供者在自己的 session() 里才读指令文件，可能排在本插件后面
-        ...(ctx.config.instructions === false ? {} : { instructions: () => ctx.service<Prompts>("prompts@1")?.instructions?.(ctx.session.id) ?? [] }),
-        id: ctx.plugin,
+        write,
+        spawn: (parent, description) =>
+          ctx.session.spawn({
+            parent,
+            label: description,
+            system,
+            ...(provider ? { provider } : {}),
+            // 只读时：只读的工具，加上 bash 这类按命令判断的（只放行审批规则认定为只读的命令，见 childHooks）。
+            // 子 Agent 不能问用户问题（ask_user）：它的过程用户看不到，问了也没有上下文
+            tools: (t) => t.name !== "ask_user" && (write || t.effect === "read" || t.meta?.shell !== undefined),
+          }),
+        register: (child, control) => {
+          controls.set(child, control);
+          return () => void controls.delete(child);
+        },
         usage: (toolUseId, u) => void usage.set(toolUseId, u),
-        contextWindow: () => models.current()?.contextWindow,
       }),
     );
     // 子 Agent 的用量记成本插件的事件（和压缩、审查的用量一样），界面据此计入会话用量；只能在 hook 里记
@@ -127,3 +116,43 @@ export default definePlugin({
     ctx.kernel.hook({ kind: "observe", point: "event", fn: (e) => void (e.type === "turn.ended" && usage.clear()) });
   },
 });
+
+/** task 开的子会话里，本插件加的 hook。control 在子会话开好之后才登记，hook 执行时再取 */
+function childHooks(ctx: SessionContext, control: () => Control | undefined, window: () => number): void {
+  // 步数上限；wrapUp 时只再要一次回复（报告）。历史接近上下文窗口时也停下，之后要报告
+  ctx.kernel.hook({
+    kind: "gate",
+    point: "turn.continue",
+    fn: (s) => {
+      const c = control();
+      if (!c) return { decision: "abstain" };
+      return stepsThisTurn(s) >= (c.wrapUp ? 1 : c.maxSteps) || (c.lastTokens ?? 0) >= window() * WRAP_UP_AT ? { decision: "deny" } : { decision: "abstain" };
+    },
+  });
+  // 要报告时工具输出可能已经很多（上面停下时、或者已经超出窗口）：只放进最近的一部分
+  ctx.kernel.hook({
+    kind: "transform",
+    point: "context.project",
+    fn: (messages) => (control()?.wrapUp ? fitToolResults(messages, window() * REPORT_TOOL_SHARE * CHARS_PER_TOKEN, ctx.plugin) : messages),
+  });
+  // 只读的子 Agent：不是只读的工具（bash）只放行主会话的审批规则认定为只读的调用（git log、ls、rg……），其余的不问用户，直接拒绝
+  ctx.kernel.hook({
+    kind: "gate",
+    point: "tool.gate",
+    fn: (call) => {
+      const c = control();
+      if (!c || c.write || call.tool.effect === "read") return { decision: "abstain" };
+      if (ctx.service<Approval>("approval@1")?.allows(ctx.session.id, call)) return { decision: "abstain" };
+      return { decision: "deny", reason: READ_ONLY_REASON(call.name) };
+    },
+  });
+  // instructions: false：不给子 Agent 指令文件（jade/prompts 放进来的、带来源的那几段）
+  if (ctx.config.instructions === false) {
+    ctx.kernel.hook({
+      kind: "transform",
+      point: "context.build",
+      order: 100,
+      fn: (req) => (control() ? { ...req, system: req.system.filter((seg) => !(seg.origin.by === "plugin" && seg.origin.id === "jade/prompts" && seg.origin.source)) } : req),
+    });
+  }
+}

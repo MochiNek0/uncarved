@@ -45,7 +45,6 @@ jade's own commands (plugins, update, --safe): jade help`;
 /** 前端自己的命令：帮助和退出。其余命令都来自 commands@1 */
 const OWN: CommandInfo[] = [
   { name: "help", about: "list the commands and keys" },
-  { name: "copy", args: "[code]", about: "copy the last reply to the clipboard as it was written (code: only its last code block)" },
   { name: "exit", about: "quit (the session stays resumable)" },
 ];
 
@@ -642,17 +641,6 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
       screen.log(all.map((c) => `${`/${c.name}${c.args ? ` ${c.args}` : ""}`.padEnd(width)}${dim(c.about)}`).join("\n"));
       return true;
     }
-    if (name === "copy") {
-      const reply = lastReply(current?.state.messages ?? []);
-      const text = rest.trim() === "code" ? reply && lastCodeBlock(reply) : reply;
-      if (!text) screen.log(dim(rest.trim() === "code" ? "The last reply has no code block." : "There is no reply to copy yet."));
-      else if (!screen.copy) screen.log(red("[error] this terminal cannot copy"));
-      else {
-        screen.copy(text);
-        screen.log(dim(`[copied ${[...text].length} characters]`));
-      }
-      return true;
-    }
     const found = commands.get(name);
     if (!found) {
       screen.log(red(`unknown command /${name}; /help lists the commands`));
@@ -773,23 +761,6 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
 }
 
 /** 当前分支；不在仓库里或没有 git 时 undefined */
-/** 最近一条有正文的助手消息的正文（模型写的原文，没有折行和排版） */
-export function lastReply(messages: readonly { role: string; content: readonly Block[] }[]): string | undefined {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i]!;
-    if (m.role !== "assistant") continue;
-    const text = m.content.flatMap((b) => (b.kind === "text" ? [b.text] : [])).join("\n").trim();
-    if (text) return text;
-  }
-  return undefined;
-}
-
-/** Markdown 里最后一个围栏代码块的内容 */
-export function lastCodeBlock(markdown: string): string | undefined {
-  const blocks = [...markdown.matchAll(/^ {0,3}(`{3,}|~{3,})[^\n]*\n([\s\S]*?)^ {0,3}\1[`~]*[ \t]*$/gm)];
-  return blocks.at(-1)?.[2]?.replace(/\n$/, "");
-}
-
 function gitBranch(cwd: string): Promise<string | undefined> {
   return new Promise((resolve) => {
     execFile("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd, timeout: 2000, windowsHide: true }, (err, stdout) => resolve(err ? undefined : stdout.trim() || undefined));

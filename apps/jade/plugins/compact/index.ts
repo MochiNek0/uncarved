@@ -58,6 +58,8 @@ export default definePlugin({
   },
 
   session(ctx) {
+    // 子会话（子 Agent）不压缩：它活不长，上下文由开它的插件管（jade/task 接近窗口时让它写报告、只放最近的工具输出）
+    if (ctx.session.parent) return;
     const models = ctx.require<Models>("models@1");
     const configured = parseTokens(ctx.config.thresholdTokens);
     const keepTokens = parseTokens(ctx.config.keepTokens);

@@ -36,9 +36,13 @@ C 的证据。"多亏是插件才能这样做"是架构对的证据，"架构挡
 
 ### 架构挡了路
 
-- 2026-11-11 设想做一个 `/team` 插件（成员是另起的 Agent）→ 嵌套 Agent 的工具只能经 `jade/task` 的 `task@1` 拿，而且是 `fs`、`shell`、`web`、`mcp` 各自在代码里"向 `task@1` 登记"：提供工具的一方得认识用工具的一方。第三方插件想另起 Agent，没法让内置插件向它登记，只能改这四个插件。这和"服务缺一个方法"不同，提需求也补不上。同日改：拆出中立的注册表 `jade/tools`（`tools@1`：`register`、`list`），提供方只管登记，`jade/task` 改成和第三方一样来取；`task@1` 删掉。`src/` 没动。检验的问题记进了 [jade.md](./jade.md) 第 11 节第 7 步。没做的（`/team` 先不做）：嵌套 Runtime 不经过主会话其他插件的关卡和 hook（审批、`/undo`、用户 hook、兜底关卡），所以登记的仍然只有只读工具和由使用方把关的 `bash`；要让嵌套 Agent 安全地写，得由核心来开子会话。
+- 2026-11-18 MCP 服务启动慢（超过 5 秒）时，它的工具要 `/clear` 开新会话才能用 → 内核的工具表在 `Runtime` 创建时就定了（`#decideTool` 拒绝表外的名字，`context.build` 往请求里加工具也没用）。没改内核，在 `jade/mcp` 里绕过去：每个服务上次连上时的工具和说明记在 `$JADE_HOME/state/mcp-tools.json`，连上过的服务不再等，会话先按上次的工具开始，调用时再等它连上；这次连上发现工具变了，少了的调用时报错，多出来的提示从下一个会话起才有。还挡着的：第一次用的服务、工具变了的服务、MCP 的 `notifications/tools/list_changed`、会话中途装的插件，新工具都只能等下一个会话。要真正解决得让内核支持会话中途增减工具（按宪法第 3 条，等至少有第二种需要它的场景再定；改了还要想清楚提示缓存和 `plugins.changed` 怎么记）。
+  - 2026-11-19 解决，内核没改：内核的 `Runtime.resume` 本来就能用一组新的工具重建同一个会话，插件清单不变时不写 `plugins.changed`。jade 核心在两轮之间 detach 旧实例、按新的工具表 resume（"重挂"，2.2 MB 的日志约几十毫秒），`ctx.kernel.tool` 在 `session()` 之后也能调用、返回撤销。`jade/mcp` 改为跟着服务变化增减工具，上面挡着的几种情况都从下一轮起生效。见 [live-tools-and-child-sessions.md](./live-tools-and-child-sessions.md)。
 
-- 2026-11-10 想做"用 `$EDITOR` 编辑输入"和通用的"复制到剪贴板"→ `ui@1` 没有暂停/恢复终端的方法，也没有剪贴板方法，插件做不了终端编辑器；`/copy` 因此只能放在 `jade/tui` 里。没改，等真的需要时给 `ui@1` 加方法。同日补上：`ui@1.copy`、`ui@1.suspend`，`jade/editor` 用后者；`/copy` 还留在 `jade/tui` 里，没有搬。
+- 2026-11-11 设想做一个 `/team` 插件（成员是另起的 Agent）→ 嵌套 Agent 的工具只能经 `jade/task` 的 `task@1` 拿，而且是 `fs`、`shell`、`web`、`mcp` 各自在代码里"向 `task@1` 登记"：提供工具的一方得认识用工具的一方。第三方插件想另起 Agent，没法让内置插件向它登记，只能改这四个插件。这和"服务缺一个方法"不同，提需求也补不上。同日改：拆出中立的注册表 `jade/tools`（`tools@1`：`register`、`list`），提供方只管登记，`jade/task` 改成和第三方一样来取；`task@1` 删掉。`src/` 没动。检验的问题记进了 [jade.md](./jade.md) 第 11 节第 7 步。没做的（`/team` 先不做）：嵌套 Runtime 不经过主会话其他插件的关卡和 hook（审批、`/undo`、用户 hook、兜底关卡），所以登记的仍然只有只读工具和由使用方把关的 `bash`；要让嵌套 Agent 安全地写，得由核心来开子会话。
+  - 2026-11-19 解决，内核没改：jade 核心加了 `ctx.session.spawn`，子会话用内核已有的 `parent`/`child` 引用，所有插件照常加入，审批、`/undo`、用户 hook、兜底关卡都生效，日志存盘。`jade/task` 改用它（配置 `write: true` 让子 Agent 写），内置插件不再往 `tools@1` 登记。第三方插件另起 Agent 也用 `spawn`。还没做的：子 Agent 的 shell 命令改的文件 `/undo` 撤销不了。见 [live-tools-and-child-sessions.md](./live-tools-and-child-sessions.md)。
+
+- 2026-11-10 想做"用 `$EDITOR` 编辑输入"和通用的"复制到剪贴板"→ `ui@1` 没有暂停/恢复终端的方法，也没有剪贴板方法，插件做不了终端编辑器；`/copy` 因此只能放在 `jade/tui` 里。没改，等真的需要时给 `ui@1` 加方法。同日补上：`ui@1.copy`、`ui@1.suspend`，`jade/editor` 用后者；`/copy` 还留在 `jade/tui` 里，没有搬。2026-11-18 搬出：单独的 `jade/copy`，回复从 `sessions.current.state` 取，剪贴板经 `ui@1.copy`，`jade/tui` 里只剩 `/help`、`/exit`。
 - 2026-11-10 想让会话里的插件读自己会话的日志（`jade/cost` 恢复会话后接着算）→ `ctx.session` 没有 `history()`（命令里的 `sessions.current` 有）→ 绕过去了：合计每轮记进 `derived`。同日 `ctx.session` 加了 `state()` 和 `subscribe()`（和前端的一样）；整份日志（`history()`）仍然只有前端和命令拿得到。
 
 - 2026-11-09 想让用户在终端里一条命令装网上的 skill 和 MCP 服务（`jade skills add`、`jade mcp add`）→ 插件没法加 `jade <子命令>`，直接写进 `main.ts` 又要让核心认识 skill 和 MCP → 给核心加了 `cli@1`（核心只查名字、转交参数），安装逻辑留在 `jade/skills`、`jade/mcp`。见 [jade.md](./jade.md) 3.4。

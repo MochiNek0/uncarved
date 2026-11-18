@@ -78,6 +78,29 @@ describe("jade/undo in a session", () => {
     return { ...w, run: () => undo.run("", c) };
   }
 
+  test("files a sub-agent wrote count as the turn that started it: /undo in the main session restores them", async () => {
+    const w = await scriptedHost({ config: { "jade/task": { write: true } } });
+    const undo = w.host.service<Commands>("commands@1")!.get("undo")!.command;
+    const c: CommandContext = { signal: new AbortController().signal, ui: w.host.service<UI>("ui@1")!, sessions: w.host.sessions, print: () => {} };
+    const a = path.join(w.cwd, "a.txt");
+    await writeFile(a, "before\n");
+    w.shared.script.push(
+      use("u1", "task", { description: "fix", prompt: "change a.txt" }),
+      // 子 Agent：先读（jade/fs 要求改之前读过），再写
+      use("c0", "read_file", { path: "a.txt" }),
+      use("c1", "write_file", { path: "a.txt", content: "after\n" }),
+      say("report: changed a.txt"),
+      // 主会话
+      say("done"),
+    );
+    const s = await w.host.sessions.open();
+    await w.send(s, "fix it");
+    expect(await readFile(a, "utf8")).toBe("after\n");
+    expect(plain(await undo.run("", c))).toContain("Undid 1 change from the last turn:\n  restore a.txt");
+    expect(await readFile(a, "utf8")).toBe("before\n");
+    expect(plain(await undo.run("", c))).toBe("Nothing to undo.");
+  }, 30_000);
+
   test("/undo restores the files of the last turn, then the turn before, and tells the model", async () => {
     const { cwd, host, shared, send, run } = await setup();
     const a = path.join(cwd, "a.txt");

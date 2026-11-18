@@ -1,14 +1,19 @@
-// jade/task：只读的子 Agent。从旧 jade 的 test/jade.test.ts（task …）移植：
-// 子 Agent 的工具来自 tools@1（jade/tools）的登记（jade/fs 登记它的只读工具），模型经 models@1。
+// jade/task：子 Agent 是核心开的子会话（ctx.session.spawn）。从旧 jade 的 test/jade.test.ts（task …）移植：
+// 子 Agent 的工具就是会话里的工具（默认只留只读的，加上只放行只读命令的 bash），审批经主会话同一套 jade/approval。
 
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { symlink, writeFile } from "node:fs/promises";
+import { readFile, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { ProviderError, type Block, type RuntimeNotice } from "uncarved";
+import { JsonlLogStore } from "@uncarved/store-jsonl";
+import { ProviderError, readAll, type Block, type ChildRef, type RuntimeNotice } from "uncarved";
+import type { ChildSession } from "@uncarved/jade-api";
+import { DELEGATION } from "../src/session.ts";
 import { say, cleanup, scriptedHost, textOf, use } from "./scripted-ui.ts";
 
 afterEach(cleanup);
+// 每个子 Agent 都是一个完整的会话（所有插件都加入）：全量测试的负载下可能超过默认的 5 秒
+setDefaultTimeout(30_000);
 import { OMITTED, taskTool, WRAP_UP } from "../plugins/task/subagent.ts";
 import { SEARCH_PROVIDERS } from "../plugins/web/web.ts";
 
@@ -17,8 +22,8 @@ const SEARCH_KEYS = SEARCH_PROVIDERS.map((p) => p.env);
 const ASK = { "jade/approval": { mode: "ask" } };
 
 describe("jade/task", () => {
-  test("runs a read-only sub-agent and returns its report; progress shows its tool calls", async () => {
-    const { host, shared, send } = await scriptedHost();
+  test("runs a read-only sub-agent in a child session and returns its report; progress shows its tool calls", async () => {
+    const { home, host, shared, send } = await scriptedHost();
     shared.script.push(
       use("u1", "task", { description: "look", prompt: "list the root" }),
       // 子 Agent
@@ -34,10 +39,12 @@ describe("jade/task", () => {
 
     expect(shared.requests).toHaveLength(4);
     const sub = shared.requests[1]!;
-    expect(sub.tools.map((t) => t.name).sort()).toEqual(expect.arrayContaining(["glob", "grep", "list_dir", "read_file"]));
-    expect(sub.tools.map((t) => t.name)).not.toContain("write_file");
-    expect(sub.tools.map((t) => t.name)).not.toContain("task");
-    expect(sub.system[0]!.text).toContain("read-only research sub-agent");
+    expect(sub.tools.map((t) => t.name).sort()).toEqual(expect.arrayContaining(["bash", "glob", "grep", "list_dir", "read_file"]));
+    for (const name of ["write_file", "edit_file", "task", "ask_user"]) expect(sub.tools.map((t) => t.name)).not.toContain(name);
+    // 核心的委派说明在最前，然后是 task 给的角色；主 Agent 的角色说明没有
+    expect(sub.system[0]!.text).toBe(DELEGATION);
+    expect(sub.system[1]!.text).toContain("read-only research sub-agent");
+    expect(sub.system.some((seg) => seg.text === shared.requests[0]!.system[0]!.text)).toBe(false);
     expect(textOf(sub.messages[0]!.content)).toBe("list the root");
     // 子 Agent 看不到主会话
     expect(sub.messages).toHaveLength(1);
@@ -45,9 +52,21 @@ describe("jade/task", () => {
     expect(progress).toEqual([
       { kind: "task-start", sessionId: expect.any(String), description: "look" },
       { kind: "task-model" },
-      { kind: "task-tool", name: "list_dir", input: { path: "." }, decision: "allow" },
+      // 参数是审批插件换成绝对路径之后的
+      { kind: "task-tool", name: "list_dir", input: { path: expect.any(String) }, decision: "allow" },
       { kind: "task-model" },
     ]);
+
+    // 子会话的日志存盘，和父会话互相引用；子会话结束了，不进 /resume 的列表
+    const completed = (await s.history()).find((e) => e.type === "tool.completed" && (e.data as { toolUseId: string }).toolUseId === "u1")!;
+    const ref = (completed.data as { child?: ChildRef }).child!;
+    expect(ref.sessionId).toBe((progress[0] as { sessionId: string }).sessionId);
+    const log = await readAll(new JsonlLogStore(path.join(home, "sessions")), ref.sessionId);
+    expect(log[0]).toMatchObject({ type: "session.started", data: { parent: { sessionId: s.id } } });
+    expect(log.at(-1)!.type).toBe("session.ended");
+    expect(log.at(-1)!.seq).toBe(ref.seq);
+    const index = await readFile(path.join(home, "state", "sessions.jsonl"), "utf8");
+    expect(index).not.toContain(ref.sessionId);
   });
 
   test("the sub-agent gets the session's instruction files, the repository's ones untrusted; instructions: false leaves them out", async () => {
@@ -61,13 +80,14 @@ describe("jade/task", () => {
       const project = sub.system.filter((seg) => seg.text.includes("Always cite the design doc."));
       if (off) {
         expect(project).toEqual([]);
+        // 主会话照常有
+        expect(shared.requests[0]!.system.some((seg) => seg.text.includes("Always cite the design doc."))).toBe(true);
         continue;
       }
       expect(project).toHaveLength(1);
       expect(project[0]!.trust).toBe("untrusted");
-      expect(project[0]!.origin).toMatchObject({ by: "plugin", id: "jade/task", source: { layer: "project", path: "AGENTS.md" } });
-      // 子 Agent 自己的提示词排在前面
-      expect(sub.system[0]!.text).toContain("read-only research sub-agent");
+      expect(project[0]!.origin).toMatchObject({ by: "plugin", id: "jade/prompts", source: { layer: "project", path: "AGENTS.md" } });
+      // 委派说明和子 Agent 的角色排在前面
       expect(sub.system.indexOf(project[0]!)).toBeGreaterThan(1);
     }
   });
@@ -130,25 +150,26 @@ describe("jade/task", () => {
   });
 
   test("after an error whose retries are used up, the sub-agent is not asked for a report again", async () => {
-    let calls = 0;
-    const tool = taskTool({
-      cwd: process.cwd(),
-      provider: {
-        id: "p",
-        async complete() {
-          calls++;
-          // 跨插件时宿主的膜把它包成 PluginError，原来的在 cause 里
-          throw Object.assign(new Error("plugin m (models@1.complete): overloaded", { cause: new ProviderError("overloaded", { retryable: true, status: 529 }) }), { name: "PluginError" });
-        },
+    let sends = 0;
+    // 跨插件时宿主的膜把它包成 PluginError，原来的在 cause 里
+    const overloaded = Object.assign(new Error("plugin m (models@1.complete): overloaded", { cause: new ProviderError("overloaded", { retryable: true, status: 529 }) }), { name: "PluginError" });
+    const child: ChildSession = {
+      id: "child",
+      send: async () => {
+        sends++;
+        throw overloaded;
       },
-      tools: () => [],
-      maxSteps: 5,
-      id: "jade/task",
-    });
+      state: { sessionId: "child", lastSeq: 2, phase: "idle", messages: [], batch: [], plugins: [], derived: {} },
+      subscribe: () => () => {},
+      abort: () => {},
+      close: async () => ({ sessionId: "child", seq: 3 }),
+    };
+    const tool = taskTool({ spawn: async () => child, maxSteps: 5, write: false, register: () => () => {} });
     const ctx = { sessionId: "s", toolUseId: "t", signal: new AbortController().signal, parent: { sessionId: "s", eventId: "e" }, progress() {} };
     const r = await tool.execute({ description: "x", prompt: "y" }, ctx);
-    expect(calls).toBe(1);
+    expect(sends).toBe(1);
     expect(r.isError).toBe(true);
+    expect(r.child).toEqual({ sessionId: "child", seq: 3 });
   });
 
   test("a sub-agent whose history nears the context window stops and reports", async () => {
@@ -187,14 +208,13 @@ describe("jade/task", () => {
       shared.script.push(use("u2", "task", { description: "web", prompt: "search it" }), say("report"), say("done"));
       await send(s2, "again");
       expect(shared.requests[4]!.tools.map((t) => t.name)).toContain("web_search");
-      // 换会话之后子 Agent 仍有文件工具（新会话的登记不被旧会话的撤销带走）
       expect(shared.requests[4]!.tools.map((t) => t.name)).toContain("read_file");
     } finally {
       for (const [k, v] of Object.entries(saved)) if (v !== undefined) process.env[k] = v;
     }
   });
 
-  test("reads outside the working directory are put to the user; without an answer they are denied", async () => {
+  test("reads outside the working directory are put to the user, labelled with the task; without an answer they are denied", async () => {
     const { home, host, shared, send } = await scriptedHost({ config: ASK });
     const outside = path.join(home, "secret.txt");
     await writeFile(outside, "the secret");
@@ -202,22 +222,22 @@ describe("jade/task", () => {
       shared.script.push(use("u1", "task", { description: "read", prompt: "read the file" }), use("c1", "read_file", { path: outside }), say("report"), say("done"));
 
     script();
-    shared.answers.push("yes");
+    shared.answers.push("once");
     const s = await host.sessions.open();
     await send(s, "go");
-    expect(shared.asked).toEqual([`A sub-agent wants to read ${outside}, outside the working directory. Allow it?`]);
+    expect(shared.asked).toEqual(["[read] Allow read_file?"]);
     expect(textOf(shared.requests[2]!.messages.at(-1)!.content)).toContain("the secret");
 
     script();
-    shared.answers.push("no");
+    shared.answers.push("deny");
     await send(s, "again");
-    expect(textOf(shared.requests[6]!.messages.at(-1)!.content)).toBe("The user denied this action.");
+    expect(textOf(shared.requests[6]!.messages.at(-1)!.content)).toContain("The user denied this tool call");
 
     // 不能提问的前端
     script();
     shared.interactive = false;
     await send(s, "once more");
-    expect(textOf(shared.requests[10]!.messages.at(-1)!.content)).toContain("Nobody can approve");
+    expect(textOf(shared.requests[10]!.messages.at(-1)!.content)).toContain("nobody can approve it");
     expect(shared.asked).toHaveLength(2);
   });
 
@@ -263,14 +283,36 @@ describe("jade/task", () => {
     );
     const s = await host.sessions.open();
     await send(s, "go");
-    const sub = shared.requests[1]!;
-    expect(sub.tools.map((t) => t.name)).toContain("bash");
-    // 给子 Agent 的 bash 不能在后台跑
-    expect(JSON.stringify(sub.tools.find((t) => t.name === "bash")!.inputSchema)).not.toContain("run_in_background");
+    expect(shared.requests[1]!.tools.map((t) => t.name)).toContain("bash");
     expect(textOf(shared.requests[2]!.messages.at(-1)!.content)).toContain("hello");
     expect(textOf(shared.requests[3]!.messages.at(-1)!.content)).toContain("sub-agents can only run read-only commands");
     expect(existsSync(path.join(cwd, "a.txt"))).toBe(true);
   }, 30_000);
+
+  test("with write: true the sub-agent gets every tool, and its changes go through approval", async () => {
+    const { cwd, host, shared, send } = await scriptedHost({ config: { ...ASK, "jade/task": { write: true } } });
+    shared.script.push(
+      use("u1", "task", { description: "fix", prompt: "write the file" }),
+      use("c1", "write_file", { path: "out.txt", content: "made by a sub-agent\n" }),
+      say("report: wrote out.txt"),
+      say("done"),
+    );
+    shared.answers.push("once");
+    const s = await host.sessions.open();
+    await send(s, "go");
+    expect(shared.requests[1]!.tools.map((t) => t.name)).toContain("write_file");
+    expect(shared.asked).toEqual(["[fix] Allow write_file?"]);
+    expect(await readFile(path.join(cwd, "out.txt"), "utf8")).toBe("made by a sub-agent\n");
+    expect(textOf(shared.requests[3]!.messages.at(-1)!.content)).toBe("report: wrote out.txt");
+  });
+
+  test("with sub-agents turned off the session has no task tool", async () => {
+    const { host, shared, send } = await scriptedHost({ config: { "jade/core": { maxDepth: 0 } } });
+    shared.script.push(say("ok"));
+    const s = await host.sessions.open();
+    await send(s, "go");
+    expect(shared.requests[0]!.tools.map((t) => t.name)).not.toContain("task");
+  });
 
   test("the model configured for sub-agents is the one they call", async () => {
     const { host, shared, send } = await scriptedHost({ config: { "jade/task": { model: "cheap" } } });
@@ -290,19 +332,19 @@ describe("jade/task", () => {
       throw e;
     }
     shared.script.push(use("u1", "task", { description: "read", prompt: "read link" }), use("c1", "read_file", { path: "link" }), say("report"), say("done"));
-    shared.answers.push("no");
+    shared.answers.push("deny");
     const s = await host.sessions.open();
     await send(s, "go");
-    expect(shared.asked).toEqual(["A sub-agent wants to read link, outside the working directory. Allow it?"]);
+    expect(shared.asked).toEqual(["[read] Allow read_file?"]);
   });
 
   test("a glob whose pattern escapes the working directory is put to the user too", async () => {
     const { host, shared, send } = await scriptedHost({ config: ASK });
     shared.script.push(use("u1", "task", { description: "find", prompt: "find keys" }), use("c1", "glob", { pattern: "../**/.ssh/*" }), say("report"), say("done"));
-    shared.answers.push("no");
+    shared.answers.push("deny");
     const s = await host.sessions.open();
     await send(s, "go");
-    expect(shared.asked).toEqual(["A sub-agent wants to read ../**/.ssh/*, outside the working directory. Allow it?"]);
-    expect(textOf(shared.requests[2]!.messages.at(-1)!.content)).toBe("The user denied this action.");
+    expect(shared.asked).toEqual(["[find] Allow glob?"]);
+    expect(textOf(shared.requests[2]!.messages.at(-1)!.content)).toContain("The user denied this tool call");
   });
 });

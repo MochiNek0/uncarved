@@ -1,6 +1,6 @@
 // 文件快照：write_file / edit_file / multi_edit 执行前保存原内容，/undo 用它恢复。从旧 jade 的 tools/checkpoint.ts 移植。
 //
-// 快照放在 <dir>/<sessionId>/<toolUseId>.json，不进日志：文件可能很大，而撤销是用户的操作，不影响插件决策。
+// 快照放在 <dir>/<sessionId>/<toolUseId>.json（子 Agent 写的放在根会话的目录里，via 是根会话里打开它的调用），不进日志：文件可能很大，而撤销是用户的操作，不影响插件决策。
 // 哪些修改已经撤销记在同一个目录的 undone.json 里（命令拿不到会话日志），恢复会话后仍然有效。
 
 import { createHash } from "node:crypto";
@@ -19,6 +19,8 @@ export interface Checkpoint {
   afterHash: string;
   /** 写入完成的时间（毫秒，带小数），决定撤销顺序 */
   at: number;
+  /** 子 Agent（子会话）写的：根会话里打开它的那次工具调用（例如 task）。/undo 按它找到是哪一轮 */
+  via?: string;
 }
 
 export const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -101,7 +103,7 @@ const UNDONE = "undone.json";
  * 最近一轮还有没撤销的修改的快照（最新的在前）。一轮从一条用户自己写的消息开始；
  * 只有工具结果、或者只有插件、宿主加的说明（例如自动续写的提示）的消息不算新的一轮。没有可撤销的返回空数组
  */
-export function lastTurnChanges<T extends { toolUseId: string }>(messages: readonly Message[], checkpoints: readonly T[], undone: ReadonlySet<string>): T[] {
+export function lastTurnChanges<T extends { toolUseId: string; via?: string }>(messages: readonly Message[], checkpoints: readonly T[], undone: ReadonlySet<string>): T[] {
   const pending = checkpoints.filter((c) => !undone.has(c.toolUseId));
   if (pending.length === 0) return [];
   let ids = new Set<string>();
@@ -113,7 +115,7 @@ export function lastTurnChanges<T extends { toolUseId: string }>(messages: reado
     }
     const startsTurn = m.content.some((b) => b.kind !== "tool_result" && b.origin.by === "user");
     if (!startsTurn) continue;
-    const hits = pending.filter((c) => ids.has(c.toolUseId));
+    const hits = pending.filter((c) => ids.has(c.via ?? c.toolUseId));
     if (hits.length > 0) return hits;
     ids = new Set();
   }

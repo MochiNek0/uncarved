@@ -240,8 +240,8 @@ function wrapLine(l: Line, width: number): string[] {
   return l.details === undefined ? head : [...head, ...wrap(l.details, width)];
 }
 
-/** 状态容器：频繁的流式更新合并到一帧再通知界面 */
-class Store {
+/** 状态容器：频繁的流式更新合并到一帧再通知界面。导出给测试用 */
+export class Store {
   state: UiState;
   #listeners = new Set<() => void>();
   #timer: ReturnType<typeof setTimeout> | undefined;
@@ -254,6 +254,19 @@ class Store {
   /** 带名字的项，amend 用 */
   #named = new Map<string, Line>();
   #width = 0;
+  /**
+   * 一共往 #wrapped 前面补过多少行（宽度变了之后分批补上前面的）。补了之后已有的行号都往后挪，
+   * 界面上记着行号的东西（选区）减掉它存，就不会跟着跳到别的行（见 App 的 stable）
+   */
+  #front = 0;
+  /** 行号整体重来（宽度变了、裁掉了最早的行、清空）的次数：变了之后记着的行号都作废 */
+  #generation = 0;
+  get front(): number {
+    return this.#front;
+  }
+  get generation(): number {
+    return this.#generation;
+  }
   /** #lines 里前这么多项还没按 #width 折行：宽度变了先折看得见的最后一段，前面的在后台分批补上 */
   #unwrapped = 0;
   #rewrap: ReturnType<typeof setTimeout> | undefined;
@@ -328,6 +341,7 @@ class Store {
       this.#lines = this.#lines.slice(-MAX_LINES * 0.8);
       this.#named = new Map(this.#lines.flatMap((l) => (l.id === undefined ? [] : [[l.id, l] as const])));
       this.#width = 0;
+      this.#generation++;
     }
     const before = this.#wrapped.length;
     if (this.#width) for (const l of lines) this.#push(l);
@@ -375,6 +389,7 @@ class Store {
    */
   lines(width: number, need = Infinity): string[] {
     if (width !== this.#width) {
+      if (this.#width) this.#generation++;
       this.#width = width;
       this.#wrapped = [];
       this.#owners = [];
@@ -412,6 +427,7 @@ class Store {
     if (rows.length === 0) return;
     rows.reverse();
     owners.reverse();
+    this.#front += count;
     this.#wrapped = [...rows.flat(), ...this.#wrapped];
     this.#owners = [...owners.flatMap((l, i) => rows[i]!.map(() => l)), ...this.#owners];
   }
@@ -446,6 +462,7 @@ class Store {
   }
 
   clear() {
+    this.#generation++;
     this.#lines = [];
     this.#wrapped = [];
     this.#owners = [];
@@ -958,6 +975,25 @@ const osc52 = (text: string) => `\x1b]52;c;${Buffer.from(text, "utf8").toString(
  * 不中断模型、不清空输入、不取消对话框
  */
 const SelectionContext = createContext<{ active(): boolean; clear(): void }>({ active: () => false, clear: () => {} });
+/**
+ * 对话区一共 total 行、高 height 行、离底部 scroll 行时能看见哪几行 [start, end)。
+ * 往上翻看时最后一行用来提示（scrolled），能看见的少一行（view）。
+ * 最多能翻多远（max）按翻上去之后的可见行数算：还在底部时按 height 算，翻到顶会少一行，第一行看不见
+ */
+function viewport(total: number, height: number, wanted: number) {
+  const scrolled = wanted > 0 && total > height;
+  const view = Math.max(0, scrolled ? height - 1 : height);
+  const max = total > height ? total - Math.max(0, height - 1) : 0;
+  const scroll = Math.min(wanted, max);
+  const end = total - scroll;
+  return { scrolled, view, max, scroll, end, start: Math.max(0, end - view) };
+}
+
+/** 拖选时鼠标停在对话区上面或下面，隔这么久滚一次 */
+const DRAG_SCROLL_MS = 50;
+/** 每次滚几行：离对话区越远滚得越快，最多这么多行 */
+const DRAG_SCROLL_MAX = 8;
+
 /** 终端矮于这么多行时标题只占一行 */
 const COMPACT_ROWS = 24;
 
@@ -1023,6 +1059,8 @@ function App({
   const width = Math.max(10, columns - 2);
   // 往上翻看时要折到能看见的地方；多要一屏给翻页
   const done = store.lines(width, state.scroll + 2 * rows);
+  // 选区记的是减掉 front 的行号（见 Store.front）：宽度变了之后前面分批补上行，看着的那几行行号会变，选区不能跟着跳
+  const front = store.front;
   // 还没结束的流式块和正在运行的工具的进度：思考只显示最新的一行，进度每个工具一行
   const live = [
     ...(state.live?.pending ?? []).flatMap((l) => mdRows(l, width)),
@@ -1030,14 +1068,7 @@ function App({
     ...state.progress.map((p) => oneRow(p.line, width).row),
   ];
   const total = done.length + live.length;
-  // 往上翻看时最后一行用来提示
-  const scrolled = state.scroll > 0 && total > height;
-  const view = Math.max(0, scrolled ? height - 1 : height);
-  // 最多能翻多远按翻上去之后的可见行数算：还在底部时按 height 算，翻到顶会少一行，第一行看不见
-  const max = total > height ? total - Math.max(0, height - 1) : 0;
-  const scroll = Math.min(state.scroll, max);
-  const end = total - scroll;
-  const start = Math.max(0, end - view);
+  const { scrolled, view, max, scroll, end, start } = viewport(total, height, state.scroll);
   const shown = [
     ...done.slice(start, Math.min(end, done.length)),
     ...live.slice(
@@ -1048,7 +1079,8 @@ function App({
   const page = Math.max(1, view - 2);
 
   // 选中文字：按下左键记下位置，拖动时更新，松开时复制；点一下（没拖动）还是展开或收起那一项。
-  // 几个事件可能在同一块输入里连着到达，来不及重画，所以另外用 ref 记着最新的值
+  // 几个事件可能在同一块输入里连着到达，来不及重画，所以另外用 ref 记着最新的值。
+  // pressed、selected 里的行号都是减掉 front 的（见上）
   const [selection, setSelectionState] = useState<Selection>();
   const selected = useRef<Selection>(undefined);
   const pressed = useRef<Point>(undefined);
@@ -1057,8 +1089,35 @@ function App({
     setSelectionState(s);
   };
   const [selectionApi] = useState(() => ({ active: () => selected.current !== undefined, clear: () => setSelection(undefined) }));
-  // 宽度变了，行重新折过，原来的位置对不上了
-  useEffect(() => setSelection(undefined), [width]);
+  // 拖选时鼠标停在对话区外面，终端不再发事件（只在移动时发），所以由定时器接着滚、接着扩大选区。
+  // 定时器里要用最新一帧的行数和高度，每次渲染写进 geometry
+  const geometry = useRef({ total, height, front });
+  geometry.current = { total, height, front };
+  const dragScroll = useRef<{ timer: ReturnType<typeof setInterval>; dir: 1 | -1; lines: number; col: number }>(undefined);
+  const stopDragScroll = () => {
+    clearInterval(dragScroll.current?.timer);
+    dragScroll.current = undefined;
+  };
+  const dragScrollTick = () => {
+    const d = dragScroll.current;
+    const anchor = pressed.current;
+    if (!d || !anchor) return stopDragScroll();
+    const g = geometry.current;
+    store.scrollBy(d.dir * d.lines, viewport(g.total, g.height, 0).max);
+    const v = viewport(g.total, g.height, store.get().scroll);
+    if (v.end <= v.start) return;
+    // 往上滚时选到看得见的第一行，往下滚时选到最后一行
+    const focus = { row: (d.dir > 0 ? v.start : v.end - 1) - g.front, col: d.col };
+    const s = selected.current;
+    if (!s || !same(s.focus, focus)) setSelection({ anchor, focus });
+  };
+  useEffect(() => stopDragScroll, []);
+  // 宽度变了、裁掉了最早的行、清空了：行号整体重来，原来的位置对不上了
+  useEffect(() => {
+    stopDragScroll();
+    pressed.current = undefined;
+    setSelection(undefined);
+  }, [width, store.generation]);
   const rowAt = (i: number) => (i < done.length ? done[i] : live[i - done.length]);
   // 复制之后在输入框下面提示一会儿
   const [copied, setCopied] = useState<string>();
@@ -1066,7 +1125,7 @@ function App({
   useEffect(() => () => clearTimeout(copiedTimer.current), []);
   /** 输入框文字在屏幕上的位置（Prompt 里的 EditableText 每次渲染时写入） */
   const inputPlace = useRef<Placement>(undefined);
-  const copySelection = (s: Selection) => copyText(selectedText(s, rowAt));
+  const copySelection = (s: Selection) => copyText(selectedText(s, (i) => rowAt(i + front)));
   const copyText = (text: string) => {
     copy(text);
     clearTimeout(copiedTimer.current);
@@ -1093,7 +1152,7 @@ function App({
       const at = (clamp: boolean): Point | undefined => {
         const i = mouse.y - top;
         if (!clamp && (i < 0 || i >= shown.length)) return undefined;
-        return { row: start + Math.min(Math.max(i, 0), shown.length - 1), col: Math.max(0, mouse.x - 1) };
+        return { row: start + Math.min(Math.max(i, 0), shown.length - 1) - front, col: Math.max(0, mouse.x - 1) };
       };
       // 滚轮在放不下全部文字的输入框上（含上下边框）时由输入框自己翻
       const input = inputPlace.current;
@@ -1102,11 +1161,27 @@ function App({
       if (mouse.button === 64) store.scrollBy(WHEEL_LINES, max);
       else if (mouse.button === 65) store.scrollBy(-WHEEL_LINES, max);
       else if (mouse.button === 0 && mouse.press) {
+        stopDragScroll();
         if (selected.current) setSelection(undefined);
         pressed.current = at(false);
       } else if (mouse.button === DRAG && pressed.current) {
         setSelection({ anchor: pressed.current, focus: at(true)! });
+        // 拖到对话区上面或下面：一直滚，直到拖回来或者松开
+        const above = top - mouse.y;
+        const below = mouse.y - (top + shown.length - 1);
+        const dir = above > 0 ? 1 : below > 0 && shown.length >= view ? -1 : 0;
+        if (dir === 0) stopDragScroll();
+        else {
+          const lines = Math.min(DRAG_SCROLL_MAX, dir > 0 ? above : below);
+          const col = Math.max(0, mouse.x - 1);
+          if (dragScroll.current) Object.assign(dragScroll.current, { dir, lines, col });
+          else {
+            dragScroll.current = { timer: setInterval(dragScrollTick, DRAG_SCROLL_MS), dir, lines, col };
+            dragScrollTick();
+          }
+        }
       } else if (mouse.button === 0 && !mouse.press && pressed.current) {
+        stopDragScroll();
         const p = pressed.current;
         pressed.current = undefined;
         const s = selected.current;
@@ -1114,13 +1189,17 @@ function App({
         else {
           if (s) setSelection(undefined);
           // 点在对话区里已经完成的输出上：展开或收起那一项
-          if (p.row < done.length) store.toggle(p.row, start, view);
+          if (p.row + front < done.length) store.toggle(p.row + front, start, view);
         }
       }
       return;
     }
     // 按别的键取消选中；Ctrl+C 由输入框和对话框处理（见 SelectionContext）
-    if (selected.current && !(key.ctrl && input === "c")) setSelection(undefined);
+    if (selected.current && !(key.ctrl && input === "c")) {
+      stopDragScroll();
+      pressed.current = undefined;
+      setSelection(undefined);
+    }
     // 选择框自己用 PgUp/PgDn 翻选项
     if (dialog?.kind === "select") return;
     if (key.pageUp) store.scrollBy(page, max);
@@ -1163,7 +1242,7 @@ function App({
           shown.map((raw, i) => {
             // 续行的记号不显示
             const l = visibleRow(raw);
-            const cols = selection && selectedCols(selection, start + i);
+            const cols = selection && selectedCols(selection, start + i - front);
             return h(Text, { key: i, wrap: "truncate-end" }, cols ? highlight(l || " ", ...cols) : l || " ");
           }),
           scrolled

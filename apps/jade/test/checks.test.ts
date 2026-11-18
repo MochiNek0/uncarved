@@ -256,6 +256,9 @@ describe.skipIf(!hasShell)("jade/checks plugin", () => {
     } finally {
       await w.host.close();
     }
+    // 旧记录由插件自己读（核心不认识它），用到时顺手记进 trust@1
+    const migrated = (JSON.parse(await readFile(path.join(home, "state", "confirmed.json"), "utf8")) as { records: { hash: string }[] }).records;
+    expect(migrated.map((r) => r.hash)).toEqual([`jade/checks\0${hash}`]);
   }, 30_000);
 
   test("does not run unconfirmed commands when nobody can confirm them; can be turned off in config", async () => {

@@ -10,7 +10,7 @@
 //
 // - before：工具执行前（审批的关卡里）运行。退出码不是 0 时这次调用被拒绝，命令的输出作为理由告诉模型；是 0 时不表态。
 // - after：工具成功执行后运行。退出码不是 0 时把输出留给模型看（下一次请求时附上），不改工具的结果。
-// - turn：一轮结束后运行，结果不影响会话。
+// - turn：一轮结束后运行，结果不影响会话。子 Agent 的轮次不触发。
 // tool 是工具名，不写或写 "*" 表示所有工具。命令经 shell@1 在工作目录里运行（和 bash 工具同一个 shell），环境变量：
 // JADE_TOOL（工具名）、JADE_TOOL_INPUT（参数的 JSON 文件的路径）、JADE_TOOL_PATH（参数里有 path 时）。
 
@@ -132,7 +132,8 @@ export default definePlugin({
         },
       });
     }
-    if (hooks.some((h) => h.on === "turn")) {
+    // turn 是用户等着的那一轮结束了（例如弹通知）：子会话（子 Agent）的轮次不算，before、after 照常
+    if (hooks.some((h) => h.on === "turn") && !ctx.session.parent) {
       ctx.kernel.hook({
         kind: "observe",
         point: "event",

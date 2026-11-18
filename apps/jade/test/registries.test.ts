@@ -201,24 +201,23 @@ describe("registries", () => {
     }
   });
 
-  test("tools for nested agents: any plugin registers them, any plugin lists them, and they are revoked with their plugin", async () => {
+  test("tools for nested agents (tools@1, kept for third-party plugins): any plugin registers them, any plugin lists them, and they are revoked with their plugin", async () => {
     const { host, reports } = await start();
     try {
       // 取用的一方（这里是核心，换成任何插件都一样）不用登记的一方认识它
       const tools = host.service<Tools>("tools@1")!;
       await host.sessions.open();
       const names = () => tools.list().map((t) => t.name);
-      expect(names()).toEqual(expect.arrayContaining(["read_file", "grep", "bash", "web_fetch", "peek"]));
-      expect(names()).not.toContain("write_file");
+      // 内置插件不再往这里登记：子 Agent 是核心开的子会话（ctx.session.spawn）
+      expect(names()).toEqual(["peek"]);
       const signal = new AbortController().signal;
       const peek = tools.list().find((t) => t.name === "peek")!;
       expect(await peek.execute({}, { sessionId: "s", toolUseId: "t", signal, parent: { sessionId: "s", eventId: "e" }, progress() {} })).toEqual({ content: "peeked" });
-      tools.register({ ...peek, name: "read_file" });
-      expect(reports).toEqual(["jade/tools: read_file from jade was skipped: jade/fs already registered it"]);
-      expect(tools.list().find((t) => t.name === "read_file")!.description).not.toBe("peeks");
+      tools.register({ ...peek, description: "again" });
+      expect(reports).toEqual(["jade/tools: peek from jade was skipped: test/user already registered it"]);
+      expect(tools.list().find((t) => t.name === "peek")!.description).toBe("peeks");
       await host.quarantine("test/user", "test");
-      expect(names()).not.toContain("peek");
-      expect(names()).toContain("read_file");
+      expect(names()).toEqual([]);
     } finally {
       await host.close();
     }

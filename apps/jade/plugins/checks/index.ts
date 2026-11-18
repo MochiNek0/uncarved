@@ -13,7 +13,7 @@ import path from "node:path";
 import { definePlugin, type SessionContext, type Text, type Trust, type UI } from "@uncarved/jade-api";
 import type { Approval, Commands, EventRenderer, Renderers, Shell } from "@uncarved/jade-api/services";
 import { changedFiles, checks, type Check, type Checks } from "./checks.ts";
-import { bold, dim, display, lines as joinLines, realPath, repoRoot, warn } from "./project.ts";
+import { bold, dim, display, lines as joinLines, realPath, repoRoot, warn, withLegacyTrust } from "./project.ts";
 
 /** 确认记录：同一个目录里的同一条命令只问一次。和旧 jade 的算法相同 */
 const checkHash = (c: Check) => createHash("sha256").update(`jade-check\0${c.cwd}\0${c.command}`).digest("hex");
@@ -53,7 +53,7 @@ export const checksRenderers: EventRenderer[] = [
 export default definePlugin({
   process(ctx) {
     const off = ctx.config.enabled === false || process.env.JADE_CHECKS === "off";
-    const trust = ctx.require<Trust>("trust@1");
+    const trust = withLegacyTrust(ctx.require<Trust>("trust@1"), ctx.home);
     const renderers = ctx.service<Renderers>("renderers@1");
     if (renderers) for (const r of checksRenderers) renderers.event(r);
 

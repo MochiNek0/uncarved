@@ -6,7 +6,7 @@ import { NO_APPROVAL_REASON, NO_APPROVER_ERROR, ServiceUnavailable, StaleContext
 import { info, world } from "./helpers.ts";
 
 type Step = Omit<ModelResponse, "model">;
-const g = globalThis as { __script?: Step[]; __log?: string[]; __ctx?: { session: { send(i: unknown): Promise<void>; abort(reason?: string): void } } };
+const g = globalThis as { __script?: Step[]; __log?: string[]; __tools?: string[]; __late?: (t: unknown) => () => void; __ctx?: { session: { send(i: unknown): Promise<void>; abort(reason?: string): void } } };
 const MODEL = { by: "model", provider: "scripted", model: "s1" } as const;
 const use = (id: string, name: string, input: unknown = {}): Block => ({ kind: "tool_use", id, name, input, origin: MODEL, trust: "trusted" });
 const say = (text: string): Step => ({ content: [{ kind: "text", text, origin: MODEL, trust: "trusted" }], stopReason: "end" });
@@ -21,6 +21,8 @@ afterEach(() => {
   delete g.__script;
   delete g.__log;
   delete g.__ctx;
+  delete g.__tools;
+  delete g.__late;
 });
 
 // 模型：按 globalThis.__script 依次回复
@@ -28,6 +30,7 @@ const PROVIDER = `export default { process(ctx) {
   ctx.provide("provider@1", {
     id: "scripted",
     async complete(req) {
+      globalThis.__tools?.push(req.tools.map((t) => t.name).sort().join(","));
       const next = globalThis.__script.shift();
       if (!next) throw new Error("script exhausted");
       return { model: "s1", ...next };
@@ -454,11 +457,316 @@ describe("plugins that cannot join", () => {
     await host.close();
   });
 
-  test("tools can only be registered while session() runs", async () => {
+  test("hooks can only be registered while session() runs", async () => {
     const { host } = await setup((w) => w.plugin("bundled", { id: "late" }, `export default { session(ctx) { globalThis.__ctx = ctx; } };`));
     await host.sessions.open();
-    const late = g.__ctx as unknown as { kernel: { tool(t: unknown): void } };
-    expect(() => late.kernel.tool({})).toThrow("only be registered while session() runs");
+    const late = g.__ctx as unknown as { kernel: { hook(h: unknown): void } };
+    expect(() => late.kernel.hook({})).toThrow("only be registered while session() runs");
+    await host.close();
+  });
+});
+
+describe("tools registered after session() returns", () => {
+  // 插件把 ctx.kernel.tool 交出来，测试在会话开始之后调用
+  const LATE = `export default { session(ctx) { globalThis.__late = (t) => ctx.kernel.tool(t); } };`;
+  const tool = (name: string, effect = "read") => ({
+    name, effect, description: name, inputSchema: { type: "object" }, concurrency: "safe", idempotent: true,
+    execute: async () => ({ content: `${name} ok` }),
+  });
+
+  test("take effect from the next turn without opening a new session, and go away when unregistered", async () => {
+    const { host } = await setup((w) => w.plugin("bundled", { id: "late" }, LATE));
+    g.__tools = [];
+    const s = await host.sessions.open();
+    const seen: string[] = [];
+    s.subscribe((n) => n.type === "event" && seen.push(n.event.type));
+    g.__script!.push(say("one"));
+    await s.send(msg("first"));
+    const off = g.__late!(tool("fresh"));
+    expect(s.tool("fresh")?.name).toBe("fresh");
+    g.__script!.push(call(use("t1", "fresh")), say("two"));
+    await s.send(msg("second"));
+    expect(results(s.state).t1).toEqual([false, "fresh ok"]);
+    off();
+    off(); // 撤销两次无害
+    g.__script!.push(say("three"));
+    await s.send(msg("third"));
+    expect(g.__tools).toEqual(["peek,poke", "fresh,peek,poke", "fresh,peek,poke", "peek,poke"]);
+    // 同一个会话：对话都在，订阅没有因为重挂断掉，插件清单不算变化
+    expect(s.state.messages.filter((m) => m.role === "user").length).toBe(4); // 三条消息 + 一条工具结果
+    expect(seen).toContain("session.detached");
+    expect(seen.filter((t) => t === "input.received").length).toBe(3);
+    const types = (await s.history()).map((e) => e.type);
+    expect(types).not.toContain("plugins.changed");
+    expect(types.filter((t) => t === "session.detached").length).toBe(2);
+    await host.close();
+  });
+
+  test("several changes between two turns remount once", async () => {
+    const { host } = await setup((w) => w.plugin("bundled", { id: "late" }, LATE));
+    const s = await host.sessions.open();
+    g.__late!(tool("a"));
+    g.__late!(tool("b"))();
+    g.__late!(tool("c"));
+    g.__tools = [];
+    g.__script!.push(say("ok"));
+    await s.send(msg("go"));
+    expect(g.__tools).toEqual(["a,c,peek,poke"]);
+    expect((await s.history()).filter((e) => e.type === "session.detached").length).toBe(1);
+    await host.close();
+  });
+
+  test("a tool registered during a turn is offered from the next turn, not in the middle of this one", async () => {
+    const LATE_IN_TOOL = `export default { session(ctx) {
+      ctx.kernel.tool({ name: "grow", effect: "read", description: "grow", inputSchema: { type: "object" }, concurrency: "safe", idempotent: true,
+        async execute() { ctx.kernel.tool({ name: "grown", effect: "read", description: "grown", inputSchema: { type: "object" }, concurrency: "safe", idempotent: true, execute: async () => ({ content: "grown ok" }) }); return { content: "grew" }; } });
+    } };`;
+    const { host } = await setup((w) => w.plugin("bundled", { id: "late" }, LATE_IN_TOOL));
+    g.__tools = [];
+    const s = await host.sessions.open();
+    g.__script!.push(call(use("t1", "grow")), call(use("t2", "grown")), say("done"));
+    await s.send(msg("go"));
+    // 这一轮里内核还不认识 grown
+    expect(results(s.state).t2![0]).toBe(true);
+    g.__script!.push(call(use("t3", "grown")), say("done"));
+    await s.send(msg("again"));
+    expect(results(s.state).t3).toEqual([false, "grown ok"]);
+    expect(g.__tools).toEqual(["grow,peek,poke", "grow,peek,poke", "grow,peek,poke", "grow,grown,peek,poke", "grow,grown,peek,poke"]);
+    await host.close();
+  });
+
+  test("a name that is already taken is refused when registered, so the session keeps working", async () => {
+    const { host } = await setup((w) => w.plugin("bundled", { id: "late" }, LATE));
+    const s = await host.sessions.open();
+    expect(() => g.__late!(tool("peek"))).toThrow("tool peek is already registered by tools");
+    g.__script!.push(say("ok"));
+    await s.send(msg("go"));
+    expect((await s.history()).some((e) => e.type === "session.detached")).toBe(false);
+    await host.close();
+  });
+
+  test("a quarantined plugin's tools are no longer offered to the model", async () => {
+    const { host } = await setup();
+    g.__tools = [];
+    const s = await host.sessions.open();
+    await host.quarantine("tools", "test");
+    g.__script!.push(say("ok"));
+    await s.send(msg("go"));
+    expect(g.__tools).toEqual([""]);
+    expect(s.tool("peek")).toBeUndefined();
+    await host.close();
+  });
+
+  test("when remounting fails, that input fails and the next one tries again", async () => {
+    // 日志存储：globalThis.__failReads 大于 0 时读日志失败（resume 要读日志）
+    const STORE = `export default { process(ctx) {
+      const logs = new Map();
+      ctx.provide("store@1", {
+        async append(id, events) { logs.set(id, [...(logs.get(id) ?? []), ...structuredClone(events)]); },
+        async *read(id, from = 1) {
+          if (globalThis.__failReads > 0) { globalThis.__failReads--; throw new Error("disk on fire"); }
+          for (const e of logs.get(id) ?? []) if (e.seq >= from) yield structuredClone(e);
+        },
+      });
+    } };`;
+    const { host } = await setup(async (w) => {
+      await w.plugin("bundled", { id: "store", provides: ["store@1"] }, STORE);
+      await w.plugin("bundled", { id: "late" }, LATE);
+    });
+    const s = await host.sessions.open();
+    g.__late!(tool("fresh"));
+    (globalThis as { __failReads?: number }).__failReads = 1;
+    g.__tools = [];
+    await expect(s.send(msg("lost"))).rejects.toThrow("could not update its tools: disk on fire");
+    g.__script!.push(say("ok"));
+    await s.send(msg("go"));
+    expect(g.__tools).toEqual(["fresh,peek,poke"]);
+    // 第一次 detach 已经写了，重试时不再写
+    expect((await s.history()).filter((e) => e.type === "session.detached").length).toBe(1);
+    delete (globalThis as { __failReads?: number }).__failReads;
+    await host.close();
+  });
+
+  test("a session closed with changes pending still detaches and resumes normally", async () => {
+    const { host } = await setup((w) => w.plugin("bundled", { id: "late" }, LATE));
+    const s = await host.sessions.open();
+    g.__late!(tool("fresh"));
+    await host.sessions.close();
+    expect(() => g.__late!(tool("other"))).toThrow(StaleContext);
+    g.__tools = [];
+    const again = await host.sessions.open({ resume: s.id });
+    g.__script!.push(say("ok"));
+    await again.send(msg("go"));
+    expect(g.__tools).toEqual(["peek,poke"]); // fresh 是上个会话作用域里注册的，不带过来
+    await host.close();
+  });
+});
+
+describe("child sessions (ctx.session.spawn)", () => {
+  type Ctx = {
+    session: {
+      id: string;
+      parent?: { sessionId: string };
+      depth: number;
+      canSpawn: boolean;
+      spawn(o: unknown): Promise<{ id: string; close(): Promise<{ sessionId: string; seq: number }>; state: State }>;
+      tool(name: string): unknown;
+    };
+    status?: unknown;
+    service(name: string): { select(r: { title: string; options: { label: string; value: string }[] }): Promise<string | undefined> } | undefined;
+  };
+  type Kid = Awaited<ReturnType<Ctx["session"]["spawn"]>>;
+  const k = globalThis as {
+    __run?: (ctx: Ctx, t: { parent: { sessionId: string; eventId: string }; signal: AbortSignal }) => Promise<unknown>;
+    __kids?: Ctx[];
+    __select?: (r: { title: string }) => Promise<string | undefined>;
+  };
+  afterEach(() => {
+    delete k.__run;
+    delete k.__kids;
+    delete k.__select;
+  });
+  // 主会话里的 run 工具交给测试的 __run 执行；子会话里记下插件的 ctx
+  const SPAWNER = `export default { session(ctx) {
+    if (ctx.session.parent) { (globalThis.__kids ??= []).push(ctx); return; }
+    ctx.kernel.tool({ name: "run", effect: "read", description: "run", inputSchema: { type: "object" }, concurrency: "safe", idempotent: true,
+      async execute(input, t) { const r = await globalThis.__run(ctx, t); return r ?? { content: "ran" }; } });
+  } };`;
+  // 前端：select 交给测试的 __select
+  const FRONT = `export default { process(ctx) {
+    ctx.provide("ui@1", { interactive: true, notify() {}, select: (r) => globalThis.__select(r), input: async () => undefined,
+      session: () => ({ status() {}, dispose() {} }) });
+  } };`;
+  const start = async (config?: object) => {
+    const w = await world();
+    await w.plugin("bundled", { id: "models", provides: ["provider@1"] }, PROVIDER);
+    await w.plugin("bundled", { id: "tools" }, TOOLS);
+    await w.plugin("bundled", { id: "front", provides: ["ui@1"] }, FRONT);
+    await w.plugin("bundled", { id: "spawner", optional: ["ui@1"] }, SPAWNER);
+    if (config) await Bun.write(path.join(w.home, "config.json"), JSON.stringify(config));
+    return { w, host: await w.start() };
+  };
+  const run = async (host: Awaited<ReturnType<typeof start>>["host"]) => {
+    g.__script!.push(call(use("t1", "run")), say("done"));
+    const s = await host.sessions.open();
+    await s.send(msg("go"));
+    return s;
+  };
+
+  test("a child session is logged with its parent, gets every plugin but no session UI, and keeps only the tools asked for", async () => {
+    const { host } = await start();
+    let ref: { sessionId: string; seq: number } | undefined;
+    k.__run = async (ctx, t) => {
+      const kid = await ctx.session.spawn({ parent: t.parent, label: "look", tools: (tool: { effect: string }) => tool.effect === "read" });
+      const c = k.__kids![0]!;
+      expect(c.session.parent).toEqual(t.parent);
+      expect(c.session.depth).toBe(1);
+      // 默认上限 1 层：子会话不能再开
+      expect(c.session.canSpawn).toBe(false);
+      await expect(c.session.spawn({ parent: { sessionId: c.session.id, eventId: "x" } })).rejects.toThrow("nested at most 1 level");
+      expect(c.status).toBeUndefined();
+      expect(c.session.tool("peek")).toBeDefined();
+      expect(c.session.tool("poke")).toBeUndefined();
+      expect(kid.state.parent).toEqual(t.parent);
+      ref = await kid.close();
+      return { content: "ran", child: ref };
+    };
+    const s = await run(host);
+    expect(results(s.state).t1).toEqual([false, "ran"]);
+    const done = (await s.history()).find((e) => e.type === "tool.completed")!;
+    expect((done.data as { child?: unknown }).child).toEqual(ref);
+    expect(g.__log).toContain(`tools closed ${ref!.sessionId}`); // 子会话的插件作用域关了
+    expect(host.sessions.current).toBe(s);
+    await host.close();
+  });
+
+  test("spawn needs a tool call of this session as parent", async () => {
+    const { host } = await start();
+    k.__run = async (ctx) => {
+      await expect(ctx.session.spawn({ parent: { sessionId: "elsewhere", eventId: "e" } })).rejects.toThrow("ToolContext.parent");
+      await expect(ctx.session.spawn({})).rejects.toThrow("ToolContext.parent");
+    };
+    await run(host);
+    await host.close();
+  });
+
+  test("sub-agents can be turned off, or allowed to nest deeper", async () => {
+    const off = await start({ "jade/core": { maxDepth: 0 } });
+    k.__run = async (ctx, t) => {
+      expect(ctx.session.canSpawn).toBe(false);
+      await expect(ctx.session.spawn({ parent: t.parent })).rejects.toThrow("turned off");
+    };
+    await run(off.host);
+    await off.host.close();
+
+    const deep = await start({ "jade/core": { maxDepth: 2 } });
+    k.__run = async (ctx, t) => {
+      const kid = await ctx.session.spawn({ parent: t.parent });
+      expect(k.__kids![0]!.session.canSpawn).toBe(true);
+      await kid.close();
+    };
+    await run(deep.host);
+    await deep.host.close();
+  });
+
+  test("beyond maxActive, spawn waits for a running child to end", async () => {
+    const { host } = await start({ "jade/core": { maxActive: 1 } });
+    k.__run = async (ctx, t) => {
+      const first = await ctx.session.spawn({ parent: t.parent });
+      let second: Kid | undefined;
+      const waiting = ctx.session.spawn({ parent: t.parent }).then((x) => (second = x));
+      await new Promise((r) => setTimeout(r, 50));
+      expect(second).toBeUndefined();
+      await first.close();
+      await waiting;
+      expect(second).toBeDefined();
+      await second!.close();
+    };
+    await run(host);
+    await host.close();
+  });
+
+  test("dialogs from child sessions are asked one at a time, titled with the child's label", async () => {
+    const { host } = await start();
+    const shown: string[] = [];
+    let open = 0;
+    let most = 0;
+    k.__select = async (r) => {
+      shown.push(r.title);
+      most = Math.max(most, ++open);
+      await new Promise((x) => setTimeout(x, 20));
+      open--;
+      return "yes";
+    };
+    k.__run = async (ctx, t) => {
+      const kids = await Promise.all(["one", "two"].map((label) => ctx.session.spawn({ parent: t.parent, label })));
+      const ask = (c: Ctx) => c.service("ui@1")!.select({ title: "Allow it?", options: [{ label: "Yes", value: "yes" }] });
+      expect(await Promise.all(k.__kids!.map(ask))).toEqual(["yes", "yes"]);
+      for (const kid of kids) await kid.close();
+    };
+    await run(host);
+    expect(shown.sort()).toEqual(["[one] Allow it?", "[two] Allow it?"]);
+    expect(most).toBe(1);
+    await host.close();
+  });
+
+  test("when the parent session is left, its child sessions are ended and the waiting tool call stops", async () => {
+    const { w, host } = await start();
+    let kid: Kid | undefined;
+    k.__run = async (ctx, t) => {
+      kid = await ctx.session.spawn({ parent: t.parent });
+      await new Promise((r) => t.signal.addEventListener("abort", r, { once: true }));
+      throw t.signal.reason;
+    };
+    g.__script!.push(call(use("t1", "run")));
+    const s = await host.sessions.open();
+    const sent = s.send(msg("go")).catch(() => {});
+    while (!kid) await new Promise((r) => setTimeout(r, 10));
+    await host.sessions.close();
+    await sent;
+    expect(kid.state.phase).toBe("ended");
+    expect(g.__log).toContain(`tools closed ${kid.id}`);
+    expect(w.reports.join("\n")).not.toContain("could not end it");
     await host.close();
   });
 });
