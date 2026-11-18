@@ -4,6 +4,15 @@ import { tuiScreen } from "../plugins/tui/tui.ts";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** 反复试一个条件直到成立或者超时：后台分批做的事（重新折行）在负载下不一定按固定的时间做完 */
+async function until(check: () => boolean, ms = 5000) {
+  const end = Date.now() + ms;
+  while (!check()) {
+    if (Date.now() > end) throw new Error("timed out waiting for a condition");
+    await sleep(25);
+  }
+}
+
 /** 极简终端：只跟踪光标行列和每行文字，够判断光标落在哪一行 */
 class Vt {
   lines: string[];
@@ -229,12 +238,14 @@ test("after a width change the whole long transcript is still there", async () =
     for (let i = 0; i < 3000; i++) screen.log(`row ${i} ${"x".repeat(i % 120)}`);
     await sleep(300);
     resize(70, 40);
-    await sleep(300);
-    expect(vt.lines.some((l) => l.includes("row 2999 "))).toBe(true);
-    stdin.write("\x1b[1;5H"); // ctrl+home
-    await sleep(300);
-    expect(vt.lines.some((l) => /\brow 1\b/.test(l))).toBe(true);
-    expect(vt.lines.some((l) => /\brow 2\b/.test(l))).toBe(true);
+    // 宽度变了先折看得见的最后一段：底部马上画出来
+    await until(() => vt.lines.some((l) => l.includes("row 2999 ")));
+    // 最前面的是最后一批折的，而且每补一批都会把 scroll 当成"离底部的距离"保持不动，
+    // 所以跳到最上面要等整份都折完才真的到顶：反复跳，跳到 row 1/row 2 出现为止
+    await until(() => {
+      stdin.write("\x1b[1;5H"); // ctrl+home
+      return vt.lines.some((l) => /\brow 1\b/.test(l)) && vt.lines.some((l) => /\brow 2\b/.test(l));
+    });
   } finally {
     await screen.close();
   }
