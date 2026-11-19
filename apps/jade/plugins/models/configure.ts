@@ -7,7 +7,7 @@
 import { readFile, rm, writeFile } from "node:fs/promises";
 import { hasProvider, parseTokens } from "./config.ts";
 import { contextWindow } from "./context.ts";
-import { EFFORTS, isBuiltinKind, jsonObject, KEY_KEY, listModels, MODEL_KEY, providerInfo, providerKind, rpmFromEnv, URL_KEY, visionFromEnv, type ProviderKind } from "./provider.ts";
+import { EFFORTS, fallbacksFromEnv, isBuiltinKind, isOfficialAnthropic, jsonObject, KEY_KEY, listModels, MODEL_KEY, providerInfo, providerKind, rpmFromEnv, URL_KEY, visionFromEnv, type ProviderKind } from "./provider.ts";
 import { MODEL_SETTINGS, readSavedServices, updateEnvFile, writeSavedServices, type Env, type SavedModel, type SavedService } from "./saved.ts";
 import type { UI } from "@uncarved/jade-api";
 
@@ -53,6 +53,21 @@ function visionSetting(env: Env): boolean | undefined {
 function visionHint(env: Env, kind: string): string {
   const v = visionSetting(env);
   return v === undefined ? `${isBuiltinKind(kind) && kind !== "openai-compat" ? "yes" : "no"} (default)` : v ? "yes" : "no";
+}
+
+/** JADE_FALLBACKS 设成了什么；没设或写错时 undefined */
+function fallbacksSetting(env: Env): boolean | undefined {
+  if (!env.JADE_FALLBACKS?.trim()) return undefined;
+  try {
+    return fallbacksFromEnv({ JADE_FALLBACKS: env.JADE_FALLBACKS });
+  } catch {
+    return undefined;
+  }
+}
+
+function fallbacksHint(env: Env, baseURL: string | undefined): string {
+  const v = fallbacksSetting(env);
+  return v === undefined ? `${isOfficialAnthropic(baseURL) ? "on" : "off"} (default)` : v ? "on" : "off";
 }
 
 /** 一个服务包含的变量（不含模型名） */
@@ -313,16 +328,18 @@ export function configurator(opts: ConfigureOptions): Configure {
     title: string;
     kind: string;
     model: string;
+    /** 服务地址：Claude 的服务端回退默认开不开看它 */
+    baseURL: string | undefined;
     read(): Promise<Env>;
     update(settings: Env): Promise<boolean>;
   }
 
   /**
-   * 某个模型的设置（输出上限、思考力度、上下文窗口、限速、能不能看图，openai-compat 还有额外请求参数）。
+   * 某个模型的设置（输出上限、思考力度、上下文窗口、限速、能不能看图，Claude 还有服务端回退，openai-compat 还有额外请求参数）。
    * 改完一项回到这个菜单接着改（重新读一遍，显示的是改过的值）；Back 或 Esc 才离开
    */
   async function configureSettings(target: SettingsTarget) {
-    const { title, kind, model } = target;
+    const { title, kind, model, baseURL } = target;
     const efforts = isBuiltinKind(kind) ? EFFORTS[kind] : undefined;
     while (true) {
       const env = await target.read();
@@ -335,6 +352,7 @@ export function configurator(opts: ConfigureOptions): Configure {
             { label: "Context window", value: "window", hint: `${contextWindow(model, env)} tokens${env.JADE_CONTEXT_WINDOW ? "" : " (default)"}` },
             { label: "Requests per minute", value: "rpm", hint: env.JADE_RPM ? `${env.JADE_RPM}/min` : "no limit (slows down after being rate limited)" },
             { label: "Can see images", value: "vision", hint: visionHint(env, kind) },
+            ...(kind === "anthropic" ? [{ label: "Server-side fallback", value: "fallbacks", hint: fallbacksHint(env, baseURL) }] : []),
             ...(kind === "openai-compat" ? [{ label: "Extra request body", value: "extra", hint: env.OPENAI_COMPAT_EXTRA_BODY ? shorten(env.OPENAI_COMPAT_EXTRA_BODY) : "none" }] : []),
             { label: "Back", value: "back" },
           ],
@@ -385,6 +403,21 @@ export function configurator(opts: ConfigureOptions): Configure {
           const on = choice === DEFAULT ? isBuiltinKind(kind) && kind !== "openai-compat" : choice === "on";
           report(on ? "Images will be sent to the model." : "Images will be replaced with a note.");
         }
+      } else if (action === "fallbacks" && kind === "anthropic") {
+        const DEFAULT = "\0default";
+        const current = fallbacksSetting(env);
+        const choice = await ui.select(
+          {
+            title: "Retry with another model on the service side when Claude refuses for safety reasons?",
+            options: [
+              { label: "On", value: "on", hint: current === true ? "current" : "official API only; most relays reject it" },
+              { label: "Off", value: "off", hint: current === false ? "current" : "the field is not sent" },
+              { label: "Default", value: DEFAULT, hint: isOfficialAnthropic(baseURL) ? "on (official API)" : "off (not the official API)" },
+            ],
+          },
+          opts.signal,
+        );
+        if (choice !== undefined) await target.update({ JADE_FALLBACKS: choice === DEFAULT ? undefined : choice });
       } else if (action === "window") {
         const n = await ui.input({ title: "Context window in tokens, e.g. 128000, 512K, 1M (empty to infer it from the model name, or 256K if unknown)", initial: env.JADE_CONTEXT_WINDOW ?? "" }, opts.signal);
         if (n !== undefined && tokensInput("Context window", n)) await target.update({ JADE_CONTEXT_WINDOW: n || undefined });
@@ -469,6 +502,7 @@ export function configurator(opts: ConfigureOptions): Configure {
           title: o.model.name,
           kind,
           model: o.model.name,
+          baseURL: providerInfo(o.service.env).baseURL,
           read,
           update: (updates) => (isCurrent ? applyConfig(updates) : writeSavedModel(o.service, o.model, updates)),
         });

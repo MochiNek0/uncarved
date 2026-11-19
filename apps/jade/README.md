@@ -203,6 +203,7 @@ plugin.run()
 | `JADE_EFFORT` | `.env` | 思考力度（Claude：`low`–`max`；OpenAI：`minimal`–`high`） |
 | `JADE_CONTEXT_WINDOW` | `.env` | 模型上下文窗口，不设时按模型名推断 |
 | `JADE_RPM` | `.env` | 每分钟最多发几个模型请求，不设时不主动限速 |
+| `JADE_FALLBACKS` | `.env` | Claude 因安全策略拒绝时由服务端换模型重试；不设时只对官方地址开启，其他 Anthropic 格式的服务默认关闭。可在 `/model` 的模型设置里按模型改 |
 | `JADE_SEARCH` | `.env` | 搜索服务顺序，逗号分隔 |
 | `JADE_SEARCH_RESULTS` | `.env` | 每次搜索返回条数，默认 10 |
 | `JADE_SHELL` | shell | shell 工具用的 shell，默认 bash（Windows 上是 Git Bash） |

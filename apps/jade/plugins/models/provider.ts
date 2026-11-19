@@ -258,6 +258,28 @@ export function visionFromEnv(env: Env = process.env): boolean {
   throw new Error(`JADE_VISION must be on or off, got ${JSON.stringify(env.JADE_VISION)}`);
 }
 
+/** 地址是不是 Anthropic 官方的（没设地址时用的也是官方的） */
+export function isOfficialAnthropic(baseURL: string | undefined): boolean {
+  if (!baseURL?.trim()) return true;
+  try {
+    return new URL(baseURL).host === "api.anthropic.com";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * JADE_FALLBACKS：Claude 因安全策略拒绝时，由服务端换模型重试。不设时只对官方地址开启：
+ * 中转站多半不认这个字段，整个请求返回 400
+ */
+export function fallbacksFromEnv(env: Env = process.env): boolean {
+  const text = env.JADE_FALLBACKS?.trim().toLowerCase();
+  if (!text) return isOfficialAnthropic(env.ANTHROPIC_BASE_URL);
+  if (["1", "true", "on", "yes"].includes(text)) return true;
+  if (["0", "false", "off", "no"].includes(text)) return false;
+  throw new Error(`JADE_FALLBACKS must be on or off, got ${JSON.stringify(env.JADE_FALLBACKS)}`);
+}
+
 /** JADE_EFFORT；不设时 Claude 用 high，OpenAI 用服务端默认值 */
 export function effortFromEnv(env: Env = process.env): string | undefined {
   const effort = env.JADE_EFFORT;
@@ -304,6 +326,7 @@ export function providerInfo(env: Env = process.env): ProviderInfo {
  * JADE_RPM 是每分钟最多发几个请求，见 rpmFromEnv（限速在 withRetry 的 gate 里做）
  * JADE_IDLE_TIMEOUT 是等模型服务回数据的时限，见 idleTimeoutFromEnv
  * JADE_VISION 是模型能不能看图片，见 visionFromEnv
+ * JADE_FALLBACKS 是 Claude 被安全策略拒绝时要不要服务端换模型重试，见 fallbacksFromEnv
  * 只导入用到的那个服务的包：Anthropic 的 SDK 加载要一百多毫秒，拖慢启动
  */
 export async function providerFromEnv(env: Env = process.env): Promise<Provider> {
@@ -352,6 +375,7 @@ export async function providerFromEnv(env: Env = process.env): Promise<Provider>
     model: env.ANTHROPIC_MODEL,
     effort: (effort ?? "high") as "low" | "medium" | "high" | "xhigh" | "max",
     maxTokens,
+    fallbacks: fallbacksFromEnv(env),
   });
 }
 

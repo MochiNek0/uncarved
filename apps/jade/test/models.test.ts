@@ -18,6 +18,7 @@ import {
   RETRY_DELAYS_MS,
   rpmFromEnv,
   visionFromEnv,
+  fallbacksFromEnv,
   withRetry,
   type RetriedResponse,
 } from "../plugins/models/provider.ts";
@@ -202,6 +203,15 @@ test("RateGate spaces requests by the limit and pauses everyone after a 429", as
 // ---------- 按环境变量选择服务 ----------
 
 describe("model configuration", () => {
+  test("JADE_FALLBACKS: on by default only for the official API", () => {
+    expect(fallbacksFromEnv({})).toBe(true);
+    expect(fallbacksFromEnv({ ANTHROPIC_BASE_URL: "https://api.anthropic.com" })).toBe(true);
+    expect(fallbacksFromEnv({ ANTHROPIC_BASE_URL: "https://relay.example" })).toBe(false);
+    expect(fallbacksFromEnv({ ANTHROPIC_BASE_URL: "https://relay.example", JADE_FALLBACKS: " ON " })).toBe(true);
+    expect(fallbacksFromEnv({ JADE_FALLBACKS: "off" })).toBe(false);
+    expect(() => fallbacksFromEnv({ JADE_FALLBACKS: "maybe" })).toThrow("JADE_FALLBACKS");
+  });
+
   test("JADE_VISION: on by default for Claude and OpenAI, off for compatible services", () => {
     expect(visionFromEnv({})).toBe(true);
     expect(visionFromEnv({ OPENAI_API_KEY: "k" })).toBe(true);
