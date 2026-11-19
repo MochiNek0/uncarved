@@ -17,7 +17,7 @@
     },
     "apps/jade": {
       "name": "@uncarved/jade",
-      "version": "0.3.1",
+      "version": "0.4.0",
       "bin": {
         "jade": "./bin/jade.js",
       },
@@ -42,7 +42,7 @@
     },
     "packages/jade-api": {
       "name": "@uncarved/jade-api",
-      "version": "1.2.0",
+      "version": "1.3.0",
       "peerDependencies": {
         "uncarved": "workspace:^",
       },
@@ -77,7 +77,7 @@
     },
     "packages/provider-openai-responses": {
       "name": "@uncarved/provider-openai-responses",
-      "version": "0.1.4",
+      "version": "0.1.5",
       "peerDependencies": {
         "uncarved": "workspace:^",
       },
