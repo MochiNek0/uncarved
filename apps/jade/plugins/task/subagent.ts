@@ -28,8 +28,8 @@ export interface Control {
 }
 
 export interface TaskOptions {
-  /** 开子会话（ctx.session.spawn），parent 是这次 task 调用的 ToolContext.parent */
-  spawn(parent: SessionRef, description: string): Promise<ChildSession>;
+  /** 开子会话（ctx.session.spawn），parent、signal 是这次 task 调用的 ToolContext.parent、signal */
+  spawn(parent: SessionRef, description: string, signal: AbortSignal): Promise<ChildSession>;
   /** 子 Agent 一次最多回复几次 */
   maxSteps: number;
   /** 子 Agent 能不能改东西 */
@@ -136,7 +136,7 @@ export function taskTool(opts: TaskOptions): Tool {
       const used: Required<Usage> = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
       let child: ChildSession;
       try {
-        child = await opts.spawn(ctx.parent, description);
+        child = await opts.spawn(ctx.parent, description, ctx.signal);
       } catch (e) {
         opts.usage?.(ctx.toolUseId, used);
         if (ctx.signal.aborted) throw e;

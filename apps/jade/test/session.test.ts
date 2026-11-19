@@ -611,6 +611,7 @@ describe("child sessions (ctx.session.spawn)", () => {
       canSpawn: boolean;
       spawn(o: unknown): Promise<{ id: string; close(): Promise<{ sessionId: string; seq: number }>; state: State }>;
       tool(name: string): unknown;
+      abort(reason?: string): void;
     };
     status?: unknown;
     service(name: string): { select(r: { title: string; options: { label: string; value: string }[] }): Promise<string | undefined> } | undefined;
@@ -620,15 +621,17 @@ describe("child sessions (ctx.session.spawn)", () => {
     __run?: (ctx: Ctx, t: { parent: { sessionId: string; eventId: string }; signal: AbortSignal }) => Promise<unknown>;
     __kids?: Ctx[];
     __select?: (r: { title: string }) => Promise<string | undefined>;
+    __join?: () => Promise<void>;
   };
   afterEach(() => {
     delete k.__run;
     delete k.__kids;
     delete k.__select;
+    delete k.__join;
   });
   // 主会话里的 run 工具交给测试的 __run 执行；子会话里记下插件的 ctx
   const SPAWNER = `export default { session(ctx) {
-    if (ctx.session.parent) { (globalThis.__kids ??= []).push(ctx); return; }
+    if (ctx.session.parent) { (globalThis.__kids ??= []).push(ctx); return globalThis.__join?.(); }
     ctx.kernel.tool({ name: "run", effect: "read", description: "run", inputSchema: { type: "object" }, concurrency: "safe", idempotent: true,
       async execute(input, t) { const r = await globalThis.__run(ctx, t); return r ?? { content: "ran" }; } });
   } };`;
@@ -723,6 +726,73 @@ describe("child sessions (ctx.session.spawn)", () => {
       await second!.close();
     };
     await run(host);
+    await host.close();
+  });
+
+  test("a spawn waiting for a slot stops when its signal aborts; a sub-agent does not wait for one", async () => {
+    const { host } = await start({ "jade/core": { maxActive: 1, maxDepth: 2 } });
+    k.__run = async (ctx, t) => {
+      const first = await ctx.session.spawn({ parent: t.parent });
+      const stop = new AbortController();
+      const waiting = ctx.session.spawn({ parent: t.parent, signal: stop.signal });
+      stop.abort(new Error("esc pressed"));
+      await expect(waiting).rejects.toThrow("esc pressed");
+      // 子会话占着唯一的名额：它再开不等（等下去谁都等不到），直接报错
+      const kid = k.__kids![0]!;
+      await expect(kid.session.spawn({ parent: { sessionId: kid.session.id, eventId: "x" } })).rejects.toThrow("cannot wait for a slot");
+      await first.close();
+      // 不再等的那次没有占着名额
+      const second = await ctx.session.spawn({ parent: t.parent });
+      await second.close();
+    };
+    await run(host);
+    await host.close();
+  });
+
+  test("a child still starting when its parent is left is ended, and its slot is freed", async () => {
+    const { host } = await start({ "jade/core": { maxActive: 1 } });
+    let joined!: () => void;
+    k.__join = () => new Promise<void>((r) => (joined = r));
+    let spawned: Promise<unknown> | undefined;
+    k.__run = async (ctx, t) => {
+      spawned = ctx.session.spawn({ parent: t.parent });
+      spawned.catch(() => {});
+      await new Promise((r) => t.signal.addEventListener("abort", r, { once: true }));
+      throw t.signal.reason;
+    };
+    g.__script!.push(call(use("t1", "run")));
+    const s = await host.sessions.open();
+    const sent = s.send(msg("go")).catch(() => {});
+    while (!k.__kids?.length) await new Promise((r) => setTimeout(r, 10));
+    await host.sessions.close();
+    await sent;
+    delete k.__join;
+    joined();
+    await expect(spawned).rejects.toThrow("was closed");
+    expect(g.__log).toContain(`tools closed ${k.__kids![0]!.session.id}`);
+    k.__run = async (ctx, t) => {
+      const kid = await ctx.session.spawn({ parent: t.parent });
+      await kid.close();
+    };
+    await run(host);
+    await host.close();
+  });
+
+  test("stopping a child session's turn on the user's behalf stops the top-level turn too", async () => {
+    const { host } = await start();
+    k.__run = async (ctx, t) => {
+      const kid = await ctx.session.spawn({ parent: t.parent });
+      k.__kids![0]!.session.abort("the user cancelled the approval request");
+      expect(t.signal.aborted).toBe(true);
+      await kid.close();
+      throw t.signal.reason;
+    };
+    g.__script!.push(call(use("t1", "run")), say("never reached"));
+    const s = await host.sessions.open();
+    await s.send(msg("go")).catch(() => {});
+    const ended = (await s.history()).filter((e) => e.type === "turn.ended").map((e) => (e.data as { reason: string }).reason);
+    expect(ended).toEqual(["aborted"]);
+    expect(g.__script).toHaveLength(1);
     await host.close();
   });
 

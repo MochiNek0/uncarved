@@ -119,6 +119,50 @@ describe("MCP stdio client", () => {
     expect(await readFile(mark, "utf8")).toContain("cancelled");
   }, 20_000);
 
+  test("when reconnecting on a tool call fails, the server stops offering its tools and sessions are told", async () => {
+    const cwd = await tempDir("jade-mcp-");
+    const delay = path.join(cwd, "delay.txt");
+    let failed = 0;
+    const entry: McpServerEntry = { name: "fake", layer: "user", file: "mcp.json", config: { command: process.execPath, args: [SERVER], env: { MCP_DELAY_FILE: delay }, startupTimeoutMs: 1500 } };
+    const client = new McpClient(entry, { cwd, onFailed: () => void failed++ });
+    open.push(client);
+    await client.connect();
+    const signal = new AbortController().signal;
+    // 用 .catch 取错误：bun 的 expect(...).rejects 在这里等不到结果
+    const failure = (p: Promise<unknown>) => p.then(() => "resolved", (e: unknown) => String(e));
+    expect(await failure(client.callTool("crash", {}, signal))).toContain("exited");
+    // 断了以后工具照常提供，调用时重连
+    expect(client.offered().length).toBeGreaterThan(0);
+    await writeFile(delay, "5000");
+    expect(await failure(client.callTool("echo", { text: "x" }, signal))).toContain("did not finish starting");
+    expect(client.offered()).toEqual([]);
+    expect(failed).toBe(1);
+  }, 20_000);
+
+  test("a server whose tools stay the same still has its cache entry refreshed on each connect", async () => {
+    const home = await tempDir("jade-mcp-home-");
+    await writeFile(path.join(home, "mcp.json"), JSON.stringify({ mcpServers: { fake: fakeServer } }));
+    const at = async () => {
+      const raw = JSON.parse(await readFile(path.join(home, "state", "mcp-tools.json"), "utf8")) as { servers: Record<string, { at: number }> };
+      return Object.values(raw.servers)[0]!.at;
+    };
+    const connectOnce = async () => {
+      const { host, state } = await featureHost({ home });
+      try {
+        state.script.push(reply("ok"));
+        await (await host.sessions.open()).send(msg("hi"));
+        for (let i = 0; i < 50 && !(await mcpConnected(host)); i++) await new Promise((r) => setTimeout(r, 100));
+      } finally {
+        await host.close();
+      }
+    };
+    await connectOnce();
+    const first = await at();
+    await new Promise((r) => setTimeout(r, 20));
+    await connectOnce();
+    expect(await at()).toBeGreaterThan(first);
+  }, 60_000);
+
   test.skipIf(process.platform !== "win32")("on Windows a command that is a .cmd script on PATH (like npx) starts through cmd.exe", async () => {
     const cwd = await tempDir("jade-mcp-");
     const bin = path.join(cwd, "bin with space");

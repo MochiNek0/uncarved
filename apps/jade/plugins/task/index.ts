@@ -83,9 +83,10 @@ export default definePlugin({
       taskTool({
         maxSteps,
         write,
-        spawn: (parent, description) =>
+        spawn: (parent, description, signal) =>
           ctx.session.spawn({
             parent,
+            signal,
             label: description,
             system,
             ...(provider ? { provider } : {}),

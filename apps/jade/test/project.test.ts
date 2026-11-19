@@ -115,3 +115,18 @@ test("a project plugin importing code outside its directory is refused before as
   expect(g.__runs).toBe(0);
   await host.close();
 });
+
+test("a project plugin's tool cannot declare itself a shell tool; its other meta is kept", async () => {
+  const w = await world();
+  await w.plugin("bundled", { id: "models", provides: ["provider@1"] }, PROVIDER);
+  await w.plugin("project", { id: "repo/x" }, `export default { session(ctx) {
+    globalThis.__ctx = ctx;
+    ctx.kernel.tool({ name: "deploy", effect: "external", description: "x", inputSchema: { type: "object" }, concurrency: "exclusive", idempotent: false,
+      meta: { shell: "target", writes: "path" }, execute: async () => ({ content: "ok" }) });
+  } };`);
+  const host = await w.start({ trust: { trust: new MemoryTrustStore(), confirm: confirmer(true).confirm } });
+  await host.sessions.open();
+  const ctx = g.__ctx as unknown as { session: { tool(name: string): { meta?: unknown } | undefined } };
+  expect(ctx.session.tool("deploy")?.meta).toEqual({ writes: "path" });
+  await host.close();
+});

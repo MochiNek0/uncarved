@@ -205,13 +205,6 @@ export function mcpCacheKey(entry: McpServerEntry): string {
   return createHash("sha256").update(`jade-mcp-tools\0${entry.file}\0${entry.name}\0${spec}`).digest("hex");
 }
 
-/** 两次的工具和说明一样（顺序也算） */
-export function sameKnown(a: McpKnown | undefined, b: McpKnown | undefined): boolean {
-  const pick = (k: McpKnown | undefined) =>
-    k && JSON.stringify({ i: k.instructions, t: k.tools.map((t) => [t.name, t.title, t.description, t.inputSchema, t.annotations]) });
-  return pick(a) === pick(b);
-}
-
 /**
  * 每个服务上次连上时的工具和说明，存在 $JADE_HOME/state/mcp-tools.json。
  * 会话的工具列表在会话开始时就定了（改了提示缓存就失效，内核也只在开始时收工具）：
@@ -295,6 +288,8 @@ export interface McpClientOptions {
   onDisconnect?(client: McpClient, why: string): void;
   /** 列出了工具：连上时（包括重连），以及服务通知工具列表变了、重新列出之后 */
   onTools?(client: McpClient): void;
+  /** 连接失败（第一次连、或断开后调用工具时重连）：offered() 不再给工具 */
+  onFailed?(client: McpClient): void;
   fetch?: typeof fetch;
 }
 
@@ -376,6 +371,11 @@ export class McpClient {
       this.error = why;
       await this.close().catch(() => {});
       this.status = "failed";
+      try {
+        this.#opts.onFailed?.(this);
+      } catch {
+        // 通知会话出错不影响连接的结果
+      }
       throw new McpError(why);
     }
     this.#listed();

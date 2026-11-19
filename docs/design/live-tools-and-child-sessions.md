@@ -90,6 +90,8 @@ interface SpawnOptions {
   provider?: Provider
   /** 打开子会话的插件给它的系统提示词，放在其他插件给的之前 */
   system?: string
+  /** 中止时不再等同时数量的名额（工具调用的 ToolContext.signal） */
+  signal?: AbortSignal
 }
 
 interface ChildSession {
@@ -193,7 +195,7 @@ pi 在"第一条消息发出前"等，比 jade 在"会话打开时"等更好：�
 
 **决定**：放在 jade 核心的 `spawn` 里，跟 dsh 一样。上限防的是资源失控，不是策略：任何开子会话的插件都不能绕过它。
 - 层数默认 **1**（不是草稿里的 3）：子 Agent 再开子 Agent 的需求还没出现过，要的人在配置里调大；0 表示不允许开子会话。
-- 一棵会话树同时最多 **8** 个子会话，超出的 `spawn` 等待前面的结束，而不是报错（并行的 task 调用照样能跑完）。
+- 一棵会话树同时最多 **8** 个子会话，顶层会话超出的 `spawn` 等待前面的结束，而不是报错（并行的 task 调用照样能跑完）；`SpawnOptions.signal` 中止时（用户按 Esc）不再等。子会话超出的 `spawn` 直接报错：它自己占着名额，层数大于 1 时一层层等下去会死锁。
 - 层数从日志算：子会话的 `session.started` 带着 `parent`，沿着它往上数。内核已经保证引用能解析到（宪法 3.4），所以恢复的会话也数得对，不用另记。
 - 配置在核心的配置里（用户 `config.json` 的 `"jade/core": { "maxDepth": 1, "maxActive": 8 }`），不是某个插件的配置；项目层的 `.jade/config.json` 设不了，克隆的仓库不能放宽上限。
 

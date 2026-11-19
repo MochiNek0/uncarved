@@ -176,7 +176,10 @@ export interface SessionControl {
    * 内核接着跑到再次停下（下一个审批，或这一轮结束）时 resolve。没有在跑的一轮、或没有这个待批的调用时 reject
    */
   send(input: UserInput): Promise<void>;
-  /** 中止正在跑的这一轮（例如用户在别处喊停）；空闲时什么都不做。项目层插件不能用 */
+  /**
+   * 中止正在跑的这一轮（例如用户在别处喊停）；空闲时什么都不做。项目层插件不能用。
+   * 在子会话里调用时顶层会话这一轮也中止：用户要停的是整件事
+   */
   abort(reason?: string): void;
   /**
    * 会话现在的状态（阶段、消息、还没做完的工具调用、derived）的一份拷贝，和前端的 Session.state 相同。
@@ -201,7 +204,8 @@ export interface SessionControl {
    * 开一个子会话（子 Agent）：一个真正的会话，日志存盘、记着父会话，所有插件照常加入（审批、/undo、hook、检查都生效）。
    * 只在本会话的工具执行期间用：opts.parent 是那次调用的 ToolContext.parent。子会话不会成为当前会话，
    * 本会话离开（/clear、/resume、退出）时一并结束。层数、同时数量有上限（$JADE_HOME/config.json 的 "jade/core"：
-   * maxDepth 默认 1，maxActive 默认 8）：超过层数时抛错，超过数量时等前面的结束。项目层插件不能用
+   * maxDepth 默认 1，maxActive 默认 8）：超过层数时抛错；超过数量时，顶层会话开的等前面的结束（opts.signal 中止时不再等，reject），
+   * 子会话开的直接抛错（它自己占着名额，等下去可能谁都等不到）。项目层插件不能用
    */
   spawn(opts: SpawnOptions): Promise<ChildSession>;
 }
@@ -218,6 +222,8 @@ export interface SpawnOptions {
   provider?: Provider;
   /** 给子会话的系统提示词（它的角色和任务的做法），放在核心的委派说明之后、其他插件给的之前 */
   system?: string;
+  /** 中止时不再等同时数量的名额（例如这次工具调用的 ToolContext.signal） */
+  signal?: AbortSignal;
 }
 
 /** 子会话：打开它的插件拿着，用完 close */

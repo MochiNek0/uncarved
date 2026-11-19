@@ -221,6 +221,8 @@ export default definePlugin({
         if (e.type === "tool.decided") decided.set(e.id, (e.data as { toolUseId: string }).toolUseId);
         if (e.type !== "turn.ended") return;
         before.clear();
+        // 只有这一轮里开的子会话查它（子会话在打开它的那次调用里结束）
+        decided.clear();
         snapped = false;
       },
     });

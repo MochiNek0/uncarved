@@ -532,8 +532,30 @@ export class Sessions implements SessionManager {
           : `sub-agents can be nested at most ${maxDepth} level${maxDepth > 1 ? "s" : ""} deep; this session is already at level ${parent.depth} (raise "jade/core": { "maxDepth" } in config.json)`,
       );
     }
-    // 同时数量的上限：等前面的结束，而不是报错
-    while (this.#running >= maxActive) await new Promise<void>((r) => this.#waiting.push(r));
+    const signal = opts.signal instanceof AbortSignal ? opts.signal : undefined;
+    // 同时数量的上限：顶层会话开的等前面的结束；子会话开的直接报错，它自己占着名额，等下去可能谁都等不到
+    while (this.#running >= maxActive) {
+      if (parent.depth > 0) throw new Error(`${maxActive} sub-agents are already running; a sub-agent cannot wait for a slot (raise "jade/core": { "maxActive" } in config.json)`);
+      await new Promise<void>((resolve, reject) => {
+        const wake = () => {
+          signal?.removeEventListener("abort", stop);
+          resolve();
+        };
+        const stop = () => {
+          const i = this.#waiting.indexOf(wake);
+          if (i >= 0) this.#waiting.splice(i, 1);
+          reject(signal!.reason);
+        };
+        if (signal?.aborted) return stop();
+        signal?.addEventListener("abort", stop, { once: true });
+        this.#waiting.push(wake);
+      });
+    }
+    if (signal?.aborted) {
+      // 被叫醒时已经中止：名额让给下一个等着的
+      this.#waiting.shift()?.();
+      throw signal.reason;
+    }
     this.#running++;
     let released = false;
     const release = () => {
@@ -557,7 +579,6 @@ export class Sessions implements SessionManager {
       ...(typeof opts.system === "string" && opts.system ? { system: opts.system } : {}),
     };
     const s: LiveSession = new LiveSession(crypto.randomUUID(), parent.store, host.report, () => this.#guarded(s), child);
-    parent.children.add(s);
     const core = this.#corePlugin(s);
     const delegation = this.#delegation(child);
     const kernelPlugins = () => [core, ...s.parts.map((p) => p.kernel()), delegation];
@@ -566,7 +587,6 @@ export class Sessions implements SessionManager {
       for (const p of host.active()) if (p.module.session) await this.#join(s, p);
       rt = await Runtime.create({ store: s.store, provider, plugins: kernelPlugins(), sessionId: s.id, parent: child.ref });
     } catch (e) {
-      parent.children.delete(s);
       await this.#closeParts(s);
       release();
       throw e;
@@ -575,8 +595,14 @@ export class Sessions implements SessionManager {
     s.subscribe((n) => {
       if (n.type === "hook-error") host.report(`plugin ${n.info.plugin} failed at ${n.info.point} in a sub-agent: ${n.info.error instanceof Error ? n.info.error.message : String(n.info.error)}`);
     });
-    let closing: Promise<{ sessionId: string; seq: number }> | undefined;
     s.onEnd = release;
+    // Runtime 建好了才算父会话的子会话：父会话离开时结束它要用 Runtime。开的期间父会话离开了：马上结束
+    parent.children.add(s);
+    if (parent.left) {
+      await this.#end(s);
+      throw new Error(`session ${parent.id} was closed`);
+    }
+    let closing: Promise<{ sessionId: string; seq: number }> | undefined;
     return {
       id: s.id,
       send: (input) => s.send(input),
@@ -722,7 +748,12 @@ export class Sessions implements SessionManager {
         abort: (reason) => {
           if (scope.closed) throw new StaleContext(id);
           if (layer === "project") throw new Error(`plugin ${id}: project plugins cannot stop turns on the user's behalf`);
-          s.abort(new Error(reason ?? `stopped by plugin ${id}`));
+          const why = new Error(reason ?? `stopped by plugin ${id}`);
+          s.abort(why);
+          // 子会话里替用户喊停（例如审批时按 Esc）：用户要停的是整件事，顶层会话这一轮也停，不让父会话拿着结果接着干
+          let top = s;
+          while (top.child) top = top.child.session;
+          if (top !== s) top.abort(why);
         },
         state: () => {
           if (scope.closed) throw new StaleContext(id);
@@ -752,7 +783,7 @@ export class Sessions implements SessionManager {
       kernel: {
         tool: (t) => {
           if (scope.closed) throw new StaleContext(id);
-          const tool = liveTool({ ...t, ...toolMeta(id, t) }, owner);
+          const tool = liveTool({ ...t, ...toolMeta(id, layer, t) }, owner);
           if (!open) {
             // session() 返回之后注册的从下一项工作起生效（重挂 Runtime）。重名的在这里拒绝，不能让重挂失败
             if (!part) throw new Error(`plugin ${id}: did not join session ${s.id}`);
@@ -919,8 +950,12 @@ function statusSegment(s: string | StatusSegment | undefined): string | StatusSe
   };
 }
 
-/** 工具的 meta 只留认得的字段（字段名都是字符串），写错了抛错：插件加入会话失败，比别的插件悄悄认不出这个工具好查 */
-function toolMeta(plugin: string, t: { name: string; meta?: unknown }): { meta?: ToolMeta } {
+/**
+ * 工具的 meta 只留认得的字段（字段名都是字符串），写错了抛错：插件加入会话失败，比别的插件悄悄认不出这个工具好查。
+ * 项目层插件的 shell 不算：审批按它把只读命令直接放行、只读的子 Agent 也留着这个工具，克隆的仓库不能自己声明这个。
+ * 去掉之后它就是普通的工具，照常经过审批
+ */
+function toolMeta(plugin: string, layer: PluginSource["layer"], t: { name: string; meta?: unknown }): { meta?: ToolMeta } {
   if (t.meta === undefined) return {};
   const m = t.meta as Record<string, unknown> | null;
   if (typeof m !== "object" || m === null) throw new Error(`plugin ${plugin}: tool ${t.name}: meta must be an object`);
@@ -928,6 +963,7 @@ function toolMeta(plugin: string, t: { name: string; meta?: unknown }): { meta?:
   for (const k of ["writes", "shell"] as const) {
     if (m[k] === undefined) continue;
     if (typeof m[k] !== "string" || !m[k]) throw new Error(`plugin ${plugin}: tool ${t.name}: meta.${k} must be the name of an input field`);
+    if (k === "shell" && layer === "project") continue;
     meta[k] = m[k];
   }
   return { meta };

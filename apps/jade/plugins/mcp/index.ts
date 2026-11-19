@@ -11,7 +11,7 @@
 import path from "node:path";
 import { definePlugin, type Cli, type ProcessContext, type Text, type Tool, type Trust, type UI } from "@uncarved/jade-api";
 import type { Commands, Prompts } from "@uncarved/jade-api/services";
-import { describeServer, loadMcpConfig, McpClient, mcpCacheKey, McpToolCache, mcpTools, mcpTrustHash, sameKnown, type McpServerEntry } from "./mcp.ts";
+import { describeServer, loadMcpConfig, McpClient, mcpCacheKey, McpToolCache, mcpTools, mcpTrustHash, type McpServerEntry } from "./mcp.ts";
 import { manageMcp, manageUsage } from "./install.ts";
 import { bold, clip, dim, display, error, estimateTokens, lines as joinLines, ok, realPath, repoRoot, splitArgs, warn, withLegacyTrust } from "./project.ts";
 
@@ -142,19 +142,20 @@ class Servers {
       cwd: setup.cwd,
       onDisconnect: (c, why) => this.notify(`MCP server ${c.name} disconnected: ${why}. jade reconnects on its next tool call; /mcp shows details`, "warning"),
       // 连上、重新列出工具之后：记进缓存，会话跟着增减工具
+      // 工具没变也记：刷新时间，常用的服务不会因为工具一直没变被当作久没连上而清掉
       onTools: (c) => {
         const now = { tools: c.tools, ...(c.instructions ? { instructions: c.instructions } : {}) };
-        if (!sameKnown(c.known, now)) void setup.cache.put(entry, now);
+        void setup.cache.put(entry, now);
         c.known = now;
         this.#changed();
       },
+      // 连不上（包括调用工具时的重连）：上次的工具不再提供
+      onFailed: () => this.#changed(),
     });
     client.known = setup.cache.get(entry);
     this.clients.push(client);
     const done = client.connect().catch((err) => {
       this.notify(`MCP server ${client.name} is unavailable: ${errorText(err)}`, "warning");
-      // 上次的工具不再提供
-      this.#changed();
     });
     // 包一层：async 函数直接返回 Promise 会被等到它完成
     return { client, done };
