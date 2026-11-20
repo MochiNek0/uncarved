@@ -3,6 +3,7 @@
   "version": "0.3.0",
   "api": "^1",
   "entry": "./index.ts",
+  "provides": ["undo@1"],
   "optional": ["commands@1", "prompts@1"],
   "config": {
     "shell": {

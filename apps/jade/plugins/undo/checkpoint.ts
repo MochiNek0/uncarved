@@ -52,7 +52,9 @@ export class Checkpoints {
     for (const n of names) {
       if (!n.endsWith(".json") || n === UNDONE) continue;
       try {
-        out.push(JSON.parse(await readFile(path.join(dir, n), "utf8")) as Checkpoint);
+        const cp = JSON.parse(await readFile(path.join(dir, n), "utf8")) as Partial<Checkpoint> | null;
+        // 同一个目录里还有别的文件（工作区快照的 snapshots.json）：只认快照的样子
+        if (typeof cp?.toolUseId === "string" && typeof cp.path === "string" && typeof cp.at === "number") out.push(cp as Checkpoint);
       } catch {
         // 写到一半的快照，忽略
       }

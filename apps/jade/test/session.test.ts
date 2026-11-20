@@ -466,6 +466,33 @@ describe("plugins that cannot join", () => {
   });
 });
 
+describe("send called while session() runs", () => {
+  // 插件在 session() 里就发一条消息（不 await），把 Promise 交出来
+  const EAGER = `export default { session(ctx) {
+    globalThis.__sent = ctx.session.send({ kind: "message", content: [{ kind: "text", text: "from the plugin", origin: { by: "user" }, trust: "trusted" }] });
+    globalThis.__sent.catch(() => {});
+  } };`;
+  const sent = () => (globalThis as { __sent?: Promise<void> }).__sent!;
+
+  test("waits until the session is built, then runs the turn", async () => {
+    const { host } = await setup((w) => w.plugin("bundled", { id: "eager" }, EAGER));
+    g.__script!.push(say("hello"));
+    const s = await host.sessions.open();
+    await sent();
+    const texts = s.state.messages.map((m) => m.content.map((b) => (b.kind === "text" ? b.text : "")).join(""));
+    expect(texts).toEqual(["from the plugin", "hello"]);
+    await host.close();
+  });
+
+  test("is rejected when the session cannot be opened", async () => {
+    const { host } = await setup((w) => w.plugin("bundled", { id: "eager" }, EAGER));
+    await expect(host.sessions.open({ resume: "no-such-session" })).rejects.toThrow();
+    await expect(sent()).rejects.toThrow("was closed before this input ran");
+    expect(g.__script).toEqual([]);
+    await host.close();
+  });
+});
+
 describe("tools registered after session() returns", () => {
   // 插件把 ctx.kernel.tool 交出来，测试在会话开始之后调用
   const LATE = `export default { session(ctx) { globalThis.__late = (t) => ctx.kernel.tool(t); } };`;

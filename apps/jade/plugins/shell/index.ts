@@ -2,7 +2,7 @@
 // 后台命令自己结束时告诉用户，并给模型留一句说明（不用它一直轮询）；/shells 给用户看和停掉后台命令。
 
 import { definePlugin, type Span, type UI } from "@uncarved/jade-api";
-import type { Commands, Prompts, Renderers } from "@uncarved/jade-api/services";
+import type { Commands, Prompts, Renderers, Undo } from "@uncarved/jade-api/services";
 import { shellRenderers } from "./renderers.ts";
 import { shellService } from "./service.ts";
 import { shellTools, type ShellTools } from "./shell.ts";
@@ -50,8 +50,9 @@ export default definePlugin({
         let live = "";
         let r: { code: number | null; output: string; timedOut: boolean };
         let stopped = false;
-        try {
-          r = await shell.run(command, {
+        const session = manager.current;
+        const exec = () =>
+          shell.run(command, {
             cwd: ctx.cwd,
             timeoutMs: SH_TIMEOUT_MS,
             signal,
@@ -60,6 +61,10 @@ export default definePlugin({
               progress?.(live);
             },
           });
+        // 有 undo@1 时这条命令改的文件能用 /undo 撤销（单独算一步）
+        const undo = ctx.service<Undo>("undo@1");
+        try {
+          r = session && undo ? await undo.track(session.id, `$ ${firstLine(command)}`, exec) : await exec();
         } catch (e) {
           if (!signal.aborted) throw e;
           stopped = true;
@@ -73,7 +78,6 @@ export default definePlugin({
         const more = lines.length > 1 ? ` (+${lines.length - 1} lines)` : "";
         const folded = lines.length > 1 || first.length > SH_SUMMARY;
         print(shade(failed, `⎿ ${first.length > SH_SUMMARY ? `${first.slice(0, SH_SUMMARY)}…` : first}${more}`), folded ? { details: r.output.replace(/^/gm, "    ") } : undefined);
-        const session = manager.current;
         if (!stopped && session && session.state.messages.length > 0) return { prompt: `I ran this shell command myself (${status}):\n$ ${command}\n${r.output}` };
         if (session) ctx.service<Prompts>("prompts@1")?.note(session.id, `The user ran this shell command themselves (${status}):\n$ ${command}\n${r.output}`);
       },

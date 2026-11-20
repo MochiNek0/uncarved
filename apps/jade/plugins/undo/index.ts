@@ -3,16 +3,19 @@
 // jade/fs 不再保存检查点，这里自己观察：tool.before 在写文件的工具（meta.writes，例如 write_file）执行前记下文件原来的内容，
 // tool.after 在执行成功后记下新内容的哈希，存成快照（checkpoint.ts）。tool.before 在审批之前执行，
 // 所以等用户批准期间别人对文件的改动会算进"原来的内容"。
-// shell 命令改的文件：在 git 仓库里，每轮第一次执行命令（meta.shell，例如 bash）之前给工作区拍一张快照（snapshot.ts），撤销时把之后变了的文件恢复回去。
+// shell 命令改的文件：在 git 仓库里，每轮第一次执行命令（meta.shell，例如 bash）之前给工作区拍一张快照（snapshot.ts），一轮结束时再拍一张，
+// 撤销时把这两张之间变了的文件恢复回去。子 Agent 的命令算在根会话的这一轮里：整棵会话树一轮只在第一次跑命令之前拍一张。
+// undo@1：用户自己执行的命令（/sh）前后各拍一张，单独算一步撤销。
 // 认工具靠它注册时给的 meta，不认工具名：换掉提供文件工具的插件照样能撤销。
 
+import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { realpathSync } from "node:fs";
 import path from "node:path";
-import { definePlugin } from "@uncarved/jade-api";
-import type { Commands, Prompts } from "@uncarved/jade-api/services";
+import { definePlugin, type UI } from "@uncarved/jade-api";
+import type { Commands, Prompts, Undo } from "@uncarved/jade-api/services";
 import { Checkpoints, lastTurnChanges, safe, sha256, turnToolNames, type Checkpoint } from "./checkpoint.ts";
-import { Snapshots, type Change, type Snapshot } from "./snapshot.ts";
+import { snapshotsAt, type Change, type Snapshot, type Snapshots } from "./snapshot.ts";
 import { dim, ok } from "./style.ts";
 
 /** 没有工作区快照（不在 git 仓库里、配置关掉了）时，shell 命令改了什么无从得知，撤销不了；这一轮跑过时提醒一句 */
@@ -47,6 +50,28 @@ function realPath(p: string): string {
 const decidedBy = new Map<string, Map<string, string>>();
 /** 打开着的会话：会话 id → 它的改动记在哪个根会话、算作根会话里哪次调用的 */
 const links = new Map<string, () => { root: string; via?: string }>();
+/** 根会话 id → 这一轮的工作区快照：整棵会话树（包括并行的子 Agent）第一次跑命令之前拍的那张。根会话这一轮结束时清掉 */
+const turnSnaps = new Map<string, Promise<{ snapshots: Snapshots; toolUseId: string } | undefined>>();
+/** 根会话 id → 正在给这一轮的快照补拍结束时的 tree：/undo、下一张快照先等它 */
+const closing = new Map<string, Promise<void>>();
+
+const now = () => performance.timeOrigin + performance.now();
+/** 会话的工作区快照（子 Agent 的记在根会话里） */
+const snapshotsOf = (home: string, sessionId: string, cwd: string) => snapshotsAt(path.join(home, "checkpoints", safe(sessionId)), cwd);
+
+/** 根会话这一轮结束：拍过快照的话补上结束时的 tree。返回补拍完成 */
+function closeTurn(root: string): Promise<void> | undefined {
+  const p = turnSnaps.get(root);
+  if (!p) return undefined;
+  turnSnaps.delete(root);
+  const done = p
+    .then((r) => r?.snapshots.close(r.toolUseId))
+    .catch(() => {
+      // 补拍不了：撤销时退回到和工作区现在的样子比
+    });
+  closing.set(root, done);
+  return done;
+}
 
 /** 文件现在的内容；不存在时 null */
 async function contentOf(file: string): Promise<string | null> {
@@ -62,25 +87,92 @@ export default definePlugin({
   process(ctx) {
     const checkpoints = new Checkpoints(path.join(ctx.home, "checkpoints"));
     const cwd = realPath(ctx.cwd);
+    ctx.provide("undo@1", {
+      async track(session, label, fn) {
+        if (ctx.config.shell === false) return fn();
+        const snapshots = snapshotsOf(ctx.home, session, ctx.cwd);
+        await closing.get(session);
+        let id: string | undefined;
+        try {
+          const tree = await snapshots.take();
+          if (tree) {
+            id = `user-${randomUUID()}`;
+            await snapshots.save({ toolUseId: id, tree, label, at: now() });
+          }
+        } catch {
+          // 拍不了快照：照样执行，只是撤销不了
+        }
+        try {
+          return await fn();
+        } finally {
+          if (id) await snapshots.close(id).catch(() => {});
+        }
+      },
+    } satisfies Undo);
+    /** 文件的显示名：恢复前算好（恢复时会删掉新建的文件）。文件可能已经不在了：解析它所在的目录 */
+    const shownName = (p: string) => display(cwd, path.join(realPath(path.dirname(p)), path.basename(p)));
+    /** 撤销用户自己执行的命令（undo@1.track 记下的一步） */
+    const undoRun = async (sessionId: string, snapshots: Snapshots, run: Snapshot, { changes, conflicts }: { changes: Change[]; conflicts: Set<string> }, ui: UI, signal: AbortSignal) => {
+      const shown = new Map(changes.map((c) => [c.path, shownName(c.path)]));
+      const rows = changes.map((c) => `  ${c.added ? "delete " : "restore"} ${shown.get(c.path)}`);
+      const list = rows.length > MAX_LISTED ? [...rows.slice(0, MAX_LISTED), `  … ${rows.length - MAX_LISTED} more`].join("\n") : rows.join("\n");
+      const changed = changes.filter((c) => conflicts.has(c.path)).map((c) => shown.get(c.path)!);
+      const files = `${changes.length} file${changes.length > 1 ? "s" : ""}`;
+      const answer = await ui.select(
+        {
+          title:
+            changed.length > 0
+              ? `${changed.join(", ")} changed since your command ${run.label} ran. Undo it anyway and discard those changes too?`
+              : `Undo your command ${run.label} (${files})?`,
+          detail: list,
+          options: [
+            { label: "No", value: "no" },
+            { label: changed.length > 0 ? "Yes, undo anyway" : "Yes, undo", value: "yes" },
+          ],
+        },
+        signal,
+      );
+      if (answer !== "yes") return;
+      await snapshots.restore(run.tree, changes);
+      await checkpoints.markUndone(sessionId, [run.toolUseId]);
+      const what = changes.slice(0, MAX_LISTED).map((c) => (c.added ? `deleted ${shown.get(c.path)} (the command had created it)` : `restored ${shown.get(c.path)}`));
+      if (changes.length > MAX_LISTED) what.push(`and ${changes.length - MAX_LISTED} more files`);
+      ctx.service<Prompts>("prompts@1")?.note(sessionId, `The user undid what their own shell command ${run.label} changed: ${what.join("; ")}. Read these files again before changing them.`);
+      return [ok(`Undid your command ${run.label} (${files}):`), "\n", dim(list)];
+    };
     ctx.service<Commands>("commands@1")?.register({
       name: "undo",
       description: "restore the files the agent changed in its last turn; in a git repository that includes what its shell commands changed (run again to go further back)",
       async run(_args, { sessions, ui, signal }) {
         const s = sessions.current;
         if (!s) return "No session is open.";
-        const snapshots = new Snapshots(path.join(ctx.home, "checkpoints", safe(s.id)), ctx.cwd);
+        await closing.get(s.id);
+        const snapshots = snapshotsOf(ctx.home, s.id, ctx.cwd);
         const undone = await checkpoints.undone(s.id);
         const snaps = await snapshots.list();
-        const entries = [...(await checkpoints.list(s.id)), ...snaps].sort((x, y) => y.at - x.at);
-        /** 这一轮文件工具的快照（最新的在前）、命令之前的工作区快照、工作区在那之后变了的文件 */
-        let cps: Checkpoint[];
+        /** 用户自己执行的命令，最新的在前：不属于哪一轮，按时间和 Agent 的轮次排先后 */
+        const runs = snaps.filter((x) => x.label !== undefined);
+        const entries = [...(await checkpoints.list(s.id)), ...snaps.filter((x) => x.label === undefined)].sort((x, y) => y.at - x.at);
+        /** 这一轮文件工具的快照（最新的在前）、命令之前的工作区快照、撤销它要动的文件、其中之后又被改过的 */
+        let cps: Checkpoint[] = [];
         let snap: Snapshot | undefined;
-        let tree: Change[];
+        let tree: Change[] = [];
+        let conflicts = new Set<string>();
         for (;;) {
           const hits = lastTurnChanges<Checkpoint | Snapshot>(s.state.messages, entries, undone);
+          // 用户的命令比这一轮的改动新（例如这一轮之后跑的 !npm i）：先撤销它。它引出的那一轮比它晚，先撤那一轮
+          const run = runs.find((r) => !undone.has(r.toolUseId));
+          if (run && (hits.length === 0 || run.at > Math.min(...hits.map((h) => h.at)))) {
+            const found = await snapshots.changes(run);
+            if (found.changes.length > 0) return undoRun(s.id, snapshots, run, found, ui, signal);
+            // 命令什么都没改（或者已经改回去了）：看更早的
+            undone.add(run.toolUseId);
+            await checkpoints.markUndone(s.id, [run.toolUseId]);
+            continue;
+          }
           cps = hits.filter((h): h is Checkpoint => "path" in h);
           snap = hits.find((h): h is Snapshot => "tree" in h);
-          tree = snap ? await snapshots.changed(snap.tree) : [];
+          ({ changes: tree, conflicts } = snap ? await snapshots.changes(snap) : { changes: [], conflicts: new Set<string>() });
           if (!snap || cps.length > 0 || tree.length > 0) break;
           // 命令什么都没改（或者已经改回去了）的一轮：没有可撤销的，看更早的一轮
           undone.add(snap.toolUseId);
@@ -108,8 +200,9 @@ export default definePlugin({
         const latest = new Map<string, Checkpoint>();
         for (const cp of fileCps) if (!latest.has(cp.path)) latest.set(cp.path, cp);
         const changed: string[] = [];
-        // 工作区快照之后变了的文件多半是命令改的，下面的问题里一起说明，不算"别人改过"
+        // 工作区快照覆盖到的文件按快照判断：这一轮结束之后又变了的才算"别人改过"
         for (const cp of latest.values()) if (!inTree.has(same(cp.path)) && !(await checkpoints.unchangedSince(cp))) changed.push(show(cp.path));
+        for (const c of tree) if (conflicts.has(c.path)) changed.push(show(c.path));
         const rows = [...plan.values()].map((f) => `  ${f.gone ? "delete " : "restore"} ${show(f.path)}`);
         const list = rows.length > MAX_LISTED ? [...rows.slice(0, MAX_LISTED), `  … ${rows.length - MAX_LISTED} more`].join("\n") : rows.join("\n");
         if (plan.size > 1 || changed.length > 0 || tree.length > 0) {
@@ -119,7 +212,7 @@ export default definePlugin({
                 changed.length > 0
                   ? `${changed.join(", ")} changed since the agent wrote ${changed.length > 1 ? "them" : "it"}. Undo anyway and discard those changes too?`
                   : tree.length > 0
-                    ? `Undo the agent's last turn (${plan.size} file${plan.size > 1 ? "s" : ""})? It ran shell commands: these files go back to how they were before the first command, and edits you made to them since then are lost too.`
+                    ? `Undo the agent's last turn (${plan.size} file${plan.size > 1 ? "s" : ""})? It ran shell commands: these files go back to how they were before the first command${snap?.after ? "." : ", and edits you made to them since then are lost too."}`
                     : `Undo the agent's last turn of changes (${plan.size} files)?`,
               detail: list,
               options: [
@@ -165,12 +258,30 @@ export default definePlugin({
     void ctx.effect(() => () => {
       if (decidedBy.get(sessionId) === decided) decidedBy.delete(sessionId);
       if (links.get(sessionId) === link) links.delete(sessionId);
+      if (!ctx.session.parent) closeTurn(sessionId);
     });
     /** toolUseId → 执行前的内容，执行成功后存成快照 */
     const before = new Map<string, { tool: string; path: string; before: string | null }>();
-    const snapshots = new Snapshots(path.join(ctx.home, "checkpoints", safe(sessionId)), ctx.cwd);
-    /** 这一轮已经拍过工作区快照 */
-    let snapped = false;
+    /**
+     * 这一轮第一次跑命令之前给工作区拍快照：整棵会话树（根会话和它这一轮开的子 Agent）共用一张，记在根会话里。
+     * 并行的子 Agent 同时要跑命令时等同一张拍完
+     */
+    const beforeCommand = (toolUseId: string) => {
+      const { root, via } = link();
+      let p = turnSnaps.get(root);
+      if (!p) {
+        const snapshots = snapshotsOf(ctx.home, root, ctx.cwd);
+        p = (async () => {
+          await closing.get(root);
+          const tree = await snapshots.take();
+          if (!tree) return undefined;
+          await snapshots.save({ toolUseId, tree, at: now(), ...(via ? { via } : {}) });
+          return { snapshots, toolUseId };
+        })().catch(() => undefined);
+        turnSnaps.set(root, p);
+      }
+      return p;
+    };
 
     ctx.kernel.hook({
       kind: "transform",
@@ -182,12 +293,9 @@ export default definePlugin({
       timeoutMs: SNAPSHOT_TIMEOUT_MS,
       fn: async (call) => {
         const meta = ctx.session.tool(call.name)?.meta;
-        // 每轮第一次跑命令之前给工作区拍一张快照：命令改了什么，/undo 时和它一比就知道。
-        // 子会话不拍：并行的几个子 Agent 不能同时用根会话的影子仓库（子 Agent 的命令改的文件撤销不了）
-        if (meta?.shell !== undefined && ctx.config.shell !== false && !snapped && !ctx.session.parent) {
-          snapped = true;
-          const tree = await snapshots.take();
-          if (tree) await snapshots.save({ toolUseId: call.toolUseId, tree, at: performance.timeOrigin + performance.now() });
+        // 每轮第一次跑命令之前给工作区拍一张快照：命令改了什么，/undo 时和它一比就知道
+        if (meta?.shell !== undefined && ctx.config.shell !== false) {
+          await beforeCommand(call.toolUseId);
           return;
         }
         if (meta?.writes === undefined) return;
@@ -223,7 +331,9 @@ export default definePlugin({
         before.clear();
         // 只有这一轮里开的子会话查它（子会话在打开它的那次调用里结束）
         decided.clear();
-        snapped = false;
+        // 子会话结束不算：它的命令属于根会话这一轮。
+        // 返回补拍：内核等 observe 完成才交还这一轮（5.1），之后用户再动的文件不会被拍进这一轮
+        if (!ctx.session.parent) return closeTurn(sessionId);
       },
     });
   },

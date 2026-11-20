@@ -313,6 +313,17 @@ export interface Shell {
   which(bin: string): string | undefined;
 }
 
+// ---------- undo@1（jade/undo） ----------
+
+/** undo@1：替用户改工作区的操作（例如 /sh 执行的命令）也能用 /undo 撤销 */
+export interface Undo {
+  /**
+   * 执行 fn，前后各给工作区拍一张快照，记成会话 session 里单独的一步：/undo 撤销它改了的文件（比它之后的先撤销）。
+   * label 在对话框和结果里显示，例如 "$ npm install"。拍不了快照时（不在 git 仓库里、配置关掉了）只执行 fn
+   */
+  track<T>(session: string, label: string, fn: () => Promise<T>): Promise<T>;
+}
+
 // ---------- tools@1（jade/tools） ----------
 
 /**

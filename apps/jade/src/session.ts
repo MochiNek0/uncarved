@@ -267,7 +267,8 @@ class LiveSession implements Session {
     if (this.#left) return Promise.reject(this.#left);
     return new Promise((resolve, reject) => {
       this.#queue.push({ run, resolve, reject });
-      this.#kick();
+      // session() 执行期间（Runtime 还没建）排进来的等 attach 再开始
+      if (this.#attached) this.#kick();
     });
   }
 
@@ -311,7 +312,7 @@ class LiveSession implements Session {
     this.#plugins = plugins;
     this.#use(rt);
     this.#attached = true;
-    if (this.#after.length > 0) this.#kick();
+    if (this.#queue.length > 0 || this.#after.length > 0) this.#kick();
   }
 
   /** 换上一个 Runtime：通知从它转给订阅者。插件的回调以插件身份执行；出错只报告 */
@@ -379,7 +380,8 @@ class LiveSession implements Session {
   }
 
   abort(reason?: unknown): void {
-    this.rt.abort(reason);
+    // Runtime 还没建（session() 执行期间、打开失败时）：没有在跑的
+    this.rt?.abort(reason);
     // 停在等待人工审批时内核没有在跑，信号结束不了这一轮
     if (this.#turn) {
       this.#turn.stop = { reason };
@@ -497,6 +499,8 @@ export class Sessions implements SessionManager {
         ? await Runtime.resume({ store, provider, plugins, sessionId: s.id })
         : await Runtime.create({ store, provider, plugins, sessionId: s.id });
     } catch (e) {
+      // session() 里排进来的输入不会再执行了
+      s.leave();
       await this.#closeParts(s);
       throw e;
     }
@@ -587,6 +591,7 @@ export class Sessions implements SessionManager {
       for (const p of host.active()) if (p.module.session) await this.#join(s, p);
       rt = await Runtime.create({ store: s.store, provider, plugins: kernelPlugins(), sessionId: s.id, parent: child.ref });
     } catch (e) {
+      s.leave();
       await this.#closeParts(s);
       release();
       throw e;

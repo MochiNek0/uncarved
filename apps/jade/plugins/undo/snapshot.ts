@@ -4,16 +4,24 @@
 // 项目自己的 .git（暂存区、提交、stash）一点不碰。只在 git 仓库里做：要靠 .gitignore 跳过 node_modules 这类目录，
 // 对象库借用项目的（alternates），已经提交过的内容不再存一份。被忽略的文件不在快照里，撤销不了。
 // 快照是 tree 对象，不建提交；哪一轮对应哪个 tree 记在 snapshots.json。
+// 一轮结束时再拍一张（after）：撤销时只动这一轮之内变了的文件，之后别人（用户的 /sh、手改）动过的不会被一起冲掉，而是先问。
+// 同一个影子仓库的操作在进程内排队：并行的子 Agent、/undo 都会用它，git 的 index.lock 不能并发。
 
 import { execFile } from "node:child_process";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 export interface Snapshot {
-  /** 这一轮第一次 bash 调用的 toolUseId：/undo 按它找到是哪一轮 */
+  /** 这一轮第一次 bash 调用的 toolUseId：/undo 按它找到是哪一轮。用户自己执行的命令（label）是生成的 id */
   toolUseId: string;
-  /** 影子仓库里的 tree */
+  /** 影子仓库里的 tree：命令之前 */
   tree: string;
+  /** 一轮（或用户的命令）结束时的 tree；没有时（旧记录、进程中途退出）撤销时和工作区现在的样子比 */
+  after?: string;
+  /** 子 Agent 拍的：根会话里打开它的那次调用（同 Checkpoint.via） */
+  via?: string;
+  /** 有它的是用户自己执行的命令（例如 /sh 的 "$ npm i"），单独算一步撤销，不属于哪一轮 */
+  label?: string;
   /** 拍下的时间，和 Checkpoint.at 同一个钟 */
   at: number;
 }
@@ -28,6 +36,29 @@ export interface Change {
 const FILE = "snapshots.json";
 /** 一次 git 命令最多带这么多路径：Windows 的命令行长度有限 */
 const CHUNK = 100;
+
+/** 影子仓库目录 → 排在最后的操作 */
+const queues = new Map<string, Promise<unknown>>();
+/** 同一个目录的操作一个接一个执行（前一个失败不影响后一个） */
+function serial<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const next = (queues.get(key) ?? Promise.resolve()).then(fn, fn);
+  const tail = next.catch(() => {});
+  queues.set(key, tail);
+  void tail.then(() => {
+    if (queues.get(key) === tail) queues.delete(key);
+  });
+  return next;
+}
+
+/** 同一个目录共用一个实例：影子仓库只准备一次 */
+const instances = new Map<string, Snapshots>();
+/** dir：会话的快照目录；cwd：会话的工作目录 */
+export function snapshotsAt(dir: string, cwd: string): Snapshots {
+  const key = `${dir}|${cwd}`;
+  let s = instances.get(key);
+  if (!s) instances.set(key, (s = new Snapshots(dir, cwd)));
+  return s;
+}
 
 export class Snapshots {
   readonly #dir: string;
@@ -72,8 +103,16 @@ export class Snapshots {
     })());
   }
 
+  #serial<T>(fn: () => Promise<T>): Promise<T> {
+    return serial(this.#dir, fn);
+  }
+
   /** 给工作区拍一张快照，返回 tree；不在 git 仓库里时 undefined */
-  async take(): Promise<string | undefined> {
+  take(): Promise<string | undefined> {
+    return this.#serial(() => this.#take());
+  }
+
+  async #take(): Promise<string | undefined> {
     const r = await this.#prepare();
     if (!r) return undefined;
     await git(["add", "-A", "--ignore-errors", "."], { cwd: r.root, env: r.env }).catch(() => {
@@ -82,12 +121,26 @@ export class Snapshots {
     return (await git(["write-tree"], { cwd: r.root, env: r.env })).trim();
   }
 
-  /** 工作区现在和快照 tree 相比变了的文件 */
-  async changed(tree: string): Promise<Change[]> {
-    const r = await this.#prepare();
-    const now = await this.take();
-    if (!r || !now || now === tree) return [];
-    const out = await git(["diff-tree", "-r", "--no-renames", "--name-status", "-z", tree, now], { cwd: r.root, env: r.env });
+  /**
+   * 撤销这张快照要动的文件，和其中之后又被改过的（conflicts，绝对路径）。
+   * 有 after 时是 tree 到 after 之间变了的文件，工作区现在和 after 不一样的算之后改过；
+   * 没有时（旧记录、进程中途退出）是 tree 到现在变了的文件，分不出哪些是之后改的
+   */
+  changes(snap: Pick<Snapshot, "tree" | "after">): Promise<{ changes: Change[]; conflicts: Set<string> }> {
+    return this.#serial(async () => {
+      const r = await this.#prepare();
+      const now = await this.#take();
+      if (!r || !now) return { changes: [], conflicts: new Set<string>() };
+      const end = snap.after ?? now;
+      const changes = await this.#diff(r, snap.tree, end);
+      const later = new Set((await this.#diff(r, end, now)).map((c) => c.path));
+      return { changes, conflicts: new Set(changes.map((c) => c.path).filter((p) => later.has(p))) };
+    });
+  }
+
+  async #diff(r: { env: NodeJS.ProcessEnv; root: string }, from: string, to: string): Promise<Change[]> {
+    if (from === to) return [];
+    const out = await git(["diff-tree", "-r", "--no-renames", "--name-status", "-z", from, to], { cwd: r.root, env: r.env });
     const parts = out.split("\0");
     const changes: Change[] = [];
     for (let i = 0; i + 1 < parts.length; i += 2) changes.push({ path: path.join(r.root, parts[i + 1]!), added: parts[i] === "A" });
@@ -95,7 +148,11 @@ export class Snapshots {
   }
 
   /** 把这些文件恢复成快照 tree 里的样子：之后新出现的删掉，其余的取回 */
-  async restore(tree: string, changes: readonly Change[]): Promise<void> {
+  restore(tree: string, changes: readonly Change[]): Promise<void> {
+    return this.#serial(() => this.#restore(tree, changes));
+  }
+
+  async #restore(tree: string, changes: readonly Change[]): Promise<void> {
     const r = await this.#prepare();
     if (!r) return;
     for (const c of changes) if (c.added) await rm(c.path, { force: true });
@@ -106,7 +163,11 @@ export class Snapshots {
   }
 
   /** 本会话记下的快照，最新的在前 */
-  async list(): Promise<Snapshot[]> {
+  list(): Promise<Snapshot[]> {
+    return this.#serial(() => this.#list());
+  }
+
+  async #list(): Promise<Snapshot[]> {
     try {
       const all = JSON.parse(await readFile(path.join(this.#dir, FILE), "utf8")) as unknown;
       return Array.isArray(all) ? (all as Snapshot[]).sort((a, b) => b.at - a.at) : [];
@@ -115,10 +176,22 @@ export class Snapshots {
     }
   }
 
-  async save(snapshot: Snapshot): Promise<void> {
-    const all = await this.list();
+  save(snapshot: Snapshot): Promise<void> {
+    return this.#serial(async () => this.#write([snapshot, ...(await this.#list())]));
+  }
+
+  /** 给这张快照补上结束时的 tree（现在工作区的样子） */
+  close(toolUseId: string): Promise<void> {
+    return this.#serial(async () => {
+      const after = await this.#take();
+      if (!after) return;
+      await this.#write((await this.#list()).map((s) => (s.toolUseId === toolUseId ? { ...s, after } : s)));
+    });
+  }
+
+  async #write(all: Snapshot[]): Promise<void> {
     await mkdir(this.#dir, { recursive: true });
-    await writeFile(path.join(this.#dir, FILE), JSON.stringify([snapshot, ...all]));
+    await writeFile(path.join(this.#dir, FILE), JSON.stringify(all));
   }
 }
 

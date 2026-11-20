@@ -9,7 +9,7 @@ import type { Block, Message } from "uncarved";
 import type { UI } from "../src/index.ts";
 import type { CommandContext, Commands } from "@uncarved/jade-api/services";
 import { lastTurnChanges, turnToolNames, type Checkpoint } from "../plugins/undo/checkpoint.ts";
-import { say, cleanup, scriptedHost, textOf, use } from "./scripted-ui.ts";
+import { MODEL, say, cleanup, scriptedHost, textOf, use } from "./scripted-ui.ts";
 
 afterEach(cleanup);
 
@@ -257,4 +257,96 @@ export default { session(ctx) {
     expect(reports.join(" ")).toContain("plugin test/patcher did not join session");
     expect(reports.join(" ")).toContain("tool put: meta.writes must be the name of an input field");
   });
+});
+
+// 一轮结束时也拍快照、子 Agent 的命令、用户自己执行的 /sh
+describe("jade/undo with shell commands from the turn's end, sub-agents and /sh", () => {
+  async function repo(opts: Parameters<typeof scriptedHost>[0] = {}) {
+    const w = await scriptedHost(opts);
+    const git = (...args: string[]) => Bun.spawnSync(["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "core.autocrlf=false", ...args], { cwd: w.cwd }).stdout.toString();
+    git("init", "-q");
+    await writeFile(path.join(w.cwd, "kept.txt"), "original\n");
+    git("add", "-A");
+    git("commit", "-q", "-m", "init");
+    const command = (name: string) => w.host.service<Commands>("commands@1")!.get(name)!.command;
+    const c: CommandContext = { signal: new AbortController().signal, ui: w.host.service<UI>("ui@1")!, sessions: w.host.sessions, print: () => {} };
+    const file = (name: string) => path.join(w.cwd, name);
+    return { ...w, undo: () => command("undo").run("", c), sh: (cmd: string) => command("sh").run(cmd, c), file };
+  }
+
+  test("files changed after the turn are left alone; ones the turn changed and that changed again are asked about", async () => {
+    const { host, shared, send, undo, file } = await repo();
+    shared.script.push(use("u1", "bash", { command: "printf agent > kept.txt && printf agent > other.txt" }), say("done"));
+    const s = await host.sessions.open();
+    await send(s, "do it");
+    // 这一轮之后用户自己建了一个文件、又改了 agent 建的文件
+    await writeFile(file("notes.txt"), "mine");
+    await writeFile(file("other.txt"), "edited by me");
+    shared.answers.push("yes");
+    expect(plain(await undo())).toContain("Undid the last turn (2 files):");
+    expect(shared.asked).toEqual(["other.txt changed since the agent wrote it. Undo anyway and discard those changes too?"]);
+    expect(await readFile(file("kept.txt"), "utf8")).toBe("original\n");
+    expect(existsSync(file("other.txt"))).toBe(false);
+    expect(await readFile(file("notes.txt"), "utf8")).toBe("mine");
+  }, 30_000);
+
+  test("/sh is a step of its own, undone in time order with the agent's turns", async () => {
+    const { host, shared, send, undo, sh, file } = await repo();
+    shared.script.push(use("u1", "bash", { command: "printf agent > kept.txt" }), say("done"));
+    const s = await host.sessions.open();
+    await send(s, "do it");
+    // 这一轮之后用户自己跑的命令：先撤销它，agent 那一轮不受影响
+    expect(await sh("printf user > mine.txt")).toMatchObject({ prompt: expect.stringContaining("I ran this shell command myself") });
+    shared.answers.push("yes", "yes");
+    expect(plain(await undo())).toContain("Undid your command $ printf user > mine.txt (1 file):\n  delete  mine.txt");
+    expect(shared.asked.at(-1)).toBe("Undo your command $ printf user > mine.txt (1 file)?");
+    expect(existsSync(file("mine.txt"))).toBe(false);
+    expect(await readFile(file("kept.txt"), "utf8")).toBe("agent");
+    expect(plain(await undo())).toContain("Undid the last turn (1 file):");
+    expect(shared.asked.at(-1)).toBe("Undo the agent's last turn (1 file)? It ran shell commands: these files go back to how they were before the first command.");
+    expect(await readFile(file("kept.txt"), "utf8")).toBe("original\n");
+    expect(plain(await undo())).toBe("Nothing to undo.");
+
+    // 用户的命令引出的那一轮比它晚：先撤销那一轮，命令建的文件留着
+    const r = (await sh("printf first > first.txt")) as { prompt: string };
+    shared.script.push(use("u2", "bash", { command: "printf again > kept.txt" }), say("done"));
+    await send(s, r.prompt);
+    shared.answers.push("yes", "yes");
+    await undo();
+    expect(await readFile(file("kept.txt"), "utf8")).toBe("original\n");
+    expect(existsSync(file("first.txt"))).toBe(true);
+    await undo();
+    expect(existsSync(file("first.txt"))).toBe(false);
+    shared.script.push(say("ok"));
+    await send(s, "and now?");
+    expect(textOf(shared.requests.at(-1)!.messages.at(-1)!.content)).toContain("The user undid what their own shell command $ printf first > first.txt changed: deleted first.txt (the command had created it)");
+  }, 30_000);
+
+  test("shell commands of parallel sub-agents count as the turn that started them: one snapshot, one /undo", async () => {
+    const { host, home, shared, send, undo, file } = await repo({ config: { "jade/task": { write: true } } });
+    const task = (id: string) => ({ kind: "tool_use", id, name: "task", input: { description: id, prompt: "write a file" }, origin: MODEL, trust: "trusted" }) as Block;
+    shared.script.push(
+      { content: [task("t1"), task("t2")], stopReason: "tool_use" },
+      // 两个子 Agent 从同一份脚本里取：先取到的两次都是命令，谁跑哪条都一样
+      use("c1", "bash", { command: "printf a > a.txt && printf a > kept.txt" }),
+      use("c2", "bash", { command: "printf b > b.txt" }),
+      say("report"),
+      say("report"),
+      say("done"),
+    );
+    const s = await host.sessions.open();
+    await send(s, "fan out");
+    expect(await readFile(file("a.txt"), "utf8")).toBe("a");
+    expect(await readFile(file("b.txt"), "utf8")).toBe("b");
+    const snaps = JSON.parse(await readFile(path.join(home, "checkpoints", s.id, "snapshots.json"), "utf8")) as { via?: string; after?: string }[];
+    expect(snaps).toHaveLength(1);
+    expect(["t1", "t2"]).toContain(snaps[0]!.via!);
+    expect(snaps[0]!.after).toBeString();
+    shared.answers.push("yes");
+    expect(plain(await undo())).toContain("Undid the last turn (3 files):");
+    expect(existsSync(file("a.txt"))).toBe(false);
+    expect(existsSync(file("b.txt"))).toBe(false);
+    expect(await readFile(file("kept.txt"), "utf8")).toBe("original\n");
+    expect(plain(await undo())).toBe("Nothing to undo.");
+  }, 60_000);
 });

@@ -285,7 +285,9 @@ export default definePlugin({
           .finally(() => running.delete(t.id));
       }
     };
-    // 不在这里立即检查：session() 执行时会话还没建好，这时 send 会失败，认领了的任务就丢了
+    // 会话建好就先检查一次：jade 没开着的时候到期的任务不用等第一个间隔。
+    // 不直接在这里检查：会话没能打开时排着的 send 被拒绝，认领了的任务就丢了；afterTurn 等会话建好才执行
+    ctx.session.afterTurn(() => void check());
     await ctx.effect(() => {
       const timer = setInterval(() => void check(), every);
       return () => clearInterval(timer);

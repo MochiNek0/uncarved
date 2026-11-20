@@ -92,6 +92,21 @@ describe("jade/task", () => {
     }
   });
 
+  test("the sub-agent reuses the environment and instruction files its session read at the start instead of reading them again", async () => {
+    const { cwd, host, shared, send } = await scriptedHost();
+    await writeFile(path.join(cwd, "AGENTS.md"), "Version one.");
+    const s = await host.sessions.open();
+    // 会话开始之后才改：子 Agent 看到的和主会话一样，是开始时读到的
+    await writeFile(path.join(cwd, "AGENTS.md"), "Version two.");
+    shared.script.push(use("u1", "task", { description: "look", prompt: "look around" }), say("report"), say("done"));
+    await send(s, "go");
+    const env = (i: number) => shared.requests[i]!.system.find((seg) => seg.text.startsWith("# Environment"))?.text;
+    const text = (i: number) => shared.requests[i]!.system.map((seg) => seg.text).join("\n");
+    expect(text(1)).toContain("Version one.");
+    expect(text(1)).not.toContain("Version two.");
+    expect(env(1)).toBe(env(0)!);
+  });
+
   test("the sub-agent's token usage is logged in the session, so the status bar can count it", async () => {
     const { host, shared, send } = await scriptedHost();
     shared.script.push(
