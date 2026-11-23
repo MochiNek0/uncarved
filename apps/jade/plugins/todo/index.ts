@@ -39,7 +39,7 @@ export function todoTool(onChange?: (todos: Todo[]) => void): Tool {
     description:
       "Maintain a task list for multi-step work. Each call replaces the whole list. " +
       "Use it when a task has three or more steps: write the plan, mark one item in_progress while working on it, " +
-      "and mark items completed as soon as they are done. Skip it for simple tasks.",
+      "and mark items completed as soon as they are done, including the last one before you reply. Skip it for simple tasks.",
     inputSchema: {
       type: "object",
       properties: {
@@ -88,7 +88,7 @@ const bold = (text: string): Span => ({ text, style: "bold" });
 const args = (input: unknown) => (input !== null && typeof input === "object" ? input : {}) as Record<string, unknown>;
 const list = (input: unknown) => (Array.isArray(args(input).todos) ? (args(input).todos as Todo[]) : []);
 
-// 完整的清单常驻在输入框上方（ctx.panel），对话里每次更新只占一行，展开（ctrl+o、点击）看当时的完整清单。
+// 这一轮跑的时候完整的清单在输入框上方（ctx.panel），对话里每次更新只占一行，展开（ctrl+o、点击）看当时的完整清单。
 // 前端没有那个位置时，对话里的一行照样能展开
 export const todoRenderer: ToolRenderer = {
   tool: "todo_write",
@@ -99,7 +99,7 @@ export const todoRenderer: ToolRenderer = {
   result: ({ isError }) => (isError ? undefined : null),
 };
 
-/** 输入框上方的一块：还有没做完的项时显示，全部做完或清空时去掉 */
+/** 输入框上方的一块：还有没做完的项时显示，全部做完或清空时去掉（一轮结束时也去掉） */
 export function todoPanel(todos: Todo[]): Text | undefined {
   if (todos.every((t) => t?.status === "completed")) return undefined;
   const p = progressOf(todos);
@@ -112,12 +112,8 @@ export default definePlugin({
   },
   session(ctx) {
     ctx.kernel.tool(todoTool((todos) => ctx.panel?.(todoPanel(todos))));
-    // 恢复的、/rewind 复制出的会话：历史里最后一份清单接着显示
-    if (ctx.panel) {
-      ctx.session.afterTurn(() => {
-        const todos = latestTodos(ctx.session.state().messages);
-        if (Array.isArray(todos)) ctx.panel?.(todoPanel(todos));
-      });
-    }
+    // 清单只在这一轮跑的时候显示：模型做完常常不再把最后一项标完成，留着就一直挡在输入框上方。
+    // 一轮结束就收起，完整清单在对话里那一行展开看
+    if (ctx.panel) ctx.session.afterTurn(() => ctx.panel?.(undefined));
   },
 });
