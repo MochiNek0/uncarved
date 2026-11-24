@@ -17,7 +17,7 @@
     },
     "apps/jade": {
       "name": "@uncarved/jade",
-      "version": "0.4.2",
+      "version": "0.4.3",
       "bin": {
         "jade": "./bin/jade.js",
       },
@@ -49,7 +49,7 @@
     },
     "packages/kernel": {
       "name": "uncarved",
-      "version": "0.1.6",
+      "version": "0.1.7",
     },
     "packages/plugin-stdio": {
       "name": "@uncarved/plugin-stdio",
