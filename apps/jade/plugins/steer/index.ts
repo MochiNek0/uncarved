@@ -93,7 +93,7 @@ export default definePlugin({
       pending: [],
       running() {
         try {
-          const phase = ctx.session.state().phase;
+          const phase = ctx.session.phase();
           return phase !== "new" && phase !== "idle" && phase !== "ended";
         } catch {
           // 会话还没建好，或者已经关了

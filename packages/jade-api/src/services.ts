@@ -78,8 +78,12 @@ export interface Completion {
   label: string;
   /** 候选菜单下面的说明，例如 "the file's content is sent with the message" */
   hint?: string;
-  /** 候选，像路径一样用 / 分层，目录以 / 结尾；每次开始输入一个新的触发字符时取一次 */
-  candidates(): Promise<string[]>;
+  /**
+   * 候选，像路径一样用 / 分层，目录以 / 结尾；每次开始输入一个新的触发字符时取一次。
+   * 输入的是 ../、./、~/、/ 或盘符开头的路径时传入 dir（最后一个 / 之前的部分，含 /，用正斜杠），dir 变了再取一次：
+   * 这时只要给出这个目录下一层的条目，以 dir 开头（例如 dir 是 "../" 时给 "../src/"、"../README.md"）
+   */
+  candidates(dir?: string): Promise<string[]>;
 }
 
 export interface Completions {

@@ -2,7 +2,7 @@
 // 回复是流式到达的，按完整的行逐行处理：代码块要记住是否在块里，表格要攒齐所有行才能算列宽，
 // 所以做成有状态的 markdownStream。表格和分隔线跟终端宽度有关，交出去的是按宽度现排的函数。
 
-import stringWidth from "string-width";
+import { visibleWidth, wrapLines, wrapText } from "./width.ts";
 import wrapAnsi from "wrap-ansi";
 import { bold, cyan, dim, italic, strike, underline } from "./screen.ts";
 
@@ -128,12 +128,14 @@ const WRAP = { hard: true, trim: false } as const;
  */
 export function wrapRows(text: string, width: number): string[] {
   const expanded = expandTabs(text);
+  const grouped = wrapLines(expanded, width);
+  if (grouped) return grouped.flatMap((rows) => rows.map((r, i) => (i === 0 ? r : softRow(r))));
   // 整段一起折：颜色可能跨行，分开折会丢掉后面几行的颜色
   const rows = wrapAnsi(expanded, width, WRAP).split("\n");
   const logical = expanded.split("\n");
   if (rows.length === logical.length) return rows;
   // 每个原来的行占了几行：放得下的占一行，放不下的单独折一次数出来（颜色不占宽度，不影响在哪里折）
-  const counts = logical.map((l) => (stringWidth(l) <= width ? 1 : wrapAnsi(l, width, WRAP).split("\n").length));
+  const counts = logical.map((l) => (visibleWidth(l) <= width ? 1 : wrapAnsi(l, width, WRAP).split("\n").length));
   if (counts.reduce((a, b) => a + b, 0) !== rows.length) return rows;
   let at = 0;
   for (const n of counts) {
@@ -196,7 +198,7 @@ export function expandTabs(text: string, stop = 4): string {
       const parts = line.split("\t");
       parts.forEach((p, i) => {
         out += p;
-        col += stringWidth(p);
+        col += visibleWidth(p);
         if (i < parts.length - 1) {
           const n = stop - (col % stop);
           out += " ".repeat(n);
@@ -209,12 +211,12 @@ export function expandTabs(text: string, stop = 4): string {
 }
 
 /** 折行时续行缩进到 head 之后（列表项的正文、代码块的竖线）；rest 是续行开头显示的内容，宽度和 head 相同 */
-function hanging(head: string, body: string, rest = " ".repeat(stringWidth(head))): MdLine {
+function hanging(head: string, body: string, rest = " ".repeat(visibleWidth(head))): MdLine {
   return {
     render: (width) => {
-      const indent = stringWidth(head);
+      const indent = visibleWidth(head);
       const room = Math.max(1, width - indent);
-      const rows = wrapAnsi(expandTabs(body), room, WRAP).split("\n");
+      const rows = wrapText(expandTabs(body), room);
       // 折行处留下的行尾空格看不见，去掉免得多占一列；去掉了几个记在续行的记号里，复制时补回去
       return rows.map((r, i) => (i === 0 ? head + r.trimEnd() : softRow(rest + r.trimEnd(), rows[i - 1]!.length - rows[i - 1]!.trimEnd().length, indent)));
     },
@@ -263,7 +265,7 @@ function tableLine(rows: string[][], align: Align[]): MdLine {
 function renderTable(rows: string[][], align: Align[], width: number): string[] {
   const n = Math.max(...rows.map((r) => r.length));
   const grid = rows.map((r) => Array.from({ length: n }, (_, i) => r[i] ?? ""));
-  const natural = Array.from({ length: n }, (_, i) => Math.max(1, ...grid.map((r) => stringWidth(r[i]!))));
+  const natural = Array.from({ length: n }, (_, i) => Math.max(1, ...grid.map((r) => visibleWidth(r[i]!))));
   const room = width - (3 * n + 1);
   if (room < 3 * n) {
     const [head, ...body] = grid;
@@ -285,7 +287,7 @@ function renderTable(rows: string[][], align: Align[], width: number): string[] 
     }
   }
   const pad = (s: string, w: number, a: Align) => {
-    const gap = w - stringWidth(s);
+    const gap = w - visibleWidth(s);
     if (a === "right") return " ".repeat(gap) + s;
     if (a === "center") return " ".repeat(Math.floor(gap / 2)) + s + " ".repeat(Math.ceil(gap / 2));
     return s + " ".repeat(gap);

@@ -3,6 +3,7 @@
 
 import { execFile } from "node:child_process";
 import { readdir } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { display } from "./attach.ts";
 
@@ -31,6 +32,19 @@ export async function mentionCandidates(cwd: string, signal: AbortSignal = Abort
     // 列到一半被中止（超时）：用已经找到的
   }
   return [...dirs, ...files];
+}
+
+/**
+ * 输入 ../、~/、绝对路径时的候选：dir 这个目录下一层的条目，以 dir 原样开头，目录以 / 结尾。
+ * 和 attach.ts 一样，dir 相对工作目录解析，~ 是主目录；读不了时没有候选
+ */
+export async function dirCandidates(cwd: string, dir: string): Promise<string[]> {
+  const full = path.resolve(cwd, dir.replace(/^~(?=\/)/, os.homedir()));
+  const entries = await readdir(full, { withFileTypes: true }).catch(() => []);
+  return entries
+    .filter((e) => e.isDirectory() || e.isFile())
+    .slice(0, MAX_CANDIDATES)
+    .map((e) => `${dir}${e.name}${e.isDirectory() ? "/" : ""}`);
 }
 
 // 以下和 jade/fs 的 listFiles 相同：插件之间不共享代码（只能共享类型），所以这里留一份

@@ -10,6 +10,16 @@ export function mentionAt(value: string, cursor: number, triggers: readonly stri
   return { trigger: m[1]!, start: cursor - m[2]!.length - m[1]!.length, query: m[2]!.replace(/^"/, "") };
 }
 
+/**
+ * 输入的是 ../、./、~/、/ 或盘符开头的路径时，最后一个 / 之前的部分（含 /，反斜杠换成 /）：候选改成现列这个目录下一层。
+ * 预先列好的候选只有工作目录里的相对路径，这些路径在里面找不到。其他情况返回 undefined
+ */
+export function mentionDir(query: string): string | undefined {
+  const q = query.replaceAll("\\", "/");
+  if (!/^(\.{1,2}\/|~\/|\/|[A-Za-z]:\/)/.test(q)) return undefined;
+  return q.slice(0, q.lastIndexOf("/") + 1);
+}
+
 /** 补全后的文本：触发字符加候选，含空白的加引号 */
 export const mentionText = (trigger: string, p: string) => (/\s/.test(p) ? `${trigger}"${p}"` : `${trigger}${p}`);
 

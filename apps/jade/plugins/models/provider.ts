@@ -1,6 +1,6 @@
 // Provider：按环境变量选择，外面包一层重试（4.7：重试是包装 Provider 的事）。
 
-import { ProviderError, type ModelResponse, type Provider } from "uncarved";
+import { ProviderError, type ModelRequest, type ModelResponse, type Provider } from "uncarved";
 import { parseTokens } from "./config.ts";
 
 /** 默认的重试等待：一次比一次久，最长 3 分钟 */
@@ -20,8 +20,10 @@ export interface RetryOptions {
   gate?: RateGate;
   /** 每次真正发出请求前（排完队、等完重试之后）通知宿主 */
   onRequest?: (attempt: number) => void;
+  /** 这个请求要在限速里排队等一段时间才能发时通知宿主（显示用） */
+  onWait?: (info: { delayMs: number; request: ModelRequest }) => void;
   /** 每次重试前通知宿主（显示用） */
-  onRetry?: (info: { attempt: number; retries: number; delayMs: number; error: ProviderError }) => void;
+  onRetry?: (info: { attempt: number; retries: number; delayMs: number; error: ProviderError; request: ModelRequest }) => void;
 }
 
 /** 是不是被限流了（429，或者错误信息里这么说） */
@@ -60,7 +62,7 @@ export function withRetry(inner: Provider, opts: RetryOptions = {}): Provider {
       const failures: RetryRecord[] = [];
       for (let attempt = 1; ; attempt++) {
         let streamed = false;
-        await opts.gate?.acquire(options.signal);
+        await opts.gate?.acquire(options.signal, opts.onWait && ((delayMs) => opts.onWait!({ delayMs, request })));
         opts.onRequest?.(attempt);
         try {
           const res = await inner.complete(request, {
@@ -95,7 +97,7 @@ export function withRetry(inner: Provider, opts: RetryOptions = {}): Provider {
           // 失败的这次已经推送过增量的，先让订阅者作废它们（4.7）
           if (streamed) options.onDelta?.({ kind: "reset" });
           failures.push({ attempt, delayMs, error: err.message, ...(err.status !== undefined ? { status: err.status } : {}), ...(streamed ? { discarded: true as const } : {}) });
-          opts.onRetry?.({ attempt, retries, delayMs, error: err });
+          opts.onRetry?.({ attempt, retries, delayMs, error: err, request });
           await sleep(delayMs, options.signal);
         }
       }
@@ -139,12 +141,13 @@ export class RateGate {
     return this.#rpm;
   }
 
-  /** 等到可以发下一个请求，并记下这个请求。排队的请求按先来后到 */
-  acquire(signal: AbortSignal): Promise<void> {
+  /** 等到可以发下一个请求，并记下这个请求。排队的请求按先来后到；轮到它但还要等时调用 onWait（只告诉这个请求的调用方） */
+  acquire(signal: AbortSignal, onWait?: (ms: number) => void): Promise<void> {
     const turn = this.#queue.then(async () => {
       signal.throwIfAborted();
       for (let wait = this.#delay(); wait > 0; wait = this.#delay()) {
         this.#opts.onWait?.(wait);
+        onWait?.(wait);
         await sleep(wait, signal);
       }
       this.#sent.push(this.#now());
@@ -280,6 +283,18 @@ export function fallbacksFromEnv(env: Env = process.env): boolean {
   throw new Error(`JADE_FALLBACKS must be on or off, got ${JSON.stringify(env.JADE_FALLBACKS)}`);
 }
 
+/**
+ * JADE_THINKING：Anthropic 格式的请求里带不带 thinking（adaptive）。不设时带；
+ * off 给见到 thinking 字段就拒绝请求的服务用（例如基元律动的 egg-alpha-004，不带时它照样思考）
+ */
+export function thinkingFromEnv(env: Env = process.env): boolean {
+  const text = env.JADE_THINKING?.trim().toLowerCase();
+  if (!text) return true;
+  if (["1", "true", "on", "yes"].includes(text)) return true;
+  if (["0", "false", "off", "no"].includes(text)) return false;
+  throw new Error(`JADE_THINKING must be on or off, got ${JSON.stringify(env.JADE_THINKING)}`);
+}
+
 /** JADE_EFFORT；不设时 Claude 用 high，OpenAI 用服务端默认值 */
 export function effortFromEnv(env: Env = process.env): string | undefined {
   const effort = env.JADE_EFFORT;
@@ -327,9 +342,11 @@ export function providerInfo(env: Env = process.env): ProviderInfo {
  * JADE_IDLE_TIMEOUT 是等模型服务回数据的时限，见 idleTimeoutFromEnv
  * JADE_VISION 是模型能不能看图片，见 visionFromEnv
  * JADE_FALLBACKS 是 Claude 被安全策略拒绝时要不要服务端换模型重试，见 fallbacksFromEnv
- * 只导入用到的那个服务的包：Anthropic 的 SDK 加载要一百多毫秒，拖慢启动
+ * JADE_THINKING 是 Anthropic 格式的请求里带不带 thinking，见 thinkingFromEnv
+ * 只导入用到的那个服务的包：Anthropic 的 SDK 加载要一百多毫秒，拖慢启动。
+ * headers 合并进每次请求（User-Agent 标明是 jade：有的服务按它在用量里区分客户端）
  */
-export async function providerFromEnv(env: Env = process.env): Promise<Provider> {
+export async function providerFromEnv(env: Env = process.env, headers?: Record<string, string>): Promise<Provider> {
   const kind = providerKind(env);
   if (!isBuiltinKind(kind)) throw new Error(`JADE_PROVIDER must be one of ${PROVIDER_KINDS.join(", ")}, got ${JSON.stringify(kind)}`);
   const maxTokens = env.JADE_MAX_TOKENS ? parseTokens("JADE_MAX_TOKENS", env.JADE_MAX_TOKENS) : undefined;
@@ -351,6 +368,7 @@ export async function providerFromEnv(env: Env = process.env): Promise<Provider>
       reasoning: effort ? { effort: effort as "minimal" | "low" | "medium" | "high", summary: "auto" } : undefined,
       idleTimeoutMs,
       toolResultImages,
+      headers,
     });
   }
   if (kind === "openai-compat") {
@@ -365,6 +383,7 @@ export async function providerFromEnv(env: Env = process.env): Promise<Provider>
       extraBody: env.OPENAI_COMPAT_EXTRA_BODY ? jsonObject("OPENAI_COMPAT_EXTRA_BODY", env.OPENAI_COMPAT_EXTRA_BODY) : undefined,
       idleTimeoutMs,
       toolResultImages,
+      headers,
     });
   }
   const { anthropicProvider } = await import("@uncarved/provider-anthropic");
@@ -373,9 +392,12 @@ export async function providerFromEnv(env: Env = process.env): Promise<Provider>
     apiKey: env.ANTHROPIC_API_KEY,
     baseURL: env.ANTHROPIC_BASE_URL ?? "https://api.anthropic.com",
     model: env.ANTHROPIC_MODEL,
-    effort: (effort ?? "high") as "low" | "medium" | "high" | "xhigh" | "max",
+    // 不设时 provider 用 high；JADE_THINKING=off 且没设时不发 effort
+    effort: effort as "low" | "medium" | "high" | "xhigh" | "max" | undefined,
     maxTokens,
     fallbacks: fallbacksFromEnv(env),
+    thinking: thinkingFromEnv(env),
+    headers,
   });
 }
 

@@ -374,7 +374,7 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
         },
         // 打了补全的触发字符（例如 @）时向登记它的插件要候选
         completions: completionList,
-        complete: async (trigger) => (await completions?.list().find((c) => c.completion.trigger === trigger)?.completion.candidates()) ?? [],
+        complete: async (trigger, dir) => (await completions?.list().find((c) => c.completion.trigger === trigger)?.completion.candidates(dir)) ?? [],
         interrupt: () => ready && interrupt(),
         unqueue: () => takeBack(),
         exit: () => void quit(0),
@@ -405,7 +405,11 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
 
   let current: Session | undefined;
   let unsubscribe: (() => void) | undefined;
-  const canRetry = () => current?.state.phase === "idle" && current.state.messages.at(-1)?.role === "user";
+  const canRetry = () => {
+    // state 每次都拷贝整段历史，只取一次
+    const state = current?.state;
+    return state?.phase === "idle" && state.messages.at(-1)?.role === "user";
+  };
 
   const view: Transcript = transcript({
     screen,

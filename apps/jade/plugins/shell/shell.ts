@@ -112,6 +112,7 @@ export function shellTools(opts: ShellOptions): ShellTools {
       `Run a shell command with ${shell} -c in the working directory and return its exit code, stdout and stderr. ` +
       `Each call starts a fresh shell: cd and environment variables do not persist. ` +
       `Default timeout ${DEFAULT_TIMEOUT_MS / 1000}s (timeout_ms, max ${MAX_TIMEOUT_MS / 1000}s). ` +
+      `Output beyond ${MAX_OUTPUT_CHARS} characters (stdout and stderr together) keeps only the start and end. ` +
       "Set run_in_background for servers, watchers and other long-running commands: it returns an id at once, " +
       "then read new output with bash_output and stop it with kill_shell. " +
       "Never start interactive programs. Prefer read_file/grep/glob over cat/grep/find.",
@@ -145,12 +146,13 @@ export function shellTools(opts: ShellOptions): ShellTools {
       };
       signal.addEventListener("abort", kill, { once: true });
       try {
-        const [stdout, stderr, code] = await Promise.all([
+        const [out, err, code] = await Promise.all([
           collect(proc.stdout, (text) => progress({ kind: "output", stream: "stdout", text }), true, killed.done),
           collect(proc.stderr, (text) => progress({ kind: "output", stream: "stderr", text }), true, killed.done),
           Promise.race([proc.exited, killed.done.then(() => null)]),
         ]);
         signal.throwIfAborted();
+        const [stdout, stderr] = clipStreams(out, err);
         const parts = [
           timedOut
             ? `Timed out after ${timeout}ms (killed). If it needs longer, raise timeout_ms (max ${MAX_TIMEOUT_MS / 1000}s); for servers and watchers use run_in_background.`
@@ -269,12 +271,13 @@ export async function capture(executable: string, env: NodeJS.ProcessEnv | undef
   }, opts.timeoutMs);
   opts.signal?.addEventListener("abort", kill, { once: true });
   try {
-    const [stdout, stderr, code] = await Promise.all([
+    const [out, err, code] = await Promise.all([
       collect(proc.stdout, onOutput, true, killed.done),
       collect(proc.stderr, onOutput, true, killed.done),
       Promise.race([proc.exited, killed.done.then(() => null)]),
     ]);
     opts.signal?.throwIfAborted();
+    const [stdout, stderr] = clipStreams(out, err);
     return { code: timedOut ? null : code, output: [stdout, stderr].filter(Boolean).join("\n"), timedOut };
   } finally {
     clearTimeout(timer);
@@ -396,11 +399,18 @@ function giveUp(): { start(): void; done: Promise<void> } {
   return { start, done };
 }
 
+/** 读到的输出：total 不超过 MAX_OUTPUT_CHARS 时 head + tail 就是全部，否则 head 是开头一半、tail 至少是结尾一半 */
+interface Collected {
+  head: string;
+  tail: string;
+  total: number;
+}
+
 /**
- * 返回截好的输出：超过 MAX_OUTPUT_CHARS 时保留开头和结尾各一半，中间截掉。
- * 边读边截，输出再多也只占几倍 MAX_OUTPUT_CHARS 的内存。keep 为 false 时只推给 onChunk，不累积，返回空串
+ * 边读边截，输出再多也只占几倍 MAX_OUTPUT_CHARS 的内存；最后截成多长由 clipStreams 按 stdout、stderr 合计决定。
+ * keep 为 false 时只推给 onChunk，不累积
  */
-async function collect(stream: AsyncIterable<Uint8Array>, onChunk: (text: string) => void, keep = true, stop?: Promise<void>): Promise<string> {
+async function collect(stream: AsyncIterable<Uint8Array>, onChunk: (text: string) => void, keep = true, stop?: Promise<void>): Promise<Collected> {
   const half = MAX_OUTPUT_CHARS / 2;
   const decoder = new TextDecoder();
   let head = "";
@@ -434,8 +444,24 @@ async function collect(stream: AsyncIterable<Uint8Array>, onChunk: (text: string
   }
   const rest = decoder.decode();
   if (rest) add(rest);
-  if (total <= MAX_OUTPUT_CHARS) return (head + tail).trimEnd();
-  return `${head}\n… (${total - MAX_OUTPUT_CHARS} characters omitted) …\n${tail.slice(-half)}`.trimEnd();
+  return { head, tail, total };
+}
+
+/** 截到最多 limit 个字符：保留开头和结尾各一半，中间截掉 */
+function clipCollected(c: Collected, limit: number): string {
+  const full = c.total <= MAX_OUTPUT_CHARS ? c.head + c.tail : undefined;
+  if (c.total <= limit) return full!.trimEnd();
+  const half = Math.floor(limit / 2);
+  const head = (full ?? c.head).slice(0, half);
+  const tail = half > 0 ? (full ?? c.tail).slice(-half) : "";
+  return `${head}\n… (${c.total - 2 * half} characters omitted) …\n${tail}`.trimEnd();
+}
+
+/** stdout、stderr 合计最多 MAX_OUTPUT_CHARS：短的那路最多占一半，剩下的都给另一路 */
+function clipStreams(out: Collected, err: Collected): [string, string] {
+  const small = Math.min(out.total, err.total, MAX_OUTPUT_CHARS / 2);
+  const outLimit = out.total <= err.total ? small : MAX_OUTPUT_CHARS - small;
+  return [clipCollected(out, outLimit), clipCollected(err, MAX_OUTPUT_CHARS - outLimit)];
 }
 
 /** 保留开头和结尾，中间截掉 */

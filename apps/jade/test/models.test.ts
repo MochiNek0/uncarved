@@ -19,6 +19,7 @@ import {
   rpmFromEnv,
   visionFromEnv,
   fallbacksFromEnv,
+  thinkingFromEnv,
   withRetry,
   type RetriedResponse,
 } from "../plugins/models/provider.ts";
@@ -140,6 +141,17 @@ describe("withRetry", () => {
     expect(calls).toBe(10);
     expect(delays).toEqual([15, ...scaled.slice(1).map((d) => Math.round(Math.min(d, 15)))]);
   });
+
+  test("tells the caller how long its own request waits in the rate limit queue", async () => {
+    const inner: Provider = { id: "inner", complete: async () => ({ model: "m", content: [], stopReason: "end" }) };
+    const gate = new RateGate();
+    gate.limited(30);
+    const waits: { delayMs: number; request: unknown }[] = [];
+    await withRetry(inner, { gate, onWait: (w) => waits.push(w) }).complete(request, { signal: new AbortController().signal });
+    expect(waits).toHaveLength(1);
+    expect(waits[0]!.delayMs).toBeGreaterThan(0);
+    expect(waits[0]!.request).toBe(request);
+  });
 });
 
 // ---------- 限速 ----------
@@ -210,6 +222,13 @@ describe("model configuration", () => {
     expect(fallbacksFromEnv({ ANTHROPIC_BASE_URL: "https://relay.example", JADE_FALLBACKS: " ON " })).toBe(true);
     expect(fallbacksFromEnv({ JADE_FALLBACKS: "off" })).toBe(false);
     expect(() => fallbacksFromEnv({ JADE_FALLBACKS: "maybe" })).toThrow("JADE_FALLBACKS");
+  });
+
+  test("JADE_THINKING: on by default, off leaves thinking out of the request", () => {
+    expect(thinkingFromEnv({})).toBe(true);
+    expect(thinkingFromEnv({ JADE_THINKING: " OFF " })).toBe(false);
+    expect(thinkingFromEnv({ JADE_THINKING: "on" })).toBe(true);
+    expect(() => thinkingFromEnv({ JADE_THINKING: "maybe" })).toThrow("JADE_THINKING");
   });
 
   test("JADE_VISION: on by default for Claude and OpenAI, off for compatible services", () => {
@@ -294,4 +313,30 @@ describe("model configuration", () => {
     expect(hasProvider({ OPENAI_COMPAT_BASE_URL: "http://x" })).toBe(true);
     expect(hasProvider({})).toBe(false);
   });
+});
+
+test("providerFromEnv sends the given User-Agent to every built-in service, replacing the SDK's own", async () => {
+  const seen: Record<string, string | null> = {};
+  const server = Bun.serve({
+    port: 0,
+    fetch(req) {
+      seen[new URL(req.url).pathname] = req.headers.get("user-agent");
+      return new Response("no", { status: 400 });
+    },
+  });
+  try {
+    const base = `http://localhost:${server.port}`;
+    const req = { system: [], messages: [{ role: "user", content: [{ kind: "text", text: "hi", origin: { by: "user" }, trust: "trusted" }] }], tools: [] } as never;
+    for (const env of [
+      { ANTHROPIC_API_KEY: "x", ANTHROPIC_BASE_URL: base, ANTHROPIC_MODEL: "m" },
+      { OPENAI_COMPAT_BASE_URL: `${base}/compat`, OPENAI_COMPAT_MODEL: "m", OPENAI_COMPAT_API_KEY: "x" },
+      { JADE_PROVIDER: "openai", OPENAI_API_KEY: "x", OPENAI_BASE_URL: `${base}/oai` },
+    ]) {
+      const p = await providerFromEnv(env, { "user-agent": "jade/9.9.9" });
+      await p.complete(req, { signal: AbortSignal.timeout(5000), onDelta: () => {} }).catch(() => {});
+    }
+    expect(seen).toEqual({ "/v1/messages": "jade/9.9.9", "/compat/chat/completions": "jade/9.9.9", "/oai/responses": "jade/9.9.9" });
+  } finally {
+    server.stop(true);
+  }
 });

@@ -5,8 +5,8 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { mentionCandidates } from "../plugins/mentions/candidates.ts";
-import { mentionAt, mentionText, rankPaths } from "../plugins/tui/mentions.ts";
+import { dirCandidates, mentionCandidates } from "../plugins/mentions/candidates.ts";
+import { mentionAt, mentionDir, mentionText, rankPaths } from "../plugins/tui/mentions.ts";
 
 let tmp: string[] = [];
 afterEach(async () => {
@@ -43,6 +43,37 @@ describe("mentionCandidates", () => {
     const found = await mentionCandidates(cwd);
     expect(found).toContain("keep.ts");
     expect(found.some((p) => p.startsWith(".git/") || p.startsWith("node_modules/"))).toBe(false);
+  });
+});
+
+describe("paths outside the working directory", () => {
+  test("mentionDir gives the directory being typed for ../, ./, ~/, absolute and drive paths", () => {
+    expect(mentionDir("../")).toBe("../");
+    expect(mentionDir("../sr")).toBe("../");
+    expect(mentionDir("../../docs/de")).toBe("../../docs/");
+    expect(mentionDir("..\\src\\")).toBe("../src/");
+    expect(mentionDir("./a")).toBe("./");
+    expect(mentionDir("~/")).toBe("~/");
+    expect(mentionDir("/etc/ho")).toBe("/etc/");
+    expect(mentionDir("C:/Users/")).toBe("C:/Users/");
+    for (const q of ["", "src/", "..", "a/../b", "~user"]) expect(mentionDir(q)).toBeUndefined();
+  });
+
+  test("dirCandidates lists one level of that directory, prefixed with it as typed", async () => {
+    const root = await dir();
+    const cwd = path.join(root, "app");
+    await mkdir(path.join(root, "lib"), { recursive: true });
+    await mkdir(cwd);
+    await writeFile(path.join(root, "notes.md"), "");
+    await writeFile(path.join(root, "lib", "x.ts"), "");
+
+    expect((await dirCandidates(cwd, "../")).sort()).toEqual(["../app/", "../lib/", "../notes.md"]);
+    expect(await dirCandidates(cwd, "../lib/")).toEqual(["../lib/x.ts"]);
+    expect(await dirCandidates(cwd, "../missing/")).toEqual([]);
+    const abs = `${root.replaceAll("\\", "/")}/`;
+    expect((await dirCandidates(cwd, abs)).sort()).toEqual([`${abs}app/`, `${abs}lib/`, `${abs}notes.md`]);
+    // 排序时按输入的前缀找得到
+    expect(rankPaths(await dirCandidates(cwd, "../"), "../no", 10)).toEqual(["../notes.md"]);
   });
 });
 

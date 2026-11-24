@@ -94,8 +94,7 @@ jade 自带的功能全是 `apps/jade/plugins/` 下的普通插件，和第三�
 | `jade/approval` | 权限审批、模式、审查 |
 | `jade/modes` | 模式切换、计划模式 |
 | `jade/compact` | 上下文压缩、溢出后自动重试 |
-| `jade/task` | 子 Agent（嵌套 Runtime） |
-| `jade/tools` | 给嵌套 Agent 用的工具的注册表（`tools@1`） |
+| `jade/task` | 子 Agent（核心开的子会话） |
 | `jade/mcp` | MCP 服务工具 |
 | `jade/skills`、`jade/memory` | 技能目录、长期记忆 |
 | `jade/schedule` | 定时任务（cron，重启后仍生效） |
@@ -134,7 +133,7 @@ jade mcp add <名字> --url <地址> [--header "Name: value"]… [--project] [--
 jade mcp remove <名字> [--project]
 ```
 
-不加 `--project` 装到 `$JADE_HOME`（`$JADE_HOME/skills/<名字>`、`$JADE_HOME/mcp.json`），加了装到当前工作目录（`.jade/skills/<名字>`、`.jade/mcp.json`）。一个仓库里有多个 skill 时（例如 `anthropics/skills`），不加 `--path` 会列出它们，用 `--path skills/pdf` 选一个。`jade skills update` 不覆盖装好后手动改过的 skill，除非加 `--force`。新装的 skill 马上生效，运行中的 jade 从下一步起就能用，不用 `/clear` 或重启；新加的 MCP 服务重启 jade 后生效，项目层的服务第一次启动前仍然要你确认。会话里同样可以用 `/skills add …`、`/mcp add …`。
+不加 `--project` 装到 `$JADE_HOME`（`$JADE_HOME/skills/<名字>`、`$JADE_HOME/mcp.json`），加了装到当前工作目录（`.jade/skills/<名字>`、`.jade/mcp.json`）。一个仓库里有多个 skill 时（例如 `anthropics/skills`），不加 `--path` 会列出它们，用 `--path skills/pdf` 选一个。`jade skills update` 不覆盖装好后手动改过的 skill，除非加 `--force`。新装的 skill 马上生效，运行中的 jade 从下一步起就能用，不用 `/clear` 或重启；会话里同样可以用 `/skills add …`、`/mcp add …`；`/mcp add` 加的服务马上生效，`jade mcp add` 加的重启 jade 后生效，项目层的服务第一次启动前仍然要你确认。
 
 这两条命令由 `jade/skills`、`jade/mcp` 插件经核心的 `cli@1` 注册，核心并不认识 skill 和 MCP。
 
@@ -204,6 +203,7 @@ plugin.run()
 | `JADE_CONTEXT_WINDOW` | `.env` | 模型上下文窗口，不设时按模型名推断 |
 | `JADE_RPM` | `.env` | 每分钟最多发几个模型请求，不设时不主动限速 |
 | `JADE_FALLBACKS` | `.env` | Claude 因安全策略拒绝时由服务端换模型重试；不设时只对官方地址开启，其他 Anthropic 格式的服务默认关闭。可在 `/model` 的模型设置里按模型改 |
+| `JADE_THINKING` | `.env` | Anthropic 格式的请求里带不带 `thinking`（adaptive）和默认的 effort；设成 `off` 给见到这个字段就拒绝请求的服务用（例如基元律动的 egg-alpha-004），模型自己决定思不思考。可在 `/model` 的模型设置里按模型改 |
 | `JADE_SEARCH` | `.env` | 搜索服务顺序，逗号分隔 |
 | `JADE_SEARCH_RESULTS` | `.env` | 每次搜索返回条数，默认 10 |
 | `JADE_SHELL` | shell | shell 工具用的 shell，默认 bash（Windows 上是 Git Bash） |

@@ -336,3 +336,20 @@ test("只有空白的 text 块也不发送：API 同样拒绝（例如工具只�
   );
   expect(calls[0]!.messages).toEqual([{ role: "user", content: [{ type: "tool_result", tool_use_id: "t", is_error: false }] }]);
 });
+
+test("thinking: false 时请求里不带 thinking 和默认的 effort（有的服务见到 thinking 就拒绝请求），默认带 adaptive", async () => {
+  const final = { model: "m", content: [], stop_reason: "end_turn", usage: { input_tokens: 1, output_tokens: 1 } };
+  const req: ModelRequest = { system: [], tools: [], messages: [{ role: "user", content: [{ kind: "text", text: "hi", origin: user, trust: "trusted" }] }] };
+  const on = fakeClient(final);
+  await anthropicProvider({ client: on.client }).complete(req, { signal: new AbortController().signal });
+  expect(on.calls[0]).toMatchObject({ thinking: { type: "adaptive", display: "summarized" } });
+  const off = fakeClient(final);
+  await anthropicProvider({ client: off.client, thinking: false }).complete(req, { signal: new AbortController().signal });
+  expect(off.calls[0]).not.toHaveProperty("thinking");
+  // 没给 effort 时 output_config 也不带；明确给了才带
+  expect(off.calls[0]).not.toHaveProperty("output_config");
+  const effort = fakeClient(final);
+  await anthropicProvider({ client: effort.client, thinking: false, effort: "low" }).complete(req, { signal: new AbortController().signal });
+  expect(effort.calls[0]).toMatchObject({ output_config: { effort: "low" } });
+  expect(on.calls[0]).toMatchObject({ output_config: { effort: "high" } });
+});

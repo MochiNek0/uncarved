@@ -766,6 +766,11 @@ export class Sessions implements SessionManager {
           if (!s.rt) throw new Error(`plugin ${id}: the session's state is not available while session() runs`);
           return s.rt.state;
         },
+        phase: () => {
+          if (scope.closed) throw new StaleContext(id);
+          if (!s.rt) throw new Error(`plugin ${id}: the session's phase is not available while session() runs`);
+          return s.rt.phase;
+        },
         subscribe: (fn) => {
           if (scope.closed) throw new StaleContext(id);
           const off = s.watch(fn, owner);

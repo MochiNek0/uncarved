@@ -36,6 +36,11 @@ export interface AnthropicProviderOptions {
   effort?: "low" | "medium" | "high" | "xhigh" | "max";
   /** 默认 summarized，这样流式输出时能看到思考摘要 */
   thinkingDisplay?: "summarized" | "omitted";
+  /**
+   * 请求里带不带 thinking（adaptive）。默认带；false 时不带，没给 effort 时 output_config 也不带，由模型自己决定。
+   * 有的 Anthropic 格式的服务（例如基元律动的 egg-alpha-004）见到 thinking 字段就拒绝整个请求，不带时照样会思考
+   */
+  thinking?: boolean;
   /** 模型因安全策略拒绝时，由服务端自动换模型重试。默认开启 */
   fallbacks?: boolean;
   /** 每次请求都合并进请求参数，ext 中的 body 覆盖它 */
@@ -62,8 +67,9 @@ export function anthropicProvider(opts: AnthropicProviderOptions = {}): Provider
         {
           model,
           max_tokens: opts.maxTokens ?? 64000,
-          thinking: { type: "adaptive", display: opts.thinkingDisplay ?? "summarized" },
-          output_config: { effort: opts.effort ?? "high" },
+          ...(opts.thinking === false ? {} : { thinking: { type: "adaptive" as const, display: opts.thinkingDisplay ?? "summarized" } }),
+          // 不带 thinking 时也不带默认的 effort（例如 egg-alpha-004 带了 effort 就不思考），明确给了才带
+          ...(opts.thinking === false && opts.effort === undefined ? {} : { output_config: { effort: opts.effort ?? "high" } }),
           ...(opts.fallbacks === false
             ? {}
             : { betas: ["server-side-fallback-2026-07-01"], fallbacks: "default" as const }),

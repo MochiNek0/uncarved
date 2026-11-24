@@ -8,7 +8,7 @@ import path from "node:path";
 export type Env = Record<string, string | undefined>;
 
 /** 每个模型自己的设置：切换模型时一起换掉 */
-export const MODEL_SETTINGS = ["JADE_MAX_TOKENS", "JADE_EFFORT", "JADE_CONTEXT_WINDOW", "JADE_RPM", "JADE_VISION", "JADE_FALLBACKS", "OPENAI_COMPAT_EXTRA_BODY"];
+export const MODEL_SETTINGS = ["JADE_MAX_TOKENS", "JADE_EFFORT", "JADE_CONTEXT_WINDOW", "JADE_RPM", "JADE_VISION", "JADE_FALLBACKS", "JADE_THINKING", "OPENAI_COMPAT_EXTRA_BODY"];
 
 export interface SavedModel {
   name: string;

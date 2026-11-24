@@ -173,7 +173,8 @@ describe("terminal UI", () => {
       // 只有 ctrl+t、alt+v、shift+tab 有插件处理
       key: (spec) => (spec === "ctrl+t" || spec === "alt+v" || spec === "shift+tab") && calls.keys.push(spec) > 0,
       completions: () => [{ trigger: "@", label: "files", hint: "the file's content is sent with the message" }],
-      complete: async () => [
+      // 工作目录外的路径：现列 dir 下一层
+      complete: async (_trigger, dir) => dir ? (dir === "../" ? ["../lib/", "../notes.md"] : dir === "../lib/" ? ["../lib/x.ts"] : []) : [
         "src/",
         "src/main.ts",
         "src/ui/",
@@ -395,6 +396,18 @@ describe("terminal UI", () => {
     await type("\t");
     await type("\r");
     expect(calls.submit.at(-1)).toBe('@src/ui/tui.tsx and @"docs/my notes.md"');
+  });
+
+  test("@../ lists the parent directory and follows into subdirectories", async () => {
+    const { calls, type, output } = setup();
+    await type("see @../");
+    expect(output()).toContain("../notes.md");
+    await type("li");
+    await type("\t");
+    expect(output()).toContain("../lib/x.ts");
+    await type("\t");
+    await type("\r");
+    expect(calls.submit).toEqual(["see @../lib/x.ts"]);
   });
 
   test("up recalls earlier input, including history from previous sessions", async () => {

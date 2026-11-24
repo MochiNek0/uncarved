@@ -254,24 +254,18 @@ test("a plugin's colored result line is clipped by visible characters, never ins
   expect(amended.at(-1)).toContain(`${"x".repeat(198)}\x1b[32mhe…\x1b[0m`);
 });
 
-test("a sub-agent's usage is read from its own log when readLog is given, and skipped without it", async () => {
-  const child: LogEvent[] = [
-    { type: "model.responded", data: { content: [], usage: { inputTokens: 40, outputTokens: 4 } }, origin: { by: "kernel" } } as unknown as LogEvent,
-  ];
+test("a sub-agent's usage comes from the jade/task/subagent event, not from the tool result", async () => {
   const noop = () => {};
   const screen = { interactive: false, log: noop, amend: noop, progress: noop, stream: noop, endStream: noop, busy: noop, status: noop } as unknown as Screen;
-  const run = async (opts: Partial<TranscriptOptions>) => {
-    const t = transcript({ screen, cwd: "/", contextWindow: () => 100_000, canRetry: () => false, ...opts });
-    const event = { type: "tool.completed", data: { toolUseId: "t1", content: [], child: { sessionId: "child-1" } }, origin: { by: "kernel" } } as unknown as LogEvent;
-    await t.replay([event], false);
-    return t.usage;
-  };
-  const read: string[] = [];
-  expect(await run({ readLog: async (id) => (read.push(id), child) })).toMatchObject({ inputTokens: 40, outputTokens: 4 });
-  expect(read).toEqual(["child-1"]);
-  expect(await run({})).toMatchObject({ inputTokens: 0, outputTokens: 0 });
-  // 读不到子会话的日志时不算，也不抛
-  expect(await run({ readLog: async () => Promise.reject(new Error("gone")) })).toMatchObject({ inputTokens: 0 });
+  const t = transcript({ screen, cwd: "/", contextWindow: () => 100_000, canRetry: () => false });
+  await t.replay(
+    [
+      { type: "tool.completed", data: { toolUseId: "t1", content: [], child: { sessionId: "child-1" } }, origin: { by: "kernel" } } as unknown as LogEvent,
+      { type: "jade/task/subagent", data: { toolUseId: "t1", usage: { inputTokens: 40, outputTokens: 4 } }, origin: { by: "plugin", id: "jade/task" } } as unknown as LogEvent,
+    ],
+    false,
+  );
+  expect(t.usage).toMatchObject({ inputTokens: 40, outputTokens: 4 });
 });
 
 test("a long user message is echoed as its first lines, the rest folded under them", () => {
@@ -282,6 +276,8 @@ test("a long user message is echoed as its first lines, the rest folded under th
   t.echo("short\nmessage");
   t.echo(Array.from({ length: 30 }, (_, i) => `line-${i}`).join("\n"));
   expect(logged[0]).toEqual({ text: "\n› short\n  message" });
-  expect(logged[1]!.text).toBe(`\n› ${Array.from({ length: 6 }, (_, i) => `line-${i}`).join("\n  ")}\n  … +24 lines`);
-  expect(logged[1]!.details).toBe(Array.from({ length: 24 }, (_, i) => `  line-${i + 6}`).join("\n"));
+  // 消息后面空一行，和下面的回复分开
+  expect(logged[1]).toEqual({ text: "" });
+  expect(logged[2]!.text).toBe(`\n› ${Array.from({ length: 6 }, (_, i) => `line-${i}`).join("\n  ")}\n  … +24 lines`);
+  expect(logged[2]!.details).toBe(Array.from({ length: 24 }, (_, i) => `  line-${i + 6}`).join("\n"));
 });

@@ -13,8 +13,6 @@ export type Notice = Parameters<Parameters<Runtime["subscribe"]>[0]>[0];
 export interface TranscriptOptions {
   screen: Screen;
   cwd: string;
-  /** 子 Agent 的用量在它自己的日志里，从这里读；不给就不统计子 Agent 的用量 */
-  readLog?(sessionId: string): Promise<LogEvent[]>;
   /** 模型的上下文窗口（状态栏显示用） */
   contextWindow(): number;
   /** 每次回复的输出上限（回复被截断时的提示用）；没有时说是服务的默认值 */
@@ -80,16 +78,12 @@ export function transcript(opts: TranscriptOptions): Transcript {
     if (u) screen.status({ spent: { input: usage.inputTokens, output: usage.outputTokens } });
   };
   /**
-   * 一个事件带来的用量：模型回复；插件事件 data 里的 usage（压缩时的总结调用、auto 模式的审查这类插件自己发的请求）；
-   * 子 Agent 的用量在它自己的日志里（读不到时不算，不让一个读失败变成没人处理的 rejection）
+   * 一个事件带来的用量：模型回复；插件事件 data 里的 usage（压缩时的总结调用、auto 模式的审查这类插件自己发的请求，
+   * 还有 jade/task 记下的子 Agent 的用量）
    */
-  async function countUsage(e: LogEvent) {
+  function countUsage(e: LogEvent) {
     if (e.type === "model.responded") addUsage((e as LogEvent<"model.responded">).data.usage);
     else if (e.origin.by === "plugin") addUsage(usageOf((e.data as { usage?: unknown } | null)?.usage));
-    else if (e.type === "tool.completed") {
-      const child = (e as LogEvent<"tool.completed">).data.child;
-      if (child && opts.readLog) for (const c of await opts.readLog(child.sessionId).catch(() => [])) await countUsage(c);
-    }
   }
 
   /**
@@ -220,10 +214,14 @@ export function transcript(opts: TranscriptOptions): Transcript {
       const shown = (t: string) => (t.startsWith("/") ? cyan(`› ${t}`) : `\n${bold(`› ${t.replace(/\n/g, "\n  ")}`)}`);
       // 很长的输入（粘贴的日志）只显示开头几行，其余折叠起来，点击或 ctrl+o 展开
       const lines = text.split("\n");
-      if (lines.length <= MAX_ECHO_LINES) return screen.log(shown(text));
-      // 展开时接着显示其余的行
-      const rest = lines.slice(ECHO_HEAD_LINES);
-      screen.log(`${shown(lines.slice(0, ECHO_HEAD_LINES).join("\n"))}\n  ${dim(`… +${rest.length} lines`)}`, { details: rest.map((l) => `  ${l}`).join("\n") });
+      if (lines.length <= MAX_ECHO_LINES) screen.log(shown(text));
+      else {
+        // 展开时接着显示其余的行
+        const rest = lines.slice(ECHO_HEAD_LINES);
+        screen.log(`${shown(lines.slice(0, ECHO_HEAD_LINES).join("\n"))}\n  ${dim(`… +${rest.length} lines`)}`, { details: rest.map((l) => `  ${l}`).join("\n") });
+      }
+      // 消息前后都空一行，和上一段、下一段回复分开（只空前面的话，消息看起来像是下面回复的标题）
+      if (!text.startsWith("/")) screen.log("");
     },
     reset() {
       for (const k of Object.keys(usage) as (keyof Usage)[]) usage[k] = 0;
@@ -307,7 +305,7 @@ export function transcript(opts: TranscriptOptions): Transcript {
         return;
       case "model.responded": {
         const d = e.data as EventDataMap["model.responded"];
-        void countUsage(e);
+        countUsage(e);
         showContext(e as LogEvent<"model.responded">);
         if (!replaying) finishSpeed(d.usage);
         for (const b of d.content) if (b.kind === "tool_use") toolNames.set(b.id, b.name);
@@ -366,7 +364,6 @@ export function transcript(opts: TranscriptOptions): Transcript {
       }
       case "tool.completed": {
         const d = e.data as EventDataMap["tool.completed"];
-        void countUsage(e);
         activity("Working");
         doneProgress(d.toolUseId);
         const call = calls.get(d.toolUseId);
@@ -437,7 +434,7 @@ export function transcript(opts: TranscriptOptions): Transcript {
    */
   function renderPluginEvent(e: LogEvent) {
     if (e.origin.by !== "plugin") return;
-    void countUsage(e);
+    countUsage(e);
     const found = opts.eventRenderer?.(e.type);
     if (!found) return renderPluginNotice(e);
     let shown: ReturnType<EventRenderer["render"]>;
@@ -463,7 +460,7 @@ export function transcript(opts: TranscriptOptions): Transcript {
   async function replay(events: LogEvent[], show: boolean) {
     if (!show) {
       for (const e of events) {
-        await countUsage(e);
+        countUsage(e);
         if (e.type === "model.responded") showContext(e as LogEvent<"model.responded">);
       }
       return;

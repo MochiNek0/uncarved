@@ -24,8 +24,8 @@ import {
   useState,
   useSyncExternalStore,
 } from "./vendor.ts";
-import stringWidth from "string-width";
-import { mentionAt, mentionText, rankPaths } from "./mentions.ts";
+import { visibleWidth } from "./width.ts";
+import { mentionAt, mentionDir, mentionText, rankPaths } from "./mentions.ts";
 import { charWidth, edit, empty, layout, moveRow, offsetAt, type EditState } from "./editor.ts";
 import { expandTabs, markdownStream, softInfo, visibleRow, wrapRows, type MdLine } from "./markdown.ts";
 import { cells, FRAME_MS, Mascot, moodOf, nextChange, title } from "./mascot.ts";
@@ -75,8 +75,8 @@ export interface TuiHandlers {
   exit(): void;
   /** 登记了的补全（completions@1）：触发字符、占位提示里的说明、候选菜单下的说明；每次渲染时取 */
   completions?(): CompletionInfo[];
-  /** 打了触发字符时的候选（像路径一样用 / 分层，目录以 / 结尾）；每次开始输入一段新的补全时取一次 */
-  complete?(trigger: string): Promise<string[]>;
+  /** 打了触发字符时的候选（像路径一样用 / 分层，目录以 / 结尾）；每次开始输入一段新的补全时取一次，dir 见 mentionDir */
+  complete?(trigger: string, dir?: string): Promise<string[]>;
   /** 输入框有焦点时按下 jade 自己不用的 ctrl+<字母>、alt+<字母或数字>、shift+tab（见 keySpec）；返回 true 表示有插件处理了 */
   key?(spec: string): boolean;
 }
@@ -187,12 +187,12 @@ const elapsed = (t: Thinking) =>
 
 /** 按显示宽度取 text 末尾最多 cols 列；截掉了开头时以 … 开头 */
 export function tail(text: string, cols: number): string {
-  if (stringWidth(text) <= cols) return text;
+  if (visibleWidth(text) <= cols) return text;
   const chars = [...text];
   let out = "";
   let w = 1;
   for (let i = chars.length - 1; i >= 0; i--) {
-    const cw = stringWidth(chars[i]!);
+    const cw = visibleWidth(chars[i]!);
     if (w + cw > cols) break;
     out = chars[i] + out;
     w += cw;
@@ -213,7 +213,7 @@ function thinkingRow(t: Thinking, width: number): string {
     ?.trim()
     .replace(/\s+/g, " ");
   // 留出 " · "、" ▸" 和一列余量
-  const room = width - stringWidth(label) - 6;
+  const room = width - visibleWidth(label) - 6;
   return dim(latest && room >= 8 ? `${label} · ${tail(latest, room)}` : `${label}…`);
 }
 
@@ -1405,7 +1405,7 @@ const TONE: Record<NonNullable<StatusSegment["tone"]>, string> = { ok: "green", 
 export function fitSegments(segments: Segment[], width: number): Segment[] {
   const kept = segments.map((s) => ({ ...s }));
   const total = () =>
-    kept.reduce((n, s, i) => n + stringWidth(s.text) + (i ? 3 : 0), 0);
+    kept.reduce((n, s, i) => n + visibleWidth(s.text) + (i ? 3 : 0), 0);
   const steps = kept
     .flatMap((s) => [
       ...(s.short !== undefined && s.shortAt !== undefined
@@ -1500,7 +1500,7 @@ function StatusBar({ status, width }: { status: StatusInfo; width: number }) {
 /** 一行提示：按宽度选第一个放得下的写法，都放不下时用最后一个并截断 */
 function Hint({ variants, width }: { variants: string[]; width: number }) {
   const text =
-    variants.find((v) => stringWidth(v) <= width) ?? variants.at(-1)!;
+    variants.find((v) => visibleWidth(v) <= width) ?? variants.at(-1)!;
   return h(Text, { dimColor: true, wrap: "truncate-end" }, text);
 }
 
@@ -1825,19 +1825,20 @@ function Prompt({
   const notice = getNotice();
 
   const mentioning = mention?.trigger;
-  // 每次开始输入一段新的补全时重新取一次：候选可能已经变了（例如文件）
+  const mentionScope = mention ? mentionDir(mention.query) : undefined;
+  // 每次开始输入一段新的补全、或者在工作目录外换了目录时重新取一次：候选可能已经变了（例如文件）
   useEffect(() => {
     if (mentioning === undefined || !handlers.complete) return;
     let live = true;
     setPaths([]);
-    handlers.complete(mentioning).then(
+    handlers.complete(mentioning, mentionScope).then(
       (p) => void (live && setPaths(p)),
       () => {},
     );
     return () => {
       live = false;
     };
-  }, [mentioning]);
+  }, [mentioning, mentionScope]);
   const completion = completions.find((c) => c.trigger === mentioning);
   // 结果多时只显示选中项附近的几条
   const first = around(hit, results.length, menuRows);

@@ -11,7 +11,7 @@ import type { Block, Message } from "uncarved";
 import { definePlugin } from "@uncarved/jade-api";
 import type { Completions, Renderers } from "@uncarved/jade-api/services";
 import { attachMentions } from "./attach.ts";
-import { mentionCandidates } from "./candidates.ts";
+import { dirCandidates, mentionCandidates } from "./candidates.ts";
 import { clip, dim, lines as joinLines, warn } from "./style.ts";
 
 export interface MentionsState {
@@ -36,7 +36,7 @@ export default definePlugin({
       trigger: "@",
       label: "files",
       hint: "the file's content is sent with the message",
-      candidates: () => mentionCandidates(ctx.cwd),
+      candidates: (dir) => (dir ? dirCandidates(ctx.cwd, dir) : mentionCandidates(ctx.cwd)),
     });
     const renderers = ctx.service<Renderers>("renderers@1");
     renderers?.event({

@@ -7,7 +7,7 @@
 import { readFile, rm, writeFile } from "node:fs/promises";
 import { hasProvider, parseTokens } from "./config.ts";
 import { contextWindow } from "./context.ts";
-import { EFFORTS, fallbacksFromEnv, isBuiltinKind, isOfficialAnthropic, jsonObject, KEY_KEY, listModels, MODEL_KEY, providerInfo, providerKind, rpmFromEnv, URL_KEY, visionFromEnv, type ProviderKind } from "./provider.ts";
+import { EFFORTS, fallbacksFromEnv, isBuiltinKind, isOfficialAnthropic, jsonObject, KEY_KEY, listModels, MODEL_KEY, providerInfo, providerKind, rpmFromEnv, thinkingFromEnv, URL_KEY, visionFromEnv, type ProviderKind } from "./provider.ts";
 import { MODEL_SETTINGS, readSavedServices, updateEnvFile, writeSavedServices, type Env, type SavedModel, type SavedService } from "./saved.ts";
 import type { UI } from "@uncarved/jade-api";
 
@@ -68,6 +68,16 @@ function fallbacksSetting(env: Env): boolean | undefined {
 function fallbacksHint(env: Env, baseURL: string | undefined): string {
   const v = fallbacksSetting(env);
   return v === undefined ? `${isOfficialAnthropic(baseURL) ? "on" : "off"} (default)` : v ? "on" : "off";
+}
+
+/** JADE_THINKING 设成了什么；没设或写错时 undefined */
+function thinkingSetting(env: Env): boolean | undefined {
+  if (!env.JADE_THINKING?.trim()) return undefined;
+  try {
+    return thinkingFromEnv({ JADE_THINKING: env.JADE_THINKING });
+  } catch {
+    return undefined;
+  }
 }
 
 /** 一个服务包含的变量（不含模型名） */
@@ -353,6 +363,7 @@ export function configurator(opts: ConfigureOptions): Configure {
             { label: "Requests per minute", value: "rpm", hint: env.JADE_RPM ? `${env.JADE_RPM}/min` : "no limit (slows down after being rate limited)" },
             { label: "Can see images", value: "vision", hint: visionHint(env, kind) },
             ...(kind === "anthropic" ? [{ label: "Server-side fallback", value: "fallbacks", hint: fallbacksHint(env, baseURL) }] : []),
+            ...(kind === "anthropic" ? [{ label: "Send thinking settings", value: "thinking", hint: thinkingSetting(env) === false ? "off" : `on${env.JADE_THINKING ? "" : " (default)"}` }] : []),
             ...(kind === "openai-compat" ? [{ label: "Extra request body", value: "extra", hint: env.OPENAI_COMPAT_EXTRA_BODY ? shorten(env.OPENAI_COMPAT_EXTRA_BODY) : "none" }] : []),
             { label: "Back", value: "back" },
           ],
@@ -418,6 +429,19 @@ export function configurator(opts: ConfigureOptions): Configure {
           opts.signal,
         );
         if (choice !== undefined) await target.update({ JADE_FALLBACKS: choice === DEFAULT ? undefined : choice });
+      } else if (action === "thinking" && kind === "anthropic") {
+        const current = thinkingSetting(env);
+        const choice = await ui.select(
+          {
+            title: "Send thinking and effort settings with each request?",
+            options: [
+              { label: "On", value: "on", hint: current !== false ? "current" : "adaptive thinking, effort high unless set" },
+              { label: "Off", value: "off", hint: current === false ? "current" : "for services that reject the thinking field; the model decides itself" },
+            ],
+          },
+          opts.signal,
+        );
+        if (choice !== undefined) await target.update({ JADE_THINKING: choice === "on" ? undefined : choice });
       } else if (action === "window") {
         const n = await ui.input({ title: "Context window in tokens, e.g. 128000, 512K, 1M (empty to infer it from the model name, or 256K if unknown)", initial: env.JADE_CONTEXT_WINDOW ?? "" }, opts.signal);
         if (n !== undefined && tokensInput("Context window", n)) await target.update({ JADE_CONTEXT_WINDOW: n || undefined });

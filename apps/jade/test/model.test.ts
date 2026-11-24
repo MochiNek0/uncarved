@@ -59,6 +59,8 @@ interface Shared {
   hints: (string | undefined)[][];
   inputsAsked: string[];
   notes: string[];
+  /** 会话状态栏上 jade/models 那一段每次的值（undefined 是去掉） */
+  statuses: unknown[];
 }
 
 const FAKE_UI = `export default { process(ctx) {
@@ -75,6 +77,10 @@ const FAKE_UI = `export default { process(ctx) {
       return typeof a === "number" ? r.options[a]?.value : a;
     },
     input: async (r) => { g().inputsAsked.push(r.title); return g().inputs.shift(); },
+    session: ({ plugin }) => ({
+      status: (t) => { if (plugin === "jade/models") g().statuses.push(t); },
+      dispose() {},
+    }),
   });
 } };`;
 
@@ -132,7 +138,7 @@ async function setup(env: string = ENV_A) {
     }
   }
   await writeFile(path.join(home, "plugins.json"), JSON.stringify({ disabled }));
-  const shared: Shared = { selects: [], inputs: [], asked: [], offered: [], hints: [], inputsAsked: [], notes: [] };
+  const shared: Shared = { selects: [], inputs: [], asked: [], offered: [], hints: [], inputsAsked: [], notes: [], statuses: [] };
   (globalThis as { __jadeModelTest?: Shared }).__jadeModelTest = shared;
   const reports: string[] = [];
   const host = await PluginHost.start({
@@ -645,6 +651,21 @@ describe("/model", () => {
         await host.close();
       }
     });
+
+    test("thinking settings can be turned off for a model and back on", async () => {
+      const { home, shared, host, ctx, command } = await setup("JADE_PROVIDER=anthropic\nANTHROPIC_API_KEY=k\nANTHROPIC_MODEL=claude-x\n");
+      try {
+        shared.selects.push("current", "settings", "thinking", "off", undefined, undefined, undefined);
+        await command.run("", ctx);
+        expect(shared.asked).toContain("Send thinking and effort settings with each request?");
+        expect(await readEnvFile(home)).toContain("JADE_THINKING=off");
+        shared.selects.push("current", "settings", "thinking", "on", undefined, undefined, undefined);
+        await command.run("", ctx);
+        expect(await readEnvFile(home)).not.toContain("JADE_THINKING");
+      } finally {
+        await host.close();
+      }
+    });
   });
 
   test("adding a model can back out at each step without changing anything", async () => {
@@ -741,7 +762,7 @@ describe(".env values", () => {
 
 describe("retries", () => {
   test("a retried model request is written to the session log as a plugin event, not into the context", async () => {
-    const { host } = await setup();
+    const { host, shared } = await setup();
     const ok = () =>
       new Response(
         [
@@ -766,6 +787,13 @@ describe("retries", () => {
       const types = events.map((e) => e.type);
       expect(types.indexOf("jade/models/retried")).toBeGreaterThan(types.indexOf("model.responded"));
       expect(JSON.stringify(s.state.messages)).not.toContain("503");
+      // 重试前说最多几次，不像"还要再试 8 次"；成功了也说一声
+      expect(shared.notes.some((n) => /retrying in \d+s \(retry 1, at most 9\)/.test(n))).toBe(true);
+      expect(shared.notes.some((n) => /succeeded after 1 retry \(\d+s of waiting\)/.test(n))).toBe(true);
+      // 等待时状态栏倒计时，回复到了就去掉；用来找会话的标记不发给服务
+      expect(shared.statuses.some((t) => /^retrying in \d+s$/.test((t as { text?: string })?.text ?? ""))).toBe(true);
+      expect(shared.statuses.at(-1)).toBeUndefined();
+      expect(JSON.stringify(bodies)).not.toContain("jade/models");
     } finally {
       await host.close();
     }

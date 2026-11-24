@@ -6,7 +6,7 @@
 
 import path from "node:path";
 import type { ModelRequest, ModelResponse, Provider } from "uncarved";
-import { definePlugin, type UI } from "@uncarved/jade-api";
+import { definePlugin, type UI, type Updater } from "@uncarved/jade-api";
 import type { Commands, Models } from "@uncarved/jade-api/services";
 import { contextWindow } from "./context.ts";
 import { envWithFile, hasProvider, parseTokens } from "./config.ts";
@@ -18,6 +18,10 @@ import { MODEL_SETTINGS, readSavedServices, type Env } from "./saved.ts";
 let setup: { configured(): boolean; command: boolean; envFile: string } | undefined;
 /** 没配模型的提示一个进程只说一次 */
 let hinted = false;
+/** 重试前、限速排队的等待在状态栏上倒计时：会话 id → 开始倒计时。等待发生在进程级的 provider 里，靠请求上 ext["jade/models"] 的会话 id 找到会话 */
+const countdowns = new Map<string, (ms: number, label: string) => void>();
+/** 请求上记的会话 id（见 session() 里的 model.before） */
+const sessionOf = (request: ModelRequest) => (request.ext?.["jade/models"] as { session?: string } | undefined)?.session;
 
 export default definePlugin({
   async process(ctx) {
@@ -29,6 +33,11 @@ export default definePlugin({
     setup = { configured: () => hasProvider(env), command: false, envFile };
     // 用的时候再取：jade/tui 也依赖这个插件（models@1），它在这之后才激活，这里取到的是 undefined，重试的提示就没人显示
     const ui = () => ctx.service<UI>("ui@1");
+    /** 模型请求的 User-Agent：jade 和版本号，有的服务（例如基元律动的 clientApp）按它在用量里区分客户端 */
+    const userAgent = () => {
+      const version = ctx.service<Updater>("update@1")?.version;
+      return version ? `jade/${version}` : "jade";
+    };
     const watchers = new Set<() => void>();
     const notify = () => {
       for (const fn of watchers) {
@@ -53,10 +62,13 @@ export default definePlugin({
     const build = (snapshot: Env): Promise<Provider> => {
       return (async () => {
         const gate = new RateGate({ rpm: rpmFromEnv(snapshot), onLearn: (rpm) => ui()?.notify(`rate limited: spacing requests to ${rpm} per minute from now on`, "warning") });
-        return withRetry(await providerFromEnv(snapshot), {
+        return withRetry(await providerFromEnv(snapshot, { "user-agent": userAgent() }), {
           gate,
-          onRetry: ({ attempt, retries, delayMs, error }) =>
-            ui()?.notify(`model request failed (${error.message}); retry ${attempt} of ${retries} in ${Math.round(delayMs / 1000)}s`, "warning"),
+          onWait: ({ delayMs, request }) => countdowns.get(sessionOf(request) ?? "")?.(delayMs, "rate limited, sending in"),
+          onRetry: ({ attempt, retries, delayMs, error, request }) => {
+            ui()?.notify(`model request failed (${error.message}); retrying in ${Math.round(delayMs / 1000)}s (retry ${attempt}, at most ${retries})`, "warning");
+            countdowns.get(sessionOf(request) ?? "")?.(delayMs, "retrying in");
+          },
         });
       })();
     };
@@ -205,13 +217,58 @@ export default definePlugin({
         }
       },
     });
+    // 重试前、限速排队时状态栏倒计时，不然几十秒里只看到"在请求"，像卡住了。子会话没有状态栏，不用做
+    let timer: ReturnType<typeof setInterval> | undefined;
+    const stopCountdown = () => {
+      if (timer === undefined) return;
+      clearInterval(timer);
+      timer = undefined;
+      ctx.status?.(undefined);
+    };
+    if (ctx.status) {
+      const id = ctx.session.id;
+      countdowns.set(id, (ms, label) => {
+        stopCountdown();
+        const until = Date.now() + ms;
+        const tick = () => {
+          const left = Math.ceil((until - Date.now()) / 1000);
+          if (left <= 0) return stopCountdown();
+          ctx.status?.({ text: `${label} ${left}s`, tone: "warn" });
+        };
+        timer = setInterval(tick, 1000);
+        tick();
+      });
+      ctx.signal.addEventListener("abort", () => {
+        stopCountdown();
+        countdowns.delete(id);
+      });
+      // ext[provider id] 由那个 provider 解释（4.7），这里的 provider 就是 jade/models，别的 provider 不看
+      ctx.kernel.hook({
+        kind: "transform",
+        point: "model.before",
+        fn: (req) => ({ ...req, ext: { ...req.ext, "jade/models": { session: id } } }),
+      });
+      // 中断或失败时等待也就不算数了
+      ctx.kernel.hook({
+        kind: "observe",
+        point: "event",
+        fn: (e) => {
+          if (e.type === "turn.ended") stopCountdown();
+        },
+      });
+    }
     // 重试过的请求：把每次失败写进会话日志，事后能查到为什么慢、为什么重新输出（插件事件，不进上下文）
     ctx.kernel.hook({
       kind: "observe",
       point: "model.after",
       fn: async (res, hook) => {
+        stopCountdown();
         const retries = (res as RetriedResponse).retries;
-        if (retries?.length) await hook.emit("retried", { retries });
+        if (!retries?.length) return;
+        // 重试中的提示只说了"在重试"，成功了也要说一声，不然看起来像重试到一半没了
+        const waited = Math.round(retries.reduce((ms, r) => ms + r.delayMs, 0) / 1000);
+        ui?.notify(`model request succeeded after ${retries.length} ${retries.length === 1 ? "retry" : "retries"} (${waited}s of waiting)`, "info");
+        await hook.emit("retried", { retries });
       },
     });
   },

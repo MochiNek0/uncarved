@@ -72,3 +72,22 @@ test("/plugins lists every plugin's state, why it is not active, and who provide
     await host.close();
   }
 });
+
+test("every service a bundled plugin looks up is declared in its plugin.json", async () => {
+  // 没声明的服务只在第一次真的去取时报错（例如 jade/models 建 provider 时），端到端测试换掉了模型插件，跑不到那里
+  const missing: string[] = [];
+  for (const dir of await readdir(BUNDLED, { withFileTypes: true })) {
+    if (!dir.isDirectory()) continue;
+    const root = path.join(BUNDLED, dir.name);
+    const manifest = JSON.parse(await readFile(path.join(root, "plugin.json"), "utf8")) as Record<string, string[] | undefined>;
+    const declared = new Set([...(manifest.requires ?? []), ...(manifest.optional ?? []), ...(manifest.provides ?? [])]);
+    for (const file of await readdir(root, { recursive: true })) {
+      if (!file.endsWith(".ts")) continue;
+      const source = await readFile(path.join(root, file), "utf8");
+      for (const m of source.matchAll(/ctx\.(?:service|require)(?:<[^>]*>)?\("([^"]+)"\)/g)) {
+        if (!declared.has(m[1]!)) missing.push(`${dir.name}/${file}: ${m[1]}`);
+      }
+    }
+  }
+  expect(missing).toEqual([]);
+});

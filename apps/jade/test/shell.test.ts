@@ -79,6 +79,18 @@ describe("bash", () => {
     expect(text.length).toBeLessThan(31_000);
   }, 20_000);
 
+  test("stdout and stderr share one output limit; a short stream is kept whole", async () => {
+    const cwd = await workspace();
+    const tool = shellTool({ cwd });
+    const big = (await tool.execute({ command: "head -c 200000 /dev/zero | tr '\\0' o; head -c 200000 /dev/zero | tr '\\0' e >&2" }, ctx())).content as string;
+    expect(big).toContain("<stdout>");
+    expect(big).toContain("<stderr>");
+    expect(big.length).toBeLessThan(31_000);
+    const mixed = (await tool.execute({ command: "head -c 200000 /dev/zero | tr '\\0' o; echo oops >&2" }, ctx())).content as string;
+    expect(mixed).toContain("<stderr>\noops\n</stderr>");
+    expect(mixed.length).toBeLessThan(31_000);
+  }, 20_000);
+
   test("coreutils are on PATH (Git Bash on Windows is started without its launcher)", async () => {
     const cwd = await workspace();
     const shell = shellTools({ cwd });

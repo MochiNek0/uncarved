@@ -187,6 +187,8 @@ export interface SessionControl {
    * session() 执行期间还没有（会话在全部插件加入之后才建），那时调用会抛错：在 hook、工具、afterTurn、subscribe 的回调里用
    */
   state(): State;
+  /** 会话现在的阶段，和 state().phase 相同，但不拷贝整段历史；什么时候能调用同 state() */
+  phase(): State["phase"];
   /**
    * 订阅运行时的通知（写进日志的事件、流式增量、工具进度、停下来等人工审批的 awaiting），和前端的 Session.subscribe 相同；
    * 返回取消订阅，作用域关闭时自动取消。可以在 session() 里订阅。回调要马上返回：它在内核运行的中途被调用。
