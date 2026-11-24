@@ -7,7 +7,7 @@
   "config": {
     "maxSteps": {
       "default": 100,
-      "description": "the most model responses in one turn (after one user message); the turn stops when it is reached"
+      "description": "the most model responses in one turn (after one user message); when it is reached the turn stops and the model is asked, with tools disabled, to summarize for the user"
     }
   }
 }

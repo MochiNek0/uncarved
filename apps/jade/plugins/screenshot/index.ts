@@ -8,7 +8,8 @@ import { findBrowser, screenshotTool } from "./tool.ts";
 
 /** 提示词里的一段：有截图工具时才加 */
 const NOTE =
-  "- When the work is visual (a page, a drawing, styles), take a screenshot of the result and look at it instead of guessing from the source. " +
+  "- When the work is visual (a page, a drawing, styles), take a screenshot of the result and look at it instead of guessing from the source, unless the user said not to test or check it. " +
+  "A few looks are enough: fix what is clearly broken, then reply; do not keep polishing details the user did not ask for. " +
   "If screenshots keep failing, or keep showing something you cannot explain after a couple of attempts, stop changing code to chase it: tell the user what you see and let them look.";
 
 export default definePlugin({

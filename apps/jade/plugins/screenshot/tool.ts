@@ -67,7 +67,7 @@ export function screenshotTool(opts: ScreenshotOptions): Tool | undefined {
     name: "screenshot",
     description:
       "Render a local file (HTML, SVG, image) or a web page in a headless browser and return a screenshot, so you can see how it actually looks. " +
-      "Give either path or url. Use it to check visual work (layout, colors, drawings) instead of guessing from the source. " +
+      "Give either path or url. Use it to check visual work (layout, colors, drawings) instead of guessing from the source; skip it when the user said not to test or check. " +
       `The viewport defaults to ${DEFAULT_WIDTH}x${DEFAULT_HEIGHT}; only what fits in it is captured. ` +
       "To see a part further down a long page, give scroll_to (a CSS selector, or some text that appears there) instead of a very tall viewport. " +
       "Narrow widths are laid out as given, so use the real device width to check a mobile layout. " +

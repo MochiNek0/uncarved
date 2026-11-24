@@ -52,6 +52,7 @@ const HOW: Line[] = [
     tools: ["bash"],
     without: "- There is no shell in this session (no bash tool), so you cannot run commands. After changing code, tell the user which commands would verify it.",
   },
+  { text: "- If the user says not to test or check the result, do not: no tests, builds, screenshots or other checks of any kind. Finish the work and reply." },
   { text: "- Use the task tool for broad searches so that only conclusions come back into this conversation.", tools: ["task"] },
   {
     text: "- Do not guess about things outside the repository that may have changed (library APIs, versions, error messages): look them up with the web tools.",
