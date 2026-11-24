@@ -58,7 +58,7 @@ const RESIZE_SETTLE_MS = 100;
 const RESIZE_FRAME_MS = 200;
 /**
  * 整帧重画之前先停这么久不画：要比 Ink 的帧间隔（30fps，约 33ms）长，
- * 重画那次提交才会马上画出来（节流的第一下），而不是被推迟、和下一次提交合并掉
+ * 重画那次提交多半能马上画出来（节流的第一下）。停的时候别的组件照样可能提交，所以不能靠它保证画出来（见 Store.drawn）
  */
 const REPAINT_GAP_MS = 40;
 /** 宽度变了之后在后台重新折行，每批折这么多项 */
@@ -327,6 +327,25 @@ export class Store {
     this.paused = false;
     this.update({ ...patch, repaint: true }, true);
   }
+
+  /** 已经提交给 Ink、还没画出来的界面里有整帧重画（App 渲染时标上） */
+  #repaintPending = false;
+  repaintInTree() {
+    this.#repaintPending = true;
+  }
+
+  /**
+   * Ink 画了一帧（render 的 onRender，算好输出、写出去之前）。画的是比终端高的那次，就可以恢复了。
+   * 不能在提交之后马上恢复：Ink 每 33ms 最多画一帧，这次提交可能还压在节流里，
+   * 恢复的提交赶在它画出来之前，Ink 就只画恢复后的样子，等于没重画。
+   * 光靠重画前停一下（REPAINT_GAP_MS）躲不开：停的时候别的组件自己的状态变了照样会提交、照样占着节流。
+   * 恢复不马上画：这一轮里别的组件跟着改的状态（量出来的高度）和恢复合在同一次提交里，不会再画一帧比终端高的
+   */
+  drawn = () => {
+    if (!this.#repaintPending) return;
+    this.#repaintPending = false;
+    this.update({ repaint: false });
+  };
 
   /** 追加普通的行；带 item 时 texts 合成一项（可折叠、可以之后补充），texts 是收起时显示的部分 */
   append(texts: string[], item?: Omit<Line, "text">) {
@@ -682,6 +701,7 @@ export function tuiScreen(opts: TuiOptions): Screen {
         alternateScreen: true,
         // 全屏每帧只重写变化的行
         incrementalRendering: true,
+        onRender: store.drawn,
         ...(opts.io
           ? { ...opts.io, interactive: true, patchConsole: false }
           : {}),
@@ -1136,11 +1156,8 @@ function App({
   // 窗口停止缩放后和按 Ctrl+L 时整帧重画一次（见 Store.repaint）。
   // 启动时不重画：第一帧之前已经清屏、光标在左上角；整帧重画在不支持同步输出的终端上（Windows 上常见）看得出闪一下
   const repaint = state.repaint === true;
-  // 整帧重画那次提交已经马上画出来了（见 Store.repaint），下一次提交就恢复；
-  // 这一轮里别的组件跟着改的状态（量出来的高度）和恢复合在同一次提交里，不会再画一帧比终端高的
-  useEffect(() => {
-    if (repaint) store.update({ repaint: false });
-  }, [repaint]);
+  // 这次提交的界面比终端高；等 Ink 真的把它画出来再恢复（见 Store.drawn）
+  if (repaint) store.repaintInTree();
 
   useInput((input, key) => {
     if (key.ctrl && input === "l") return store.repaint();

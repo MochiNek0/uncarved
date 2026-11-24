@@ -213,23 +213,32 @@ test("dragging the window repaints at the new size now and then, not on every ev
 });
 
 // 运行中每 50ms 一帧：重画那次提交要是被节流推迟，就会和下一次合并掉（没有重画），或者连画几帧比终端高的（每帧清屏）
+// 不按固定时间等：机器很忙的时候（加压时见过按键 400ms 后才处理）要么重画还没开始就检查了，
+// 要么上一次的恢复帧还没写出去，落到下一次里多算一次清屏。所以等到这次清屏之后又画出一帧不清屏的普通帧，才算这次重画做完
+const CLEAR = "\x1b[2J";
+const settled = (writes: string[]) => {
+  const last = writes.findLastIndex((w) => w.includes(CLEAR));
+  return last >= 0 && writes.slice(last + 1).some((w) => w.length > 50 && !w.includes(CLEAR));
+};
 test("ctrl+l repaints the whole screen once, also while busy", async () => {
   const { writes, stdin, screen } = mountVt(100, 40);
   try {
     screen.busy("Working");
-    await sleep(300);
+    // 启动时那次清屏之后，运行中的帧已经在正常画了
+    await until(() => settled(writes), 10_000);
     for (let i = 0; i < 3; i++) {
       writes.length = 0;
       stdin.write("\x0c");
-      await sleep(300);
-      const clears = writes.join("").split("\x1b[2J").length - 1;
+      await until(() => settled(writes), 10_000);
+      const clears = writes.join("").split(CLEAR).length - 1;
       expect(clears).toBeGreaterThan(0);
       expect(clears).toBeLessThanOrEqual(2);
     }
   } finally {
     await screen.close();
   }
-});
+  // 每次都等重画做完，机器很忙时一轮可能要好几秒，四轮加起来会远超默认的 5 秒
+}, 45_000);
 
 // 宽度变了先折看得见的最后一段，前面的在后台补上：底部马上画出来，翻到最上面也还是完整的
 test("after a width change the whole long transcript is still there", async () => {

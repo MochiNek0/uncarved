@@ -101,7 +101,10 @@ class Greeter:
 def wait_for_cancel(name, signal):
     while not cancelled():
         time.sleep(0.01)
-    open(name + "-cancelled.txt", "w").write(repr(signal))
+    # 先写到临时文件再改名：测试一看到文件就读，直接写的话可能读到还没写进去的空文件
+    with open(name + "-cancelled.tmp", "w") as f:
+        f.write(repr(signal))
+    os.replace(name + "-cancelled.tmp", name + "-cancelled.txt")
     return "cancelled"
 
 @plugin.process
