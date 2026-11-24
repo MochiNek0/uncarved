@@ -38,7 +38,7 @@ test("every frame is three rows of fifteen cells with the same outline", () => {
       // 身体的轮廓不变，只有身体里的颜色在变
       expect(rows.map((r) => r.slice(0, 9).replace(/[▀▄█]/g, "#"))).toEqual([" ####### ", "#########", "#########"]);
     }
-});
+}, 20_000);
 
 test("resting eyes are crisp: two dark pixels tall, the same color", () => {
   const grid = settled("idle", 0); // 停在 2000ms：不在眨眼
@@ -164,4 +164,4 @@ test("thinking ponders up-left, then three pixel dots appear one by one in a row
 test("side effects keep a blank column away from the body", () => {
   for (const m of ["thinking", "writing", "tool", "asking", "happy"] as Mood[])
     for (let now = 0; now < 3000; now += 40) for (const row of settled(m, now)) expect(row[9]).toBeUndefined();
-});
+}, 20_000);

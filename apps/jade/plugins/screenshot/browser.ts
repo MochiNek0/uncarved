@@ -13,7 +13,7 @@ import path from "node:path";
 import { spawn, type Proc } from "./sys.ts";
 
 /** 浏览器启动到能连接的最长时间 */
-const READY_MS = 10_000;
+const READY_MS = 30_000;
 /** 等页面 load 事件的最长时间；到时间还没有就按当时的样子截 */
 const LOAD_MS = 15_000;
 /** load 之后等网络安静下来（脚本、图片、字体）的最长时间 */
