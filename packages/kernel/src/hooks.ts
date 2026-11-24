@@ -1,5 +1,6 @@
 // 扩展点与组合规则。对应宪法第五章。
 
+import { deepFreeze } from "./freeze.ts";
 import { isRemote, toLocalHook, type RemoteHookSpec } from "./remote.ts";
 import type { Awaitable, LogEvent, GatedToolCall, Message, ModelRequest, ModelResponse, State, ToolCall, ToolOutcome } from "./types.ts";
 
@@ -166,15 +167,16 @@ export class HookBus {
     /** 对每个 hook 的输出做检查，抛错视同该 hook 出错 */
     check?: (value: TransformPayloads[P]) => void,
   ): Promise<TransformPayloads[P]> {
-    // hook 的输出立即拷贝：超时后仍在运行、或留着引用的 hook 改不到之后的值，输出无法拷贝时算作这个 hook 出错。
-    // 所以 value 始终是私有的。optional 的 hook 再拿一份拷贝：它出错被跳过时，原地改过的值不会留下来；
-    // 其他 hook 出错时整个流水线失败，value 不再使用，直接交给它，省一次拷贝（历史很长时每次拷贝要几毫秒）
+    // 交给 hook 的值是深度冻结的：hook 只能返回新值，改不了别的 hook 看到的值，也改不了之后的值；
+    // optional 的 hook 出错被跳过时，也不会留下原地改过的痕迹。
+    // hook 的输出立即冻结：超时后仍在运行、或留着引用的 hook 同样改不到它；输出不是普通数据时算作这个 hook 出错。
+    // 冻结跳过已冻结的部分，所以每个 hook 只多走一遍它新造的部分，而不是像拷贝那样走一遍整段历史
+    value = deepFreeze(value);
     for (const h of this.ordered(point)) {
       if (h.spec.kind !== "transform") continue;
       try {
-        const input = h.spec.optional ? structuredClone(value) : value;
-        const out = await invoke(h.spec.fn as AnyFn, input, ctx(h.plugin), h.spec.timeoutMs);
-        const next = structuredClone(out === undefined ? input : (out as TransformPayloads[P]));
+        const out = await invoke(h.spec.fn as AnyFn, value, ctx(h.plugin), h.spec.timeoutMs);
+        const next = out === undefined ? value : deepFreeze(out as TransformPayloads[P], true);
         check?.(next);
         value = next;
       } catch (error) {
@@ -195,11 +197,12 @@ export class HookBus {
     ctx: HookContextFor,
   ): Promise<GateResult & { by?: string }> {
     const hooks = this.ordered(point).filter((h) => h.spec.kind === "gate");
+    // 冻结后所有 gate 共享同一份：并发执行时，一个 gate 改不了其他 gate 看到的内容
+    deepFreeze(payload);
     const results = await Promise.all(
       hooks.map(async (h) => {
         try {
-          // 每个 gate 一份拷贝：并发执行时，一个 gate 改了 payload 不能影响其他 gate 看到的内容
-          const r = (await invoke(h.spec.fn as AnyFn, structuredClone(payload), ctx(h.plugin), h.spec.timeoutMs)) as GateResult;
+          const r = (await invoke(h.spec.fn as AnyFn, payload, ctx(h.plugin), h.spec.timeoutMs)) as GateResult;
           if (!r || !Object.hasOwn(GATE_RANK, r.decision)) throw new Error(`invalid gate result ${JSON.stringify(r)}`);
           return { ...r, by: h.plugin };
         } catch (error) {
@@ -215,13 +218,13 @@ export class HookBus {
 
   /**
    * 并发执行，调用方不等待，错误只记录。未完成的 observe 由 idle() 等待。
-   * 返回之前就为每个 hook 拷贝好 payload：运行时直接交出状态和日志事件本身，不再先拷一份（I-5）
+   * 运行时直接交出状态和日志事件本身：这里把它们冻结，所有 hook 共享同一份，谁也改不了（I-5）
    */
   observe<P extends ObservePoint>(point: P, payload: ObservePayloads[P], ctx: HookContextFor): void {
+    deepFreeze(payload);
     for (const h of this.ordered(point)) {
       if (h.spec.kind !== "observe") continue;
-      // 每个 observe 一份拷贝：并发执行时，一个 hook 改了 payload 不能影响其他 hook 看到的内容
-      const p = invoke(h.spec.fn as AnyFn, structuredClone(payload), ctx(h.plugin), h.spec.timeoutMs).then(
+      const p = invoke(h.spec.fn as AnyFn, payload, ctx(h.plugin), h.spec.timeoutMs).then(
         () => {},
         (error) => this.#onError({ plugin: h.plugin, point, error }),
       );

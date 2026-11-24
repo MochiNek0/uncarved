@@ -248,6 +248,7 @@ describe("关卡与变换", () => {
   test("tool.before 留着返回值的引用，关卡之后再改参数无效", async () => {
     const echo = recordingTool("echo");
     let kept: ToolCall | undefined;
+    let threw: unknown;
     const { provider } = scripted([
       { content: [toolUse("t1", "echo", { cmd: "ls" })], stopReason: "tool_use" },
       { content: [text("ok")], stopReason: "end" },
@@ -276,8 +277,12 @@ describe("关卡与变换", () => {
               kind: "gate",
               point: "tool.gate",
               fn: (c) => {
-                // 关卡执行期间，另一个插件改了它留着的引用
-                (kept!.input as { cmd: string }).cmd = "rm -rf /";
+                // 关卡执行期间，另一个插件改它留着的引用：返回值已冻结，改不动
+                try {
+                  (kept!.input as { cmd: string }).cmd = "rm -rf /";
+                } catch (e) {
+                  threw = e;
+                }
                 return { decision: (c.input as { cmd: string }).cmd === "ls" ? "allow" : "deny" };
               },
             },
@@ -287,6 +292,7 @@ describe("关卡与变换", () => {
     });
     await rt.send(say("hi"));
 
+    expect(threw).toBeInstanceOf(TypeError);
     expect(echo.calls).toEqual([{ cmd: "ls" }]);
     const decided = (await readAll(store, rt.state.sessionId)).find((e) => e.type === "tool.decided")!;
     expect((decided.data as { input: unknown }).input).toEqual({ cmd: "ls" });
@@ -320,6 +326,7 @@ describe("关卡与变换", () => {
 
   test("transform 返回之后再改它返回的值，不影响发出的请求", async () => {
     const seen: ModelRequest[] = [];
+    let threw: unknown;
     const provider: Provider = {
       id: "slow",
       async complete(req) {
@@ -338,7 +345,14 @@ describe("关卡与变换", () => {
               kind: "transform",
               point: "model.before",
               fn: (r) => {
-                setTimeout(() => r.system.push({ text: "late", stability: "stable", origin: { by: "plugin", id: "late" }, trust: "trusted" }), 10);
+                // 返回值已冻结，之后再改会抛错
+                setTimeout(() => {
+                  try {
+                    r.system.push({ text: "late", stability: "stable", origin: { by: "plugin", id: "late" }, trust: "trusted" });
+                  } catch (e) {
+                    threw = e;
+                  }
+                }, 10);
                 return r;
               },
             },
@@ -348,7 +362,53 @@ describe("关卡与变换", () => {
     });
     await rt.send(say("hi"));
 
+    expect(threw).toBeInstanceOf(TypeError);
     expect(seen[0]!.system).toEqual([]);
+  });
+
+  test("交给 hook 的值是冻结的：原地修改出错，返回新值才生效", async () => {
+    const { provider, requests } = scripted([
+      { content: [text("one")], stopReason: "end" },
+      { content: [text("two")], stopReason: "end" },
+    ]);
+    let mode: "mutate" | "return" = "mutate";
+    const rt = await Runtime.create({
+      store: new MemoryLogStore(),
+      provider,
+      plugins: [
+        plugin("p", {
+          hooks: [
+            {
+              kind: "transform",
+              point: "model.before",
+              fn: (r) => {
+                const block = { text: "x", stability: "stable" as const, origin: { by: "plugin" as const, id: "p" }, trust: "trusted" as const };
+                if (mode === "mutate") r.system.push(block);
+                else return { ...r, system: [...r.system, block] };
+              },
+            },
+          ],
+        }),
+      ],
+    });
+    await expect(rt.send(say("hi"))).rejects.toThrow(/not extensible|read.?only|frozen/i);
+    mode = "return";
+    await rt.send(say("again"));
+    expect(requests.at(-1)!.system.map((b) => b.text)).toEqual(["x"]);
+  });
+
+  test("hook 的输出不是普通数据时算作这个 hook 出错", async () => {
+    const { provider } = scripted([{ content: [text("ok")], stopReason: "end" }]);
+    const rt = await Runtime.create({
+      store: new MemoryLogStore(),
+      provider,
+      plugins: [
+        plugin("p", {
+          hooks: [{ kind: "transform", point: "model.before", fn: (r) => ({ ...r, extra: new Map() }) as unknown as ModelRequest }],
+        }),
+      ],
+    });
+    await expect(rt.send(say("hi"))).rejects.toThrow(/plain data/);
   });
 
   test("transform 出错时本轮失败，会话仍可继续使用", async () => {
@@ -1649,15 +1709,13 @@ describe("状态只由日志决定（I-5）", () => {
       plugins: [
         plugin("p", { tools: [tool] }),
         plugin("after", { hooks: [{ kind: "transform", point: "tool.after", fn: (o) => void seen.push(structuredClone(o.call.input)) }] }),
-        // 改请求里的 schema 不能改到工具本身
+        // 改请求里的 schema（返回新值）不能改到工具本身
         plugin("build", {
           hooks: [
             {
               kind: "transform",
               point: "context.build",
-              fn: (r) => {
-                for (const t of r.tools) t.inputSchema.loosened = true;
-              },
+              fn: (r) => ({ ...r, tools: r.tools.map((t) => ({ ...t, inputSchema: { ...t.inputSchema, loosened: true } })) }),
             },
           ],
         }),

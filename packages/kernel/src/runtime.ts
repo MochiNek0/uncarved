@@ -1,6 +1,7 @@
 // 内存运行时：执行 Effect，把结果作为事件写回日志。对应宪法 4.2 ~ 4.5。
 
 import { createHash } from "node:crypto";
+import { deepFreeze } from "./freeze.ts";
 import {
   HookBus,
   type GatePayloads,
@@ -417,7 +418,7 @@ export class Runtime {
         this.#notify({ type: "awaiting", toolUseIds: effect.toolUseIds });
         return;
       case "DecideContinue": {
-        const g = await this.#gate("turn.continue", structuredClone(this.#state));
+        const g = await this.#gate("turn.continue", this.#state);
         if (g.decision === "allow" || g.decision === "abstain") return this.#callModel();
         return this.#commit("turn.ended", { reason: "stopped" }, RUNTIME);
       }
@@ -448,7 +449,8 @@ export class Runtime {
         }
       }
     };
-    const messages = await this.#transform("context.project", structuredClone(this.#state.messages), unmodified);
+    // 状态由 step() 生成、从不原地修改，交给 hook 时被冻结，可以直接共享，不必拷贝整段历史
+    const messages = await this.#transform("context.project", this.#state.messages, unmodified);
     let request: ModelRequest = {
       system: [],
       messages,
@@ -487,7 +489,8 @@ export class Runtime {
       { content: res.content, stopReason: res.stopReason, usage: res.usage },
       { by: "model", provider: res.provider ?? this.#provider.id, model: res.model },
     );
-    this.#hooks.observe("model.after", res, this.#hookCtx);
+    // provider 自己可能还留着 res 的引用：拷贝一次再交给 hook 冻结
+    this.#hooks.observe("model.after", structuredClone(res), this.#hookCtx);
   }
 
   async #decideTool(call: PendingCall): Promise<void> {
@@ -499,7 +502,7 @@ export class Runtime {
     // tool.before 必须在 tool.gate 之前：关卡审的是最终参数（4.4）
     const final = await this.#transform(
       "tool.before",
-      { toolUseId: call.toolUseId, name: call.name, input: structuredClone(call.input) },
+      { toolUseId: call.toolUseId, name: call.name, input: call.input },
       (out) => {
         if (out.toolUseId !== call.toolUseId) throw new ToolCallModified("toolUseId");
         if (out.name !== call.name) throw new ToolCallModified("name");
@@ -508,7 +511,7 @@ export class Runtime {
     const g = await this.#gate("tool.gate", {
       toolUseId: call.toolUseId,
       name: call.name,
-      input: structuredClone(final.input),
+      input: final.input,
       tool: toolInfo(this.#tools.get(call.name)!),
     });
     await this.#commit(
@@ -553,9 +556,10 @@ export class Runtime {
         content = [{ kind: "text", text, origin, trust: "untrusted" }];
         isError = true;
       }
+      // 工具的输出拷贝一次再交给 hook 冻结：工具自己可能还留着引用
       const out = await this.#transform("tool.after", {
-        call: { toolUseId: c.toolUseId, name: c.name, input: structuredClone(c.input) },
-        content,
+        call: { toolUseId: c.toolUseId, name: c.name, input: c.input },
+        content: structuredClone(content),
         isError,
       });
       if (child && !(await resolves(this.#store, child.sessionId, (e) => e.seq === child.seq))) {
@@ -641,7 +645,7 @@ export class Runtime {
       return {
         sessionId: this.#state.sessionId,
         signal: this.#abort.signal,
-        derived: structuredClone(this.#state.derived),
+        derived: deepFreeze(this.#state.derived),
         record: (key, value) =>
           declared("log:record").then(() => this.#commit("derived.recorded", { key, value }, origin, depth)),
         emit: (type, data) => declared("log:emit").then(() => this.#append(`${plugin}/${type}`, data, origin, depth)),
