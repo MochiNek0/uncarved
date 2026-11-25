@@ -124,6 +124,8 @@
 - `Frontend.run({ argv, sessions, signal })` 返回退出码。`argv` 是核心去掉自己的参数（`plugins`、`--safe`）之后的命令行，`sessions` 是核心的会话管理器（`SessionManager`：`open`、`close`、`current`）。
 - `UI`：`interactive`、`notify(message, level)`、`select({ title, detail, options }, signal)`、`input({ title, initial, placeholder, mask }, signal)`。不能提问的前端（`jade/print`）`interactive` 为 false，`select`、`input` 总是返回 `undefined`。
 - `UI.copy(text)`、`UI.suspend(fn)`（都可选，2026-11-10 加）：把文字放进系统剪贴板；把终端让出来执行 `fn`（例如启动 `$EDITOR`），结束后重新接管。`jade/tui` 的 `suspend` 卸载界面（退出备用屏幕、关掉 raw mode 和鼠标上报），`fn` 结束后重新画：界面的内容都在界面之外的状态里，输入框里打了一半的字先记下再放回去。期间会话照常运行。`jade/editor`（Ctrl+G 用 `$EDITOR` 编辑输入）就是靠它做成插件的。
+- `UI.notice(message, level)`（可选，2026-11-25 加）：显示一条之后还会变的提示，返回 `{ update(message, level) }` 原地改写它。前端现在做不到时返回 `undefined`，调用方改用 `notify`；只有 `jade/tui` 的终端界面能改写。`jade/models` 用它把一个请求接连的重试合成一条：倒计时、第几次重试都改在这一条上，请求成功或这一轮结束时停在结果上。
+- `UI.job({ session, kind, title, stop })`（可选，2026-11-25 加）：登记一件在后台进行的事，返回 `{ append(text), status(text, done), dispose() }`。`jade/tui` 在状态栏上按种类数还在运行的（"2 agents · 1 shell · ctrl+t to view"），Ctrl+T 打开列表：enter 看一件的输出（跟着最新的，PgUp/PgDn 翻看），x 调用它的 `stop`，esc 返回、关掉；列表不是提问，审批之类的对话框来了先显示它们。只列出正在显示的会话的；输出每件只留末尾 100k 个字符，攒 100ms 交给界面一次。`jade/task` 登记每个子 Agent（它说的话、调用的工具和结果的第一行；停掉只停它，task 返回"用户停掉了"和它已经写下的内容，主会话这一轮照常进行），`jade/shell` 登记后台命令（输出；停掉时经 `prompts@1.note` 告诉模型），会话关闭时去掉。Ctrl+T 是前端保留的键。`jade/print` 没有。
 - `UI.session({ session, plugin })`（可选）：一个插件在一个会话里的界面——状态栏上它的一段（`status(text)`，一行，undefined 去掉）、输入框上方的一块（`panel(text)`，可选，可以多行，例如 `jade/todo` 的任务清单）和输入框（`draft`：读、插入、整段替换、灰色提示）。核心为每个加入会话的插件调用一次，插件的作用域关闭时调用返回值的 `dispose()` 收掉它的段落。前端没有这些东西时返回 `undefined`，插件的 `ctx.status`、`ctx.input` 也就是 `undefined`。`jade/tui` 提供它；`jade/print` 没有。
 - `Session.history()` 返回会话日志里的全部事件：前端恢复会话时用它重新显示对话（日志存储归核心，前端拿不到）。
 

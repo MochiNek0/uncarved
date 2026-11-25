@@ -213,6 +213,28 @@ describe("jade/shell in a session", () => {
     expect(w.shared.requests.at(-1)!.messages.map((m) => textOf(m.content)).join("\n")).toContain("[Note from jade] Background shell bg1 (exit 3) exited with code 3. Read its remaining output with bash_output.");
   }, 30_000);
 
+  test("a background command is listed in the frontend's background jobs with its output; the user can stop it there", async () => {
+    const w = await scriptedHost();
+    // 第一次有输出时当作用户在列表里按了停
+    w.shared.stopJobs = true;
+    w.shared.script.push(use("u1", "bash", { command: "echo serving; sleep 30", run_in_background: true }), say("started"));
+    const s = await w.host.sessions.open();
+    await w.send(s, "start it");
+    const job = () => w.shared.jobs[0];
+    for (let i = 0; i < 50 && !job()?.statuses.some((t) => t.endsWith("(done)")); i++) await Bun.sleep(100);
+    expect(job()).toMatchObject({ session: s.id, kind: "shell", title: "bg1 echo serving; sleep 30" });
+    expect(job()!.output).toContain("serving");
+    expect(job()!.statuses).toEqual(["running", "stopped by you (done)"]);
+    // 被停掉的不当作"自己结束了"再报一次；模型下一次请求时知道是用户停的
+    expect(w.shared.notes.some((n) => n.includes("bg1"))).toBe(false);
+    w.shared.script.push(say("ok"));
+    await w.send(s, "and now?");
+    expect(w.shared.requests.at(-1)!.messages.map((m) => textOf(m.content)).join("\n")).toContain("The user stopped background shell bg1 (echo serving; sleep 30).");
+    // 会话关闭时从列表里去掉
+    await w.host.sessions.close();
+    expect(job()!.disposed).toBe(true);
+  }, 30_000);
+
   test("/sh runs the user's command without the model and notes the output for the next request", async () => {
     const w = await scriptedHost();
     const s = await w.host.sessions.open();

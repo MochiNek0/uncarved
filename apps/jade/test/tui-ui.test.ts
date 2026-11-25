@@ -170,8 +170,8 @@ describe("terminal UI", () => {
       submit: (t) => void calls.submit.push(t),
       interrupt: () => void calls.interrupt++,
       exit: () => void calls.exit++,
-      // 只有 ctrl+t、alt+v、shift+tab 有插件处理
-      key: (spec) => (spec === "ctrl+t" || spec === "alt+v" || spec === "shift+tab") && calls.keys.push(spec) > 0,
+      // 只有 ctrl+y、alt+v、shift+tab 有插件处理
+      key: (spec) => (spec === "ctrl+y" || spec === "alt+v" || spec === "shift+tab") && calls.keys.push(spec) > 0,
       completions: () => [{ trigger: "@", label: "files", hint: "the file's content is sent with the message" }],
       // 工作目录外的路径：现列 dir 下一层
       complete: async (_trigger, dir) => dir ? (dir === "../" ? ["../lib/", "../notes.md"] : dir === "../lib/" ? ["../lib/x.ts"] : []) : [
@@ -249,10 +249,10 @@ describe("terminal UI", () => {
   test("plugin keys reach the handler, and plugins can read and change the input", async () => {
     const { screen, calls, type } = setup();
     await type("ab");
-    await type("\x14"); // ctrl+t
+    await type("\x19"); // ctrl+y
     await type("\x1bv"); // alt+v
     await type("\x01"); // ctrl+a：jade 自己的键，不交给插件
-    expect(calls.keys).toEqual(["ctrl+t", "alt+v"]);
+    expect(calls.keys).toEqual(["ctrl+y", "alt+v"]);
     // 插件的键没有插入文字；ctrl+a 把光标移到了开头
     expect(screen.draft!.text()).toBe("ab");
     screen.draft!.insert("说 ");
@@ -484,6 +484,41 @@ describe("terminal UI", () => {
     expect(output()).toContain("•••••••••");
   });
 
+  test("ctrl+t lists background jobs: view one's output, stop it, esc goes back without interrupting", async () => {
+    const { screen, calls, type, output, clear } = setup();
+    const stopped: number[] = [];
+    screen.busy("Thinking");
+    screen.jobs!([
+      { id: 1, kind: "agent", title: "find the parser", status: "read_file(src/a.ts)", done: false, output: "● grep(parse)\n  ⎿ 3 matches\n", stop: () => void stopped.push(1) },
+      { id: 2, kind: "shell", title: "bg1 npm run dev", status: "running", done: false, output: "ready on :3000\n", stop: () => void stopped.push(2) },
+      { id: 3, kind: "shell", title: "bg2 make", status: "exited with code 0", done: true, output: "" },
+    ]);
+    await sleep(80);
+    expect(output()).toContain("1 agent · 1 shell · ctrl+t to view");
+    await type("\x14"); // ctrl+t
+    expect(output()).toContain("Background tasks");
+    expect(output()).toContain("agent · find the parser · read_file(src/a.ts)");
+    expect(output()).toContain("shell · bg2 make · exited with code 0");
+    // 第二项：看输出，在里面按 x 停掉它
+    await type("\x1b[B");
+    clear();
+    await type("\r");
+    expect(output()).toContain("ready on :3000");
+    await type("x");
+    expect(stopped).toEqual([2]);
+    // 已经结束的不能停
+    await type("\x1b");
+    await type("\x1b[B");
+    await type("x");
+    expect(stopped).toEqual([2]);
+    // esc 关掉列表，不打断正在进行的这一轮；之后打字回到输入框
+    await type("\x1b");
+    expect(calls.interrupt).toBe(0);
+    screen.busy(undefined);
+    await type("hi\r");
+    expect(calls.submit).toEqual(["hi"]);
+  });
+
   test("ctrl+j starts a new line; enter sends", async () => {
     const { calls, type } = setup();
     await type("one");
@@ -686,6 +721,17 @@ describe("terminal UI", () => {
     // 找不到那一项时另起一行
     screen.amend("missing", "⎿ orphan");
     await until(output, "  ⎿ orphan");
+  });
+
+  test("a note is rewritten in place, even after later lines", async () => {
+    const { screen, output, clear } = setup();
+    screen.note!("n1", "retrying in 3s (retry 1)");
+    screen.log("after");
+    await until(output, "after");
+    clear();
+    screen.note!("n1", "retrying in 2s (retry 2)");
+    await until(output, "retrying in 2s (retry 2)");
+    expect(output()).not.toContain("retrying in 3s");
   });
 
   test("runs fullscreen with a header showing the version, model and directory", async () => {

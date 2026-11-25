@@ -444,6 +444,11 @@ export interface UI {
   readonly interactive: boolean;
   /** 告诉用户一件事 */
   notify(message: string, level?: "info" | "warning" | "error"): void;
+  /**
+   * 告诉用户一件之后还会变的事（例如重试的倒计时、第几次重试），返回原地改写它的句柄。
+   * 前端现在做不到（纯文本输出、界面还没起来）时返回 undefined，调用方改用 notify。不能改写的前端没有这个方法
+   */
+  notice?(message: string, level?: "info" | "warning" | "error"): Notice | undefined;
   /** 请用户从选项里选一个，返回选中项的 value；不能提问、用户取消或 signal 中止时返回 undefined */
   select<T extends string>(request: SelectRequest<T>, signal?: AbortSignal): Promise<T | undefined>;
   /** 请用户输入一行；不能提问、用户取消或 signal 中止时返回 undefined */
@@ -464,6 +469,39 @@ export interface UI {
    * 核心为每个加入会话的插件调用一次；不能显示时返回 undefined。插件的作用域关闭时核心调用 dispose
    */
   session?(request: SessionRequest): SessionUI | undefined;
+  /**
+   * 登记一件在后台进行的事（子 Agent、后台命令）：前端在状态栏上显示还有几件在运行，
+   * 用户能打开列表看每一件的输出、停掉它。返回更新它的句柄，用完调用 dispose。不能显示的前端没有这个方法
+   */
+  job?(request: JobRequest): Job;
+}
+
+/** UI.job 的参数 */
+export interface JobRequest {
+  /** 属于哪个会话：前端只列出正在显示的那个会话的 */
+  session: string;
+  /** 种类，状态栏按它计数，例如 "agent"、"shell" */
+  kind: string;
+  /** 列表里的一行，例如子 Agent 的标签、命令的第一行 */
+  title: string;
+  /** 用户要停掉它时调用；没有时不能停 */
+  stop?(): void;
+}
+
+/** UI.job 登记的一件事 */
+export interface Job {
+  /** 追加输出；前端只留末尾一段 */
+  append(text: Text): void;
+  /** 一行状态，例如正在做什么、退出码；done 为 true 时不再算作在运行（仍在列表里，直到 dispose） */
+  status(text: string, done?: boolean): void;
+  /** 从列表里去掉 */
+  dispose(): void;
+}
+
+/** UI.notice 显示的一条提示 */
+export interface Notice {
+  /** 把这条提示改成新的内容和级别 */
+  update(message: string, level?: "info" | "warning" | "error"): void;
 }
 
 /** UI.session 的参数：会话 id 和调用它的插件 */

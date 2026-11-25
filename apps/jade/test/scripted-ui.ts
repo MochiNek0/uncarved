@@ -62,6 +62,10 @@ export interface Shared {
   drafts: string[];
   /** 插件经 ctx.status 设置过的状态栏段落，按先后 */
   statuses: { plugin: string; segment: unknown }[];
+  /** 经 ui@1.job 登记的后台的事：追加的输出（纯文字）、状态，去掉了没有 */
+  jobs: { session: string; kind: string; title: string; output: string; statuses: string[]; disposed: boolean }[];
+  /** 为 true 时，后台的事第一次有输出就当作用户按了停 */
+  stopJobs: boolean;
 }
 
 const FAKE_MODEL = `export default { process(ctx) {
@@ -98,6 +102,19 @@ export default { process(ctx) {
       draft: { text: () => "", insert: () => {}, set: (t) => void g().drafts.push(t), hint: (t) => void g().hints.push(t) },
       dispose: () => {},
     }),
+    job: (r) => {
+      const j = { session: r.session, kind: r.kind, title: r.title, output: "", statuses: [], disposed: false };
+      g().jobs.push(j);
+      let stopped = false;
+      return {
+        append: (t) => {
+          j.output += plain(t);
+          if (g().stopJobs && !stopped && r.stop) { stopped = true; r.stop(); }
+        },
+        status: (s, done) => void j.statuses.push(done ? s + " (done)" : s),
+        dispose: () => void (j.disposed = true),
+      };
+    },
   });
 } };`;
 
@@ -122,6 +139,8 @@ export async function scriptedHost(opts: { config?: Record<string, Record<string
     listed: [],
     drafts: [],
     statuses: [],
+    jobs: [],
+    stopJobs: false,
   };
   (globalThis as { __jadeScriptedUi?: Shared }).__jadeScriptedUi = shared;
   const plugin = async (name: string, manifest: object, code: string) => {

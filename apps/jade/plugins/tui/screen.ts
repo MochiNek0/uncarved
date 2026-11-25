@@ -49,6 +49,20 @@ export interface CompletionInfo {
   hint?: string;
 }
 
+/** 后台的一件事（UI.job 登记的子 Agent、后台命令） */
+export interface JobInfo {
+  id: number;
+  kind: string;
+  title: string;
+  status: string;
+  /** 不再在运行 */
+  done: boolean;
+  /** 输出的末尾一段，可以带 ANSI 颜色 */
+  output: string;
+  /** 用户停掉它；没有时不能停 */
+  stop?(): void;
+}
+
 export interface Screen {
   /** 能向用户提问；为 false 时 select / input 直接返回 undefined */
   readonly interactive: boolean;
@@ -63,6 +77,8 @@ export interface Screen {
    * 纯文本输出另起一行缩进显示。找不到那一项时也是另起一行
    */
   amend(id: string, text: string, opts?: { details?: string }): void;
+  /** 能改写的一行：第一次用这个 id 时追加，之后用同一个 id 原地改写成 text。只有终端界面有 */
+  note?(id: string, text: string): void;
   /**
    * 正在运行的工具 id 的一行进度（已经排好版）；undefined 表示工具结束了。
    * 终端界面只在对话最后显示每个工具最新的一行，结束时去掉；纯文本输出逐行打印。
@@ -84,6 +100,8 @@ export interface Screen {
   input(title: string, opts?: { initial?: string; mask?: boolean; placeholder?: string; signal?: AbortSignal }): Promise<string | undefined>;
   /** 输入框里还没提交的文字和灰色提示（插件的 ctx.input 用）；只有终端界面有 */
   readonly draft?: { text(): string; insert(text: string): void; set(text: string): void; hint(text: string | undefined): void };
+  /** 后台的事（当前会话的全部，按登记的先后）；只有终端界面有 */
+  jobs?(jobs: JobInfo[]): void;
   /** 把文字放进系统剪贴板（OSC 52）；只有终端界面有 */
   copy?(text: string): void;
   /** 把终端让出来执行 fn（例如启动 $EDITOR），结束后重新接管、重画界面；只有终端界面有 */
@@ -178,6 +196,8 @@ export function safeScreen(screen: Screen): Screen {
     interactive: screen.interactive,
     log: (text, o) => screen.log(s(text), o && { ...o, details: opt(o.details) }),
     amend: (id, text, o) => screen.amend(id, s(text), o && { ...o, details: opt(o.details) }),
+    ...(screen.note ? { note: (id: string, text: string) => screen.note!(id, s(text)) } : {}),
+    ...(screen.jobs ? { jobs: (jobs: JobInfo[]) => screen.jobs!(jobs.map((j) => ({ ...j, title: s(j.title), status: s(j.status), output: s(j.output) }))) } : {}),
     progress: (id, line, o) => screen.progress(id, opt(line), o),
     stream: (kind, text) => {
       // 上一段末尾没完的转义序列接到这一段前面再过滤，不然它被拆成两半，后一半当成文字显示出来

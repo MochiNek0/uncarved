@@ -6,7 +6,7 @@
 
 import type { Block, ChildRef, EventDataMap, Message, SessionRef, Tool, ToolResult, Usage } from "uncarved";
 import { ProviderError } from "uncarved";
-import type { ChildSession } from "@uncarved/jade-api";
+import type { ChildSession, Job, Text } from "@uncarved/jade-api";
 
 /** ctx.progress 推送的内容 */
 export type TaskProgress =
@@ -38,6 +38,12 @@ export interface TaskOptions {
   register(child: string, control: Control): () => void;
   /** 子 Agent 跑完时（成功、失败、中止都算）调用，给出它这次调用模型的用量合计 */
   usage?(toolUseId: string, usage: Usage): void;
+  /**
+   * 把子 Agent 登记到前端的后台列表里（UI.job），用户能看它在做什么、单独停掉它；前端不支持时返回 undefined。
+   * describe 给出工具调用括号里的一行摘要
+   */
+  job?(description: string, stop: () => void): Job | undefined;
+  describe?(name: string, input: unknown): Text;
 }
 
 /** 历史到了上下文窗口的这个比例就停下来写报告：子 Agent 没有压缩，再读几个大文件就会超出窗口 */
@@ -59,6 +65,12 @@ export const WRAP_UP =
 /** 只读的子 Agent 想执行会改东西的命令时给它的理由 */
 export const READ_ONLY_REASON = (name: string) =>
   `${name}: sub-agents can only run read-only commands inside the working directory (for example git log, git diff, ls, rg). Describe anything else in your report instead.`;
+
+/** 用户在后台列表里停掉子 Agent 时，task 的结果 */
+export const STOPPED = "The user stopped this sub-agent before it finished. Do not start it again unless the user asks.";
+
+/** 后台列表里工具结果只显示第一行，最多这么多个字符 */
+const JOB_RESULT_CHARS = 160;
 
 /** 返回给主会话的报告上限，免得一个子 Agent 撑满主会话的上下文 */
 const MAX_REPORT_CHARS = 20_000;
@@ -145,20 +157,42 @@ export function taskTool(opts: TaskOptions): Tool {
       const unregister = opts.register(child.id, control);
       const progress = (p: TaskProgress) => ctx.progress(p);
       progress({ kind: "task-start", sessionId: child.id, description });
+      // 用户在后台列表里停掉它：只停这个子 Agent，主会话这一轮照常进行
+      let stopped = false;
+      const job = opts.job?.(description, () => {
+        stopped = true;
+        child.abort("stopped by the user");
+      });
+      job?.status("starting");
+      const describe = (name: string, input: unknown): Text => opts.describe?.(name, input) ?? clipText(JSON.stringify(input) ?? "", JOB_RESULT_CHARS);
       const names = new Map<string, string>();
       const unsubscribe = child.subscribe((n) => {
         if (n.type !== "event") return;
         if (n.event.type === "model.requested") {
           progress({ kind: "task-model" });
+          job?.status("thinking");
         } else if (n.event.type === "model.responded") {
           const data = n.event.data as EventDataMap["model.responded"];
           for (const b of data.content) if (b.kind === "tool_use") names.set(b.id, b.name);
+          const said = data.content.flatMap((b) => (b.kind === "text" && b.text.trim() ? [b.text.trim()] : [])).join("\n");
+          if (said) job?.append(`${said}\n\n`);
           for (const k of Object.keys(used) as (keyof Usage)[]) used[k] += data.usage?.[k] ?? 0;
           // 输入 token 已含缓存部分（各 provider 的 Usage 约定）；这次的输出也会进下一次请求
           if (data.usage) control.lastTokens = (data.usage.inputTokens ?? 0) + (data.usage.outputTokens ?? 0);
         } else if (n.event.type === "tool.decided") {
           const d = n.event.data as EventDataMap["tool.decided"];
-          progress({ kind: "task-tool", name: names.get(d.toolUseId) ?? "?", input: d.input, decision: d.decision });
+          const name = names.get(d.toolUseId) ?? "?";
+          progress({ kind: "task-tool", name, input: d.input, decision: d.decision });
+          if (job) {
+            const call: Text = [`● ${name}(`, describe(name, d.input), ")"];
+            job.status(`${name}(${plain(describe(name, d.input))})`);
+            job.append(d.decision === "deny" ? [call, { text: ` ✗ denied${d.reason ? `: ${d.reason}` : ""}`, style: "error" }, "\n"] : [call, "\n"]);
+          }
+        } else if (n.event.type === "tool.completed" && job) {
+          const d = n.event.data as EventDataMap["tool.completed"];
+          const out = d.content.flatMap((b) => (b.kind === "text" ? [b.text] : [])).join("\n").trim().split("\n");
+          const more = out.length > 1 ? ` (+${out.length - 1} lines)` : "";
+          job.append([{ text: `  ⎿ ${clipText(out[0] ?? "", JOB_RESULT_CHARS)}${more}`, style: d.isError ? "error" : "dim" }, "\n"]);
         }
       });
       const forward = () => child.abort(String(ctx.signal.reason ?? "aborted"));
@@ -179,7 +213,7 @@ export function taskTool(opts: TaskOptions): Tool {
         // 再要一次报告，否则前面的调研全白做了。重试已经用完的错误（限流、服务不可用）不再要：再试一次也一样，还要再等很久
         const cause = unwrap(failure);
         const exhausted = cause instanceof ProviderError && cause.retryable;
-        if (!ctx.signal.aborted && !exhausted && !lastText(child.state.messages)) {
+        if (!ctx.signal.aborted && !stopped && !exhausted && !lastText(child.state.messages)) {
           control.wrapUp = true;
           try {
             await turn(WRAP_UP);
@@ -195,6 +229,7 @@ export function taskTool(opts: TaskOptions): Tool {
         messages = child.state.messages;
         ref = await child.close().catch(() => undefined);
         unregister();
+        job?.dispose();
         opts.usage?.(ctx.toolUseId, used);
       }
       if (ctx.signal.aborted) throw failure ?? ctx.signal.reason;
@@ -202,6 +237,7 @@ export function taskTool(opts: TaskOptions): Tool {
       const linked = ref ? { child: ref } : {};
       // 还是没有报告时，把它一路上说过的话都带回去
       const text = clip(lastText(messages) || allText(messages));
+      if (stopped) return { content: `${STOPPED}${text ? `\nWhat it had written so far:\n${text}` : ""}`, isError: true, ...linked };
       if (failure) {
         const msg = failure instanceof Error ? failure.message : String(failure);
         return { content: `Sub-agent failed: ${msg}${text ? `\nLast output:\n${text}` : ""}`, isError: true, ...linked };
@@ -237,6 +273,15 @@ function allText(messages: Message[]): string {
     .map(textOf)
     .filter(Boolean)
     .join("\n\n");
+}
+
+const clipText = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}…` : s);
+
+/** 带样式的文字只取字 */
+function plain(t: Text): string {
+  if (typeof t === "string") return t;
+  if (Array.isArray(t)) return (t as readonly Text[]).map(plain).join("");
+  return String((t as { text?: unknown }).text ?? "");
 }
 
 function clip(s: string): string {

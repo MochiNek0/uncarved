@@ -61,6 +61,9 @@ interface Shared {
   notes: string[];
   /** 会话状态栏上 jade/models 那一段每次的值（undefined 是去掉） */
   statuses: unknown[];
+  /** 为 true 时 ui@1.notice 能用；每条 notice 的历次内容（第一项是显示时的） */
+  canNotice?: boolean;
+  notices: { message: string; level?: string }[][];
 }
 
 const FAKE_UI = `export default { process(ctx) {
@@ -68,6 +71,12 @@ const FAKE_UI = `export default { process(ctx) {
   ctx.provide("ui@1", {
     interactive: true,
     notify: (m) => void g().notes.push(m),
+    notice: (message, level) => {
+      if (!g().canNotice) return undefined;
+      const history = [{ message, level }];
+      g().notices.push(history);
+      return { update: (m, l) => void history.push({ message: m, level: l }) };
+    },
     select: async (r) => {
       g().asked.push(r.title);
       g().offered.push(r.options.map((o) => o.value));
@@ -138,7 +147,7 @@ async function setup(env: string = ENV_A) {
     }
   }
   await writeFile(path.join(home, "plugins.json"), JSON.stringify({ disabled }));
-  const shared: Shared = { selects: [], inputs: [], asked: [], offered: [], hints: [], inputsAsked: [], notes: [], statuses: [] };
+  const shared: Shared = { selects: [], inputs: [], asked: [], offered: [], hints: [], inputsAsked: [], notes: [], statuses: [], notices: [] };
   (globalThis as { __jadeModelTest?: Shared }).__jadeModelTest = shared;
   const reports: string[] = [];
   const host = await PluginHost.start({
@@ -798,6 +807,38 @@ describe("retries", () => {
       await host.close();
     }
   }, 10_000);
+
+  test("back-to-back retries of one request rewrite one notice instead of adding a line each", async () => {
+    const { host, shared } = await setup();
+    shared.canNotice = true;
+    const ok = () =>
+      new Response(
+        [
+          `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: "ok" } }] })}\n\n`,
+          `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`,
+          "data: [DONE]\n\n",
+        ].join(""),
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    let calls = 0;
+    respond = (url) => (url.endsWith("/chat/completions") && ++calls <= 2 ? new Response("busy", { status: 503 }) : ok());
+    try {
+      const s = await host.sessions.open();
+      await s.send({ kind: "message", content: [{ kind: "text", text: "hi", origin: { by: "user" }, trust: "trusted" }] });
+      expect(shared.notices).toHaveLength(1);
+      const shown = shared.notices[0]!.map((n) => n.message);
+      // 倒计时和第几次重试都在这一条上改写
+      expect(shown[0]).toMatch(/retrying in \d+s \(retry 1, at most 9\)/);
+      expect(shown.some((m) => /retrying in \d+s \(retry 2, at most 9\)/.test(m))).toBe(true);
+      expect(new Set(shown.filter((m) => m.includes("(retry 1,"))).size).toBeGreaterThan(1);
+      // 成功了停在结果上，不另起一行，也不再用状态栏倒计时
+      expect(shared.notices[0]!.at(-1)).toEqual({ message: expect.stringMatching(/; succeeded after 2 retries \(\d+s of waiting\)$/), level: "info" });
+      expect(shared.notes.filter((n) => /retr/.test(n))).toEqual([]);
+      expect(shared.statuses.filter((t) => t !== undefined)).toEqual([]);
+    } finally {
+      await host.close();
+    }
+  }, 20_000);
 });
 
 // 没配模型时怎么配由 jade/models 自己说（原来写在 jade/tui 里，换掉这个插件时前端还会提 /model）

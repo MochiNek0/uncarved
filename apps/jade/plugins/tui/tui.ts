@@ -34,6 +34,7 @@ import {
   type Choice,
   type CommandInfo,
   type CompletionInfo,
+  type JobInfo,
   type Screen,
   type StatusInfo,
 } from "./screen.ts";
@@ -108,7 +109,9 @@ type Dialog =
       mask?: boolean;
       placeholder?: string;
       resolve(v: string | undefined): void;
-    };
+    }
+  /** 后台的事的列表（ctrl+t）：不是提问，别的对话框来了先让给它们 */
+  | { kind: "jobs"; resolve(v: unknown): void };
 
 interface UiState {
   /** 对话内容变化时递增，让界面重画 */
@@ -124,6 +127,8 @@ interface UiState {
   progress: { id: string; line: string }[];
   queued: string[];
   dialogs: Dialog[];
+  /** 后台的事（子 Agent、后台命令），ctrl+t 打开列表 */
+  jobs: JobInfo[];
   status: StatusInfo;
   /** 插件设置的灰色提示（ctx.input.hint）：输入框为空时显示，Tab 或 → 接受 */
   hint?: string;
@@ -278,7 +283,7 @@ export class Store {
   paused = false;
 
   constructor(status: StatusInfo, size: Size) {
-    this.state = { version: 0, scroll: 0, progress: [], queued: [], dialogs: [], status, size };
+    this.state = { version: 0, scroll: 0, progress: [], queued: [], dialogs: [], jobs: [], status, size };
   }
 
   subscribe = (fn: () => void) => {
@@ -751,6 +756,12 @@ export function tuiScreen(opts: TuiOptions): Screen {
           o?.details !== undefined ? { details: o.details } : undefined,
         );
     },
+    note(id, text) {
+      if (store.amend(id, (l) => void (l.text = text))) return;
+      flushLive(true);
+      store.update({ live: undefined });
+      store.append([text], { id });
+    },
     progress(id, line) {
       const rest = store.state.progress.filter((p) => p.id !== id);
       store.update({
@@ -805,6 +816,9 @@ export function tuiScreen(opts: TuiOptions): Screen {
     },
     queued(items) {
       store.update({ queued: [...items] });
+    },
+    jobs(jobs) {
+      store.update({ jobs });
     },
     draft: {
       text: () => draft.current?.get() ?? "",
@@ -1043,7 +1057,8 @@ function App({
   draft: DraftBridge;
 }) {
   const state = useSyncExternalStore(store.subscribe, store.get);
-  const dialog = state.dialogs[0];
+  // 后台的事的列表只是查看：提问（审批之类）来了先显示提问
+  const dialog = state.dialogs.find((d) => d.kind !== "jobs") ?? state.dialogs[0];
   const columns = Math.max(1, state.size.columns - 1);
   const rows = state.size.rows;
   const compact = rows < COMPACT_ROWS;
@@ -1059,7 +1074,7 @@ function App({
     return () => clearInterval(t);
   }, [busy]);
   const now = Date.now();
-  const mood = moodOf({ busy: state.busy?.label, asking: dialog !== undefined, doneAt: state.doneAt }, now);
+  const mood = moodOf({ busy: state.busy?.label, asking: dialog !== undefined && dialog.kind !== "jobs", doneAt: state.doneAt }, now);
   const mascot = useRef<Mascot>(undefined);
   mascot.current ??= new Mascot();
   const showBot = !compact && columns >= 50;
@@ -1163,6 +1178,12 @@ function App({
     if (key.ctrl && input === "l") return store.repaint();
     // 展开或收起最近的一项（工具结果、思考、检查报告），鼠标点不了时也能看完整内容
     if (key.ctrl && input === "o") return store.toggleLatest(start, view);
+    // 后台的事的列表；已经开着对话框时不开
+    if (key.ctrl && input === "t") {
+      if (state.dialogs.length) return;
+      const d: Dialog = { kind: "jobs", resolve: () => store.update({ dialogs: store.get().dialogs.filter((x) => x !== d) }, true) };
+      return store.update({ dialogs: [...state.dialogs, d] }, true);
+    }
     const mouse = mouseEvent(input);
     if (mouse) {
       // 对话区里的位置；clamp 时拖出对话区停在第一行或最后一行，否则在对话区外返回 undefined
@@ -1217,8 +1238,8 @@ function App({
       pressed.current = undefined;
       setSelection(undefined);
     }
-    // 选择框自己用 PgUp/PgDn 翻选项
-    if (dialog?.kind === "select") return;
+    // 选择框自己用 PgUp/PgDn 翻选项，后台的事的列表用它翻输出
+    if (dialog?.kind === "select" || dialog?.kind === "jobs") return;
     if (key.pageUp) store.scrollBy(page, max);
     else if (key.pageDown) store.scrollBy(-page, max);
     else if (key.ctrl && key.home) store.scrollBy(max, max);
@@ -1286,7 +1307,9 @@ function App({
           dialog
             ? dialog.kind === "select"
               ? h(SelectDialog, { key: dialogKey(dialog), dialog })
-              : h(InputDialog, { key: dialogKey(dialog), dialog })
+              : dialog.kind === "jobs"
+                ? h(JobsDialog, { key: dialogKey(dialog), dialog, jobs: state.jobs })
+                : h(InputDialog, { key: dialogKey(dialog), dialog })
             : null,
           h(Prompt, {
             commands,
@@ -1303,7 +1326,7 @@ function App({
             place: inputPlace,
             onCopy: copyText,
           }),
-          h(StatusBar, { status: state.status, width: Math.max(10, columns - 2) }),
+          h(StatusBar, { status: state.status, jobs: state.jobs, width: Math.max(10, columns - 2) }),
         ),
       ),
     ),
@@ -1439,7 +1462,7 @@ export function fitSegments(segments: Segment[], width: number): Segment[] {
   return kept;
 }
 
-function StatusBar({ status, width }: { status: StatusInfo; width: number }) {
+function StatusBar({ status, jobs, width }: { status: StatusInfo; jobs: JobInfo[]; width: number }) {
   const ctx = status.context;
   const pct = ctx ? Math.round((ctx.used / ctx.limit) * 100) : 0;
   const nearFull = pct >= 80;
@@ -1457,8 +1480,11 @@ function StatusBar({ status, width }: { status: StatusInfo; width: number }) {
   const kept = (status.plugins ?? []).filter((p) => typeof p.text !== "string" && p.text.keep);
   const others = (status.plugins ?? []).filter((p) => !kept.includes(p));
   // 窄的时候依次：提示变短、去掉提示、用量变短、去掉缓存、模式变短、去掉用量、上下文变短、去掉速度
+  const running = runningJobs(jobs);
   const segments: Segment[] = [
     ...kept.map((p) => plugin(p, true)),
+    // 在后台运行的事：一直留着，窄的时候去掉按键说明
+    ...(running ? [{ text: `${running} · ctrl+t to view`, short: running, shortAt: 6.5, color: "cyan" }] : []),
     ctx
       ? {
           text: `ctx ${tokens(ctx.used)}/${tokens(ctx.limit)} (${pct}%)`,
@@ -2429,6 +2455,112 @@ function SelectDialog({
       variants: filtering
         ? ["↑↓ select · type to filter · enter confirm · esc clear/cancel", "↑↓ · enter · esc"]
         : ["↑↓ select · enter confirm · esc cancel", "↑↓ · enter · esc"],
+    }),
+  );
+}
+
+/** 还在运行的后台的事按种类计数，例如 "2 agents · 1 shell"；没有时是空字符串 */
+export function runningJobs(jobs: readonly JobInfo[]): string {
+  const counts = new Map<string, number>();
+  for (const j of jobs) if (!j.done) counts.set(j.kind, (counts.get(j.kind) ?? 0) + 1);
+  return [...counts].map(([kind, n]) => `${n} ${kind}${n > 1 ? "s" : ""}`).join(" · ");
+}
+
+/** 查看一件后台的事时，输出只折最后这么多行 */
+const JOB_TAIL_LINES = 2000;
+
+/**
+ * 后台的事（ctrl+t）：列表里选一件，enter 看它的输出（跟着最新的，PgUp/PgDn 翻看），x 停掉，esc 返回、关掉。
+ * 正在看的那件被去掉了（子 Agent 交了报告）时回到列表
+ */
+function JobsDialog({ dialog, jobs }: { dialog: Extract<Dialog, { kind: "jobs" }>; jobs: JobInfo[] }) {
+  const selection = useContext(SelectionContext);
+  const [getSelected, setSelected] = useLive(0);
+  const [getViewing, setViewing] = useLive<number | undefined>(undefined);
+  /** 看输出时离底部翻上去了多少行 */
+  const [getBack, setBack] = useLive(0);
+  const { rows, columns } = useScreenSize();
+  const width = Math.max(10, columns - 4);
+  const viewing = jobs.find((j) => j.id === getViewing());
+  const selected = Math.min(getSelected(), Math.max(0, jobs.length - 1));
+  const room = Math.max(3, rows - 14);
+  // 输出折好行，只显示末尾 room 行（往上翻了 back 行）
+  const lines = viewing ? wrap(viewing.output.replace(/\n+$/, "").split("\n").slice(-JOB_TAIL_LINES).join("\n"), width).map(visibleRow) : [];
+  const maxBack = Math.max(0, lines.length - room);
+  const back = Math.min(getBack(), maxBack);
+  const scrolling = useRef({ maxBack, room });
+  scrolling.current = { maxBack, room };
+  useInput((input, key) => {
+    if (key.ctrl && input === "c" && selection.active()) return selection.clear();
+    const current = jobs.find((j) => j.id === getViewing());
+    const target = current ?? jobs[Math.min(getSelected(), jobs.length - 1)];
+    if (input === "x" && target && !target.done && target.stop) return target.stop();
+    if (current) {
+      const { maxBack, room } = scrolling.current;
+      const by = (n: number) => setBack(Math.max(0, Math.min(maxBack, Math.min(getBack(), maxBack) + n)));
+      if (key.pageUp) return by(room - 1);
+      if (key.pageDown) return by(-(room - 1));
+      if (key.upArrow || input === "k") return by(1);
+      if (key.downArrow || input === "j") return by(-1);
+      if (key.escape || key.leftArrow || (key.ctrl && input === "c")) {
+        setBack(0);
+        return setViewing(undefined);
+      }
+      return;
+    }
+    const n = jobs.length;
+    if (key.upArrow || input === "k") return n && setSelected((Math.min(getSelected(), n - 1) - 1 + n) % n);
+    if (key.downArrow || input === "j") return n && setSelected((Math.min(getSelected(), n - 1) + 1) % n);
+    if ((key.return || key.rightArrow) && target) {
+      setBack(0);
+      return setViewing(target.id);
+    }
+    if (key.escape || (key.ctrl && input === "c")) return dialog.resolve(undefined);
+  });
+  const mark = (j: JobInfo) => (j.done ? h(Text, { dimColor: true }, "○ ") : h(Text, { color: "green" }, "● "));
+  const canStop = (j: JobInfo | undefined) => j !== undefined && !j.done && j.stop !== undefined;
+  const frame = { flexDirection: "column", borderStyle: "round", borderColor: "cyan", paddingX: 1, marginTop: 1 } as const;
+  if (viewing) {
+    const shown = lines.slice(lines.length - room - back, lines.length - back);
+    return h(
+      Box,
+      frame,
+      h(Text, { wrap: "truncate-end" }, mark(viewing), h(Text, { bold: true }, `${viewing.kind} · ${viewing.title}`), viewing.status ? h(Text, { dimColor: true }, ` · ${viewing.status}`) : null),
+      lines.length > room + back ? h(Text, { dimColor: true }, ` ↑ ${lines.length - room - back} more lines`) : null,
+      lines.length === 0 ? h(Text, { dimColor: true }, " (no output yet)") : null,
+      shown.map((l, i) => h(Text, { key: i, wrap: "truncate-end" }, l || " ")),
+      back > 0 ? h(Text, { dimColor: true }, ` ↓ ${back} more lines`) : null,
+      h(Hint, {
+        width,
+        variants: [`PgUp/PgDn ↑↓ scroll${canStop(viewing) ? " · x stop" : ""} · esc back`, `↑↓${canStop(viewing) ? " · x" : ""} · esc`],
+      }),
+    );
+  }
+  const visible = roomFor(rows, VISIBLE);
+  const start = around(selected, jobs.length, visible);
+  return h(
+    Box,
+    frame,
+    h(Text, { bold: true }, "Background tasks"),
+    jobs.length === 0 ? h(Text, { dimColor: true }, "Nothing is running in the background.") : null,
+    start > 0 ? h(Text, { dimColor: true }, ` ↑ ${start} more`) : null,
+    jobs.slice(start, start + visible).map((j, k) => {
+      const on = start + k === selected;
+      return h(
+        Text,
+        { key: j.id, wrap: "truncate-end" },
+        h(Text, { color: on ? "cyan" : undefined, bold: on }, on ? "❯ " : "  "),
+        mark(j),
+        h(Text, { color: on ? "cyan" : undefined, bold: on }, `${j.kind} · ${j.title}`),
+        j.status ? h(Text, { dimColor: true }, ` · ${j.status}`) : null,
+      );
+    }),
+    start + visible < jobs.length ? h(Text, { dimColor: true }, ` ↓ ${jobs.length - start - visible} more`) : null,
+    h(Hint, {
+      width,
+      variants: jobs.length
+        ? [`↑↓ select · enter view output${canStop(jobs[selected]) ? " · x stop" : ""} · esc close`, `↑↓ · enter${canStop(jobs[selected]) ? " · x" : ""} · esc`]
+        : ["esc close"],
     }),
   );
 }

@@ -6,10 +6,10 @@ import type { Key, Keys } from "@uncarved/jade-api/services";
 /** "ctrl+<字母>"、"alt+<字母或数字>" 或 "shift+tab" */
 export const KEY_SPEC = /^(ctrl\+[a-z]|alt\+[a-z0-9]|shift\+tab)$/;
 /**
- * 前端自己用的键，插件不能用：编辑（ctrl+a/e/d/w/u/k，按词移动的 alt+f/b）、搜索历史（ctrl+r）、重画（ctrl+l）、展开（ctrl+o）、
+ * 前端自己用的键，插件不能用：编辑（ctrl+a/e/d/w/u/k，按词移动的 alt+f/b）、搜索历史（ctrl+r）、重画（ctrl+l）、展开（ctrl+o）、后台的事（ctrl+t）、
  * 中断和退出（ctrl+c），以及终端里等同于退格、Tab、回车的 ctrl+h/i/j/m
  */
-export const RESERVED_KEYS: ReadonlySet<string> = new Set([..."acdehijklmoruw"].map((c) => `ctrl+${c}`).concat("alt+f", "alt+b"));
+export const RESERVED_KEYS: ReadonlySet<string> = new Set([..."acdehijklmortuw"].map((c) => `ctrl+${c}`).concat("alt+f", "alt+b"));
 
 const registry = new Map<string, { key: Key; plugin: string }>();
 

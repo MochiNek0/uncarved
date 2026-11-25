@@ -62,16 +62,19 @@ export function withRetry(inner: Provider, opts: RetryOptions = {}): Provider {
       const failures: RetryRecord[] = [];
       for (let attempt = 1; ; attempt++) {
         let streamed = false;
-        await opts.gate?.acquire(options.signal, opts.onWait && ((delayMs) => opts.onWait!({ delayMs, request })));
+        const done = await opts.gate?.acquire(options.signal, opts.onWait && ((delayMs) => opts.onWait!({ delayMs, request })));
         opts.onRequest?.(attempt);
         try {
-          const res = await inner.complete(request, {
-            ...options,
-            onDelta: (d) => {
-              streamed = true;
-              options.onDelta?.(d);
-            },
-          });
+          const res = await inner
+            .complete(request, {
+              ...options,
+              onDelta: (d) => {
+                streamed = true;
+                options.onDelta?.(d);
+              },
+            })
+            // 限速从请求结束算起（见 RateGate）；失败的也要在下面推上限之前算结束
+            .finally(() => done?.());
           // 实际回复的是被包装者（4.7 第 3 款）
           return { ...res, provider: res.provider ?? inner.id, ...(failures.length > 0 ? { retries: failures } : {}) };
         } catch (err) {
@@ -115,15 +118,28 @@ export interface RateGateOptions {
   onLearn?: (rpm: number) => void;
 }
 
+/** 限速窗口：一分钟，再留一点余量，免得正好卡在服务端窗口的边上 */
+const WINDOW_MS = 60_000;
+const WINDOW_MARGIN_MS = 1_000;
+
+/** 经过限速发出的一个请求：at 是结束的时间，还没结束时是发出的时间 */
+interface Sent {
+  at: number;
+  inFlight: boolean;
+  finished: Promise<void>;
+}
+
 /**
  * 同一个服务的所有请求共用的限速。免费模型常常按每分钟请求数限流，主 Agent、并行的子 Agent、压缩各自重试会一起撞上去。
- * - 有上限（JADE_RPM，或者被限流后推出来的）时，相邻两个请求至少间隔 60s / 上限，平均分布在一分钟里
+ * - 有上限（JADE_RPM，或者被限流后推出来的）时按滑动窗口：最近一分钟里结束的请求（加上还没结束的）不到上限才发。
+ *   从请求结束算起：服务端常常在请求结束时才记一次，从发出时算、按 60s / 上限平均间隔的话，
+ *   每隔上限个请求就正好卡在窗口边上被拒，每次再白等一个 Retry-After
  * - 收到 429 后，所有请求都等到重试时间之后再发
  */
 export class RateGate {
   #rpm: number | undefined;
   readonly #explicit: boolean;
-  #sent: number[] = [];
+  #sent: Sent[] = [];
   #until = 0;
   #queue: Promise<void> = Promise.resolve();
   readonly #now: () => number;
@@ -141,24 +157,48 @@ export class RateGate {
     return this.#rpm;
   }
 
-  /** 等到可以发下一个请求，并记下这个请求。排队的请求按先来后到；轮到它但还要等时调用 onWait（只告诉这个请求的调用方） */
-  acquire(signal: AbortSignal, onWait?: (ms: number) => void): Promise<void> {
+  /**
+   * 等到可以发下一个请求，并记下这个请求；返回的函数在请求结束（成功或失败）时调用。
+   * 排队的请求按先来后到；轮到它但还要等时调用 onWait（只告诉这个请求的调用方）
+   */
+  acquire(signal: AbortSignal, onWait?: (ms: number) => void): Promise<() => void> {
     const turn = this.#queue.then(async () => {
       signal.throwIfAborted();
-      for (let wait = this.#delay(); wait > 0; wait = this.#delay()) {
+      for (let wait = this.#delay(); wait !== 0; wait = this.#delay()) {
+        // 挡路的请求还没结束：等它结束再算还要等多久
+        if (typeof wait !== "number") {
+          await untilSettled(wait, signal);
+          continue;
+        }
         this.#opts.onWait?.(wait);
         onWait?.(wait);
         await sleep(wait, signal);
       }
-      this.#sent.push(this.#now());
+      let finish!: () => void;
+      const sent: Sent = { at: this.#now(), inFlight: true, finished: new Promise((r) => (finish = r)) };
+      this.#sent.push(sent);
+      return () => {
+        if (!sent.inFlight) return;
+        sent.inFlight = false;
+        sent.at = this.#now();
+        finish();
+      };
     });
-    this.#queue = turn.catch(() => {});
+    this.#queue = turn.then(
+      () => {},
+      () => {},
+    );
     // 排队时被取消的也要立即返回（I-9）；轮到它时看到已取消，不会记成发出了请求
     return new Promise((resolve, reject) => {
-      const stop = () => reject(signal.reason);
+      let stopped = false;
+      const stop = () => {
+        stopped = true;
+        reject(signal.reason);
+      };
       if (signal.aborted) return stop();
       signal.addEventListener("abort", stop, { once: true });
-      turn.then(resolve, reject).finally(() => signal.removeEventListener("abort", stop));
+      // 刚记下就被取消了：请求不会发，马上算它结束，不然它一直占着窗口
+      turn.then((done) => (stopped ? done() : resolve(done)), reject).finally(() => signal.removeEventListener("abort", stop));
     });
   }
 
@@ -179,19 +219,36 @@ export class RateGate {
     }
   }
 
+  /** 还算在窗口里的请求数：没结束的，和最近一分钟里结束的 */
   #recent(now: number): number {
-    this.#sent = this.#sent.filter((t) => now - t < 60_000);
+    this.#sent = this.#sent.filter((s) => s.inFlight || now - s.at < WINDOW_MS + WINDOW_MARGIN_MS);
     return this.#sent.length;
   }
 
-  #delay(): number {
+  /** 还要等多少毫秒；要等一个还没结束的请求时返回它结束的 Promise */
+  #delay(): number | Promise<void> {
     const now = this.#now();
-    this.#recent(now);
-    let wait = this.#until - now;
-    const last = this.#sent.at(-1);
-    if (this.#rpm !== undefined && last !== undefined) wait = Math.max(wait, last + 60_000 / this.#rpm - now);
-    return Math.ceil(wait);
+    const wait = Math.max(0, this.#until - now);
+    if (this.#rpm === undefined || this.#recent(now) < this.#rpm) return Math.ceil(wait);
+    // 要等窗口里最早的几个出去，剩下的不到上限；没结束的最晚出去
+    const order = [...this.#sent].sort((a, b) => (a.inFlight ? Infinity : a.at) - (b.inFlight ? Infinity : b.at));
+    const blocker = order[order.length - this.#rpm]!;
+    if (blocker.inFlight) return blocker.finished;
+    return Math.ceil(Math.max(wait, blocker.at + WINDOW_MS + WINDOW_MARGIN_MS - now));
   }
+}
+
+/** 等 p 完成；signal 中止时立即以它的原因失败 */
+function untilSettled(p: Promise<void>, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const stop = () => reject(signal.reason);
+    if (signal.aborted) return stop();
+    signal.addEventListener("abort", stop, { once: true });
+    p.then(() => {
+      signal.removeEventListener("abort", stop);
+      resolve();
+    });
+  });
 }
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {

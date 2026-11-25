@@ -69,6 +69,40 @@ describe("jade/task", () => {
     expect(index).not.toContain(ref.sessionId);
   });
 
+  test("a running sub-agent is listed in the frontend's background jobs with what it does, and removed when it reports", async () => {
+    const { shared, host, send } = await scriptedHost();
+    shared.script.push(use("u1", "task", { description: "look", prompt: "list the root" }), use("c1", "list_dir", { path: "." }), say("report: empty"), say("done"));
+    const s = await host.sessions.open();
+    await send(s, "go");
+    expect(shared.jobs).toHaveLength(1);
+    const job = shared.jobs[0]!;
+    expect(job).toMatchObject({ session: s.id, kind: "agent", title: "look", disposed: true });
+    expect(job.output).toContain("● list_dir(");
+    expect(job.output).toContain("report: empty");
+    expect(job.statuses).toContain("thinking");
+    expect(job.statuses.some((t) => t.startsWith("list_dir("))).toBe(true);
+  });
+
+  test("stopping a sub-agent from the background jobs ends only it; the main agent gets what it had and continues", async () => {
+    const { shared, host, send } = await scriptedHost();
+    shared.stopJobs = true;
+    shared.script.push(
+      use("u1", "task", { description: "look", prompt: "list the root" }),
+      // 子 Agent 说了一句、要调用工具：这时（它第一次有输出）用户停掉它，它不会再请求模型
+      { content: [...(say("checking the root") as { content: Block[] }).content, ...(use("c1", "list_dir", { path: "." }) as { content: Block[] }).content], stopReason: "tool_use" },
+      // 主会话
+      say("ok, stopped"),
+    );
+    const s = await host.sessions.open();
+    await send(s, "go");
+    expect(shared.requests).toHaveLength(3);
+    const result = shared.requests[2]!.messages.at(-1)!.content.find((b) => b.kind === "tool_result") as Extract<Block, { kind: "tool_result" }>;
+    expect(result.isError).toBe(true);
+    expect(textOf(result.content)).toContain("The user stopped this sub-agent");
+    expect(textOf(result.content)).toContain("checking the root");
+    expect(shared.jobs[0]!.disposed).toBe(true);
+  });
+
   test("the sub-agent gets the session's instruction files, the repository's ones untrusted; instructions: false leaves them out", async () => {
     for (const off of [false, true]) {
       const { cwd, host, shared, send } = await scriptedHost(off ? { config: { "jade/task": { instructions: false } } } : {});

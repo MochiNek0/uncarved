@@ -6,12 +6,12 @@
 
 import path from "node:path";
 import type { ModelRequest, ModelResponse, Provider } from "uncarved";
-import { definePlugin, type UI, type Updater } from "@uncarved/jade-api";
+import { definePlugin, type Notice, type UI, type Updater } from "@uncarved/jade-api";
 import type { Commands, Models } from "@uncarved/jade-api/services";
 import { contextWindow } from "./context.ts";
 import { envWithFile, hasProvider, parseTokens } from "./config.ts";
 import { configurator } from "./configure.ts";
-import { isBuiltinKind, listModels, MODEL_KEY, providerFromEnv, providerInfo, providerKind, RateGate, rpmFromEnv, visionFromEnv, withRetry, type RetriedResponse } from "./provider.ts";
+import { isBuiltinKind, listModels, MODEL_KEY, providerFromEnv, providerInfo, providerKind, RateGate, rpmFromEnv, visionFromEnv, withRetry, type RetriedResponse, type RetryOptions } from "./provider.ts";
 import { MODEL_SETTINGS, readSavedServices, type Env } from "./saved.ts";
 
 /** 进程级的配置交给会话里的提示用：有没有配好模型、有没有 /model、.env 在哪 */
@@ -22,6 +22,11 @@ let hinted = false;
 const countdowns = new Map<string, (ms: number, label: string) => void>();
 /** 请求上记的会话 id（见 session() 里的 model.before） */
 const sessionOf = (request: ModelRequest) => (request.ext?.["jade/models"] as { session?: string } | undefined)?.session;
+type RetryInfo = Parameters<NonNullable<RetryOptions["onRetry"]>>[0];
+/** 重试前在会话里怎么显示：会话 id → 显示这一次重试。找不到会话的（子会话、-p）直接 notify */
+const retryShows = new Map<string, (info: RetryInfo) => void>();
+/** 重试的提示；next 是接下来做什么（"retrying in 5s"） */
+const retryText = ({ attempt, retries, error }: RetryInfo, next: string) => `model request failed (${error.message}); ${next} (retry ${attempt}, at most ${retries})`;
 
 export default definePlugin({
   async process(ctx) {
@@ -65,9 +70,10 @@ export default definePlugin({
         return withRetry(await providerFromEnv(snapshot, { "user-agent": userAgent() }), {
           gate,
           onWait: ({ delayMs, request }) => countdowns.get(sessionOf(request) ?? "")?.(delayMs, "rate limited, sending in"),
-          onRetry: ({ attempt, retries, delayMs, error, request }) => {
-            ui()?.notify(`model request failed (${error.message}); retrying in ${Math.round(delayMs / 1000)}s (retry ${attempt}, at most ${retries})`, "warning");
-            countdowns.get(sessionOf(request) ?? "")?.(delayMs, "retrying in");
+          onRetry: (info) => {
+            const show = retryShows.get(sessionOf(info.request) ?? "");
+            if (show) show(info);
+            else ui()?.notify(retryText(info, `retrying in ${Math.round(info.delayMs / 1000)}s`), "warning");
           },
         });
       })();
@@ -217,7 +223,7 @@ export default definePlugin({
         }
       },
     });
-    // 重试前、限速排队时状态栏倒计时，不然几十秒里只看到"在请求"，像卡住了。子会话没有状态栏，不用做
+    // 限速排队时（还有前端不能改写提示时的重试前）状态栏倒计时，不然几十秒里只看到"在请求"，像卡住了。子会话没有状态栏，不用做
     let timer: ReturnType<typeof setInterval> | undefined;
     const stopCountdown = () => {
       if (timer === undefined) return;
@@ -225,9 +231,26 @@ export default definePlugin({
       timer = undefined;
       ctx.status?.(undefined);
     };
+    const safe = (fn: () => void) => {
+      try {
+        fn();
+      } catch {
+        // 前端不在了
+      }
+    };
+    // 一个请求接连重试时只用一条提示（前端能原地改写时）：倒计时、第几次重试都改在这一条上，
+    // 请求有了结果就停在结果上。之后的请求再重试是新的一条
+    let retry: { notice: Notice; info: RetryInfo; timer?: ReturnType<typeof setInterval> } | undefined;
+    const endRetry = (outcome: string, level: "info" | "warning") => {
+      const r = retry;
+      if (!r) return;
+      retry = undefined;
+      clearInterval(r.timer);
+      safe(() => r.notice.update(`model request failed (${r.info.error.message}); ${outcome}`, level));
+    };
     if (ctx.status) {
       const id = ctx.session.id;
-      countdowns.set(id, (ms, label) => {
+      const countdown = (ms: number, label: string) => {
         stopCountdown();
         const until = Date.now() + ms;
         const tick = () => {
@@ -237,10 +260,40 @@ export default definePlugin({
         };
         timer = setInterval(tick, 1000);
         tick();
+      };
+      countdowns.set(id, countdown);
+      retryShows.set(id, (info) => {
+        const until = Date.now() + info.delayMs;
+        const text = () => {
+          const left = Math.ceil((until - Date.now()) / 1000);
+          return retryText(info, left > 0 ? `retrying in ${left}s` : "retrying now");
+        };
+        let r = retry;
+        if (r) {
+          clearInterval(r.timer);
+          r.info = info;
+          const shown = r;
+          safe(() => shown.notice.update(text(), "warning"));
+        } else {
+          const notice = ui?.notice?.(text(), "warning");
+          // 前端不能改写：每次重试一条提示，倒计时放在状态栏上
+          if (!notice) {
+            ui?.notify(text(), "warning");
+            return countdown(info.delayMs, "retrying in");
+          }
+          r = retry = { notice, info };
+        }
+        const shown = r;
+        shown.timer = setInterval(() => {
+          if (Date.now() >= until) clearInterval(shown.timer);
+          safe(() => shown.notice.update(text(), "warning"));
+        }, 1000);
       });
       ctx.signal.addEventListener("abort", () => {
         stopCountdown();
+        clearInterval(retry?.timer);
         countdowns.delete(id);
+        retryShows.delete(id);
       });
       // ext[provider id] 由那个 provider 解释（4.7），这里的 provider 就是 jade/models，别的 provider 不看
       ctx.kernel.hook({
@@ -253,7 +306,10 @@ export default definePlugin({
         kind: "observe",
         point: "event",
         fn: (e) => {
-          if (e.type === "turn.ended") stopCountdown();
+          if (e.type !== "turn.ended") return;
+          stopCountdown();
+          // 没等到成功这一轮就结束了（中断、重试次数用完）：倒计时不再算数
+          endRetry("stopped retrying", "warning");
         },
       });
     }
@@ -267,7 +323,9 @@ export default definePlugin({
         if (!retries?.length) return;
         // 重试中的提示只说了"在重试"，成功了也要说一声，不然看起来像重试到一半没了
         const waited = Math.round(retries.reduce((ms, r) => ms + r.delayMs, 0) / 1000);
-        ui?.notify(`model request succeeded after ${retries.length} ${retries.length === 1 ? "retry" : "retries"} (${waited}s of waiting)`, "info");
+        const after = `${retries.length} ${retries.length === 1 ? "retry" : "retries"} (${waited}s of waiting)`;
+        if (retry) endRetry(`succeeded after ${after}`, "info");
+        else ui?.notify(`model request succeeded after ${after}`, "info");
         await hook.emit("retried", { retries });
       },
     });

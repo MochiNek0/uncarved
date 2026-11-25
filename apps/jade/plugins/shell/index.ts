@@ -1,7 +1,7 @@
 // jade/shell：bash 工具，以及后台命令的 bash_output、kill_shell；shell@1 给其他插件执行命令。
 // 后台命令自己结束时告诉用户，并给模型留一句说明（不用它一直轮询）；/shells 给用户看和停掉后台命令。
 
-import { definePlugin, type Span, type UI } from "@uncarved/jade-api";
+import { definePlugin, type Job, type Span, type UI } from "@uncarved/jade-api";
 import type { Commands, Prompts, Renderers, Undo } from "@uncarved/jade-api/services";
 import { shellRenderers } from "./renderers.ts";
 import { shellService } from "./service.ts";
@@ -101,6 +101,10 @@ export default definePlugin({
   async session(ctx) {
     const shell = typeof ctx.config.shell === "string" ? ctx.config.shell : undefined;
     const id = ctx.session.id;
+    /** 前端后台列表里的后台命令（ctrl+t）：用户能看输出、停掉；会话关闭时去掉 */
+    const jobs = new Set<Job>();
+    /** 用户在后台列表里停掉的 */
+    const stoppedByUser = new Set<string>();
     const { tools, executable, unavailable, shutdown, list, kill } = shellTools({
       cwd: ctx.cwd,
       ...(shell ? { shell } : {}),
@@ -108,6 +112,24 @@ export default definePlugin({
         const what = `Background shell ${bg.id} (${firstLine(bg.command)}) exited with code ${bg.exitCode}`;
         ctx.service<UI>("ui@1")?.notify(what, bg.exitCode === 0 ? "info" : "warning");
         ctx.service<Prompts>("prompts@1")?.note(id, `${what}. Read its remaining output with bash_output.`);
+      },
+      onBackground(bg) {
+        const job = ctx.service<UI>("ui@1")?.job?.({
+          session: id,
+          kind: "shell",
+          title: `${bg.id} ${firstLine(bg.command)}`,
+          async stop() {
+            stoppedByUser.add(bg.id);
+            if (await kill(bg.id)) ctx.service<Prompts>("prompts@1")?.note(id, `The user stopped background shell ${bg.id} (${firstLine(bg.command)}).`);
+          },
+        });
+        if (!job) return undefined;
+        jobs.add(job);
+        job.status("running");
+        return {
+          output: (text) => job.append(text),
+          exit: (code) => job.status(stoppedByUser.has(bg.id) ? "stopped by you" : `exited with code ${code}`, true),
+        };
       },
     });
     sessions.set(id, { list, kill });
@@ -135,6 +157,7 @@ export default definePlugin({
     await ctx.effect(() => () => {
       sessions.delete(id);
       shutdown();
+      for (const job of jobs) job.dispose();
     });
   },
 });

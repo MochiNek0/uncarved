@@ -10,10 +10,10 @@ import { readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Block } from "uncarved";
-import type { Frontend, OpenOptions, Session, SessionManager, SessionUI, StatusSegment, Text, UI } from "@uncarved/jade-api";
+import type { Frontend, Job, JobRequest, OpenOptions, Session, SessionManager, SessionUI, StatusSegment, Text, UI } from "@uncarved/jade-api";
 import type { CommandContext, Commands, Completions, EventRenderer, Keys, Models, Renderers, SessionIndex, Steer, ToolRenderer } from "@uncarved/jade-api/services";
 import { InputHistory } from "./history.ts";
-import { ansi, dim, red, safeScreen, yellow, type CommandInfo, type CompletionInfo, type Screen } from "./screen.ts";
+import { ansi, dim, red, safeScreen, yellow, type CommandInfo, type CompletionInfo, type JobInfo, type Screen } from "./screen.ts";
 import { transcript, type Transcript } from "./transcript.ts";
 
 /**
@@ -53,7 +53,7 @@ const KEYS = [
   "  send       enter send · ctrl+j, alt+enter or \\ then enter: new line · tab completes /commands",
   "  input      ↑↓ history · ctrl+r search history · ↑ on the first line edits queued messages · esc twice or ctrl+c clears the input",
   "  editing    ctrl+←/→ or alt+b/f move by words · ctrl+w or alt+backspace delete a word · ctrl+a/e line start/end · ctrl+u/k delete to start/end",
-  "  running    esc interrupt (twice to also move queued messages back to the input) · ctrl+c twice to exit",
+  "  running    esc interrupt (twice to also move queued messages back to the input) · ctrl+c twice to exit · ctrl+t sub-agents and background commands",
   "  transcript pgup/pgdn scroll · ctrl+home/end top/bottom · ctrl+o expands the latest item, a click the one under it · drag to select and copy · ctrl+l redraw",
 ].join("\n");
 
@@ -155,15 +155,29 @@ export class ScreenBridge {
   #panels = new Map<string, Map<string, string>>();
   /** 界面现在显示哪个会话；换会话时由前端调用 show */
   #session: string | undefined;
+  /** UI.notice 给每条提示编号，作为它在界面里的 id */
+  #notices = 0;
+  /** UI.job 登记的事（所有会话的）；界面只显示正在显示的会话的 */
+  #jobs: (JobInfo & { session: string })[] = [];
+  #nextJob = 0;
+  /** 输出攒一小段时间再交给界面，后台命令输出很快时不至于每一块都重画 */
+  #jobTimer: ReturnType<typeof setTimeout> | undefined;
 
   readonly ui: UI = {
     interactive: true,
     notify: (message, level = "info") => {
-      const text = level === "error" ? red(`[error] ${message}`) : level === "warning" ? yellow(`[warning] ${message}`) : dim(message);
+      const text = noticeText(message, level);
       if (this.#held) this.#held.push(text);
       else if (this.screen) this.screen.log(text);
       else if (this.#closed) process.stderr.write(`jade: ${message}\n`);
       else this.#early.push(text);
+    },
+    // 只有终端界面能原地改写；攒着提示（正在打开会话）时也不行，调用方改用 notify
+    notice: (message, level = "info") => {
+      if (this.#held || !this.screen?.note) return undefined;
+      const id = `\0notice-${++this.#notices}`;
+      this.screen.note(id, noticeText(message, level));
+      return { update: (m, l = "info") => this.screen?.note?.(id, noticeText(m, l)) };
     },
     select: async (req, signal) => {
       if (!this.screen) return undefined;
@@ -181,6 +195,7 @@ export class ScreenBridge {
     // 界面没有占着终端（不是终端界面、还没起来）时没有什么要让的，直接执行
     suspend: async (fn) => (this.screen?.suspend ? this.screen.suspend(fn) : fn()),
     session: ({ session, plugin }) => this.#sessionUI(session, plugin),
+    job: (req) => this.#job(req),
   };
 
   attach(screen: Screen): void {
@@ -204,6 +219,7 @@ export class ScreenBridge {
   }
 
   detach(): void {
+    clearTimeout(this.#jobTimer);
     this.screen = undefined;
     this.#closed = true;
   }
@@ -212,6 +228,45 @@ export class ScreenBridge {
   show(session: string | undefined): void {
     this.#session = session;
     this.#apply();
+    this.#applyJobs();
+  }
+
+  #job(req: JobRequest): Job {
+    const entry: JobInfo & { session: string } = {
+      id: ++this.#nextJob,
+      session: String(req.session),
+      kind: String(req.kind),
+      title: String(req.title),
+      status: "",
+      done: false,
+      output: "",
+      ...(req.stop ? { stop: () => req.stop!() } : {}),
+    };
+    this.#jobs = [...this.#jobs, { ...entry }];
+    this.#applyJobs();
+    // entry 是最新的值；列表里每次换成它的一份新拷贝，界面按引用判断哪一项变了。已经去掉的不再更新
+    const update = (patch: Partial<JobInfo>, soon = false) => {
+      if (!this.#jobs.some((j) => j.id === entry.id)) return;
+      Object.assign(entry, patch);
+      this.#jobs = this.#jobs.map((j) => (j.id === entry.id ? { ...entry } : j));
+      if (soon) this.#jobTimer ??= setTimeout(() => this.#applyJobs(), JOB_REDRAW_MS);
+      else this.#applyJobs();
+    };
+    return {
+      append: (text) => update({ output: (entry.output + ansi(text)).slice(-MAX_JOB_OUTPUT) }, true),
+      status: (text, done) => update({ status: String(text), done: done === true }),
+      dispose: () => {
+        const before = this.#jobs.length;
+        this.#jobs = this.#jobs.filter((j) => j.id !== entry.id);
+        if (this.#jobs.length !== before) this.#applyJobs();
+      },
+    };
+  }
+
+  #applyJobs(): void {
+    clearTimeout(this.#jobTimer);
+    this.#jobTimer = undefined;
+    this.screen?.jobs?.(this.#jobs.filter((j) => j.session === this.#session));
   }
 
   #apply(): void {
@@ -263,6 +318,14 @@ export class ScreenBridge {
     };
   }
 }
+
+/** 每件后台的事最多留这么多个字符的输出 */
+const MAX_JOB_OUTPUT = 100_000;
+/** 后台的事的输出攒这么久交给界面一次 */
+const JOB_REDRAW_MS = 100;
+
+const noticeText = (message: string, level: "info" | "warning" | "error") =>
+  level === "error" ? red(`[error] ${message}`) : level === "warning" ? yellow(`[warning] ${message}`) : dim(message);
 
 /** 输入框上方的一块最多这么多行，多出的最后一行写成还有几行；每行在界面里按宽度截断 */
 function clipPanel(text: string): string {

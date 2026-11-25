@@ -4,7 +4,7 @@
 // 配置 write 为 true 时全部保留，写操作和主会话一样经过审批。子会话的日志存盘，父会话的工具结果带着它的引用。
 
 import type { Usage } from "uncarved";
-import { definePlugin, type SessionContext } from "@uncarved/jade-api";
+import { definePlugin, type SessionContext, type UI } from "@uncarved/jade-api";
 import type { Approval, Models, Renderers } from "@uncarved/jade-api/services";
 import { CHARS_PER_TOKEN, FALLBACK_WINDOW, fitToolResults, READ_ONLY_REASON, REPORT_TOOL_SHARE, stepsThisTurn, subagentPrompt, taskTool, WRAP_UP_AT, type Control, type TaskProgress } from "./subagent.ts";
 import { clip, dim, error, lines as joinLines } from "./style.ts";
@@ -99,6 +99,8 @@ export default definePlugin({
           return () => void controls.delete(child);
         },
         usage: (toolUseId, u) => void usage.set(toolUseId, u),
+        job: (description, stop) => ctx.service<UI>("ui@1")?.job?.({ session: ctx.session.id, kind: "agent", title: description, stop }),
+        describe: (name, input) => ctx.service<Renderers>("renderers@1")?.forTool(name)?.renderer.summary?.(input) ?? clip(JSON.stringify(input) ?? "", 120),
       }),
     );
     // 子 Agent 的用量记成本插件的事件（和压缩、审查的用量一样），界面据此计入会话用量；只能在 hook 里记

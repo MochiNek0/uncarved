@@ -156,37 +156,57 @@ describe("withRetry", () => {
 
 // ---------- 限速 ----------
 
-test("RateGate spaces requests by the limit and pauses everyone after a 429", async () => {
+test("RateGate keeps at most the limit in any minute, counted from when requests end, and pauses everyone after a 429", async () => {
   let now = 0;
   const waits: number[] = [];
   const learned: number[] = [];
   const gate = new RateGate({ now: () => now, onWait: (ms) => waits.push(ms), onLearn: (n) => learned.push(n) });
   const signal = new AbortController().signal;
+  const tick = () => new Promise((r) => setTimeout(r, 5));
   // 没有上限时不等
-  for (let i = 0; i < 4; i++) await gate.acquire(signal);
+  for (let i = 0; i < 4; i++) (await gate.acquire(signal))();
   expect(waits).toEqual([]);
   // 一分钟里发了 4 个后被限流：推出每分钟 3 个，暂停期间谁都不发
   gate.limited(1);
   expect(learned).toEqual([3]);
   expect(gate.rpm).toBe(3);
-  now = 60_000;
-  await gate.acquire(signal);
+  // 窗口空了：3 个接连发出，不用等；每个用 10 秒
+  now = 61_000;
+  for (let i = 0; i < 3; i++) {
+    const done = await gate.acquire(signal);
+    now += 10_000;
+    done();
+  }
   expect(waits).toEqual([]);
-  // 下一个要隔 20 秒；排在它后面的被取消时立即返回
+  // 第 4 个等最早那个结束（71s）满一分钟再加余量，而不是从发出时算平均间隔（那样正好卡在服务端窗口的边上）
   const slow = new AbortController();
   const next = gate.acquire(slow.signal);
-  await new Promise((r) => setTimeout(r, 5));
-  expect(waits[0]).toBe(20_000);
+  await tick();
+  expect(waits).toEqual([71_000 + 61_000 - now]);
+  // 排在它后面的被取消时立即返回
   const ac = new AbortController();
   const queued = gate.acquire(ac.signal);
   ac.abort(new Error("stop"));
   await expect(queued).rejects.toThrow("stop");
   slow.abort(new Error("slow"));
   await expect(next).rejects.toThrow("slow");
+  // 还没结束的请求占着窗口：等它结束，再从结束时算
+  const single = new RateGate({ rpm: 1, now: () => now, onWait: (ms) => waits.push(ms) });
+  waits.length = 0;
+  const first = await single.acquire(signal);
+  const stopSecond = new AbortController();
+  const second = single.acquire(stopSecond.signal);
+  await tick();
+  expect(waits).toEqual([]);
+  first();
+  await tick();
+  expect(waits).toEqual([61_000]);
+  stopSecond.abort(new Error("second"));
+  await expect(second).rejects.toThrow("second");
   // 设了 JADE_RPM 时不改
   const fixed = new RateGate({ rpm: 30, now: () => now });
   for (let i = 0; i < 4; i++) {
-    await fixed.acquire(signal);
+    (await fixed.acquire(signal))();
     now += 2_000;
   }
   fixed.limited(1);
@@ -197,7 +217,7 @@ test("RateGate spaces requests by the limit and pauses everyone after a 429", as
   // 并发数限流：一起暂停，但不推每分钟的上限
   const busyWaits: number[] = [];
   const busy = new RateGate({ now: () => now, onWait: (ms) => busyWaits.push(ms) });
-  for (let i = 0; i < 10; i++) await busy.acquire(signal);
+  for (let i = 0; i < 10; i++) (await busy.acquire(signal))();
   const concurrency = new ProviderError("HTTP 429: Model is at its concurrency limit (32); please retry later", { retryable: true, status: 429 });
   expect(isConcurrencyLimit(concurrency)).toBe(true);
   busy.limited(5_000, { learn: !isConcurrencyLimit(concurrency) });

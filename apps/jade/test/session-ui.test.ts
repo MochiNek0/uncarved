@@ -5,7 +5,7 @@ import { describe, expect, test } from "bun:test";
 import type { SessionUI } from "../src/api.ts";
 import { PluginHost } from "../src/index.ts";
 import { ScreenBridge } from "../plugins/tui/frontend.ts";
-import type { Choice, Screen, StatusInfo } from "../plugins/tui/screen.ts";
+import type { Choice, JobInfo, Screen, StatusInfo } from "../plugins/tui/screen.ts";
 import { world } from "./helpers.ts";
 
 const PROVIDER = `export default { process(ctx) {
@@ -198,5 +198,41 @@ describe("ScreenBridge status segments", () => {
     expect(draft.value).toBe("hello");
     expect(draft.inserted).toEqual(["!"]);
     expect(draft.hint).toBe("Tab to accept");
+  });
+
+  test("background jobs show only for the current session; output is batched, status at once; dispose removes them", async () => {
+    const { screen } = fakeScreen();
+    const shown: JobInfo[][] = [];
+    screen.jobs = (jobs) => void shown.push(jobs);
+    const bridge = new ScreenBridge();
+    bridge.attach(screen);
+    bridge.show("s1");
+    let stops = 0;
+    const a = bridge.ui.job!({ session: "s1", kind: "shell", title: "bg1 npm run dev", stop: () => void stops++ });
+    bridge.ui.job!({ session: "s2", kind: "agent", title: "elsewhere" });
+    expect(shown.at(-1)!.map((j) => j.title)).toEqual(["bg1 npm run dev"]);
+
+    a.status("running");
+    expect(shown.at(-1)![0]).toMatchObject({ status: "running", done: false, output: "" });
+    const before = shown.length;
+    a.append("one\n");
+    a.append({ text: "two\n", style: "dim" });
+    expect(shown.length).toBe(before);
+    await Bun.sleep(150);
+    expect(shown.at(-1)![0]!.output).toContain("one\n");
+    expect(shown.at(-1)![0]!.output).toContain("two");
+    shown.at(-1)![0]!.stop!();
+    expect(stops).toBe(1);
+
+    a.status("exited with code 0", true);
+    expect(shown.at(-1)![0]!.done).toBe(true);
+    bridge.show("s2");
+    expect(shown.at(-1)!.map((j) => j.title)).toEqual(["elsewhere"]);
+    bridge.show("s1");
+    a.dispose();
+    expect(shown.at(-1)).toEqual([]);
+    // 去掉之后再更新不会让它回来
+    a.status("late");
+    expect(shown.at(-1)).toEqual([]);
   });
 });
