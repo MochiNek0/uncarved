@@ -104,7 +104,7 @@
 
 | 服务 | 核心用它做什么 | 默认提供者 |
 |---|---|---|
-| `frontend@1` | 启动后把控制权交给它：`run({ argv, sessions, signal })` | `jade/tui`（`-p` 时 `jade/print`） |
+| `frontend@1` | 启动后把控制权交给它：`run({ argv, sessions, signal })` | `jade/tui`（`-p` 时 `jade/print`，`--serve` 时 `jade/serve`） |
 | `provider@1` | 新建或恢复会话时取一个 uncarved `Provider` | `jade/models` |
 | `store@1`（可选） | 会话日志存储；没有提供者时用核心自带的 jsonl | — |
 | `jade@1` | 核心自己提供（不是插件）：每个插件的状态和原因、服务的提供者。`/plugins` 用它；插件可以在 `requires` 里写，但没有插件能提供它 | 核心 |
@@ -121,7 +121,7 @@
 
 `frontend@1` 和 `ui@1` 的形状由 jade 定义（`api.ts` 的 `Frontend`、`UI`），因为每个前端都要提供它们、很多插件都要用 `ui@1`：
 
-- `Frontend.run({ argv, sessions, signal })` 返回退出码。`argv` 是核心去掉自己的参数（`plugins`、`--safe`）之后的命令行，`sessions` 是核心的会话管理器（`SessionManager`：`open`、`close`、`current`）。
+- `Frontend.run({ argv, sessions, signal })` 返回退出码。`argv` 是核心去掉自己的参数（`plugins`、`--safe`）之后的命令行，`sessions` 是核心的会话管理器（`SessionManager`：`open`、`close`、`current`，以及 `start`：开一个和当前会话并存、不切换的会话，给一个进程同时跑多个会话的无头前端用；可选成员，前端转交给命令的包装可以没有）。
 - `UI`：`interactive`、`notify(message, level)`、`select({ title, detail, options }, signal)`、`input({ title, initial, placeholder, mask }, signal)`。不能提问的前端（`jade/print`）`interactive` 为 false，`select`、`input` 总是返回 `undefined`。
 - `UI.copy(text)`、`UI.suspend(fn)`（都可选，2026-11-10 加）：把文字放进系统剪贴板；把终端让出来执行 `fn`（例如启动 `$EDITOR`），结束后重新接管。`jade/tui` 的 `suspend` 卸载界面（退出备用屏幕、关掉 raw mode 和鼠标上报），`fn` 结束后重新画：界面的内容都在界面之外的状态里，输入框里打了一半的字先记下再放回去。期间会话照常运行。`jade/editor`（Ctrl+G 用 `$EDITOR` 编辑输入）就是靠它做成插件的。
 - `UI.notice(message, level)`（可选，2026-11-25 加）：显示一条之后还会变的提示，返回 `{ update(message, level) }` 原地改写它。前端现在做不到时返回 `undefined`，调用方改用 `notify`；只有 `jade/tui` 的终端界面能改写。`jade/models` 用它把一个请求接连的重试合成一条：倒计时、第几次重试都改在这一条上，请求成功或这一轮结束时停在结果上。
@@ -305,6 +305,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 |---|---|---|---|
 | `jade/tui` | `frontend@1`（默认）、`ui@1`（含 `session`：状态栏段落、输入框）；启动参数 `--resume <id>`、`-c/--continue`；输入框里的补全（候选来自 `completions@1`）和命令简写（`Command.prefix`）。不认识具体功能：模式、压缩阈值是 jade/modes、jade/compact 自己的状态栏段落，没配模型的提示由 jade/models 给 | `commands@1`、`keys@1`、`renderers@1`；可选 `models@1`、`completions@1`、`sessions@1`、`steer@1` | `ui/*`、`main.ts` 的界面部分（`frontend.ts`）。`tui@1`（local）等第一个要扩展界面的插件出现时再做 |
 | `jade/print` | `frontend@1`（`-p`）、`ui@1` | — | `-p` 模式 |
+| `jade/serve` | `frontend@1`（`--serve`）、`ui@1`：无头常驻，stdin/stdout 一行一个 JSON，用 `sessions.start` 同时跑多个会话 | — | 新增（2026-11-25） |
 | `jade/commands` | `commands@1`：`register`、`get`、`list`、`byPrefix`。只登记不执行，前端带着 `{ signal, ui, sessions, print }` 调用 `run`。命令可以带一个字符的简写 `prefix`（jade/shell 的 `/sh` 是 `!`）和输入框里的说明 `prefixHint`；简写被占了时命令照常注册、没有简写 | — | 插件命令（`PluginCommand`）。自定义命令（Markdown 文件）以后由单独的插件注册进来 |
 | `jade/keys` | `keys@1`：`register`、`get`、`list`；`shift+tab` 也可以注册 | — | 快捷键 |
 | `jade/completions` | `completions@1`：`register`、`list`。输入框补全的注册表：触发字符、占位提示里的说明、候选菜单下的说明、候选（像路径一样用 / 分层）。前端只管列、排序、插入 | — | 原来写死在 jade/tui 里的 `@` 补全（2026-11-12 拆出） |
@@ -399,7 +400,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
    每做一个插件，再问一句：**有没有改到别的内置插件？改的是"给它的服务加方法"，还是"让它认识我"？** 前者是接口在长，记一笔就行。后者说明依赖的方向反了（第三方插件没法让内置插件认识它），记进 [jade-log.md](./jade-log.md) 的"架构挡了路"，把那个接口改成中立的注册表：提供方只管登记，谁要用谁来取（例子：`task@1` → `tools@1`）。
    大部分已完成：web、todo、ask、task、compact、mcp、skills、checks、memory、undo、mentions、continue、repeats、budget，各有测试（`test/<插件>.test.ts`）。期间核心改了两处：会话队列的竞争（上一条 `send` 刚 resolve 就再 `send`，新输入没人处理），兜底关卡只认 `approval@1` 的提供者（见第 7 节）。
    已完成：从 npm、git 和本地目录安装/更新插件（`test/install.test.ts` 覆盖本地目录、git 提交、npm 包、`--link`、`--project`、`--path`、本地改动保护和更新记录）。
-   移植中发现的缺口，以后再定：~~子 Agent 的日志不能关联到父会话~~（2026-11-19 解决：子 Agent 是核心开的子会话，见 [live-tools-and-child-sessions.md](./live-tools-and-child-sessions.md)）；~~`session()` 执行期间（包括 `ctx.effect` 里立即执行的部分）调用 `session.send` 会失败，因为 Runtime 在全部插件加入之后才建~~（2026-11-21 解决：排着队等 Runtime 建好再开始，会话没能打开时 reject；`jade/schedule` 改为会话建好就先检查一次）；一个进程同时只有一个会话、工作目录和项目层插件按进程定，所以后台另开会话、桌面端同时开几个对话都要先让 `SessionManager` 能同时挂同一目录的多个会话。已经补上的："给模型留一句说明"的接口（`prompts@1.note`，memory、undo 原来各自在 `context.project` 里附说明；`/undo` 的已撤销记录仍存在 `$JADE_HOME/checkpoints`）；`jade/checks` 不再复制 jade/shell 找 shell、杀进程树的代码，改由 `shell@1` 提供。
+   移植中发现的缺口，以后再定：~~子 Agent 的日志不能关联到父会话~~（2026-11-19 解决：子 Agent 是核心开的子会话，见 [live-tools-and-child-sessions.md](./live-tools-and-child-sessions.md)）；~~`session()` 执行期间（包括 `ctx.effect` 里立即执行的部分）调用 `session.send` 会失败，因为 Runtime 在全部插件加入之后才建~~（2026-11-21 解决：排着队等 Runtime 建好再开始，会话没能打开时 reject；`jade/schedule` 改为会话建好就先检查一次）；~~一个进程同时只有一个会话~~（2026-11-25：`SessionManager.start` 开并存的会话，`jade/serve` 用它）；工作目录和项目层插件仍按进程定，所以并存的会话都在同一目录。已经补上的："给模型留一句说明"的接口（`prompts@1.note`，memory、undo 原来各自在 `context.project` 里附说明；`/undo` 的已撤销记录仍存在 `$JADE_HOME/checkpoints`）；`jade/checks` 不再复制 jade/shell 找 shell、杀进程树的代码，改由 `shell@1` 提供。
 8. ~~功能对齐后改名为 jade~~：已提前完成（2026-11-05）。旧 jade 归档到 `.archive/jade`，新实现直接占用 `apps/jade` 和 `jade` 命令；功能对齐前，jade 只是开发中的版本。
 
 ## 附录 A：参考调研摘要

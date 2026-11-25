@@ -66,7 +66,7 @@ describe("registries", () => {
   test("the bundled distribution activates, with tui as the default frontend", async () => {
     const { host, reports } = await start();
     try {
-      const bad = host.status().filter((p) => p.state !== "active" && p.state !== "replaced" && !(p.id === "jade/print" && p.state === "skipped"));
+      const bad = host.status().filter((p) => p.state !== "active" && p.state !== "replaced" && !((p.id === "jade/print" || p.id === "jade/serve") && p.state === "skipped"));
       expect(bad).toEqual([]);
       expect(host.plan.frontend).toBe("jade/tui");
       expect(reports).toEqual([]);

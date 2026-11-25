@@ -323,7 +323,22 @@ export interface SessionManager {
   readonly current: Session | undefined;
   /** 新建或恢复一个会话，成功后它成为当前会话，旧会话离开（仍可恢复）。失败时旧会话不受影响 */
   open(opts?: OpenOptions): Promise<Session>;
-  /** 当前会话离开（仍可恢复） */
+  /**
+   * 当前会话离开（仍可恢复）。
+   * start 开的会话也在这时离开
+   */
+  close(): Promise<void>;
+  /**
+   * 新建或恢复一个会话，和当前会话、其他 start 开的会话同时存在：不成为当前会话，不换掉谁。
+   * 给一个进程同时跑多个会话的前端用（例如无头的 jade/serve）。用完调用它的 close（离开，仍可恢复）。
+   * 只有核心交给前端的会话管理器有；前端转交给命令等的包装可以没有
+   */
+  start?(opts?: OpenOptions): Promise<StartedSession>;
+}
+
+/** start 开的会话 */
+export interface StartedSession extends Session {
+  /** 离开（仍可恢复）：中止正在跑的工作，关闭插件的会话作用域。重复调用返回同一个 Promise */
   close(): Promise<void>;
 }
 

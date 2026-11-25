@@ -41,6 +41,7 @@ jade -p "把 README 翻成英文"   # 非交互：把消息发给模型后打印
 cat err.log | jade -p - "解释这个错误"   # "-"：把 stdin 接在消息后面（不写 "-" 时，有消息就不读 stdin）
 jade -p -c "接着做"          # 非交互，接着这个目录里最近一次会话
 jade -p --json "..."       # 结束时在 stdout 输出一个 JSON：session、result（最后的回复）、reason、usage
+jade --serve               # 无头常驻：stdin/stdout 一行一个 JSON，一个进程同时跑多个会话、多轮对话（jade --serve --help 看协议）
 jade -c                    # 继续最近一次会话
 jade --resume <id>         # 恢复指定会话
 jade --safe                # 只加载自带的插件（排查故障用）
@@ -77,6 +78,43 @@ jade 默认在改动前问你。模式由 `jade/approval` 插件提供，用 Shi
 
 安全性靠三条：**拒绝优先**（任何一个插件的拒绝都不能被推翻）、**兜底关卡**（审批插件不在场时核心拒绝所有写操作，而不是放行）、**层级**（项目层插件换不掉你的审批、模型配置和前端）。审批插件坏掉的结果是"什么都改不了"，不是"什么都放行"。
 
+## 无头模式
+
+`jade --serve` 不画界面、常驻运行：stdin 每行一个 JSON 请求，stdout 每行一个 JSON 事件，一个进程同时跑多个会话。协议见 `jade --serve --help`。
+
+无头模式没人能回答审批，要问的调用一律拒绝。默认的 `ask` 模式下连工作目录里的 `write_file` 也会被拒绝，只能读。要让它改文件，在 `$JADE_HOME/config.json` 里设模式，例如 `{"jade/approval": {"mode": "auto"}}`（工作目录内的改动放行，判断不了的先让模型审，审不过的拒绝）。`jade -p` 也是这样。
+
+### 内存占用
+
+一个 `jade --serve` 进程里开 1、5、10、20 个会话，每个会话同时跑 5 轮带工具调用的真实模型对话，每轮结束等 1 秒后对整棵进程树采样，口径和提示词与 jcode 的 [bench_headless_memory.py](https://github.com/1jehuang/jcode/blob/master/scripts/bench_headless_memory.py) 相同。复现：`bun scripts/bench-serve-memory.ts --sessions 1,5,10,20 --runtime node`（`--scripted` 换成不联网的假模型）。
+
+| 工具 | 第一个会话 | 每多一个会话 | 和 jcode 比（每多一个） |
+|---|---:|---:|---|
+| **jade**（Node） | **75.6 MB** | **~2.2 MB** | 0.67× |
+| jade（Bun，假模型） | 217.3 MB | ~4.8 MB | 1.45× |
+| jcode | 71.3 MB | ~3.3 MB | 基准 |
+| OpenCode | 637.1 MB | ~5.9 MB | 1.8× |
+| pi | 84.0 MB | ~79.6 MB | 24.1× |
+| Claude Code | 272.9 MB | ~169.3 MB | 51.3× |
+| Codex CLI | 398.6 MB | ~194.1 MB | 58.8× |
+
+| 工具 | 启动到能接收输入 | 和 jcode 比 |
+|---|---:|---|
+| jade（Node） | 289 ms | ~15× |
+| jade（Bun） | 313 ms | ~16× |
+| jcode | 19.1 ms | 基准 |
+| pi | 596.4 ms | 31.2× |
+| Codex CLI | 905.8 ms | 47.4× |
+| OpenCode | 1047.9 ms | 54.9× |
+| Claude Code | 3512.8 ms | 183.9× |
+
+jade 的数字测于 2026-11-25（i5-1340P、32 GB、Windows 11，Node 22.22 / Bun 1.3.9，模型 egg-alpha-004）；其余各行抄自 [jcode 的 README](https://github.com/1jehuang/jcode)，它没写硬件和平台。两边口径不完全相同，只能粗看：
+
+- jcode 量的是 Linux 上的 PSS（共享的内存按进程分摊）；Windows 上量的是工作集，共享的内存整份计入，数字偏大。同一次测量的私有字节：1 个会话 70 MB，20 个会话 118.5 MB。
+- "每多一个会话" = （20 个会话 − 1 个会话）÷ 19，都取第 5 轮之后的值。jcode 没写它怎么算。
+- 启动时间：jcode 量的是在交互界面里打的字出现在屏幕上（10 次启动）；jade 量的是从启动 `jade --serve` 到回复 `opened`（10 次，中位数），不是同一个指标。
+- npm 装的 `jade` 用 Node 运行。Bun 一开始就多占约 150 MB。
+
 ## 会话与恢复
 
 每个会话是一条只追加的事件日志，内核状态完全由日志重建。进程退出后会话仍在，`jade -c` 或 `jade --resume <id>` 接着跑。会话索引在 `$JADE_HOME/state/sessions.jsonl`。崩溃恢复时，未完成的幂等工具会重跑，其余中断的工具交给你或插件决定，内核不自动重试。
@@ -87,7 +125,7 @@ jade 自带的功能全是 `apps/jade/plugins/` 下的普通插件，和第三�
 
 | 插件 | 提供的能力 |
 |---|---|
-| `jade/tui`、`jade/print` | 终端界面、`-p` 非交互模式 |
+| `jade/tui`、`jade/print`、`jade/serve` | 终端界面、`-p` 非交互模式、`--serve` 无头多会话模式 |
 | `jade/fs`、`jade/shell` | 文件读写、运行命令（`shell@1` 供其他插件调用） |
 | `jade/web` | `web_fetch`、`web_search`、`/search` |
 | `jade/models` | 模型路由、`/model`、`provider@1` |

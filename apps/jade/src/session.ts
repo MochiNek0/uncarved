@@ -35,6 +35,7 @@ import {
   type Session,
   type SessionContext,
   type SessionManager,
+  type StartedSession,
   type SessionTool,
   type SessionUI,
   type SpawnOptions,
@@ -441,6 +442,8 @@ class LiveSession implements Session {
 export class Sessions implements SessionManager {
   readonly #host: SessionHost;
   #current: LiveSession | undefined;
+  /** start 开的会话和交出去的句柄 */
+  #started = new Map<LiveSession, StartedSession>();
   #store: LogStore | undefined;
   /** 换会话串行进行 */
   #switching: Promise<unknown> = Promise.resolve();
@@ -469,15 +472,62 @@ export class Sessions implements SessionManager {
     return run;
   }
 
-  /** 当前会话离开（detach，仍可恢复） */
+  /** 当前会话离开（detach，仍可恢复）；start 开的会话一并离开 */
   async close(): Promise<void> {
     await this.#switching;
     const old = this.#current;
     this.#current = undefined;
     if (old) await this.#leave(old);
+    for (const h of [...this.#started.values()]) await h.close();
+  }
+
+  /** 和当前会话并存的会话（无头前端同时跑多个会话）：不成为当前会话，各自 close */
+  start(opts: OpenOptions = {}): Promise<StartedSession> {
+    const run = this.#switching.then(() => this.#start(opts));
+    this.#switching = run.catch(() => {});
+    return run;
+  }
+
+  async #start(opts: OpenOptions): Promise<StartedSession> {
+    // 同一个会话的日志不能同时挂两个 Runtime
+    if (opts.resume !== undefined && (opts.resume === this.#current?.id || [...this.#started.keys()].some((s) => s.id === opts.resume))) {
+      throw new Error(`session ${opts.resume} is already open`);
+    }
+    const s = await this.#build(opts);
+    let closing: Promise<void> | undefined;
+    const handle: StartedSession = {
+      id: s.id,
+      get state() {
+        return s.state;
+      },
+      send: (input) => s.send(input),
+      idle: () => s.idle(),
+      recover: () => s.recover(),
+      abort: (reason) => s.abort(reason),
+      subscribe: (fn) => s.subscribe(fn),
+      history: () => s.history(),
+      tool: (name) => s.tool(name),
+      close: () =>
+        (closing ??= (async () => {
+          this.#started.delete(s);
+          await this.#leave(s);
+        })()),
+    };
+    this.#started.set(s, handle);
+    return handle;
   }
 
   async #open(opts: OpenOptions): Promise<Session> {
+    const s = await this.#build(opts);
+    // 提交：新会话成为当前会话，然后旧会话离开
+    const old = this.#current;
+    this.#current = s;
+    if (old) await this.#leave(old);
+    return s;
+  }
+
+  /** 建好一个会话（全部插件加入、Runtime 建好）。任何一步失败，新会话的作用域全部撤销 */
+  async #build(opts: OpenOptions): Promise<LiveSession> {
     const host = this.#host;
     const provider = host.service<Provider>("provider@1", host.core);
     if (!provider) throw new ServiceUnavailable("provider@1", "(none): no active plugin provides a model");
@@ -508,10 +558,6 @@ export class Sessions implements SessionManager {
     s.subscribe((n) => {
       if (n.type === "hook-error") host.report(`plugin ${n.info.plugin} failed at ${n.info.point}: ${n.info.error instanceof Error ? n.info.error.message : String(n.info.error)}`);
     });
-    // 提交：新会话成为当前会话，然后旧会话离开
-    const old = this.#current;
-    this.#current = s;
-    if (old) await this.#leave(old);
     return s;
   }
 

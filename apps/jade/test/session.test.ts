@@ -432,6 +432,48 @@ describe("switching", () => {
   });
 });
 
+describe("sessions started side by side", () => {
+  test("start does not replace the current session, and started sessions run turns at the same time", async () => {
+    const { host } = await setup();
+    const current = await host.sessions.open();
+    const a = await host.sessions.start();
+    const b = await host.sessions.start();
+    expect(host.sessions.current).toBe(current);
+    expect(new Set([current.id, a.id, b.id]).size).toBe(3);
+    g.__script!.push(say("one"), say("two"));
+    await Promise.all([a.send(msg("to a")), b.send(msg("to b"))]);
+    expect(a.state.messages).toHaveLength(2);
+    expect(b.state.messages).toHaveLength(2);
+    expect(g.__log).toEqual([]);
+    await host.close();
+  });
+
+  test("close leaves only that session, which can be resumed; host.close leaves the rest", async () => {
+    const { host } = await setup();
+    g.__script!.push(say("hello"));
+    const a = await host.sessions.start();
+    const b = await host.sessions.start();
+    await a.send(msg("first"));
+    await a.close();
+    expect(g.__log).toEqual([`tools closed ${a.id}`]);
+    await expect(a.send(msg("again"))).rejects.toThrow("was closed");
+
+    const again = await host.sessions.start({ resume: a.id });
+    expect(again.state.messages).toHaveLength(2);
+    await host.close();
+    expect(g.__log!.sort()).toEqual([`tools closed ${a.id}`, `tools closed ${a.id}`, `tools closed ${b.id}`].sort());
+  });
+
+  test("a session that is already open cannot be started again", async () => {
+    const { host } = await setup();
+    const current = await host.sessions.open();
+    const a = await host.sessions.start();
+    await expect(host.sessions.start({ resume: current.id })).rejects.toThrow("already open");
+    await expect(host.sessions.start({ resume: a.id })).rejects.toThrow("already open");
+    await host.close();
+  });
+});
+
 describe("plugins that cannot join", () => {
   test("a throwing session() leaves that plugin out of the session only", async () => {
     const { w, host } = await setup((w) => w.plugin("bundled", { id: "grumpy" }, `export default { session() { throw new Error("nope"); } };`));

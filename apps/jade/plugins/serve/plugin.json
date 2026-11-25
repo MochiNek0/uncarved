@@ -1,0 +1,8 @@
+{
+  "id": "jade/serve",
+  "version": "0.1.0",
+  "api": "^1",
+  "entry": "./index.ts",
+  "provides": ["frontend@1", "ui@1"],
+  "frontend": { "name": "serve", "flag": "--serve" }
+}
