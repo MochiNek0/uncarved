@@ -102,6 +102,8 @@ export interface Screen {
   readonly draft?: { text(): string; insert(text: string): void; set(text: string): void; hint(text: string | undefined): void };
   /** 后台的事（当前会话的全部，按登记的先后）；只有终端界面有 */
   jobs?(jobs: JobInfo[]): void;
+  /** 打开后台的事的列表（同 ctrl+t）；只有终端界面有 */
+  showJobs?(): void;
   /** 把文字放进系统剪贴板（OSC 52）；只有终端界面有 */
   copy?(text: string): void;
   /** 把终端让出来执行 fn（例如启动 $EDITOR），结束后重新接管、重画界面；只有终端界面有 */
@@ -198,6 +200,7 @@ export function safeScreen(screen: Screen): Screen {
     amend: (id, text, o) => screen.amend(id, s(text), o && { ...o, details: opt(o.details) }),
     ...(screen.note ? { note: (id: string, text: string) => screen.note!(id, s(text)) } : {}),
     ...(screen.jobs ? { jobs: (jobs: JobInfo[]) => screen.jobs!(jobs.map((j) => ({ ...j, title: s(j.title), status: s(j.status), output: s(j.output) }))) } : {}),
+    ...(screen.showJobs ? { showJobs: () => screen.showJobs!() } : {}),
     progress: (id, line, o) => screen.progress(id, opt(line), o),
     stream: (kind, text) => {
       // 上一段末尾没完的转义序列接到这一段前面再过滤，不然它被拆成两半，后一半当成文字显示出来

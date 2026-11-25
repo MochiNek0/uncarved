@@ -327,6 +327,13 @@ export class Store {
     this.#repaintTimer = setTimeout(() => this.#repaintNow(), REPAINT_GAP_MS);
   }
 
+  /** 打开后台的事的列表（ctrl+t、点状态栏、/tasks）；已经开着对话框时不开 */
+  openJobs() {
+    if (this.state.dialogs.length) return;
+    const d: Dialog = { kind: "jobs", resolve: () => this.update({ dialogs: this.state.dialogs.filter((x) => x !== d) }, true) };
+    this.update({ dialogs: [...this.state.dialogs, d] }, true);
+  }
+
   #repaintNow(patch: Partial<UiState> = {}) {
     clearTimeout(this.#repaintTimer);
     this.paused = false;
@@ -820,6 +827,7 @@ export function tuiScreen(opts: TuiOptions): Screen {
     jobs(jobs) {
       store.update({ jobs });
     },
+    showJobs: () => store.openJobs(),
     draft: {
       text: () => draft.current?.get() ?? "",
       insert: (text) => draft.current?.apply((s) => edit.insert(s, text.replace(/\r\n?/g, "\n"))),
@@ -1061,6 +1069,7 @@ function App({
   const dialog = state.dialogs.find((d) => d.kind !== "jobs") ?? state.dialogs[0];
   const columns = Math.max(1, state.size.columns - 1);
   const rows = state.size.rows;
+  const statusWidth = Math.max(10, columns - 2);
   const compact = rows < COMPACT_ROWS;
   // 运行中每一帧（FRAME_MS）整体重画一次，推动转圈和吉祥物的动画。不能让 Spinner、吉祥物自己重画：
   // Ink 只在输入框也跟着提交的那一帧保留光标，否则把光标藏起来，运行中光标就不见了。
@@ -1178,14 +1187,15 @@ function App({
     if (key.ctrl && input === "l") return store.repaint();
     // 展开或收起最近的一项（工具结果、思考、检查报告），鼠标点不了时也能看完整内容
     if (key.ctrl && input === "o") return store.toggleLatest(start, view);
-    // 后台的事的列表；已经开着对话框时不开
-    if (key.ctrl && input === "t") {
-      if (state.dialogs.length) return;
-      const d: Dialog = { kind: "jobs", resolve: () => store.update({ dialogs: store.get().dialogs.filter((x) => x !== d) }, true) };
-      return store.update({ dialogs: [...state.dialogs, d] }, true);
-    }
+    // 后台的事的列表
+    if (key.ctrl && input === "t") return store.openJobs();
     const mouse = mouseEvent(input);
     if (mouse) {
+      // 点状态栏（界面的最后一行，比终端少一行）里后台的事那一段也能打开列表：终端自己占用了 ctrl+t 时用
+      if (mouse.button === 0 && mouse.press && mouse.y === rows - 2) {
+        const cols = jobsColumns(statusSegments(state.status, state.jobs, statusWidth));
+        if (cols && mouse.x >= cols[0] && mouse.x <= cols[1]) return store.openJobs();
+      }
       // 对话区里的位置；clamp 时拖出对话区停在第一行或最后一行，否则在对话区外返回 undefined
       const at = (clamp: boolean): Point | undefined => {
         const i = mouse.y - top;
@@ -1326,7 +1336,7 @@ function App({
             place: inputPlace,
             onCopy: copyText,
           }),
-          h(StatusBar, { status: state.status, jobs: state.jobs, width: Math.max(10, columns - 2) }),
+          h(StatusBar, { status: state.status, jobs: state.jobs, width: statusWidth }),
         ),
       ),
     ),
@@ -1436,6 +1446,8 @@ interface Segment {
   dropAt?: number;
   color?: string;
   dim?: boolean;
+  /** 后台的事的那一段：点一下打开列表 */
+  jobs?: boolean;
 }
 
 /** 插件段落的语义颜色怎么画 */
@@ -1462,7 +1474,8 @@ export function fitSegments(segments: Segment[], width: number): Segment[] {
   return kept;
 }
 
-function StatusBar({ status, jobs, width }: { status: StatusInfo; jobs: JobInfo[]; width: number }) {
+/** 状态栏的内容，已经按宽度缩短 */
+function statusSegments(status: StatusInfo, jobs: JobInfo[], width: number): Segment[] {
   const ctx = status.context;
   const pct = ctx ? Math.round((ctx.used / ctx.limit) * 100) : 0;
   const nearFull = pct >= 80;
@@ -1484,7 +1497,7 @@ function StatusBar({ status, jobs, width }: { status: StatusInfo; jobs: JobInfo[
   const segments: Segment[] = [
     ...kept.map((p) => plugin(p, true)),
     // 在后台运行的事：一直留着，窄的时候去掉按键说明
-    ...(running ? [{ text: `${running} · ctrl+t to view`, short: running, shortAt: 6.5, color: "cyan" }] : []),
+    ...(running ? [{ text: `${running} · click or ctrl+t to view`, short: running, shortAt: 6.5, color: "cyan", jobs: true }] : []),
     ctx
       ? {
           text: `ctx ${tokens(ctx.used)}/${tokens(ctx.limit)} (${pct}%)`,
@@ -1504,7 +1517,7 @@ function StatusBar({ status, jobs, width }: { status: StatusInfo; jobs: JobInfo[
         ]
       : []),
     ...(status.cache !== undefined
-      ? [{ text: `cache ${Math.round(status.cache * 100)}%`, dropAt: 7, dim: true }]
+      ? [{ text: `cache ${Math.round(status.cache * 1000) / 10}%`, dropAt: 7, dim: true }]
       : []),
     ...(status.spent
       ? [
@@ -1526,7 +1539,23 @@ function StatusBar({ status, jobs, width }: { status: StatusInfo; jobs: JobInfo[
       dim: true,
     },
   ];
-  const shown = fitSegments(segments, width);
+  return fitSegments(segments, width);
+}
+
+/** 状态栏里后台的事那一段占的列（从 0 数，含两端）；没有这一段时是 undefined。状态栏左右各空一列 */
+function jobsColumns(segments: Segment[]): [number, number] | undefined {
+  let x = 1;
+  for (const [i, s] of segments.entries()) {
+    if (i) x += 3;
+    const w = visibleWidth(s.text);
+    if (s.jobs) return [x, x + w - 1];
+    x += w;
+  }
+  return undefined;
+}
+
+function StatusBar({ status, jobs, width }: { status: StatusInfo; jobs: JobInfo[]; width: number }) {
+  const shown = statusSegments(status, jobs, width);
   return h(
     Box,
     { paddingX: 1 },

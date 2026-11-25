@@ -444,6 +444,26 @@ test("the notice about loaded instruction files survives the screen clear when t
   }
 });
 
+test("/tasks opens the list of background tasks, like ctrl+t", async () => {
+  const { start } = await setup();
+  const t = fakeTerminal();
+  const host = await start();
+  try {
+    const done = host.service<Frontend>("frontend@1")!.run({ argv: [], sessions: host.sessions, signal: new AbortController().signal });
+    await sleep(300);
+    await t.type("/tasks");
+    await t.type("\r");
+    await until(() => t.output().includes("Nothing is running in the background."));
+    await t.type("\x1b");
+    await sleep(50);
+    await t.type("/exit");
+    await t.type("\r");
+    expect(await done).toBe(0);
+  } finally {
+    await host.close();
+  }
+});
+
 test("a message that starts with a path is sent to the model, not run as a command", async () => {
   const { start } = await setup();
   g.__script = [{ content: [{ kind: "text", text: "path answer", origin: MODEL, trust: "trusted" }], stopReason: "end" }];

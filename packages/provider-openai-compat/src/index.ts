@@ -70,6 +70,8 @@ interface StreamChunk {
     prompt_tokens_details?: { cached_tokens?: number } | null;
     /** Kimi 的旧字段，和 prompt_tokens_details.cached_tokens 一样 */
     cached_tokens?: number;
+    /** DeepSeek 的字段：命中缓存的部分（prompt_tokens 已经包含它） */
+    prompt_cache_hit_tokens?: number;
   } | null;
   /** 部分服务端在流中途出错时发送的块 */
   error?: { message?: string; code?: number | string };
@@ -212,7 +214,7 @@ export function openaiCompatProvider(opts: OpenAICompatOptions): Provider {
             ? {
                 inputTokens: usage.prompt_tokens,
                 outputTokens: usage.completion_tokens,
-                cacheReadTokens: usage.prompt_tokens_details?.cached_tokens ?? usage.cached_tokens ?? undefined,
+                cacheReadTokens: usage.prompt_tokens_details?.cached_tokens ?? usage.cached_tokens ?? usage.prompt_cache_hit_tokens ?? undefined,
               }
             : undefined,
         };

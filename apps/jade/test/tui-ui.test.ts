@@ -493,10 +493,9 @@ describe("terminal UI", () => {
       { id: 2, kind: "shell", title: "bg1 npm run dev", status: "running", done: false, output: "ready on :3000\n", stop: () => void stopped.push(2) },
       { id: 3, kind: "shell", title: "bg2 make", status: "exited with code 0", done: true, output: "" },
     ]);
-    await sleep(80);
-    expect(output()).toContain("1 agent · 1 shell · ctrl+t to view");
+    await until(output, "1 agent · 1 shell · click or ctrl+t to view");
     await type("\x14"); // ctrl+t
-    expect(output()).toContain("Background tasks");
+    await until(output, "Background tasks");
     expect(output()).toContain("agent · find the parser · read_file(src/a.ts)");
     expect(output()).toContain("shell · bg2 make · exited with code 0");
     // 第二项：看输出，在里面按 x 停掉它
@@ -517,6 +516,21 @@ describe("terminal UI", () => {
     screen.busy(undefined);
     await type("hi\r");
     expect(calls.submit).toEqual(["hi"]);
+  });
+
+  test("clicking the background jobs in the status bar opens the list, for terminals that take ctrl+t", async () => {
+    const { screen, type, output } = setup();
+    screen.jobs!([{ id: 1, kind: "shell", title: "bg1 npm run dev", status: "running", done: false, output: "" }]);
+    await until(output, "1 shell · click or ctrl+t to view");
+    // 状态栏是最后一行（终端 40 行，界面占 39 行）；点在这一段外面不打开
+    await type("\x1b[<0;60;39M\x1b[<0;60;39m");
+    await sleep(50);
+    expect(output()).not.toContain("Background tasks");
+    await type("\x1b[<0;30;39M\x1b[<0;30;39m");
+    await until(output, "Background tasks");
+    await type("\x1b");
+    screen.showJobs!();
+    await until(output, "bg1 npm run dev");
   });
 
   test("ctrl+j starts a new line; enter sends", async () => {
@@ -572,6 +586,14 @@ describe("terminal UI", () => {
     const { screen, output } = setup();
     screen.status({ plugins: [{ plugin: "ci", text: "CI passing" }] });
     await until(output, "CI passing");
+  });
+
+  test("the cache hit rate shows at most one decimal", async () => {
+    const { screen, output } = setup();
+    screen.status({ cache: 0.98765 });
+    await until(output, "cache 98.8%");
+    screen.status({ cache: 0.5 });
+    await until(output, "cache 50%");
   });
 
   test("plugins' panels are shown above the input", async () => {

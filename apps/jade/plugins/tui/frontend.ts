@@ -45,6 +45,7 @@ jade's own commands (plugins, update, --safe): jade help`;
 /** 前端自己的命令：帮助和退出。其余命令都来自 commands@1 */
 const OWN: CommandInfo[] = [
   { name: "help", about: "list the commands and keys" },
+  { name: "tasks", about: "list sub-agents and background commands (same as ctrl+t)" },
   { name: "exit", about: "quit (the session stays resumable)" },
 ];
 
@@ -53,7 +54,7 @@ const KEYS = [
   "  send       enter send · ctrl+j, alt+enter or \\ then enter: new line · tab completes /commands",
   "  input      ↑↓ history · ctrl+r search history · ↑ on the first line edits queued messages · esc twice or ctrl+c clears the input",
   "  editing    ctrl+←/→ or alt+b/f move by words · ctrl+w or alt+backspace delete a word · ctrl+a/e line start/end · ctrl+u/k delete to start/end",
-  "  running    esc interrupt (twice to also move queued messages back to the input) · ctrl+c twice to exit · ctrl+t sub-agents and background commands",
+  "  running    esc interrupt (twice to also move queued messages back to the input) · ctrl+c twice to exit · ctrl+t, /tasks or a click on the status bar lists sub-agents and background commands",
   "  transcript pgup/pgdn scroll · ctrl+home/end top/bottom · ctrl+o expands the latest item, a click the one under it · drag to select and copy · ctrl+l redraw",
 ].join("\n");
 
@@ -693,6 +694,11 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
     const name = input.slice(1).split(/\s+/)[0]!.toLowerCase();
     const rest = input.slice(1).replace(/^\S+\s*/, "");
     if (name === "exit" || name === "quit") return false;
+    if (name === "tasks") {
+      if (screen.showJobs) screen.showJobs();
+      else screen.log(dim("[background tasks are only listed in the terminal interface]"));
+      return true;
+    }
     if (name === "help") {
       // 快捷键在前、命令在后：屏幕放不下时，紧挨着输入框的命令列表还看得见
       // 命令的简写、输入框的补全来自插件，跟着列出来

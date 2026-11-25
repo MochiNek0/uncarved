@@ -175,6 +175,15 @@ test("缓存命中数放在 usage 顶层 cached_tokens 的服务（Kimi 旧格�
   expect(res.usage).toEqual({ inputTokens: 12, outputTokens: 3, cacheReadTokens: 5 });
 });
 
+test("缓存命中数放在 prompt_cache_hit_tokens 的服务（DeepSeek）也能读到", async () => {
+  const { fetchFn } = fakeServer([
+    [chunk({ content: "ok" }, "stop"), JSON.stringify({ choices: [], usage: { prompt_tokens: 12, completion_tokens: 3, prompt_cache_hit_tokens: 7, prompt_cache_miss_tokens: 5 } })],
+  ]);
+  const provider = openaiCompatProvider({ baseURL: "https://example.test/v1", model: "m", fetch: fetchFn });
+  const res = await provider.complete({ system: [], tools: [], messages: [] }, { signal: new AbortController().signal });
+  expect(res.usage).toEqual({ inputTokens: 12, outputTokens: 3, cacheReadTokens: 7 });
+});
+
 test("错误的工具结果加上 [error] 前缀，这个格式没有 is_error 字段；空的结果给占位", async () => {
   const { fetchFn, bodies } = fakeServer([[chunk({ content: "ok" }, "stop")]]);
   const provider = openaiCompatProvider({ baseURL: "https://example.test/v1", model: "m", fetch: fetchFn });
