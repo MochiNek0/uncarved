@@ -470,6 +470,8 @@ describe("sessions started side by side", () => {
     const a = await host.sessions.start();
     await expect(host.sessions.start({ resume: current.id })).rejects.toThrow("already open");
     await expect(host.sessions.start({ resume: a.id })).rejects.toThrow("already open");
+    await expect(host.sessions.open({ resume: a.id })).rejects.toThrow("already open");
+    expect(host.sessions.current).toBe(current);
     await host.close();
   });
 });

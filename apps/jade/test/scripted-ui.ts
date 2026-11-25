@@ -64,8 +64,8 @@ export interface Shared {
   statuses: { plugin: string; segment: unknown }[];
   /** 经 ui@1.job 登记的后台的事：追加的输出（纯文字）、状态，去掉了没有 */
   jobs: { session: string; kind: string; title: string; output: string; statuses: string[]; disposed: boolean }[];
-  /** 为 true 时，后台的事第一次有输出就当作用户按了停 */
-  stopJobs: boolean;
+  /** 为 true 时，后台的事第一次有输出就当作用户按了停；"at-end" 时在它从列表里去掉的那一刻按停（已经跑完了） */
+  stopJobs: boolean | "at-end";
 }
 
 const FAKE_MODEL = `export default { process(ctx) {
@@ -109,10 +109,13 @@ export default { process(ctx) {
       return {
         append: (t) => {
           j.output += plain(t);
-          if (g().stopJobs && !stopped && r.stop) { stopped = true; r.stop(); }
+          if (g().stopJobs === true && !stopped && r.stop) { stopped = true; r.stop(); }
         },
         status: (s, done) => void j.statuses.push(done ? s + " (done)" : s),
-        dispose: () => void (j.disposed = true),
+        dispose: () => {
+          if (g().stopJobs === "at-end" && !j.disposed && r.stop) r.stop();
+          j.disposed = true;
+        },
       };
     },
   });

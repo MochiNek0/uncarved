@@ -103,6 +103,18 @@ describe("jade/task", () => {
     expect(shared.jobs[0]!.disposed).toBe(true);
   });
 
+  test("a stop that comes after the sub-agent already reported does not throw its report away", async () => {
+    const { shared, host, send } = await scriptedHost();
+    shared.stopJobs = "at-end";
+    shared.script.push(use("u1", "task", { description: "look", prompt: "list the root" }), say("report: empty"), say("done"));
+    const s = await host.sessions.open();
+    await send(s, "go");
+    const result = shared.requests[2]!.messages.at(-1)!.content.find((b) => b.kind === "tool_result") as Extract<Block, { kind: "tool_result" }>;
+    expect(result.isError).toBeFalsy();
+    expect(textOf(result.content)).toContain("report: empty");
+    expect(textOf(result.content)).not.toContain("The user stopped");
+  });
+
   test("the sub-agent gets the session's instruction files, the repository's ones untrusted; instructions: false leaves them out", async () => {
     for (const off of [false, true]) {
       const { cwd, host, shared, send } = await scriptedHost(off ? { config: { "jade/task": { instructions: false } } } : {});

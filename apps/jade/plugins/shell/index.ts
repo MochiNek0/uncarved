@@ -20,6 +20,8 @@ const SH_TIMEOUT_MS = 600_000;
 const SH_LIVE_CHARS = 4000;
 /** /sh 的结果收起时那一行最多这么多个字符 */
 const SH_SUMMARY = 160;
+/** 后台列表里最多留这么多个已经结束的后台命令（每个都带着输出） */
+const MAX_FINISHED_JOBS = 10;
 /** 结果的一行：失败的是错误，成功的是次要的（带语义样式的文字，怎么画由前端决定） */
 const shade = (failed: boolean, text: string): Span => ({ text, style: failed ? "error" : "dim" });
 
@@ -105,6 +107,8 @@ export default definePlugin({
     const jobs = new Set<Job>();
     /** 用户在后台列表里停掉的 */
     const stoppedByUser = new Set<string>();
+    /** 已经结束、还留在列表里的，先结束的在前；多于 MAX_FINISHED_JOBS 个时去掉最早的 */
+    const finished: Job[] = [];
     const { tools, executable, unavailable, shutdown, list, kill } = shellTools({
       cwd: ctx.cwd,
       ...(shell ? { shell } : {}),
@@ -128,7 +132,14 @@ export default definePlugin({
         job.status("running");
         return {
           output: (text) => job.append(text),
-          exit: (code) => job.status(stoppedByUser.has(bg.id) ? "stopped by you" : `exited with code ${code}`, true),
+          exit: (code, killed) => {
+            job.status(stoppedByUser.has(bg.id) ? "stopped by you" : killed ? "stopped" : `exited with code ${code}`, true);
+            finished.push(job);
+            for (const old of finished.splice(0, Math.max(0, finished.length - MAX_FINISHED_JOBS))) {
+              old.dispose();
+              jobs.delete(old);
+            }
+          },
         };
       },
     });

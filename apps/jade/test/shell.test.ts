@@ -235,6 +235,25 @@ describe("jade/shell in a session", () => {
     expect(job()!.disposed).toBe(true);
   }, 30_000);
 
+  test("in the background jobs, a command the model stopped says stopped, and only the latest finished commands are kept", async () => {
+    const w = await scriptedHost();
+    w.shared.script.push(
+      use("u1", "bash", { command: "sleep 30", run_in_background: true }),
+      use("u2", "kill_shell", { id: "bg1" }),
+      ...Array.from({ length: 11 }, (_, i) => use(`e${i}`, "bash", { command: `echo ${i}`, run_in_background: true })),
+      say("done"),
+    );
+    const s = await w.host.sessions.open();
+    await w.send(s, "go");
+    const finished = () => w.shared.jobs.filter((j) => j.statuses.some((t) => t.endsWith("(done)"))).length;
+    for (let i = 0; i < 100 && finished() < 12; i++) await Bun.sleep(100);
+    expect(w.shared.jobs[0]!.statuses).toEqual(["running", "stopped (done)"]);
+    expect(w.shared.jobs[1]!.statuses).toEqual(["running", "exited with code 0 (done)"]);
+    // 12 个都结束了，只留最后结束的 10 个
+    expect(w.shared.jobs.filter((j) => !j.disposed)).toHaveLength(10);
+    await w.host.sessions.close();
+  }, 30_000);
+
   test("/sh runs the user's command without the model and notes the output for the next request", async () => {
     const w = await scriptedHost();
     const s = await w.host.sessions.open();

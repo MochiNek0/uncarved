@@ -490,7 +490,7 @@ export class Sessions implements SessionManager {
 
   async #start(opts: OpenOptions): Promise<StartedSession> {
     // 同一个会话的日志不能同时挂两个 Runtime
-    if (opts.resume !== undefined && (opts.resume === this.#current?.id || [...this.#started.keys()].some((s) => s.id === opts.resume))) {
+    if (opts.resume !== undefined && (opts.resume === this.#current?.id || this.#isStarted(opts.resume))) {
       throw new Error(`session ${opts.resume} is already open`);
     }
     const s = await this.#build(opts);
@@ -517,7 +517,13 @@ export class Sessions implements SessionManager {
     return handle;
   }
 
+  #isStarted(id: string): boolean {
+    return [...this.#started.keys()].some((s) => s.id === id);
+  }
+
   async #open(opts: OpenOptions): Promise<Session> {
+    // 同一个会话的日志不能同时挂两个 Runtime：start 开着的不能再成为当前会话
+    if (opts.resume !== undefined && this.#isStarted(opts.resume)) throw new Error(`session ${opts.resume} is already open`);
     const s = await this.#build(opts);
     // 提交：新会话成为当前会话，然后旧会话离开
     const old = this.#current;

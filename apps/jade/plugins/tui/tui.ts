@@ -1542,7 +1542,11 @@ function statusSegments(status: StatusInfo, jobs: JobInfo[], width: number): Seg
   return fitSegments(segments, width);
 }
 
-/** 状态栏里后台的事那一段占的列（从 0 数，含两端）；没有这一段时是 undefined。状态栏左右各空一列 */
+/**
+ * 状态栏里后台的事那一段占的列（从 0 数，含两端）；没有这一段时是 undefined。
+ * 照着 StatusBar 的画法算（左右各空一列、段落间是 " · "），点击的行是界面最后一行（App 里的 rows - 2）：
+ * 改了状态栏的位置或画法要跟着改，tui-ui 测试里点状态栏的那一条会发现
+ */
 function jobsColumns(segments: Segment[]): [number, number] | undefined {
   let x = 1;
   for (const [i, s] of segments.entries()) {

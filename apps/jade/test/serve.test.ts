@@ -37,10 +37,10 @@ export default { process(ctx) {
 
 type Event = Record<string, unknown> & { type: string; session?: string; id?: unknown };
 
-async function serve(script: { say: string; delay?: number }[]) {
-  const home = realpathSync.native(await mkdtemp(path.join(os.tmpdir(), "jade-home-")));
-  const cwd = realpathSync.native(await mkdtemp(path.join(os.tmpdir(), "jade-cwd-")));
-  tmp.push(home, cwd);
+async function serve(script: { say: string; delay?: number }[], dirs?: { home: string; cwd: string }) {
+  const home = dirs?.home ?? realpathSync.native(await mkdtemp(path.join(os.tmpdir(), "jade-home-")));
+  const cwd = dirs?.cwd ?? realpathSync.native(await mkdtemp(path.join(os.tmpdir(), "jade-cwd-")));
+  if (!dirs) tmp.push(home, cwd);
   const dir = path.join(home, "plugins", "fake-model");
   await mkdir(dir, { recursive: true });
   await writeFile(
@@ -74,7 +74,7 @@ async function serve(script: { say: string; delay?: number }[]) {
       waiters.push({ match, resolve });
     });
   const reply = (id: string) => next((e) => e.id === id);
-  return { home, cwd, send, next, reply, events, exited, end: () => child.stdin.end(), stderr: () => stderr };
+  return { home, cwd, send, next, reply, events, exited, end: () => child.stdin.end(), kill: () => child.kill("SIGKILL"), stderr: () => stderr };
 }
 
 describe("jade --serve", () => {
@@ -161,6 +161,27 @@ describe("jade --serve", () => {
     // 出错之后会话照常能用
     t.send({ type: "send", id: "m2", session: b, text: "again" });
     expect(await t.reply("m2")).toMatchObject({ type: "done", reason: "error" });
+    t.end();
+    expect(await t.exited).toBe(0);
+  }, 60_000);
+
+  test("a resumed session whose unfinished turn fails reports it with turn_end, not a second reply to open", async () => {
+    // 第一个进程在一轮中途被杀掉，日志停在等模型回复；第二个进程恢复它时脚本已经用完，补跑的这一轮出错
+    const s = await serve([{ say: "slow", delay: 10_000 }]);
+    s.send({ type: "open", id: "o" });
+    const a = (await s.reply("o")).session as string;
+    s.send({ type: "send", id: "m", session: a, text: "hi" });
+    await new Promise((r) => setTimeout(r, 500));
+    s.kill();
+    await s.exited;
+
+    const t = await serve([], { home: s.home, cwd: s.cwd });
+    t.send({ type: "open", id: "o2", resume: a });
+    expect(await t.reply("o2")).toEqual({ type: "opened", id: "o2", session: a });
+    expect(await t.next((e) => e.type === "turn_end")).toMatchObject({ session: a, reason: "error" });
+    t.send({ type: "open", id: "probe" });
+    await t.reply("probe");
+    expect(t.events.filter((e) => e.id === "o2")).toHaveLength(1);
     t.end();
     expect(await t.exited).toBe(0);
   }, 60_000);

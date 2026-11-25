@@ -22,6 +22,8 @@ Events (stdout), each with "session":
   {"type":"tool_error", "message"} / {"type":"denied", "reason"?}
   {"type":"turn_end", "reason", "error"?, "result", "usage"}   result is the turn's final reply
 A request that cannot be carried out gets {"type":"error", "id"?, "session"?, "error"} instead of its reply.
+When a resumed session's unfinished work fails, its turn_end says so; a failure before any turn ran is an
+{"type":"error", "session", "error"} without "id" (the open was already answered with "opened").
 Notices from plugins go to stderr. Exit code: 0 when stdin closes, 130 when interrupted.
 Nobody can answer approval questions here, so calls that need approval are denied: in the default "ask" mode that
 includes writing files. To let it change files in the working directory, put {"jade/approval": {"mode": "auto"}}
@@ -131,7 +133,13 @@ const frontend: Frontend = {
           attach(s);
           emit({ type: "opened", ...id, session: s.id });
           // 恢复的会话：先把日志里没做完的工作做完（排在之后发来的消息前面）
-          if (typeof req.resume === "string") await s.recover().catch((e) => fail(e, s.id));
+          // 补跑的轮次出错时已经有 turn_end；open 已经回过 opened，没跑起来的错误也不再带 id
+          if (typeof req.resume === "string") {
+            const before = ended.get(s.id)?.count ?? 0;
+            await s.recover().catch((e) => {
+              if ((ended.get(s.id)?.count ?? 0) === before) emit({ type: "error", session: s.id, error: errorText(e) });
+            });
+          }
           return;
         }
         case "send": {

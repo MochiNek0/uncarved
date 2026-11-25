@@ -237,7 +237,8 @@ export function taskTool(opts: TaskOptions): Tool {
       const linked = ref ? { child: ref } : {};
       // 还是没有报告时，把它一路上说过的话都带回去
       const text = clip(lastText(messages) || allText(messages));
-      if (stopped) return { content: `${STOPPED}${text ? `\nWhat it had written so far:\n${text}` : ""}`, isError: true, ...linked };
+      // 跑完以后才按的停（在关子会话时）不算：报告已经有了
+      if (stopped && failure) return { content: `${STOPPED}${text ? `\nWhat it had written so far:\n${text}` : ""}`, isError: true, ...linked };
       if (failure) {
         const msg = failure instanceof Error ? failure.message : String(failure);
         return { content: `Sub-agent failed: ${msg}${text ? `\nLast output:\n${text}` : ""}`, isError: true, ...linked };

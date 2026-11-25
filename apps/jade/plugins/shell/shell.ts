@@ -22,8 +22,8 @@ export interface ShellOptions {
   shell?: string;
   /** 后台命令自己结束时调用（被 kill_shell、shutdown 停掉的不算） */
   onExit?(bg: { id: string; command: string; exitCode: number | null }): void;
-  /** 后台命令启动时调用，返回的 output 收到它的每一段输出，exit 在它结束时（包括被停掉）调用 */
-  onBackground?(bg: { id: string; command: string }): { output(text: string): void; exit(code: number | null): void } | undefined;
+  /** 后台命令启动时调用，返回的 output 收到它的每一段输出，exit 在它结束时调用；killed 表示是被停掉的（kill_shell、shutdown） */
+  onBackground?(bg: { id: string; command: string }): { output(text: string): void; exit(code: number | null, killed: boolean): void } | undefined;
 }
 
 export interface ShellTools {
@@ -94,7 +94,7 @@ export function shellTools(opts: ShellOptions): ShellTools {
     void Promise.all([collect(bg.proc.stdout, append, false), collect(bg.proc.stderr, append, false)]).catch(() => {});
     void bg.proc.exited.then((code) => {
       bg.exitCode = code;
-      watcher?.exit(code);
+      watcher?.exit(code, bg.killed === true);
       if (!bg.killed) opts.onExit?.({ id, command, exitCode: code });
     });
     background.set(id, bg);
