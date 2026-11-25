@@ -7,7 +7,7 @@ import type { Commands, Prompts, Renderers } from "@uncarved/jade-api/services";
 import { Memory, MEMORY_SCOPES, memoryTool, projectRoot, type MemoryScope } from "./memory.ts";
 import { clip, dim, error, ok as success } from "./style.ts";
 
-const args = (input: unknown) => (input ?? {}) as { action?: string; scope?: string; text?: string };
+const args = (input: unknown) => (input ?? {}) as { action?: string; scope?: string; text?: string; old?: string };
 
 export default definePlugin({
   process(ctx) {
@@ -21,6 +21,7 @@ export default definePlugin({
       },
       preview: (input) => {
         const i = args(input);
+        if (i.action === "replace") return [error("- "), String(i.old ?? ""), "\n", success("+ "), String(i.text ?? "")];
         return [i.action === "remove" ? error("- ") : success("+ "), String(i.text ?? "")];
       },
     });
@@ -38,13 +39,14 @@ export default definePlugin({
         };
         let text = input.trim();
         if (!text) {
-          const entries = (await Promise.all(MEMORY_SCOPES.map(async (scope) => (await memory.list(scope)).map((t) => ({ scope, text: t }))))).flat();
-          if (!ui.interactive) return entries.length ? entries.map((e) => `${e.scope}: ${e.text}`).join("\n") : "jade does not remember anything yet";
+          const entries = (await Promise.all(MEMORY_SCOPES.map(async (scope) => (await memory.entries(scope)).map((e) => ({ scope, ...e }))))).flat();
+          const label = (e: (typeof entries)[number]) => (e.date ? `${e.scope}, ${e.date}` : e.scope);
+          if (!ui.interactive) return entries.length ? entries.map((e) => `${label(e)}: ${e.text}`).join("\n") : "jade does not remember anything yet";
           const choice = await ui.select(
             {
               title: entries.length ? "Memory: choose an entry to remove it, or add one" : "jade does not remember anything yet",
               detail: dim(`user (all projects): ${memory.files.user}\nproject: ${memory.files.project}`),
-              options: [{ label: "Add a memory…", value: "add" }, ...entries.map((e, i) => ({ label: e.text, value: String(i), hint: e.scope }))],
+              options: [{ label: "Add a memory…", value: "add" }, ...entries.map((e, i) => ({ label: e.text, value: String(i), hint: label(e) }))],
             },
             signal,
           );
