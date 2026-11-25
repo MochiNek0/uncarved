@@ -188,6 +188,16 @@ test("同一实例每次追加都检查 seq 紧接着上一次：重复的 seq �
   expect((await readAll(store, "s1")).map((e) => e.seq)).toEqual([1, 2]);
 });
 
+test("release 之后接着写：从文件重新确认位置，seq 检查照常", async () => {
+  const store = new JsonlLogStore(dir);
+  await store.append("s1", [ev(1), ev(2)]);
+  store.release("s1");
+  await expect(store.append("s1", [ev(2)])).rejects.toBeInstanceOf(ConcurrentWrite);
+  await store.append("s1", [ev(3)]);
+  store.release("never-written");
+  expect((await readAll(store, "s1")).map((e) => e.seq)).toEqual([1, 2, 3]);
+});
+
 test("文件最后一个事件损坏时，追加报 CorruptLog 而不是解析错误", async () => {
   await writeFile(path.join(dir, "s1.jsonl"), JSON.stringify(ev(1)) + "\n{not json\n");
   const err = await new JsonlLogStore(dir).append("s1", [ev(3)]).catch((e) => e);

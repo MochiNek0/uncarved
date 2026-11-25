@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { cp, rename, rm } from "node:fs/promises";
+import { cp, readFile, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import type { Block, ModelResponse, State } from "uncarved";
 import { NO_APPROVAL_REASON, NO_APPROVER_ERROR, ServiceUnavailable, StaleContext } from "../src/index.ts";
@@ -464,6 +464,70 @@ describe("sessions started side by side", () => {
     expect(g.__log!.sort()).toEqual([`tools closed ${a.id}`, `tools closed ${a.id}`, `tools closed ${b.id}`].sort());
   });
 
+  test("close stops waiting for a tool that ignores the abort signal, blames its plugin, still detaches; the late result is not written and the session can be resumed", async () => {
+    const stuck = globalThis as { __release?: () => void };
+    try {
+      const { w, host } = await setup(async (w) => {
+        await w.plugin("bundled", { id: "stuck" }, `export default { session(ctx) {
+          ctx.kernel.tool({ name: "hang", effect: "read", description: "hang", inputSchema: { type: "object" }, concurrency: "safe", idempotent: false,
+            execute: () => new Promise((r) => { globalThis.__release = () => r({ content: "late" }); }) });
+        } };`);
+        await Bun.write(path.join(w.home, "config.json"), JSON.stringify({ "jade/core": { closeTimeoutMs: 100 } }));
+      });
+      g.__script!.push(call(use("t1", "hang")));
+      const a = await host.sessions.start();
+      // 先接住：close 期间它就被拒了
+      const sent = a.send(msg("go")).catch((e: Error) => e);
+      while (!stuck.__release) await new Promise((r) => setTimeout(r, 10));
+
+      const t0 = Date.now();
+      await a.close();
+      expect(Date.now() - t0).toBeLessThan(2000);
+      expect(String(await sent)).toContain("did not stop within 100 ms");
+      expect(w.reports.join("\n")).toContain(`session ${a.id} did not stop within 100 ms of being closed (tool hang of plugin stuck ignored the abort signal)`);
+      expect(g.__log).toEqual([`tools closed ${a.id}`]);
+      // 接手的 Runtime 照常写了 session.detached
+      const log = await a.history();
+      expect(log.at(-1)!.type).toBe("session.detached");
+
+      // 工具迟迟返回：结果写不进日志
+      stuck.__release!();
+      await new Promise((r) => setTimeout(r, 50));
+      expect((await a.history()).length).toBe(log.length);
+
+      // 和进程在这里退出一样恢复：没有结果的调用记为中断
+      g.__script!.push(say("back"));
+      const again = await host.sessions.start({ resume: a.id });
+      await again.recover();
+      expect(results(again.state).t1?.[0]).toBe(true);
+      await host.close();
+      // 故障记在提供工具的插件头上（连续故障计数）
+      const faults = JSON.parse(await readFile(path.join(w.home, "state", "faults.json"), "utf8"));
+      expect(faults.streaks.stuck.last).toContain("tool hang did not stop within 100 ms");
+    } finally {
+      delete stuck.__release;
+    }
+  });
+
+  test("plugins whose cleanup hangs share one close deadline; every cleanup still runs", async () => {
+    const hang = (id: string) => `export default { async session(ctx) {
+      await ctx.effect(() => () => { globalThis.__log.push("dispose ${id}"); return new Promise(() => {}); });
+    } };`;
+    const { w, host } = await setup(async (w) => {
+      await w.plugin("bundled", { id: "slow1" }, hang("slow1"));
+      await w.plugin("bundled", { id: "slow2" }, hang("slow2"));
+      await Bun.write(path.join(w.home, "config.json"), JSON.stringify({ "jade/core": { closeTimeoutMs: 100 } }));
+    });
+    const a = await host.sessions.start();
+    const t0 = Date.now();
+    await a.close();
+    // 没有总期限时要等 2 × 5 秒
+    expect(Date.now() - t0).toBeLessThan(1000);
+    expect(g.__log!.sort()).toEqual(["dispose slow1", "dispose slow2", `tools closed ${a.id}`].sort());
+    expect(w.reports.filter((r) => r.includes("dispose did not finish before the close deadline"))).toHaveLength(2);
+    await host.close();
+  });
+
   test("a session that is already open cannot be started again", async () => {
     const { host } = await setup();
     const current = await host.sessions.open();
@@ -711,13 +775,14 @@ describe("child sessions (ctx.session.spawn)", () => {
     ctx.provide("ui@1", { interactive: true, notify() {}, select: (r) => globalThis.__select(r), input: async () => undefined,
       session: () => ({ status() {}, dispose() {} }) });
   } };`;
-  const start = async (config?: object) => {
+  const start = async (config?: object, extra?: (w: Awaited<ReturnType<typeof world>>) => Promise<unknown>) => {
     const w = await world();
     await w.plugin("bundled", { id: "models", provides: ["provider@1"] }, PROVIDER);
     await w.plugin("bundled", { id: "tools" }, TOOLS);
     await w.plugin("bundled", { id: "front", provides: ["ui@1"] }, FRONT);
     await w.plugin("bundled", { id: "spawner", optional: ["ui@1"] }, SPAWNER);
     if (config) await Bun.write(path.join(w.home, "config.json"), JSON.stringify(config));
+    await extra?.(w);
     return { w, host: await w.start() };
   };
   const run = async (host: Awaited<ReturnType<typeof start>>["host"]) => {
@@ -847,6 +912,41 @@ describe("child sessions (ctx.session.spawn)", () => {
     };
     await run(host);
     await host.close();
+  });
+
+  test("a child whose tool ignores the abort signal is still ended: the turn ends aborted and session.ended is written", async () => {
+    const hang = globalThis as { __release?: () => void };
+    const HANGER = `export default { session(ctx) {
+      ctx.kernel.tool({ name: "hang", effect: "read", description: "hang", inputSchema: { type: "object" }, concurrency: "safe", idempotent: false,
+        execute: () => new Promise((r) => { globalThis.__release = () => r({ content: "late" }); }) });
+    } };`;
+    const { w, host } = await start({ "jade/core": { closeTimeoutMs: 100 } }, (w) => w.plugin("bundled", { id: "hanger" }, HANGER));
+    const logOf = async (id: string) =>
+      (await readFile(path.join(w.home, "sessions", `${id}.jsonl`), "utf8")).trim().split("\n").map((l) => JSON.parse(l) as { type: string; data: unknown });
+    let childLog: { type: string; data: unknown }[] = [];
+    k.__run = async (ctx, t) => {
+      const kid = (await ctx.session.spawn({ parent: t.parent })) as Kid & { send(i: unknown): Promise<void> };
+      g.__script!.unshift(call(use("c1", "hang")));
+      const sent = kid.send(msg("go")).catch((e: Error) => e);
+      while (!hang.__release) await new Promise((r) => setTimeout(r, 10));
+      const ref = await kid.close();
+      expect(String(await sent)).toContain("did not stop within 100 ms");
+      childLog = await logOf(ref.sessionId);
+      hang.__release!();
+      await new Promise((r) => setTimeout(r, 50));
+      expect((await logOf(ref.sessionId)).length).toBe(childLog.length);
+      return { content: "ran", child: ref };
+    };
+    try {
+      await run(host);
+      expect(childLog.at(-1)!.type).toBe("session.ended");
+      const ended = childLog.find((e) => e.type === "turn.ended")!;
+      expect((ended.data as { reason: string }).reason).toBe("aborted");
+      expect(w.reports.join("\n")).toContain("tool hang of plugin hanger ignored the abort signal");
+      await host.close();
+    } finally {
+      delete hang.__release;
+    }
   });
 
   test("stopping a child session's turn on the user's behalf stops the top-level turn too", async () => {

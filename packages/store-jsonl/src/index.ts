@@ -102,6 +102,11 @@ export class JsonlLogStore implements LogStore {
     }
   }
 
+  /** 会话离开后丢掉它的写入位置：常驻进程开过很多会话也不会越积越多。之后再写时从文件重新确认，和第一次写一样 */
+  release(sessionId: string): void {
+    this.#tails.delete(sessionId);
+  }
+
   /** 分块读取，内存占用与日志长度无关 */
   async *read(sessionId: string, fromSeq = 1): AsyncIterable<LogEvent> {
     let fh;

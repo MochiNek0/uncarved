@@ -16,6 +16,11 @@ Requests (stdin); "id" is optional and is copied into the reply:
                                                          "error", ...); "error" only if the message never started a turn
   {"type":"abort", "session"}                          stops the running turn
   {"type":"close", "id"?, "session"}                  -> {"type":"closed", "id"?, "session"} (it can be resumed later)
+                                                         stops the running turn first; if it has not stopped within 10 s
+                                                         (a tool ignoring the abort), it is closed anyway and that turn's
+                                                         send gets "error" instead of "done"; plugin cleanup may then take
+                                                         up to another 10 s. Set the wait with
+                                                         {"jade/core": {"closeTimeoutMs": ...}} in $JADE_HOME/config.json
 Events (stdout), each with "session":
   {"type":"text", "text"}                       reply text as it is written
   {"type":"tool_use", "name", "input"}
@@ -171,6 +176,8 @@ const frontend: Frontend = {
           if (!s) return;
           open.delete(s.id);
           await s.close();
+          // 关掉的会话不再有轮次；以后 resume 回来从头计数（send 只比较前后差值）
+          ended.delete(s.id);
           emit({ type: "closed", ...id, session: s.id });
           return;
         }

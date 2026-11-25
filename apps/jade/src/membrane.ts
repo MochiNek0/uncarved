@@ -31,8 +31,11 @@ export class Scope {
     this.#disposers.push(owner ? { d, owner } : { d });
   }
 
-  /** 中止 signal，逆序执行清理函数；每个最多等 DISPOSE_TIMEOUT_MS。返回清理时的错误，不抛出 */
-  async close(timeoutMs = DISPOSE_TIMEOUT_MS): Promise<unknown[]> {
+  /**
+   * 中止 signal，逆序执行清理函数；每个最多等 timeoutMs，到了 deadline（Date.now() 的时刻）以后不再等。
+   * 每个清理函数都会被调用，没等到的在后台接着跑。返回清理时的错误，不抛出
+   */
+  async close(timeoutMs = DISPOSE_TIMEOUT_MS, deadline = Infinity): Promise<unknown[]> {
     if (this.#closed) return [];
     this.#closed = true;
     this.#ctrl.abort(new StaleContext(this.plugin));
@@ -42,8 +45,10 @@ export class Scope {
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
         const done = ambient.run(owner, d);
+        const wait = Math.max(0, Math.min(timeoutMs, deadline - Date.now()));
         const timeout = new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new Error(`dispose timed out after ${timeoutMs} ms`)), timeoutMs);
+          const why = wait < timeoutMs ? "dispose did not finish before the close deadline" : `dispose timed out after ${timeoutMs} ms`;
+          timer = setTimeout(() => reject(new Error(why)), wait);
         });
         await Promise.race([done, timeout]);
       } catch (e) {

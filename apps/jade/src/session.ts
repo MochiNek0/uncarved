@@ -44,7 +44,7 @@ import {
   type ToolMeta,
   type UI,
 } from "./api.ts";
-import { ambient, invoke, Scope, type Owner } from "./membrane.ts";
+import { ambient, DISPOSE_TIMEOUT_MS, invoke, Scope, type Owner } from "./membrane.ts";
 import { scopedSecrets } from "./secrets.ts";
 
 /** 核心自己交给内核的插件：兜底关卡 */
@@ -111,6 +111,16 @@ export const DELEGATION =
 /** 子会话的层数、同时数量的默认上限（7.2） */
 export const DEFAULT_MAX_DEPTH = 1;
 export const DEFAULT_MAX_ACTIVE = 8;
+/** 离开会话时最多等它停下多久（毫秒）。不理会中止信号的工具、插件不能让关闭一直卡住 */
+export const DEFAULT_CLOSE_TIMEOUT_MS = 10_000;
+
+/**
+ * store@1 的契约：内核的 LogStore，加一个可选的 release（宿主离开会话时调用），存储可以丢掉为它缓存的状态，
+ * 之后再写也必须照常工作。这是 jade 和存储之间的约定，不属于内核（宪法 4.3）
+ */
+export type HostStore = LogStore & { release?(sessionId: string): void };
+
+type Job = { run: () => Promise<void>; resolve: () => void; reject: (e: unknown) => void };
 
 interface Turn {
   stop?: { reason: unknown };
@@ -122,7 +132,11 @@ class LiveSession implements Session {
   readonly parts: Part[] = [];
   rt!: Runtime;
   /** 排队的工作：一条输入，或者恢复（recover）。一次只跑一项，Runtime 同一时间只接受一个调用 */
-  #queue: { run: () => Promise<void>; resolve: () => void; reject: (e: unknown) => void }[] = [];
+  #queue: Job[] = [];
+  /** 正在跑的那一项工作 */
+  #job: Job | undefined;
+  /** 现在的 Runtime 写日志经过的围栏。放弃一个 Runtime（abandon）时关上它的围栏，下一个 Runtime 用新的 */
+  #fence: Fence = { writing: new Set() };
   #after: { fn: () => void | Promise<void>; owner: Owner }[] = [];
   #pump: Promise<void> | undefined;
   /** 离开时的原因；有了以后不再接受输入 */
@@ -148,7 +162,7 @@ class LiveSession implements Session {
   #provider!: Provider;
   #plugins!: () => Plugin[];
 
-  readonly #store: LogStore;
+  readonly #store: HostStore;
   /** 子会话的信息；顶层会话没有 */
   readonly child: Child | undefined;
   /** 第几层：顶层会话是 0 */
@@ -159,7 +173,7 @@ class LiveSession implements Session {
   ended: Promise<{ sessionId: string; seq: number }> | undefined;
   onEnd: (() => void) | undefined;
 
-  constructor(id: string, store: LogStore, report: (m: string) => void, attended: () => boolean, child?: Child) {
+  constructor(id: string, store: HostStore, report: (m: string) => void, attended: () => boolean, child?: Child) {
     this.id = id;
     this.#store = store;
     this.#report = report;
@@ -168,8 +182,14 @@ class LiveSession implements Session {
     if (child) this.depth = child.session.depth + 1;
   }
 
-  get store(): LogStore {
+  /** 存储本身：读日志、开子会话、release 用。建 Runtime 用 runtimeStore() */
+  get store(): HostStore {
     return this.#store;
+  }
+
+  /** 给现在要建的 Runtime 用的存储：这个 Runtime 被放弃以后，它的写入一律被拒 */
+  runtimeStore(): LogStore {
+    return fenced(this.#store, this.#fence);
   }
 
   get provider(): Provider {
@@ -292,6 +312,24 @@ class LiveSession implements Session {
   }
 
   /**
+   * 离开后等不到它停下（工具、插件不理会中止信号）：不再等这个 Runtime 了。它还卡在那里，之后它写日志一律被拒，
+   * 迟到的结果写不进去；它的通知不再转发。正在等这项工作的调用方立即得到 reason。
+   * 然后按日志恢复一个新的 Runtime 接手（和进程在这里退出后再恢复一样），由它写收尾的事件（detach、close）
+   */
+  async abandon(reason: Error): Promise<void> {
+    const old = this.#fence;
+    old.gone = reason;
+    this.#fence = { writing: new Set() };
+    this.#job?.reject(reason);
+    this.#unsubscribe?.();
+    this.#unsubscribe = undefined;
+    // 关围栏之前已经开始的写入（例如同一批里别的工具刚好完成）先写完，接手的才开始写：同一时间只有一个写入者（宪法 4.3）
+    await Promise.allSettled(old.writing);
+    this.#use(await Runtime.resume({ store: this.runtimeStore(), provider: this.#provider, plugins: this.#plugins(), sessionId: this.id }));
+    this.#loose = false;
+  }
+
+  /**
    * 和输入排同一个队：恢复可能要跑完一整轮，这期间插件发来的输入排在它后面，而不是撞上 RuntimeBusy。
    * 上次停在等待人工审批的（进程被杀、崩溃）：内核再发一次 awaiting 通知，审批插件据此重新问（ctx.session.subscribe），
    * 这一轮接着等回答；没有审批插件守着时和平时一样直接结束
@@ -357,7 +395,7 @@ class LiveSession implements Session {
         await this.rt.detach();
         this.#loose = true;
       }
-      const rt = await Runtime.resume({ store: this.#store, provider: this.#provider, plugins: this.#plugins(), sessionId: this.id });
+      const rt = await Runtime.resume({ store: this.runtimeStore(), provider: this.#provider, plugins: this.#plugins(), sessionId: this.id });
       this.#loose = false;
       this.#use(rt);
     } catch (e) {
@@ -369,7 +407,7 @@ class LiveSession implements Session {
   /** 结束会话（session.ended），子会话用完时。重挂到一半（旧实例已经 detach）时先恢复一个实例来写 */
   async close(): Promise<void> {
     if (this.#loose) {
-      this.#use(await Runtime.resume({ store: this.#store, provider: this.#provider, plugins: this.#plugins(), sessionId: this.id }));
+      this.#use(await Runtime.resume({ store: this.runtimeStore(), provider: this.#provider, plugins: this.#plugins(), sessionId: this.id }));
       this.#loose = false;
     }
     if (this.rt.phase !== "ended") await this.rt.close();
@@ -408,6 +446,7 @@ class LiveSession implements Session {
     await null; // 让调用方先拿到 send 的 Promise
     for (;;) {
       const job = this.#queue.shift();
+      this.#job = job;
       if (job) {
         try {
           if (this.#stale) {
@@ -419,6 +458,8 @@ class LiveSession implements Session {
           job.resolve();
         } catch (e) {
           job.reject(e);
+        } finally {
+          this.#job = undefined;
         }
       }
       if (this.#after.length > 0) await this.#runAfter();
@@ -537,7 +578,7 @@ export class Sessions implements SessionManager {
     const host = this.#host;
     const provider = host.service<Provider>("provider@1", host.core);
     if (!provider) throw new ServiceUnavailable("provider@1", "(none): no active plugin provides a model");
-    const store = host.service<LogStore>("store@1", host.core) ?? (this.#store ??= new JsonlLogStore(path.join(host.home, "sessions")));
+    const store = host.service<HostStore>("store@1", host.core) ?? (this.#store ??= new JsonlLogStore(path.join(host.home, "sessions")));
 
     if (opts.fork && opts.resume !== undefined) throw new Error("sessions.open: resume and fork cannot be used together");
     const s: LiveSession = new LiveSession(opts.resume ?? crypto.randomUUID(), store, host.report, () => this.#guarded(s));
@@ -552,8 +593,8 @@ export class Sessions implements SessionManager {
       for (const p of host.active()) if (p.module.session) await this.#join(s, p);
       const plugins = kernelPlugins();
       rt = opts.resume !== undefined || opts.fork
-        ? await Runtime.resume({ store, provider, plugins, sessionId: s.id })
-        : await Runtime.create({ store, provider, plugins, sessionId: s.id });
+        ? await Runtime.resume({ store: s.runtimeStore(), provider, plugins, sessionId: s.id })
+        : await Runtime.create({ store: s.runtimeStore(), provider, plugins, sessionId: s.id });
     } catch (e) {
       // session() 里排进来的输入不会再执行了
       s.leave();
@@ -567,11 +608,44 @@ export class Sessions implements SessionManager {
     return s;
   }
 
-  /** 子会话的上限（7.2）：用户 config.json 的 "jade/core" */
-  #limits(): { maxDepth: number; maxActive: number } {
+  /** 子会话的上限（7.2）和离开会话时最多等多久：用户 config.json 的 "jade/core" */
+  #limits(): { maxDepth: number; maxActive: number; closeTimeoutMs: number } {
     const c = this.#host.coreConfig();
     const n = (v: unknown, d: number, min: number) => (typeof v === "number" && Number.isInteger(v) && v >= min ? v : d);
-    return { maxDepth: n(c.maxDepth, DEFAULT_MAX_DEPTH, 0), maxActive: n(c.maxActive, DEFAULT_MAX_ACTIVE, 1) };
+    return {
+      maxDepth: n(c.maxDepth, DEFAULT_MAX_DEPTH, 0),
+      maxActive: n(c.maxActive, DEFAULT_MAX_ACTIVE, 1),
+      closeTimeoutMs: n(c.closeTimeoutMs, DEFAULT_CLOSE_TIMEOUT_MS, 0),
+    };
+  }
+
+  /**
+   * 等离开的会话停下，最多 closeTimeoutMs。等不到就放弃它的 Runtime、换一个接手（LiveSession.abandon），返回原因。
+   * 还没结果的工具多半不理会中止信号（宪法 I-9）：归到提供它的插件，记一次故障（5.4 的连续故障计数）。
+   * 和插件加入会话失败一样只记故障、不隔离：一条命令卡住不该让整个插件在这个进程里停掉
+   */
+  async #stopped(s: LiveSession): Promise<Error | undefined> {
+    const { closeTimeoutMs: ms } = this.#limits();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const stopped = await Promise.race([
+      s.idle().then(() => true),
+      new Promise<boolean>((resolve) => (timer = setTimeout(() => resolve(false), ms))),
+    ]);
+    clearTimeout(timer);
+    if (stopped) return undefined;
+    const names = s.rt?.state.phase === "tools" ? [...new Set(s.rt.state.batch.filter((c) => c.decision === "allow" && !c.result).map((c) => c.name))] : [];
+    const blamed = names.map((name) => ({ name, plugin: s.parts.find((p) => p.tools.some((t) => t.name === name))?.source.manifest.id }));
+    const who = blamed.length > 0 ? blamed.map((b) => `tool ${b.name}${b.plugin ? ` of plugin ${b.plugin}` : ""}`).join(", ") : "a tool or plugin";
+    const why = `session ${s.id} did not stop within ${ms} ms of being closed (${who} ignored the abort signal); stopped waiting for it, it can be resumed later`;
+    this.#host.report(why);
+    for (const b of blamed) if (b.plugin) this.#host.fault(b.plugin, `tool ${b.name} did not stop within ${ms} ms when its session was closed`);
+    const reason = new Error(why);
+    try {
+      await s.abandon(reason);
+    } catch (e) {
+      this.#host.report(`session ${s.id}: could not take it over after it did not stop: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    return reason;
   }
 
   /** 开子会话（ctx.session.spawn）：所有插件照常加入，Runtime.create 带 parent。不会成为当前会话 */
@@ -641,7 +715,7 @@ export class Sessions implements SessionManager {
     let rt: Runtime;
     try {
       for (const p of host.active()) if (p.module.session) await this.#join(s, p);
-      rt = await Runtime.create({ store: s.store, provider, plugins: kernelPlugins(), sessionId: s.id, parent: child.ref });
+      rt = await Runtime.create({ store: s.runtimeStore(), provider, plugins: kernelPlugins(), sessionId: s.id, parent: child.ref });
     } catch (e) {
       s.leave();
       await this.#closeParts(s);
@@ -677,13 +751,17 @@ export class Sessions implements SessionManager {
     if (s.ended) return s.ended;
     s.ended = (async () => {
       s.leave();
-      for (const c of [...s.children]) await this.#end(c);
-      await s.idle();
+      // 子会话同时结束：各自最多等 closeTimeoutMs，不一个个累加
+      await Promise.all([...s.children].map((c) => this.#end(c)));
+      // 等不到它停下时由接手的 Runtime 结束这一轮（aborted，没结果的调用记为错误）再写 session.ended，和正常结束的日志一样收尾
+      const abandoned = await this.#stopped(s);
       try {
+        if (abandoned) await s.rt.endTurn(abandoned);
         await s.close();
       } catch (e) {
         this.#host.report(`sub-agent session ${s.id}: could not end it: ${e instanceof Error ? e.message : String(e)}`);
       }
+      s.store.release?.(s.id);
       await this.#closeParts(s);
       s.child?.session.children.delete(s);
       s.onEnd?.();
@@ -972,21 +1050,29 @@ export class Sessions implements SessionManager {
   /** 离开会话：中止正在跑的工作，等它停下，detach，关闭插件的会话作用域 */
   async #leave(s: LiveSession): Promise<void> {
     s.leave();
-    // 它开的子会话一并结束：正在等子会话的工具调用随之结束
-    for (const c of [...s.children]) await this.#end(c);
-    await s.idle();
+    // 它开的子会话一并结束（同时进行）：正在等子会话的工具调用随之结束
+    await Promise.all([...s.children].map((c) => this.#end(c)));
+    // 等不到它停下时由接手的 Runtime 写 session.detached；没结果的调用留着，恢复时记为中断（宪法 4.5）
+    await this.#stopped(s);
     try {
       await s.detach();
     } catch (e) {
       this.#host.report(`session ${s.id}: detach failed: ${e instanceof Error ? e.message : String(e)}`);
     }
+    s.store.release?.(s.id);
     await this.#closeParts(s);
   }
 
+  /**
+   * 逆序关闭各插件在这个会话里的作用域。每个清理函数照常最多等 DISPOSE_TIMEOUT_MS，
+   * 但全部加起来最多等 closeTimeoutMs：几个插件的清理函数都卡住时，关闭不会一个个累加着等下去。
+   * 这段从等会话停下之后才开始算，所以离开一个会话最多等 2 × closeTimeoutMs（另加写收尾事件的时间）
+   */
   async #closeParts(s: LiveSession): Promise<void> {
+    const deadline = Date.now() + this.#limits().closeTimeoutMs;
     for (const p of [...s.parts].reverse()) {
       this.#host.untrack(p.owner.plugin, p.owner.scope);
-      for (const e of await p.owner.scope.close()) this.#host.report(e instanceof Error ? e.message : String(e));
+      for (const e of await p.owner.scope.close(DISPOSE_TIMEOUT_MS, deadline)) this.#host.report(e instanceof Error ? e.message : String(e));
     }
   }
 }
@@ -1059,6 +1145,24 @@ function liveHook(h: LocalHookSpec | RemoteHookSpec, owner: Owner): LocalHookSpe
     return ambient.run(owner, () => fn(payload, ctx));
   };
   return { ...h, fn: wrapped } as LocalHookSpec;
+}
+
+/** 一个 Runtime 的围栏：gone 有值以后它的写入一律被拒；writing 是还没写完的写入 */
+type Fence = { gone?: Error; writing: Set<Promise<void>> };
+
+/** 围栏关上以后拒绝写入，读照常 */
+function fenced(store: LogStore, fence: Fence): LogStore {
+  return {
+    append: (sessionId, events) => {
+      if (fence.gone) return Promise.reject(fence.gone);
+      const p = store.append(sessionId, events);
+      fence.writing.add(p);
+      const done = () => void fence.writing.delete(p);
+      p.then(done, done);
+      return p;
+    },
+    read: (sessionId, fromSeq) => store.read(sessionId, fromSeq),
+  };
 }
 
 /** 会话是第几层子会话：沿着 session.started 里的 parent 往上数（内核保证引用能解析到，宪法 3.4） */
