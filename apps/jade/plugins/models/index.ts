@@ -12,7 +12,7 @@ import type { Commands, Models } from "@uncarved/jade-api/services";
 import { contextWindow } from "./context.ts";
 import { envWithFile, hasProvider, parseTokens } from "./config.ts";
 import { configurator } from "./configure.ts";
-import { isBuiltinKind, KEY_KEY, listModels, MODEL_KEY, providerFromEnv, providerInfo, providerKind, RateGate, rpmFromEnv, visionFromEnv, withRetry, type RetriedResponse, type RetryOptions } from "./provider.ts";
+import { isBuiltinKind, KEY_KEY, listModels, MODEL_KEY, providerFromEnv, providerInfo, providerKind, RateGate, rpmFromEnv, visionFromEnv, withRetry, type RetriedResponse, type RetryingProvider, type RetryOptions } from "./provider.ts";
 import { priceAt } from "./price.ts";
 import { MODEL_SETTINGS, parseSavedServices, readSavedServices, type Env, type SavedService } from "./saved.ts";
 
@@ -64,9 +64,9 @@ export default definePlugin({
           "  OPENAI_COMPAT_BASE_URL=... and OPENAI_COMPAT_MODEL=... (an OpenAI-compatible service)",
       );
 
-    let made: Promise<Provider> | undefined;
+    let made: Promise<RetryingProvider> | undefined;
     // 用创建时的这份配置：之后换了配置，新的一份自己建 provider
-    const build = (snapshot: Env): Promise<Provider> => {
+    const build = (snapshot: Env): Promise<RetryingProvider> => {
       return (async () => {
         const gate = new RateGate({ rpm: rpmFromEnv(snapshot), onLearn: (rpm) => ui()?.notify(`rate limited: spacing requests to ${rpm} per minute from now on`, "warning") });
         return withRetry(await providerFromEnv(snapshot, { "user-agent": userAgent() }), {
@@ -82,7 +82,7 @@ export default definePlugin({
     };
 
     // 第一次用时才创建：配置写错时错误出现在这一轮里，而不是让插件激活失败、连会话都打不开
-    const provider = (): Promise<Provider> => {
+    const provider = (): Promise<RetryingProvider> => {
       if (!hasProvider(env)) return Promise.reject(notConfigured());
       if (made) return made;
       const p = build(env);
@@ -95,8 +95,8 @@ export default definePlugin({
     };
 
     /** 保存过的模型的 provider，按配置缓存：models.json 里的密钥或设置改了就另建一份 */
-    const savedProviders = new Map<string, Promise<Provider>>();
-    const cachedBuild = (snapshot: Env): Promise<Provider> => {
+    const savedProviders = new Map<string, Promise<RetryingProvider>>();
+    const cachedBuild = (snapshot: Env): Promise<RetryingProvider> => {
       const key = JSON.stringify(snapshot);
       const cached = savedProviders.get(key);
       if (cached) return cached;
@@ -106,7 +106,7 @@ export default definePlugin({
       p.catch(() => savedProviders.delete(key));
       return p;
     };
-    const saved = async (name: string): Promise<Provider> => {
+    const saved = async (name: string): Promise<RetryingProvider> => {
       for (const s of await readSavedServices(modelsFile)) {
         const m = s.models.find((x) => x.name === name);
         const kind = providerKind(s.env);
@@ -144,7 +144,7 @@ export default definePlugin({
       return m?.price ? priceAt(m.price, at) : undefined;
     };
 
-    const current: Provider["complete"] = (request, options) => provider().then((p) => p.complete(request, options));
+    const current: RetryingProvider["complete"] = (request, options) => provider().then((p) => p.complete(request, options));
     const complete: Models["complete"] = (request, { model, ...options }) => (model ? saved(model).then((p) => p.complete(request, options)) : current(request, options));
 
     // 转发的 provider：会话创建时固定的是这个壳，/model 之后下一次请求就用新的配置

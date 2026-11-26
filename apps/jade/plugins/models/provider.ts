@@ -51,30 +51,38 @@ export interface RetryRecord {
  */
 export type RetriedResponse = ModelResponse & { retries?: RetryRecord[] };
 
-/** models@1 的 complete 多出来的、经 provider 传到这里的回调（见 jade-api 的 Models.complete） */
-type CallHooks = { onWait?: () => void; onSend?: () => void };
+/**
+ * withRetry 的 complete 比内核的 Provider 多收两个可选的回调，就是 models@1 的 complete 的 onWait、onSend
+ * （见 jade-api 的 Models.complete）：请求开始等待（限速排队、重试前的等待）、真正发出时告诉调用方
+ */
+export type RetryCallOptions = Parameters<Provider["complete"]>[1] & { onWait?: () => void; onSend?: () => void };
 
-export function withRetry(inner: Provider, opts: RetryOptions = {}): Provider {
+/** withRetry 包出来的 Provider：仍然是内核的 Provider（多出的参数都可选），models@1 经它把 onWait、onSend 传下来 */
+export interface RetryingProvider extends Provider {
+  complete(request: ModelRequest, options: RetryCallOptions): Promise<RetriedResponse>;
+}
+
+export function withRetry(inner: Provider, opts: RetryOptions = {}): RetryingProvider {
   const delays = opts.delaysMs ?? RETRY_DELAYS_MS;
   const retries = opts.retries ?? delays.length;
   const max = opts.maxDelayMs ?? MAX_RETRY_DELAY_MS;
   const random = opts.random ?? Math.random;
   return {
     id: `retry(${inner.id})`,
-    async complete(request, options): Promise<RetriedResponse> {
-      const hooks = options as CallHooks;
+    async complete(request: ModelRequest, options: RetryCallOptions): Promise<RetriedResponse> {
+      const { onWait, onSend, ...forwarded } = options;
       const failures: RetryRecord[] = [];
       for (let attempt = 1; ; attempt++) {
         let streamed = false;
         // 排队的时间不算请求的耗时：调用方（例如审查的超时）据此暂停、重新计时
-        if (opts.gate) hooks.onWait?.();
+        if (opts.gate) onWait?.();
         const done = await opts.gate?.acquire(options.signal, opts.onWait && ((delayMs) => opts.onWait!({ delayMs, request })));
-        hooks.onSend?.();
+        onSend?.();
         opts.onRequest?.(attempt);
         try {
           const res = await inner
             .complete(request, {
-              ...options,
+              ...forwarded,
               onDelta: (d) => {
                 streamed = true;
                 options.onDelta?.(d);
@@ -108,7 +116,7 @@ export function withRetry(inner: Provider, opts: RetryOptions = {}): Provider {
           if (streamed) options.onDelta?.({ kind: "reset" });
           failures.push({ attempt, delayMs, error: err.message, ...(err.status !== undefined ? { status: err.status } : {}), ...(streamed ? { discarded: true as const } : {}) });
           opts.onRetry?.({ attempt, retries, delayMs, error: err, request });
-          hooks.onWait?.();
+          onWait?.();
           await sleep(delayMs, options.signal);
         }
       }
