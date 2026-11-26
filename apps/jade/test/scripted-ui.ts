@@ -66,6 +66,8 @@ export interface Shared {
   jobs: { session: string; kind: string; title: string; output: string; details: string[]; statuses: string[]; disposed: boolean }[];
   /** 为 true 时，后台的事第一次有输出就当作用户按了停；"at-end" 时在它从列表里去掉的那一刻按停（已经跑完了） */
   stopJobs: boolean | "at-end";
+  /** models@1.price；没有时假的 models@1 不给单价 */
+  price?: (model: string, at: Date) => { input: number; output: number; currency?: string } | undefined;
 }
 
 const FAKE_MODEL = `export default { process(ctx) {
@@ -85,7 +87,7 @@ const FAKE_MODEL = `export default { process(ctx) {
     for (const b of res.content) if (b.kind === "text") opts.onDelta?.({ kind: "text", text: b.text });
     if (opts.signal?.aborted) throw new Error("aborted");
     return res;
-  }, list: async () => g().listed, saved: async () => g().saved });
+  }, list: async () => g().listed, saved: async () => g().saved, price: (model, at) => g().price?.(model, at) });
 } };`;
 
 const FAKE_FRONTEND = `const plain = (t) => (typeof t === "string" ? t : Array.isArray(t) ? t.map(plain).join("") : (t?.text ?? ""));

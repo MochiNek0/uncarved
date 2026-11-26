@@ -182,7 +182,7 @@ export class ScreenBridge {
     },
     select: async (req, signal) => {
       if (!this.screen) return undefined;
-      return this.screen.select(req.title, req.options.map((o) => ({ label: o.label, value: o.value, ...(o.hint ? { hint: o.hint } : {}) })), { ...(req.detail ? { body: ansi(req.detail) } : {}), ...(signal ? { signal } : {}) });
+      return this.screen.select(req.title, req.options.map((o) => ({ label: o.label, value: o.value, ...(o.hint ? { hint: o.hint } : {}), ...(o.group ? { group: o.group } : {}) })), { ...(req.detail ? { body: ansi(req.detail) } : {}), ...(signal ? { signal } : {}) });
     },
     input: async (req, signal) => {
       if (!this.screen) return undefined;

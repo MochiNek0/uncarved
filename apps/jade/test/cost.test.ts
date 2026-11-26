@@ -3,7 +3,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { UI } from "../src/index.ts";
 import type { CommandContext, Commands } from "@uncarved/jade-api/services";
-import { costOf, parsePrices, priceOf } from "../plugins/cost/index.ts";
+import { costOf, money, parsePrices, priceOf } from "../plugins/cost/index.ts";
 import { cleanup, say, scriptedHost } from "./scripted-ui.ts";
 
 afterEach(cleanup);
@@ -31,7 +31,34 @@ describe("jade/cost", () => {
     await send(s, "second");
     // 30 万输入 × $10 + 3 万输出 × $20，每百万
     expect(await cost()).toBe("s1: 300.0k in, 30.0k out · $3.60\nTotal: $3.60");
-    expect(s.state.derived["jade/cost/usage"]).toEqual({ s1: { inputTokens: 300_000, outputTokens: 30_000, cacheReadTokens: 0, cacheWriteTokens: 0 } });
+    expect(s.state.derived["jade/cost/spent"]).toEqual({ USD: expect.closeTo(3.6, 6) });
+  });
+
+  test("a price set on the model wins over the configured one and is taken at the time of each reply", async () => {
+    const { host, shared, send } = await scriptedHost({ config: { "jade/cost": { prices: { s1: { input: 10, output: 20 } } } } });
+    const c: CommandContext = { signal: new AbortController().signal, ui: host.service<UI>("ui@1")!, sessions: host.sessions, print: () => {} };
+    const cost = () => host.service<Commands>("commands@1")!.get("cost")!.command.run("", c);
+    // 第一个回复按 ¥2/¥8，之后的按 ¥1/¥4（例如进了低谷时段）
+    const times: Date[] = [];
+    shared.price = (_model, at) => {
+      times.push(at);
+      return times.length <= 1 ? { input: 2, output: 8, currency: "CNY" } : { input: 1, output: 4, currency: "CNY" };
+    };
+    const s = await host.sessions.open();
+    shared.script.push(say("one", { inputTokens: 1_000_000, outputTokens: 0 }), say("two", { inputTokens: 1_000_000, outputTokens: 0 }));
+    await send(s, "first");
+    await send(s, "second");
+    expect(s.state.derived["jade/cost/spent"]).toEqual({ CNY: 3 });
+    // /cost 从日志重算，按每个事件自己的时间取单价
+    times.length = 0;
+    expect(await cost()).toEndWith("Total: ¥3.00");
+    expect(times.every((t) => t instanceof Date && !Number.isNaN(t.getTime()))).toBe(true);
+  });
+
+  test("different currencies are added up separately", () => {
+    expect(money({ USD: 0.12, CNY: 0.8 })).toBe("$0.12 + ¥0.80");
+    expect(money({ EUR: 1 })).toBe("1.00 EUR");
+    expect(parsePrices({ deepseek: { input: 2, output: 8, currency: "cny" } }).deepseek).toEqual({ input: 2, output: 8, currency: "CNY" });
   });
 
   test("without a price /cost shows tokens and says how to configure one", async () => {
@@ -41,6 +68,6 @@ describe("jade/cost", () => {
     shared.script.push(say("one", { inputTokens: 1500, outputTokens: 10 }));
     await send(s, "first");
     const out = String(await host.service<Commands>("commands@1")!.get("cost")!.command.run("", c));
-    expect(out).toStartWith("s1: 1.5k in, 10 out\nNo price is configured for these models");
+    expect(out).toStartWith("s1: 1.5k in, 10 out\nNo price is set for these models: set one in /model");
   });
 });

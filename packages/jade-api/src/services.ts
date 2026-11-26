@@ -179,6 +179,8 @@ export interface Models {
   complete(request: ModelRequest, options: { signal: AbortSignal; onDelta?: (delta: import("uncarved").Delta) => void; model?: string }): Promise<ModelResponse>;
   /** 服务提供的模型列表；不支持或出错时为空 */
   list(): Promise<string[]>;
+  /** 给这个名字的模型填过的单价在 at 这一刻是多少（当前服务上的优先）；没填时 undefined */
+  price?(model: string, at: Date): Price | undefined;
   /** /model 保存过的模型名（complete 的 model 能用的那些），最近用过的在前 */
   saved?(): Promise<string[]>;
   /** 配置换了（/model）时调用，返回取消订阅。前端用它更新状态栏 */
@@ -288,12 +290,17 @@ export interface Price {
   output: number;
   cacheRead?: number;
   cacheWrite?: number;
+  /** 货币代码，例如 "USD"、"CNY"；没有时是 "USD" */
+  currency?: string;
 }
 
 /** cost@1 */
 export interface Cost {
-  /** 配置里这个模型的单价（名字完全相同的，否则最长的前缀）；没有配置时 undefined */
-  price(model: string): Price | undefined;
+  /**
+   * 这个模型在 at（默认现在）的单价：先看 models@1.price（/model 里给模型填的，可以分时段），
+   * 再看配置里的（名字完全相同的，否则最长的前缀）；都没有时 undefined
+   */
+  price(model: string, at?: Date): Price | undefined;
 }
 
 // ---------- sessions@1（jade/sessions） ----------

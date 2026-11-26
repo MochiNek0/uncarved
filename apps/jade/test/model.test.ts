@@ -57,6 +57,8 @@ interface Shared {
   offered: string[][];
   /** 每次选择给出的选项说明（hint） */
   hints: (string | undefined)[][];
+  /** 每次选择给出的选项分组（group） */
+  groups: (string | undefined)[][];
   inputsAsked: string[];
   notes: string[];
   /** 会话状态栏上 jade/models 那一段每次的值（undefined 是去掉） */
@@ -81,6 +83,7 @@ const FAKE_UI = `export default { process(ctx) {
       g().asked.push(r.title);
       g().offered.push(r.options.map((o) => o.value));
       g().hints.push(r.options.map((o) => o.hint));
+      g().groups.push(r.options.map((o) => o.group));
       const a = g().selects.shift();
       if (a === undefined) return undefined;
       return typeof a === "number" ? r.options[a]?.value : a;
@@ -147,7 +150,7 @@ async function setup(env: string = ENV_A) {
     }
   }
   await writeFile(path.join(home, "plugins.json"), JSON.stringify({ disabled }));
-  const shared: Shared = { selects: [], inputs: [], asked: [], offered: [], hints: [], inputsAsked: [], notes: [], statuses: [], notices: [] };
+  const shared: Shared = { selects: [], inputs: [], asked: [], offered: [], hints: [], groups: [], inputsAsked: [], notes: [], statuses: [], notices: [] };
   (globalThis as { __jadeModelTest?: Shared }).__jadeModelTest = shared;
   const reports: string[] = [];
   const host = await PluginHost.start({
@@ -168,6 +171,10 @@ async function setup(env: string = ENV_A) {
 }
 
 const readEnvFile = async (home: string) => readFile(path.join(home, ".env"), "utf8");
+
+/** 管理菜单里模型子菜单的标题 */
+const M1 = "m1 (openai-compat · a.example)";
+const M2 = "m2 (openai-compat · b.example)";
 
 describe("/model", () => {
   test("switches to a saved model on another service, keeping both in models.json", async () => {
@@ -263,11 +270,11 @@ describe("/model", () => {
   test("the menu changes the current model's settings", async () => {
     const { home, shared, host, ctx, command, models } = await setup();
     try {
-      // 主菜单 → 选中当前模型 → 设置 → 输出上限 → 64000 → 回到设置 → Esc → 回到 m1 → Esc → 回到主菜单 → Esc
-      shared.selects.push("current", "settings", "max", undefined, undefined, undefined);
+      // 主菜单 → 管理 → 当前模型 → 设置 → 输出上限 → 64000 → 回到设置 → Esc → 回到 m1 → Esc → 管理 → Esc → 主菜单 → Esc
+      shared.selects.push("manage", "model:0", "settings", "max", undefined, undefined, undefined, undefined);
       shared.inputs.push("64000");
       await command.run("", ctx);
-      expect(shared.asked).toEqual(["Switch model", "m1", "Settings for m1", "Settings for m1", "m1", "Switch model"]);
+      expect(shared.asked).toEqual(["Switch model", "Manage models", M1, "Settings for m1", "Settings for m1", M1, "Manage models", "Switch model"]);
       expect(shared.inputsAsked).toEqual(["Output limit per reply in tokens, e.g. 32000, 64K (empty for the service default)"]);
       expect(await readEnvFile(home)).toContain("JADE_MAX_TOKENS=64000");
       expect(models.current()!.model).toBe("m1");
@@ -282,11 +289,11 @@ describe("/model", () => {
   test("the settings menu stays open to change several settings in a row", async () => {
     const { home, shared, host, ctx, command } = await setup();
     try {
-      // m2 → 设置 → 输出上限 32000 → 还在设置里 → 限速 20 → 还在设置里 → Esc → m2 → Esc → 主菜单 → Esc
-      shared.selects.push("saved:0", "settings", "max", "rpm", undefined, undefined, undefined);
+      // 管理 → m2 → 设置 → 输出上限 32000 → 还在设置里 → 限速 20 → 还在设置里 → Esc → m2 → Esc → 管理 → Esc → 主菜单 → Esc
+      shared.selects.push("manage", "model:1", "settings", "max", "rpm", undefined, undefined, undefined, undefined);
       shared.inputs.push("32000", "20");
       await command.run("", ctx);
-      expect(shared.asked).toEqual(["Switch model", "m2", "Settings for m2", "Settings for m2", "Settings for m2", "m2", "Switch model"]);
+      expect(shared.asked).toEqual(["Switch model", "Manage models", M2, "Settings for m2", "Settings for m2", "Settings for m2", M2, "Manage models", "Switch model"]);
       const saved = JSON.parse(await readFile(path.join(home, "models.json"), "utf8")) as { services: { models: { name: string; settings: Record<string, string> }[] }[] };
       expect(saved.services[1]!.models[0]).toEqual({ name: "m2", settings: { JADE_MAX_TOKENS: "32000", JADE_RPM: "20" } });
     } finally {
@@ -297,10 +304,10 @@ describe("/model", () => {
   test("Esc while editing a setting returns to the settings menu without changing it", async () => {
     const { home, shared, host, ctx, command } = await setup();
     try {
-      shared.selects.push("saved:0", "settings", "max", "back", "back", undefined);
+      shared.selects.push("manage", "model:1", "settings", "max", "back", "back", "back", undefined);
       shared.inputs.push(undefined);
       await command.run("", ctx);
-      expect(shared.asked).toEqual(["Switch model", "m2", "Settings for m2", "Settings for m2", "m2", "Switch model"]);
+      expect(shared.asked).toEqual(["Switch model", "Manage models", M2, "Settings for m2", "Settings for m2", M2, "Manage models", "Switch model"]);
       const saved = JSON.parse(await readFile(path.join(home, "models.json"), "utf8")) as { services: { models: { name: string; settings: Record<string, string> }[] }[] };
       expect(saved.services[1]!.models[0]!.settings).toEqual({ JADE_MAX_TOKENS: "64000" });
     } finally {
@@ -308,14 +315,14 @@ describe("/model", () => {
     }
   });
 
-  test("switching after changing settings in the same submenu uses the changed settings", async () => {
+  test("switching after changing a saved model's settings uses the changed settings", async () => {
     const { home, shared, host, ctx, command, models } = await setup();
     try {
-      // m2 → 设置 → 输出上限 32000 → Esc → m2 → 切换到它
-      shared.selects.push("saved:0", "settings", "max", undefined, "switch", undefined);
+      // 管理 → m2 → 设置 → 输出上限 32000 → Esc → Back → Back → 主菜单里选 m2
+      shared.selects.push("manage", "model:1", "settings", "max", undefined, "back", "back", "model:1");
       shared.inputs.push("32000");
       await command.run("", ctx);
-      expect(shared.asked).toEqual(["Switch model", "m2", "Settings for m2", "Settings for m2", "m2", "Switch model"]);
+      expect(shared.asked).toEqual(["Switch model", "Manage models", M2, "Settings for m2", "Settings for m2", M2, "Manage models", "Switch model"]);
       expect(models.current()!.model).toBe("m2");
       expect(await readEnvFile(home)).toContain("JADE_MAX_TOKENS=32000");
     } finally {
@@ -326,11 +333,11 @@ describe("/model", () => {
   test("changes another saved model's settings without switching to it", async () => {
     const { home, shared, host, ctx, command, models } = await setup();
     try {
-      // 主菜单 → 选中 m2 → 设置 → 输出上限 → 32000 → 回到设置 → Esc → 回到 m2 → Esc → 回到主菜单 → Esc；改动写进 m2，当前用的还是 m1
-      shared.selects.push("saved:0", "settings", "max", undefined, undefined, undefined);
+      // 主菜单 → 管理 → m2 → 设置 → 输出上限 → 32000 → 回到设置 → Esc → 回到 m2 → Esc → 管理 → Esc → 主菜单 → Esc；改动写进 m2，当前用的还是 m1
+      shared.selects.push("manage", "model:1", "settings", "max", undefined, undefined, undefined, undefined);
       shared.inputs.push("32000");
       await command.run("", ctx);
-      expect(shared.asked).toEqual(["Switch model", "m2", "Settings for m2", "Settings for m2", "m2", "Switch model"]);
+      expect(shared.asked).toEqual(["Switch model", "Manage models", M2, "Settings for m2", "Settings for m2", M2, "Manage models", "Switch model"]);
       expect(await readEnvFile(home)).not.toContain("JADE_MAX_TOKENS");
       expect(models.current()!.model).toBe("m1");
       const saved = JSON.parse(await readFile(path.join(home, "models.json"), "utf8")) as { services: { models: { name: string; settings: Record<string, string> }[] }[] };
@@ -347,10 +354,10 @@ describe("/model", () => {
     const { home, shared, host, ctx, command, models } = await setup();
     try {
       // m2 的输出上限清空（回到服务的默认值）：只影响 m2，m1 还是原来的样子
-      shared.selects.push("saved:0", "settings", "max", undefined, undefined, undefined);
+      shared.selects.push("manage", "model:1", "settings", "max", undefined, undefined, undefined, undefined);
       shared.inputs.push("");
       await command.run("", ctx);
-      expect(shared.asked).toEqual(["Switch model", "m2", "Settings for m2", "Settings for m2", "m2", "Switch model"]);
+      expect(shared.asked).toEqual(["Switch model", "Manage models", M2, "Settings for m2", "Settings for m2", M2, "Manage models", "Switch model"]);
       const saved = JSON.parse(await readFile(path.join(home, "models.json"), "utf8")) as { services: { models: { name: string; settings: Record<string, string> }[] }[] };
       expect(saved.services.flatMap((s) => s.models.map((m) => ({ name: m.name, settings: m.settings })))).toEqual([
         { name: "m1", settings: {} },
@@ -362,13 +369,13 @@ describe("/model", () => {
     }
   });
 
-  test("Back returns to the main menu without changing anything, Esc exits /model", async () => {
+  test("Back returns to the previous menu without changing anything, Esc exits /model", async () => {
     const { home, shared, host, ctx, command, models } = await setup();
     try {
-      // 主菜单 → 选中 m2 → Back → 主菜单（m1 还是当前的）→ Esc
-      shared.selects.push("saved:0", "back", undefined);
+      // 主菜单 → 管理 → m2 → Back → 管理 → Back → 主菜单（m1 还是当前的）→ Esc
+      shared.selects.push("manage", "model:1", "back", "back", undefined);
       await command.run("", ctx);
-      expect(shared.asked).toEqual(["Switch model", "m2", "Switch model"]);
+      expect(shared.asked).toEqual(["Switch model", "Manage models", M2, "Manage models", "Switch model"]);
       expect(models.current()!.model).toBe("m1");
       const saved = JSON.parse(await readFile(path.join(home, "models.json"), "utf8")) as { services: { models: { name: string; settings: Record<string, string> }[] }[] };
       expect(saved.services.flatMap((s) => s.models.map((m) => m.name))).toEqual(["m1", "m2"]);
@@ -377,15 +384,16 @@ describe("/model", () => {
     }
   });
 
-  test("switching from a saved model's submenu makes it current and returns to the main menu", async () => {
+  test("choosing a model in the main menu switches to it and ends /model", async () => {
     const { home, shared, host, ctx, command, models } = await setup();
     try {
-      // 主菜单 → m2 → 切换到它 → 回到主菜单（m2 现在是当前的，m1 成了保存过的）→ Esc
-      shared.selects.push("saved:0", "switch", undefined);
+      shared.selects.push("model:1");
       await command.run("", ctx);
-      expect(shared.asked).toEqual(["Switch model", "m2", "Switch model"]);
-      expect(shared.offered[1]).toEqual(["switch", "settings", "forget", "back"]);
-      expect(shared.offered[2]).toEqual(["current", "saved:0", "add"]);
+      expect(shared.asked).toEqual(["Switch model"]);
+      expect(shared.offered[0]).toEqual(["model:0", "model:1", "add", "manage"]);
+      // 每个服务一组，组的标题是服务
+      expect(shared.groups[0]).toEqual(["openai-compat · a.example", "openai-compat · b.example", undefined, undefined]);
+      expect(shared.hints[0]![0]).toStartWith("current · ");
       expect(models.current()!.model).toBe("m2");
       expect(await readEnvFile(home)).toContain("OPENAI_COMPAT_MODEL=m2");
     } finally {
@@ -393,24 +401,27 @@ describe("/model", () => {
     }
   });
 
-  test("the current model's submenu only offers its settings", async () => {
-    const { shared, host, ctx, command } = await setup();
+  test("the current model cannot be removed; other saved models can", async () => {
+    const { home, shared, host, ctx, command } = await setup();
     try {
-      shared.selects.push("current", "back", undefined);
+      shared.selects.push("manage", "model:0", "back", "model:1", "forget", undefined, undefined);
       await command.run("", ctx);
-      expect(shared.asked).toEqual(["Switch model", "m1", "Switch model"]);
-      expect(shared.offered[1]).toEqual(["settings", "back"]);
+      expect(shared.asked).toEqual(["Switch model", "Manage models", M1, "Manage models", M2, "Manage models", "Switch model"]);
+      expect(shared.offered[2]).toEqual(["settings", "rename", "back"]);
+      expect(shared.offered[4]).toEqual(["settings", "rename", "forget", "back"]);
+      const saved = JSON.parse(await readFile(path.join(home, "models.json"), "utf8")) as { services: { models: { name: string }[] }[] };
+      expect(saved.services.flatMap((s) => s.models.map((m) => m.name))).toEqual(["m1"]);
     } finally {
       await host.close();
     }
   });
 
-  test("Esc in a model's submenu returns to the main menu", async () => {
+  test("Esc in a model's submenu returns to the list of models", async () => {
     const { shared, host, ctx, command, models } = await setup();
     try {
-      shared.selects.push("saved:0", undefined, undefined);
+      shared.selects.push("manage", "model:1", undefined, undefined, undefined);
       await command.run("", ctx);
-      expect(shared.asked).toEqual(["Switch model", "m2", "Switch model"]);
+      expect(shared.asked).toEqual(["Switch model", "Manage models", M2, "Manage models", "Switch model"]);
       expect(models.current()!.model).toBe("m1");
     } finally {
       await host.close();
@@ -423,7 +434,7 @@ describe("/model", () => {
       const services = structuredClone(SERVICES);
       services.services[1]!.models[0]!.settings = { JADE_MAX_TOKENS: "64000", JADE_RPM: "20", JADE_VISION: "off" } as never;
       await writeFile(path.join(home, "models.json"), JSON.stringify(services));
-      shared.selects.push("saved:0", "settings", "max", undefined, undefined, undefined);
+      shared.selects.push("manage", "model:1", "settings", "max", undefined, undefined, undefined, undefined);
       shared.inputs.push("32000");
       await command.run("", ctx);
       const saved = JSON.parse(await readFile(path.join(home, "models.json"), "utf8")) as { services: { models: { name: string; settings: Record<string, string> }[] }[] };
@@ -436,9 +447,9 @@ describe("/model", () => {
   test("setting image support back to the default", async () => {
     const { home, shared, host, ctx, command, printed } = await setup("JADE_VISION=on\n" + ENV_A);
     try {
-      shared.selects.push("current", "settings", "vision", "\0default", undefined, undefined, undefined);
+      shared.selects.push("manage", "model:0", "settings", "vision", "\0default", undefined, undefined, undefined, undefined);
       await command.run("", ctx);
-      expect(shared.asked).toEqual(["Switch model", "m1", "Settings for m1", "Can this model see images (screenshots, image files)?", "Settings for m1", "m1", "Switch model"]);
+      expect(shared.asked).toEqual(["Switch model", "Manage models", M1, "Settings for m1", "Can this model see images (screenshots, image files)?", "Settings for m1", M1, "Manage models", "Switch model"]);
       expect(await readEnvFile(home)).not.toContain("JADE_VISION");
       // openai-compat 默认不发图
       expect(printed.join("\n")).toContain("Images will be replaced with a note.");
@@ -456,10 +467,10 @@ describe("/model", () => {
     test("for the current model it goes into .env and that model's saved settings", async () => {
       const { home, shared, host, ctx, command } = await setup();
       try {
-        shared.selects.push("current", "settings", "extra", undefined, undefined, undefined);
+        shared.selects.push("manage", "model:0", "settings", "extra", undefined, undefined, undefined, undefined);
         shared.inputs.push(BODY);
         await command.run("", ctx);
-        expect(shared.offered[2]).toContain("extra");
+        expect(shared.offered[3]).toContain("extra");
         expect(parseEnv(await readEnvFile(home)).OPENAI_COMPAT_EXTRA_BODY).toBe(BODY);
         const saved = await readSaved(home);
         expect(bodies(saved)).toEqual({ m1: BODY, m2: undefined });
@@ -472,7 +483,7 @@ describe("/model", () => {
     test("for another saved model it goes into that model only", async () => {
       const { home, shared, host, ctx, command, models } = await setup();
       try {
-        shared.selects.push("saved:0", "settings", "extra", undefined, undefined, undefined);
+        shared.selects.push("manage", "model:1", "settings", "extra", undefined, undefined, undefined, undefined);
         shared.inputs.push(BODY);
         await command.run("", ctx);
         expect(await readEnvFile(home)).toBe(ENV_A);
@@ -540,13 +551,13 @@ describe("/model", () => {
         services.services[1]!.models[0]!.settings.OPENAI_COMPAT_EXTRA_BODY = BODY;
         await writeFile(path.join(home, "models.json"), JSON.stringify(services));
 
-        shared.selects.push("saved:0", "settings", "extra", undefined, undefined, undefined);
+        shared.selects.push("manage", "model:1", "settings", "extra", undefined, undefined, undefined, undefined);
         shared.inputs.push("[1, 2]");
         await command.run("", ctx);
         expect(printed.join("\n")).toContain("must be a JSON object");
         expect(bodies(await readSaved(home)).m2).toBe(BODY);
 
-        shared.selects.push("saved:0", "settings", "extra", undefined, undefined, undefined);
+        shared.selects.push("manage", "model:1", "settings", "extra", undefined, undefined, undefined, undefined);
         shared.inputs.push("");
         await command.run("", ctx);
         expect(bodies(await readSaved(home)).m2).toBeUndefined();
@@ -558,10 +569,10 @@ describe("/model", () => {
     test("other services have no such setting", async () => {
       const { shared, host, ctx, command } = await setup("JADE_PROVIDER=openai\nOPENAI_API_KEY=k\nOPENAI_MODEL=gpt-x\n");
       try {
-        shared.selects.push("current", "settings", undefined, undefined);
+        shared.selects.push("manage", "model:0", "settings", undefined, undefined, undefined);
         await command.run("", ctx);
-        expect(shared.asked[2]).toBe("Settings for gpt-x");
-        expect(shared.offered[2]).not.toContain("extra");
+        expect(shared.asked[3]).toBe("Settings for gpt-x");
+        expect(shared.offered[3]).not.toContain("extra");
       } finally {
         await host.close();
       }
@@ -635,15 +646,48 @@ describe("/model", () => {
       }
     });
 
-    test("on the same service (only the key changed) it keeps the current settings", async () => {
+    test("on the same service it starts from the defaults too, asking only for the output limit", async () => {
+      const { home, shared, host, ctx, command } = await setup(ENV_A + SETTINGS);
+      try {
+        // 主菜单 → 加一个模型 → 保存过的服务 a.example → 模型名 → 输出上限
+        shared.selects.push("add", "service:0");
+        shared.inputs.push("m5", "");
+        await command.run("", ctx);
+        expect(shared.offered[1]).toEqual(["service:0", "service:1", "provider", "back"]);
+        expect(shared.inputsAsked).toEqual(["Model name", "Output limit per reply in tokens, e.g. 32000, 64K (empty for the service default)"]);
+        const env = parseEnv(await readEnvFile(home));
+        expect([env.OPENAI_COMPAT_MODEL, env.OPENAI_COMPAT_BASE_URL, env.JADE_MAX_TOKENS, env.JADE_RPM, env.JADE_VISION]).toEqual(["m5", "https://a.example/v1", undefined, undefined, undefined]);
+      } finally {
+        await host.close();
+      }
+    });
+
+    test("a new model on a saved service other than the current one uses that service", async () => {
+      const { home, shared, host, ctx, command, models } = await setup(ENV_A + SETTINGS);
+      try {
+        shared.selects.push("add", "service:1");
+        shared.inputs.push("m7", "16K");
+        await command.run("", ctx);
+        const env = parseEnv(await readEnvFile(home));
+        expect([env.OPENAI_COMPAT_MODEL, env.OPENAI_COMPAT_BASE_URL, env.OPENAI_COMPAT_API_KEY, env.JADE_MAX_TOKENS, env.JADE_RPM]).toEqual(["m7", "https://b.example/v1", "kb", "16K", undefined]);
+        expect(models.current()!.model).toBe("m7");
+      } finally {
+        await host.close();
+      }
+    });
+
+    test("changing only the API key keeps each model's own settings", async () => {
       const { home, shared, host, ctx, command } = await setup(ENV_A + SETTINGS);
       try {
         shared.selects.push("add", "provider", "openai-compat");
-        shared.inputs.push("https://a.example/v1", "ka2", "m5");
+        shared.inputs.push("https://a.example/v1", "ka2", "m1");
         await command.run("", ctx);
         expect(shared.inputsAsked).toEqual(["Base URL", "API key", "Model name"]);
         const env = parseEnv(await readEnvFile(home));
-        expect([env.OPENAI_COMPAT_MODEL, env.JADE_MAX_TOKENS, env.JADE_RPM, env.JADE_VISION]).toEqual(["m5", "48000", "20", "off"]);
+        expect([env.OPENAI_COMPAT_MODEL, env.OPENAI_COMPAT_API_KEY, env.JADE_MAX_TOKENS, env.JADE_RPM, env.JADE_VISION]).toEqual(["m1", "ka2", "48000", "20", "off"]);
+        // 原来那个密钥的服务归到新的密钥下，不留两份
+        const saved = JSON.parse(await readFile(path.join(home, "models.json"), "utf8")) as { services: { env: Record<string, string> }[] };
+        expect(saved.services.map((s) => s.env.OPENAI_COMPAT_API_KEY)).toEqual(["ka2", "kb"]);
       } finally {
         await host.close();
       }
@@ -652,10 +696,10 @@ describe("/model", () => {
     test("Claude's settings show its default output limit", async () => {
       const { shared, host, ctx, command } = await setup("JADE_PROVIDER=anthropic\nANTHROPIC_API_KEY=k\nANTHROPIC_MODEL=claude-x\n");
       try {
-        shared.selects.push("current", "settings");
+        shared.selects.push("manage", "model:0", "settings");
         await command.run("", ctx);
-        expect(shared.asked[2]).toBe("Settings for claude-x");
-        expect(shared.hints[2]![0]).toBe("64000 tokens (default)");
+        expect(shared.asked[3]).toBe("Settings for claude-x");
+        expect(shared.hints[3]![0]).toBe("64000 tokens (default)");
       } finally {
         await host.close();
       }
@@ -664,11 +708,11 @@ describe("/model", () => {
     test("thinking settings can be turned off for a model and back on", async () => {
       const { home, shared, host, ctx, command } = await setup("JADE_PROVIDER=anthropic\nANTHROPIC_API_KEY=k\nANTHROPIC_MODEL=claude-x\n");
       try {
-        shared.selects.push("current", "settings", "thinking", "off", undefined, undefined, undefined);
+        shared.selects.push("manage", "model:0", "settings", "thinking", "off", undefined, undefined, undefined, undefined);
         await command.run("", ctx);
         expect(shared.asked).toContain("Send thinking and effort settings with each request?");
         expect(await readEnvFile(home)).toContain("JADE_THINKING=off");
-        shared.selects.push("current", "settings", "thinking", "on", undefined, undefined, undefined);
+        shared.selects.push("manage", "model:0", "settings", "thinking", "on", undefined, undefined, undefined, undefined);
         await command.run("", ctx);
         expect(await readEnvFile(home)).not.toContain("JADE_THINKING");
       } finally {
@@ -687,10 +731,10 @@ describe("/model", () => {
       expect(models.current()!.model).toBe("m1");
       expect(await readEnvFile(home)).toBe(ENV_A);
 
-      // 主菜单 → 加一个模型 → 这个服务 → 模型名那级按 Esc → 主菜单 → Esc
+      // 主菜单 → 加一个模型 → 当前的服务 → 模型名那级按 Esc → 主菜单 → Esc
       // 当前服务不提供模型列表（fetch 返回 404），所以没有 "Choose a model" 选择，直接问模型名
       shared.asked.length = 0;
-      shared.selects.push("add", "model", undefined);
+      shared.selects.push("add", "service:0", undefined);
       await command.run("", ctx);
       expect(shared.asked).toEqual(["Switch model", "Add a model from", "Switch model"]);
       expect(shared.inputsAsked.at(-1)).toBe("Model name");
@@ -861,6 +905,107 @@ describe("the no-model hint", () => {
     try {
       await host.sessions.open();
       expect(shared.notes.some((n) => n.includes("No model is configured yet"))).toBe(false);
+    } finally {
+      await host.close();
+    }
+  });
+});
+
+describe("prices and service names in /model", () => {
+  type Saved = { services: { name?: string; env: Record<string, string>; models: { name: string; settings: Record<string, string>; price?: unknown }[] }[] };
+  const readSaved = async (home: string) => JSON.parse(await readFile(path.join(home, "models.json"), "utf8")) as Saved;
+  const PRICE_TITLE = "Price of m2 per million tokens";
+
+  test("a saved model gets a base price in CNY and an off-peak rule; models@1.price follows the time of day", async () => {
+    const { home, shared, host, ctx, command, models } = await setup();
+    try {
+      // 管理 → m2 → 设置 → 单价 → 基础价（先选货币）→ 加一条按时间的规则 → 出来
+      shared.selects.push("manage", "model:1", "settings", "price", "base", "CNY", "add", undefined, undefined, undefined, undefined, undefined);
+      shared.inputs.push("2 8 0.5", "00:30-08:30 UTC+8", "50%");
+      await command.run("", ctx);
+      expect(shared.asked.slice(3, 8)).toEqual(["Settings for m2", PRICE_TITLE, "Currency of the prices", PRICE_TITLE, PRICE_TITLE]);
+      expect(shared.groups[7]).toContain("Time-based prices (the first that matches applies)");
+      const m2 = (await readSaved(home)).services[1]!.models[0]!;
+      expect(m2.price).toEqual({ currency: "CNY", input: 2, output: 8, cacheRead: 0.5, rules: [{ times: [{ from: "00:30", to: "08:30" }], tz: "UTC+8", scale: 0.5 }] });
+      // 设置没动
+      expect(m2.settings).toEqual({ JADE_MAX_TOKENS: "64000" });
+      expect(models.price!("m2", new Date("2026-11-26T12:00:00+08:00"))).toEqual({ currency: "CNY", input: 2, output: 8, cacheRead: 0.5 });
+      expect(models.price!("m2", new Date("2026-11-26T01:00:00+08:00"))).toMatchObject({ currency: "CNY", input: 1, output: 4, cacheRead: 0.25 });
+      expect(models.price!("m1", new Date())).toBeUndefined();
+      // 主菜单里也看得到
+      shared.selects.push(undefined);
+      await command.run("", ctx);
+      expect(shared.hints.at(-1)![1]).toContain("¥2 in · ¥8 out · 1 time rule");
+    } finally {
+      await host.close();
+    }
+  });
+
+  test("the current model's price survives switching away and back", async () => {
+    const { home, shared, host, ctx, command, models } = await setup();
+    try {
+      shared.selects.push("manage", "model:0", "settings", "price", "base", "USD", undefined, undefined, undefined, undefined, undefined);
+      shared.inputs.push("3 15");
+      await command.run("", ctx);
+      await command.run("m2", ctx);
+      await command.run("m1", ctx);
+      expect(models.current()!.model).toBe("m1");
+      const m1 = (await readSaved(home)).services.flatMap((s) => s.models).find((m) => m.name === "m1");
+      expect(m1!.price).toEqual({ currency: "USD", input: 3, output: 15 });
+    } finally {
+      await host.close();
+    }
+  });
+
+  test("rules can be edited, moved up and removed; a wrong rule is reported and changes nothing", async () => {
+    const { home, shared, host, ctx, command, printed } = await setup();
+    try {
+      const services = structuredClone(SERVICES) as unknown as Saved;
+      services.services[1]!.models[0]!.price = { currency: "USD", input: 1, output: 2, rules: [{ days: [0, 6], scale: 0.8 }, { from: "00:00", to: "06:00", scale: 0.5 }] };
+      await writeFile(path.join(home, "models.json"), JSON.stringify(services));
+      const rules = async () => ((await readSaved(home)).services[1]!.models[0]!.price as { rules?: unknown[] }).rules;
+      const open = ["manage", "model:1", "settings", "price"];
+      const close = [undefined, undefined, undefined, undefined, undefined];
+
+      shared.selects.push(...open, "rule:1", "up", ...close);
+      await command.run("", ctx);
+      expect(await rules()).toEqual([{ times: [{ from: "00:00", to: "06:00" }], scale: 0.5 }, { days: [0, 6], scale: 0.8 }]);
+
+      shared.selects.push(...open, "rule:0", "edit", ...close);
+      shared.inputs.push("00:00-07:00", "- 1");
+      await command.run("", ctx);
+      expect((await rules())![0]).toEqual({ times: [{ from: "00:00", to: "07:00" }], output: 1 });
+
+      shared.selects.push(...open, "add", ...close);
+      shared.inputs.push("someday", "50%");
+      await command.run("", ctx);
+      expect(printed.join("\n")).toContain('Not understood: "someday"');
+      expect(await rules()).toHaveLength(2);
+
+      shared.selects.push(...open, "rule:1", "remove", "rule:0", "remove", ...close);
+      await command.run("", ctx);
+      expect(await rules()).toBeUndefined();
+    } finally {
+      await host.close();
+    }
+  });
+
+  test("a service can be named; the main menu groups and sorts by that name", async () => {
+    const { home, shared, host, ctx, command } = await setup();
+    try {
+      // 给 b.example 起名 "Alpha"：排到 a.example 前面
+      shared.selects.push("manage", "model:1", "rename", undefined, undefined, undefined);
+      shared.inputs.push("Alpha");
+      await command.run("", ctx);
+      expect((await readSaved(home)).services[1]!.name).toBe("Alpha");
+      shared.selects.push(undefined);
+      await command.run("", ctx);
+      expect(shared.offered.at(-1)).toEqual(["model:0", "model:1", "add", "manage"]);
+      expect(shared.groups.at(-1)).toEqual(["Alpha", "openai-compat · a.example", undefined, undefined]);
+      expect(shared.hints.at(-1)![1]).toStartWith("current · ");
+      // 切换、改设置之后名字还在
+      await command.run("m2", ctx);
+      expect((await readSaved(home)).services.find((s) => s.env.OPENAI_COMPAT_BASE_URL === "https://b.example/v1")!.name).toBe("Alpha");
     } finally {
       await host.close();
     }

@@ -127,7 +127,7 @@ jade 自带的功能全是 `apps/jade/plugins/` 下的普通插件，和第三�
 | `jade/tui`、`jade/print`、`jade/serve` | 终端界面、`-p` 非交互模式、`--serve` 无头多会话模式 |
 | `jade/fs`、`jade/shell` | 文件读写、运行命令（`shell@1` 供其他插件调用） |
 | `jade/web` | `web_fetch`、`web_search`、`/search` |
-| `jade/models` | 模型路由、`/model`、`provider@1` |
+| `jade/models` | 模型路由、`/model`（按服务分组列出模型，回车切换；设置、单价、服务名在 Manage models 里）、`provider@1` |
 | `jade/approval` | 权限审批、模式、审查 |
 | `jade/modes` | 模式切换、计划模式 |
 | `jade/compact` | 上下文压缩、溢出后自动重试 |
@@ -138,7 +138,7 @@ jade 自带的功能全是 `apps/jade/plugins/` 下的普通插件，和第三�
 | `jade/screenshot` | 无头浏览器截图交给模型看 |
 | `jade/custom-commands` | 把 Markdown 文件变成斜杠命令 |
 | `jade/hooks` | 在配置里写 shell 命令，工具调用前后、一轮结束时运行 |
-| `jade/cost` | 按配置的单价把 token 用量换算成钱，`/cost` |
+| `jade/cost` | 按单价把 token 用量换算成钱（`/model` 里给模型填的，可以分时段、美元或人民币；或者配置里的），`/cost` |
 | `jade/steer` | agent 工作时说的话在下一次请求模型时就交给它 |
 | `jade/editor` | Ctrl+G 用 `$EDITOR` 编辑输入 |
 
@@ -249,7 +249,7 @@ plugin.run()
 | `JADE_UPDATE_CHECK` | shell | 设为 `off` 不检查更新 |
 | `HTTPS_PROXY` / `HTTP_PROXY` | shell | 模型和 web 请求走代理（Node.js 版本太旧、不支持时启动时会提示；Bun 都支持） |
 
-权限模式和压缩阈值是插件配置，写在 `$JADE_HOME/config.json`，例如 `{"jade/approval": {"mode": "auto"}, "jade/compact": {"thresholdTokens": "120k"}}`。会话里用 Shift+Tab 或 `/mode` 选的模式记在 `mode.json`，比配置优先（见上文"权限"）。历史超过 100k token 时（远在压缩阈值之前）会先清理较早的大段工具输出，只留最近的一段；清理会让提示缓存失效，所以只在大约 10 次请求内能回本时清理：缓存价按 `jade/cost` 配置的单价算，没配时按原价的 1/20。100k 这个起点可用 `{"jade/compact": {"trimTokens": "200k"}}` 调整，`false` 关掉。等审批回答的时限默认 24 小时，过了按拒绝处理，可用 `{"jade/approval": {"askTimeoutMinutes": 30}}` 改短（最长一周）。
+权限模式和压缩阈值是插件配置，写在 `$JADE_HOME/config.json`，例如 `{"jade/approval": {"mode": "auto"}, "jade/compact": {"thresholdTokens": "120k"}}`。会话里用 Shift+Tab 或 `/mode` 选的模式记在 `mode.json`，比配置优先（见上文"权限"）。历史超过 100k token 时（远在压缩阈值之前）会先清理较早的大段工具输出，只留最近的一段；清理会让提示缓存失效，所以只在大约 10 次请求内能回本时清理：缓存价按 `jade/cost` 的单价（`/model` 里填的或配置里的）算，没有时按原价的 1/20。100k 这个起点可用 `{"jade/compact": {"trimTokens": "200k"}}` 调整，`false` 关掉。等审批回答的时限默认 24 小时，过了按拒绝处理，可用 `{"jade/approval": {"askTimeoutMinutes": 30}}` 改短（最长一周）。
 
 其他插件配置（都写在 `$JADE_HOME/config.json`）：
 
@@ -258,8 +258,10 @@ plugin.run()
   // 子 Agent 用另一个（更便宜、更快的）模型：/model 保存过的名字，或当前服务上的模型名
   // 子 Agent 历史到了多少 token 就写报告（默认 150000，窗口的 70% 更小时按窗口算）
   "jade/task": { "model": "claude-haiku-5-5", "wrapUpTokens": 150000 },
-  // 单价，每百万 token（这里的数字只是示例，按你用的服务填）；键是模型名或它的前缀。配了之后状态栏显示会话花了多少钱
-  "jade/cost": { "prices": { "claude-opus": { "input": 15, "output": 75, "cacheRead": 1.5, "cacheWrite": 18.75 } } },
+  // 单价，每百万 token（这里的数字只是示例，按你用的服务填）；键是模型名或它的前缀，currency 不写时是 USD。
+  // 配了之后状态栏显示会话花了多少钱，不同货币分开合计。更方便的是在 /model 里给模型填（Manage models → 模型 → Settings → Price），
+  // 那里还能加按时间的价格（峰谷价、周末价、限时折扣），并且优先于这里的
+  "jade/cost": { "prices": { "claude-opus": { "input": 15, "output": 75, "cacheRead": 1.5, "cacheWrite": 18.75, "currency": "USD" } } },
   // hook：before 的命令退出码不是 0 时拒绝这次调用；after 失败时告诉 agent；turn 在一轮结束时运行。
   // 命令里可以用 $JADE_TOOL、$JADE_TOOL_INPUT（参数的 JSON 文件）、$JADE_TOOL_PATH
   "jade/hooks": { "hooks": [

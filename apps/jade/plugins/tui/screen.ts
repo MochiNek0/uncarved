@@ -11,6 +11,8 @@ export interface Choice<T> {
   value: T;
   /** 选项后面的灰色说明 */
   hint?: string;
+  /** 分组的标题：相邻的、group 相同的选项显示在同一个标题下 */
+  group?: string;
 }
 
 export interface StatusInfo {
@@ -239,7 +241,7 @@ export function safeScreen(screen: Screen): Screen {
     select: (title, choices, o) =>
       screen.select(
         s(title),
-        choices.map((c) => ({ ...c, label: s(c.label), hint: opt(c.hint) })),
+        choices.map((c) => ({ ...c, label: s(c.label), hint: opt(c.hint), group: opt(c.group) })),
         o && { ...o, body: opt(o.body) },
       ),
     input: (title, o) => screen.input(s(title), o && { ...o, initial: opt(o.initial), placeholder: opt(o.placeholder) }),
@@ -333,7 +335,10 @@ export function plainScreen(opts: { interactive: boolean }): Screen {
       if (!opts.interactive) return undefined;
       line(yellow(title));
       if (o?.body) line(o.body);
-      choices.forEach((c, i) => line(`  ${i + 1}. ${c.label}${c.hint ? dim(`  ${c.hint}`) : ""}`));
+      choices.forEach((c, i) => {
+        if (c.group !== undefined && c.group !== choices[i - 1]?.group) line(dim(`  ${c.group}`));
+        line(`  ${i + 1}. ${c.label}${c.hint ? dim(`  ${c.hint}`) : ""}`);
+      });
       if (o?.signal?.aborted) return undefined;
       const n = Number(await ask(`Choose 1-${choices.length} (empty to cancel): `, o?.signal));
       return Number.isInteger(n) && n >= 1 && n <= choices.length ? choices[n - 1]!.value : undefined;

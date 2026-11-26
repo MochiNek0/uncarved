@@ -2399,7 +2399,7 @@ function SelectDialog({
     const q = getQuery().toLowerCase();
     return dialog.choices
       .map((c, i) => ({ c, i }))
-      .filter(({ c }) => !q || `${c.label} ${c.hint ?? ""}`.toLowerCase().includes(q));
+      .filter(({ c }) => !q || `${c.label} ${c.hint ?? ""} ${c.group ?? ""}`.toLowerCase().includes(q));
   };
   const items = filtered();
   const n = items.length;
@@ -2470,8 +2470,24 @@ function SelectDialog({
     if (Number.isInteger(digit) && digit >= 1 && digit <= Math.min(n, 9))
       dialog.resolve(items[digit - 1]!.c.value);
   });
-  // 选项多时只显示选中项附近的一段
-  const start = around(selected, n, visible);
+  // 选项多时只显示选中项附近的一段。分组的标题也占一行：第一项有分组时总带上它的标题，
+  // 放不下选中项时往后挪
+  const shownFrom = (from: number) => {
+    const out: { k: number; head?: string }[] = [];
+    for (let k = from, used = 0; k < n; k++) {
+      const g = items[k]!.c.group;
+      const head = g !== undefined && (k === from || items[k - 1]!.c.group !== g) ? g : undefined;
+      const rows = head === undefined ? 1 : 2;
+      if (used + rows > visible && out.length) break;
+      out.push({ k, ...(head === undefined ? {} : { head }) });
+      used += rows;
+    }
+    return out;
+  };
+  let start = around(selected, n, visible);
+  let shown = shownFrom(start);
+  while (start < selected && !shown.some((r) => r.k === selected)) shown = shownFrom(++start);
+  const end = shown.length ? shown.at(-1)!.k + 1 : start;
   return h(
     Box,
     { flexDirection: "column", borderStyle: "round", borderColor: "yellow", paddingX: 1, marginTop: 1 },
@@ -2490,16 +2506,18 @@ function SelectDialog({
       { flexDirection: "column", marginTop: filtering ? 0 : 1 },
       start > 0 ? h(Text, { dimColor: true }, ` ↑ ${start} more`) : null,
       n === 0 ? h(Text, { dimColor: true }, " no match") : null,
-      items.slice(start, start + visible).map(({ c, i }, j) => {
-        const on = start + j === selected;
-        return h(
+      shown.flatMap(({ k, head }) => {
+        const { c, i } = items[k]!;
+        const on = k === selected;
+        const row = h(
           Text,
           { key: i, wrap: "truncate-end" },
           h(Text, { color: on ? "cyan" : undefined, bold: on }, on ? "❯ " : "  ", filtering ? "" : `${i + 1}. `, c.label),
           c.hint ? h(Text, { dimColor: true }, ` ${c.hint}`) : null,
         );
+        return head === undefined ? [row] : [h(Text, { key: `group-${i}`, bold: true, dimColor: true, wrap: "truncate-end" }, ` ${head}`), row];
       }),
-      start + visible < n ? h(Text, { dimColor: true }, ` ↓ ${n - start - visible} more`) : null,
+      end < n ? h(Text, { dimColor: true }, ` ↓ ${n - end} more`) : null,
     ),
     h(Hint, {
       width: Math.max(10, columns - 4),

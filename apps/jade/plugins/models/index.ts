@@ -4,6 +4,7 @@
 // /model 改了配置之后不用重开会话：provider@1 给核心的是一个转发到当前 provider 的壳（设计第 10 节），
 // 下一次请求就用新的。
 
+import { readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import type { ModelRequest, ModelResponse, Provider } from "uncarved";
 import { definePlugin, type Notice, type UI, type Updater } from "@uncarved/jade-api";
@@ -11,8 +12,9 @@ import type { Commands, Models } from "@uncarved/jade-api/services";
 import { contextWindow } from "./context.ts";
 import { envWithFile, hasProvider, parseTokens } from "./config.ts";
 import { configurator } from "./configure.ts";
-import { isBuiltinKind, listModels, MODEL_KEY, providerFromEnv, providerInfo, providerKind, RateGate, rpmFromEnv, visionFromEnv, withRetry, type RetriedResponse, type RetryOptions } from "./provider.ts";
-import { MODEL_SETTINGS, readSavedServices, type Env } from "./saved.ts";
+import { isBuiltinKind, KEY_KEY, listModels, MODEL_KEY, providerFromEnv, providerInfo, providerKind, RateGate, rpmFromEnv, visionFromEnv, withRetry, type RetriedResponse, type RetryOptions } from "./provider.ts";
+import { priceAt } from "./price.ts";
+import { MODEL_SETTINGS, parseSavedServices, readSavedServices, type Env, type SavedService } from "./saved.ts";
 
 /** 进程级的配置交给会话里的提示用：有没有配好模型、有没有 /model、.env 在哪 */
 let setup: { configured(): boolean; command: boolean; envFile: string } | undefined;
@@ -122,6 +124,26 @@ export default definePlugin({
       return cachedBuild(snapshot);
     };
 
+    // models.json 里填的单价：jade/cost 每个回复都要查，是同步的，按文件的修改时间缓存（别的会话、手改文件也看得到）
+    let priced: { mtime: number; services: SavedService[] } | undefined;
+    const savedNow = (): SavedService[] => {
+      let mtime: number;
+      try {
+        mtime = statSync(modelsFile).mtimeMs;
+      } catch {
+        return [];
+      }
+      if (priced?.mtime !== mtime) priced = { mtime, services: parseSavedServices(readFileSync(modelsFile, "utf8")) };
+      return priced.services;
+    };
+    const price: NonNullable<Models["price"]> = (name, at) => {
+      const services = savedNow();
+      // 当前服务上的同名模型优先（不同服务上同一个模型可以不同价）
+      const here = hasProvider(env) ? services.find((s) => isBuiltinKind(providerKind(s.env)) && sameService(s.env, env)) : undefined;
+      const m = [...(here ? [here] : []), ...services].flatMap((s) => s.models).find((x) => x.name === name && x.price);
+      return m?.price ? priceAt(m.price, at) : undefined;
+    };
+
     const current: Provider["complete"] = (request, options) => provider().then((p) => p.complete(request, options));
     const complete: Models["complete"] = (request, { model, ...options }) => (model ? saved(model).then((p) => p.complete(request, options)) : current(request, options));
 
@@ -155,6 +177,7 @@ export default definePlugin({
         };
       },
       complete,
+      price,
       list: () => listModels(env),
       async saved() {
         const names = (await readSavedServices(modelsFile)).flatMap((s) => (isBuiltinKind(providerKind(s.env)) ? s.models.map((m) => m.name) : []));
@@ -331,6 +354,18 @@ export default definePlugin({
     });
   },
 });
+
+/** 两份配置是不是同一个服务：类型、地址、密钥都相同 */
+function sameService(a: Env, b: Env): boolean {
+  try {
+    const x = providerInfo(a);
+    const y = providerInfo(b);
+    const kind = providerKind(a);
+    return isBuiltinKind(kind) && x.kind === y.kind && (x.baseURL ?? "") === (y.baseURL ?? "") && a[KEY_KEY[kind]] === b[KEY_KEY[kind]];
+  } catch {
+    return false;
+  }
+}
 
 function via(kind: string, baseURL: string | undefined): string {
   const host = baseURL ? safeHost(baseURL) : undefined;

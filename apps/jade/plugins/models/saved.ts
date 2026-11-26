@@ -4,6 +4,7 @@
 
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { readPrice, type ModelPrice } from "./price.ts";
 
 export type Env = Record<string, string | undefined>;
 
@@ -14,9 +15,13 @@ export interface SavedModel {
   name: string;
   /** 这个模型自己的设置变量 */
   settings: Record<string, string>;
+  /** 用户填的单价（jade/cost 经 models@1.price 用） */
+  price?: ModelPrice;
 }
 
 export interface SavedService {
+  /** 用户给服务起的名字，/model 里按它分组；没有时显示地址的主机名 */
+  name?: string;
   /** 服务的变量：JADE_PROVIDER、地址、密钥等 */
   env: Record<string, string>;
   /** 最近用过的在前 */
@@ -29,10 +34,19 @@ const strings = (v: unknown): Record<string, string> =>
 /** 读不了或格式不对时返回空数组 */
 export async function readSavedServices(file: string): Promise<SavedService[]> {
   try {
-    const data = JSON.parse(await readFile(file, "utf8")) as { services?: unknown };
+    return parseSavedServices(await readFile(file, "utf8"));
+  } catch {
+    return [];
+  }
+}
+
+/** models.json 的内容；格式不对时返回空数组 */
+export function parseSavedServices(text: string): SavedService[] {
+  try {
+    const data = JSON.parse(text) as { services?: unknown };
     if (!Array.isArray(data.services)) return [];
     return data.services.flatMap((raw: unknown) => {
-      const s = raw as { env?: unknown; models?: unknown } | null;
+      const s = raw as { name?: unknown; env?: unknown; models?: unknown } | null;
       if (!s || !Array.isArray(s.models)) return [];
       // 以前额外请求参数存在服务上：分给它下面没有自己那份的模型
       const { OPENAI_COMPAT_EXTRA_BODY: extraBody, ...env } = strings(s.env);
@@ -40,9 +54,11 @@ export async function readSavedServices(file: string): Promise<SavedService[]> {
         const name = (m as { name?: unknown } | null)?.name;
         const settings = strings((m as { settings?: unknown }).settings);
         if (extraBody && settings.OPENAI_COMPAT_EXTRA_BODY === undefined) settings.OPENAI_COMPAT_EXTRA_BODY = extraBody;
-        return typeof name === "string" && name ? [{ name, settings }] : [];
+        const price = readPrice((m as { price?: unknown }).price);
+        return typeof name === "string" && name ? [{ name, settings, ...(price ? { price } : {}) }] : [];
       });
-      return models.length ? [{ env, models }] : [];
+      const label = typeof s.name === "string" && s.name.trim() ? { name: s.name.trim() } : {};
+      return models.length ? [{ ...label, env, models }] : [];
     });
   } catch {
     return [];

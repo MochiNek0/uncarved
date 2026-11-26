@@ -1,12 +1,15 @@
-// /model：选服务、填地址和密钥、选模型、改输出上限、思考力度、上下文窗口、限速和能不能看图。
+// /model：选服务、填地址和密钥、选模型、改输出上限、思考力度、上下文窗口、限速、能不能看图和单价。
 // 配置写进 $JADE_HOME/.env；用过的服务和模型记在 $JADE_HOME/models.json 里（saved.ts），可以直接切回去。
 //
-// 从旧 jade 的 ui/configure.ts 移植。省掉了旧 jade 的"插件提供的模型服务"（新的 jade 还没有这种服务），
-// 其余流程一样。
+// 主菜单按服务分组列出全部模型，回车就切换；设置、单价、服务的名字、删除在 "Manage models…" 里。
+// 新加的模型一律从默认设置开始，不沿用当前模型的。
+//
+// 从旧 jade 的 ui/configure.ts 移植。省掉了旧 jade 的"插件提供的模型服务"（新的 jade 还没有这种服务）。
 
 import { readFile, rm, writeFile } from "node:fs/promises";
 import { hasProvider, parseTokens } from "./config.ts";
 import { contextWindow } from "./context.ts";
+import { CURRENCIES, formatRates, formatRulePrices, formatWhen, parseRates, parseRulePrices, parseWhen, priceSummary, symbol, type Currency, type ModelPrice, type PriceRule } from "./price.ts";
 import { EFFORTS, fallbacksFromEnv, isBuiltinKind, isOfficialAnthropic, jsonObject, KEY_KEY, listModels, MODEL_KEY, providerInfo, providerKind, rpmFromEnv, thinkingFromEnv, URL_KEY, visionFromEnv, type ProviderKind } from "./provider.ts";
 import { MODEL_SETTINGS, readSavedServices, updateEnvFile, writeSavedServices, type Env, type SavedModel, type SavedService } from "./saved.ts";
 import type { UI } from "@uncarved/jade-api";
@@ -117,11 +120,29 @@ function describeService(service: SavedService): string {
   return [i.kind, host].filter(Boolean).join(" · ");
 }
 
-/** 保存过的、不是当前的模型，按服务分组：当前服务的在前 */
-function otherModels(services: SavedService[], currentId: string | undefined, currentModel: string): { service: SavedService; model: SavedModel }[] {
-  return [...services.filter((s) => serviceId(s.env) === currentId), ...services.filter((s) => serviceId(s.env) !== currentId)].flatMap((s) =>
-    s.models.filter((m) => !(serviceId(s.env) === currentId && m.name === currentModel)).map((m) => ({ service: s, model: m })),
+/** 分组的标题：用户起的名字，否则类型和主机名 */
+const groupOf = (s: SavedService) => s.name ?? describeService(s);
+
+const byName = (a: string, b: string) => a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
+
+/** 按名字排好的服务 */
+const sortedServices = (services: SavedService[]) => [...services].sort((a, b) => byName(groupOf(a), groupOf(b)));
+
+interface Entry {
+  service: SavedService;
+  model: SavedModel;
+  current: boolean;
+}
+
+/**
+ * 保存过的全部模型：服务按名字排，同一个服务的模型按名字排，顺序不随最近用过哪个变。
+ * 当前的模型不在 models.json 里时（不是内置的服务）单独放在最前
+ */
+function allModels(services: SavedService[], currentId: string | undefined, currentModel: string | undefined, current: () => Entry): Entry[] {
+  const list = sortedServices(services).flatMap((s) =>
+    [...s.models].sort((a, b) => byName(a.name, b.name)).map((m) => ({ service: s, model: m, current: currentId !== undefined && serviceId(s.env) === currentId && m.name === currentModel })),
   );
+  return list.some((e) => e.current) ? list : [current(), ...list];
 }
 
 /** Claude 不设输出上限时用的值：和 @uncarved/provider-anthropic 里的默认值一致（不从那里导入：加载它的 SDK 要一百多毫秒） */
@@ -183,9 +204,13 @@ export function configurator(opts: ConfigureOptions): Configure {
       return sid !== undefined && (sid === id || (replacing !== undefined && sid === replacing));
     });
     const models = old.flatMap((s) => s.models).filter((m, i, list) => m.name !== model && list.findIndex((x) => x.name === m.name) === i);
+    // 单价和服务的名字不在 .env 里：从原来那份带过来
+    const price = old.flatMap((s) => s.models).find((m) => m.name === model)?.price;
+    const name = old.find((s) => s.name)?.name;
     const service: SavedService = {
+      ...(name ? { name } : {}),
       env: { ...pick(env, serviceKeys(kind)), JADE_PROVIDER: kind },
-      models: [{ name: model, settings: pick(env, MODEL_SETTINGS) }, ...models],
+      models: [{ name: model, settings: pick(env, MODEL_SETTINGS), ...(price ? { price } : {}) }, ...models],
     };
     await writeSavedServices(modelsFile, [service, ...all.filter((s) => !old.includes(s))]);
   }
@@ -210,7 +235,7 @@ export function configurator(opts: ConfigureOptions): Configure {
   }
 
   /** 换成保存过的服务 s 上的模型 m：服务的变量和模型的设置写进 .env，模型没设的设置删掉 */
-  function useSaved(s: SavedService, m: SavedModel): Promise<boolean> {
+  function useSaved(s: SavedService, m: SavedModel, replacing?: string): Promise<boolean> {
     const kind = providerKind(s.env);
     if (!isBuiltinKind(kind)) {
       report(`The saved service ${describeService(s)} is not one of the built-in providers.`);
@@ -221,25 +246,38 @@ export function configurator(opts: ConfigureOptions): Configure {
     for (const k of MODEL_SETTINGS) updates[k] = m.settings[k];
     updates.JADE_PROVIDER = kind;
     updates[MODEL_KEY[kind]] = m.name;
-    return applyConfig(updates);
+    return applyConfig(updates, replacing);
   }
 
   /**
-   * 在当前的服务上换成 model：用过的带上它自己的设置；新的模型沿用输出上限、思考力度和额外请求参数，
-   * 上下文窗口不沿用（不同模型差别很大），按模型名推断
+   * 换成服务 serviceEnv 上的 model。from 下保存过这个模型时带上它自己的设置；新的模型一律从默认设置开始
+   * （思考力度、额外请求参数各服务写法不同，限速、上下文窗口跟着模型走，沿用别的模型的容易错），
+   * 只问输出上限：Claude 以外的服务常常默认只给 4096 个输出 token，带思考的模型很容易用完。
+   * replacing：换了密钥的那个服务原来的 id
    */
+  async function useModel(serviceEnv: Env, kind: ProviderKind, model: string, from?: SavedService, replacing?: string): Promise<boolean> {
+    const saved = from?.models.find((m) => m.name === model);
+    if (from && saved) return useSaved({ ...from, env: { ...from.env, ...pick(serviceEnv, serviceKeys(kind)) } }, saved, replacing);
+    const updates: Env = { ...pick(serviceEnv, serviceKeys(kind)), JADE_PROVIDER: kind, [MODEL_KEY[kind]]: model };
+    for (const k of MODEL_SETTINGS) updates[k] = undefined;
+    if (kind !== "anthropic" && ui.interactive) {
+      const max = await ui.input({ title: "Output limit per reply in tokens, e.g. 32000, 64K (empty for the service default)", initial: "32K" }, opts.signal);
+      if (max === undefined || !tokensInput("Output limit", max)) return false;
+      if (max) updates.JADE_MAX_TOKENS = max;
+    }
+    return applyConfig(updates, replacing);
+  }
+
+  /** 在当前的服务上换成 model（/model <name>，名字不是保存过的模型） */
   async function switchModel(model: string): Promise<boolean> {
     const env = opts.env();
-    const id = serviceId(env);
-    const service = (await savedServices()).find((s) => serviceId(s.env) === id);
-    const saved = service?.models.find((m) => m.name === model);
-    if (service && saved) return useSaved(service, saved);
     const kind = providerKind(env);
     if (!isBuiltinKind(kind)) {
       report(`JADE_PROVIDER must be one of ${PROVIDERS.map((p) => p.kind).join(", ")}; set the model in ${envFile}.`);
       return false;
     }
-    return applyConfig({ [MODEL_KEY[kind]]: model, JADE_CONTEXT_WINDOW: undefined });
+    const id = serviceId(env);
+    return useModel(env, kind, model, (await savedServices()).find((s) => serviceId(s.env) === id));
   }
 
   /** 选模型：服务能列出模型时从列表里选，否则手动输入。选 Back 和取消一样返回 undefined */
@@ -308,29 +346,36 @@ export function configurator(opts: ConfigureOptions): Configure {
     const key = answer || known;
 
     const serviceEnv: Env = { JADE_PROVIDER: kind, [URL_KEY[kind]]: baseURL, [KEY_KEY[kind]]: key };
-    const target = services.find((s) => serviceId(s.env) === serviceId(serviceEnv));
+    // 同一个地址只换了密钥：原来的服务下的模型（带着各自的设置和单价）归到新的密钥下
+    const rekeyed = same && sameAddress(env) && currentId !== undefined && key !== env[KEY_KEY[kind]];
+    const target = services.find((s) => serviceId(s.env) === serviceId(serviceEnv)) ?? (rekeyed ? services.find((s) => serviceId(s.env) === currentId) : undefined);
     const model = await chooseModel({ ...env, ...serviceEnv }, same ? current?.model : undefined, target?.models.map((m) => m.name));
     if (!model) return false;
+    return useModel(serviceEnv, kind, model, target, rekeyed ? currentId : undefined);
+  }
 
-    // 用过的模型带上它自己的设置
-    const saved = target?.models.find((m) => m.name === model);
-    if (target && saved) return useSaved({ ...target, env: { ...target.env, ...pick(serviceEnv, serviceKeys(kind)) } }, saved);
-
-    const updates: Env = { ...serviceEnv, [MODEL_KEY[kind]]: model, JADE_CONTEXT_WINDOW: undefined };
-    // 换了服务的新模型从新服务的默认值开始：思考力度、额外请求参数各服务写法不同，限速、输出上限、
-    // 能不能看图也是跟着服务和模型走的，沿用当前的容易错（例如免费服务的限速带到付费服务上）。
-    // 同一个服务（只换了密钥）照旧沿用
-    const sameService = same && sameAddress(env);
-    if (!sameService) for (const k of MODEL_SETTINGS) updates[k] = undefined;
-    // 其他服务常常默认只给 4096 个输出 token，带思考的模型很容易用完
-    if (kind !== "anthropic" && !(sameService && env.JADE_MAX_TOKENS)) {
-      const max = await ui.input({ title: "Output limit per reply in tokens, e.g. 32000, 64K (empty for the service default)", initial: "32K" }, opts.signal);
-      if (max === undefined || !tokensInput("Output limit", max)) return false;
-      if (max) updates.JADE_MAX_TOKENS = max;
-    }
-    // 同一个地址只换了密钥：原来的服务下的模型归到新的密钥下
-    const rekeyed = sameService && currentId !== undefined && key !== env[KEY_KEY[kind]];
-    return applyConfig(updates, rekeyed ? currentId : undefined);
+  /** 加一个模型：选一个保存过的服务（或者新的服务），再选模型。加好了（成了当前的模型）返回 true */
+  async function addModel(): Promise<boolean> {
+    const currentId = serviceId(opts.env());
+    const services = sortedServices(await savedServices());
+    const where = await ui.select(
+      {
+        title: "Add a model from",
+        options: [
+          ...services.map((s, i) => ({ label: groupOf(s), value: `service:${i}`, hint: `${s.name ? `${describeService(s)} · ` : ""}${serviceId(s.env) === currentId ? "current service" : `${s.models.length} saved`}` })),
+          { label: "Another service…", value: "provider", hint: "a new base URL or API key" },
+          { label: "Back", value: "back" },
+        ],
+      },
+      opts.signal,
+    );
+    if (where === "provider") return configureProvider();
+    const s = where?.startsWith("service:") ? services[Number(where.slice(8))] : undefined;
+    if (!s) return false;
+    const kind = providerKind(s.env);
+    if (!isBuiltinKind(kind)) return false;
+    const model = await chooseModel(s.env, undefined, s.models.map((m) => m.name));
+    return model ? useModel(s.env, kind, model, s) : false;
   }
 
   /** 要配置设置的模型：title 和 kind 是显示和按服务取值用的，read 读这个模型现在的设置变量，update 写回改动 */
@@ -342,6 +387,9 @@ export function configurator(opts: ConfigureOptions): Configure {
     baseURL: string | undefined;
     read(): Promise<Env>;
     update(settings: Env): Promise<boolean>;
+    /** 单价只存在 models.json 里，当前的模型也一样 */
+    readPrice(): Promise<ModelPrice | undefined>;
+    writePrice(price: ModelPrice | undefined): Promise<boolean>;
   }
 
   /**
@@ -365,12 +413,17 @@ export function configurator(opts: ConfigureOptions): Configure {
             ...(kind === "anthropic" ? [{ label: "Server-side fallback", value: "fallbacks", hint: fallbacksHint(env, baseURL) }] : []),
             ...(kind === "anthropic" ? [{ label: "Send thinking settings", value: "thinking", hint: thinkingSetting(env) === false ? "off" : `on${env.JADE_THINKING ? "" : " (default)"}` }] : []),
             ...(kind === "openai-compat" ? [{ label: "Extra request body", value: "extra", hint: env.OPENAI_COMPAT_EXTRA_BODY ? shorten(env.OPENAI_COMPAT_EXTRA_BODY) : "none" }] : []),
+            { label: "Price", value: "price", hint: priceSummary(await target.readPrice()) },
             { label: "Back", value: "back" },
           ],
         },
         opts.signal,
       );
       if (action === undefined || action === "back") return;
+      if (action === "price") {
+        await configurePrice(target);
+        continue;
+      }
       // 每一项里按 Esc 或者输入有误：什么都不改，回到这个菜单
       if (action === "max") {
         const max = await ui.input({ title: "Output limit per reply in tokens, e.g. 32000, 64K (empty for the service default)", initial: env.JADE_MAX_TOKENS ?? "32K" }, opts.signal);
@@ -464,24 +517,183 @@ export function configurator(opts: ConfigureOptions): Configure {
     }
   }
 
-  /** 把模型的设置写进 models.json 里那一个模型；.env 不变（当前用的还是原来的模型）。改回默认值的设置从 settings 里删掉 */
-  async function writeSavedModel(service: SavedService, model: SavedModel, settings: Env): Promise<boolean> {
+  /**
+   * 改 models.json 里服务 service 的那一份（在文件里现在的内容上改：菜单打开之后 models.json 可能被别的会话改过）。
+   * 找不到这个服务时报告并返回 false
+   */
+  async function editSaved(service: SavedService, fn: (s: SavedService) => SavedService): Promise<boolean> {
     const id = serviceId(service.env);
     const all = await readSavedServices(modelsFile);
-    const mine = id === undefined ? undefined : all.find((s) => serviceId(s.env) === id);
-    if (!mine) {
+    const i = id === undefined ? -1 : all.findIndex((s) => serviceId(s.env) === id);
+    if (i === -1) {
       report(`Not saved: ${describeService(service)} is no longer in ${modelsFile}.`);
       return false;
     }
-    const mineIndex = all.indexOf(mine);
-    const modelIndex = mine.models.findIndex((m) => m.name === model.name);
-    // 在文件里现在的设置上改：菜单打开之后 models.json 可能被别的会话改过
-    const merged: Env = { ...(mine.models[modelIndex]?.settings ?? model.settings), ...pick(settings, MODEL_SETTINGS), ...blank(settings, MODEL_SETTINGS) };
-    const next: SavedModel = { name: model.name, settings: Object.fromEntries(Object.entries(merged).filter(([, v]) => v !== undefined && v !== "")) as Record<string, string> };
-    const models = modelIndex === -1 ? [next, ...mine.models] : [...mine.models.slice(0, modelIndex), next, ...mine.models.slice(modelIndex + 1)];
-    await writeSavedServices(modelsFile, [...all.slice(0, mineIndex), { ...mine, models }, ...all.slice(mineIndex + 1)]);
-    report(`Settings for ${model.name} (${describeService(mine)}) saved to ${modelsFile}.`);
+    await writeSavedServices(modelsFile, [...all.slice(0, i), fn(all[i]!), ...all.slice(i + 1)]);
     return true;
+  }
+
+  /** 改 models.json 里服务 service 下的模型 name；文件里还没有这个模型时以 fallback 为底加上 */
+  const editSavedModel = (service: SavedService, fallback: SavedModel, fn: (m: SavedModel) => SavedModel) =>
+    editSaved(service, (s) => {
+      const i = s.models.findIndex((m) => m.name === fallback.name);
+      const next = fn(s.models[i] ?? fallback);
+      return { ...s, models: i === -1 ? [next, ...s.models] : [...s.models.slice(0, i), next, ...s.models.slice(i + 1)] };
+    });
+
+  /** 把模型的设置写进 models.json 里那一个模型；.env 不变（当前用的还是原来的模型）。改回默认值的设置从 settings 里删掉 */
+  async function writeSavedModel(service: SavedService, model: SavedModel, settings: Env): Promise<boolean> {
+    const ok = await editSavedModel(service, model, (m) => {
+      const merged: Env = { ...m.settings, ...pick(settings, MODEL_SETTINGS), ...blank(settings, MODEL_SETTINGS) };
+      return { ...m, settings: Object.fromEntries(Object.entries(merged).filter(([, v]) => v !== undefined && v !== "")) as Record<string, string> };
+    });
+    if (ok) report(`Settings for ${model.name} (${groupOf(service)}) saved to ${modelsFile}.`);
+    return ok;
+  }
+
+  /** 把模型的单价写进 models.json；undefined 删掉 */
+  async function writePrice(service: SavedService, model: SavedModel, price: ModelPrice | undefined): Promise<boolean> {
+    const ok = await editSavedModel(service, model, ({ price: _old, ...m }) => (price ? { ...m, price } : m));
+    if (ok) report(price ? `Price of ${model.name}: ${priceSummary(price)}.` : `Removed the price of ${model.name}.`);
+    return ok;
+  }
+
+  /** 保存过的模型在 models.json 里现在的样子；找不到时用 fallback 那份 */
+  async function savedModel(service: SavedService, fallback: SavedModel): Promise<SavedModel> {
+    const id = serviceId(service.env);
+    const mine = id === undefined ? undefined : (await readSavedServices(modelsFile)).find((s) => serviceId(s.env) === id);
+    return mine?.models.find((m) => m.name === fallback.name) ?? fallback;
+  }
+
+  /** 规则的价格在菜单里的样子："50% of the base price"，或者 "in ¥0.5 · out ¥2" */
+  function ruleHint(rule: PriceRule, currency: Currency): string {
+    if (rule.scale !== undefined) return `${formatRulePrices(rule)} of the base price`;
+    const s = symbol(currency);
+    const names = { input: "in", output: "out", cacheRead: "cache read", cacheWrite: "cache write" } as const;
+    return (Object.keys(names) as (keyof typeof names)[]).flatMap((k) => (rule[k] === undefined ? [] : [`${names[k]} ${s}${rule[k]}`])).join(" · ");
+  }
+
+  const WHEN_TITLE =
+    "When it applies: times like 00:30-08:30 (may cross midnight; several like 09:00-12:00,14:00-18:00), days like mon-fri or sat,sun, dates like 2026-12-01..2026-12-31, and a time zone like UTC+8 or Asia/Shanghai (default: this computer's). Any of them, in any order";
+  const RULE_PRICE_TITLE = 'Price at those times: a share of the base price like 50%, or input output [cache read] [cache write] per million tokens ("-" keeps the base price)';
+
+  /** 问一条规则的时间和价格（编辑时预填 rule 的）；Esc 或写错时 undefined */
+  async function askRule(rule?: PriceRule): Promise<PriceRule | undefined> {
+    const whenText = await ui.input({ title: WHEN_TITLE, initial: rule ? formatWhen(rule) : "", placeholder: "00:30-08:30 UTC+8" }, opts.signal);
+    if (whenText === undefined) return undefined;
+    let when: PriceRule;
+    try {
+      when = parseWhen(whenText);
+    } catch (err) {
+      report(errorText(err));
+      return undefined;
+    }
+    if (Object.keys(when).length === 0) {
+      report("Write when the price applies, for example 00:30-08:30 or sat,sun.");
+      return undefined;
+    }
+    const pricesText = await ui.input({ title: RULE_PRICE_TITLE, initial: rule ? formatRulePrices(rule) : "", placeholder: "50%" }, opts.signal);
+    if (pricesText === undefined) return undefined;
+    try {
+      return { ...when, ...parseRulePrices(pricesText) };
+    } catch (err) {
+      report(errorText(err));
+      return undefined;
+    }
+  }
+
+  /**
+   * 一个模型的单价：货币、基础价和按时间的规则（从上往下第一条符合的算数）。
+   * 改完一项回到这个菜单；Back 或 Esc 离开
+   */
+  async function configurePrice(target: SettingsTarget) {
+    while (true) {
+      const p = await target.readPrice();
+      const rules = p?.rules ?? [];
+      const action = await ui.select(
+        {
+          title: `Price of ${target.title} per million tokens`,
+          options: [
+            { label: "Base price", value: "base", hint: p ? `${symbol(p.currency)} ${formatRates(p)} (input output cache-read cache-write)` : "not set" },
+            ...(p ? [{ label: "Currency", value: "currency", hint: `${p.currency} (${symbol(p.currency)})` }] : []),
+            ...rules.map((r, i) => ({ label: formatWhen(r), value: `rule:${i}`, hint: ruleHint(r, p!.currency), group: "Time-based prices (the first that matches applies)" })),
+            ...(p ? [{ label: "Add a time-based price…", value: "add", hint: "off-peak, weekend or promotional prices" }] : []),
+            ...(p ? [{ label: "Remove the price", value: "clear" }] : []),
+            { label: "Back", value: "back" },
+          ],
+        },
+        opts.signal,
+      );
+      if (action === undefined || action === "back") return;
+      if (action === "base") {
+        // 第一次填时先选货币
+        const currency = p?.currency ?? (await chooseCurrency());
+        if (!currency) continue;
+        const text = await ui.input(
+          {
+            title: `Price per million tokens in ${currency}: input output [cache read] [cache write], e.g. 3 15 0.3 3.75 (cache prices default to the input price${p ? "; empty removes the price" : ""})`,
+            initial: p ? formatRates(p) : "",
+          },
+          opts.signal,
+        );
+        if (text === undefined) continue;
+        if (!text.trim()) {
+          if (p) await target.writePrice(undefined);
+          continue;
+        }
+        try {
+          const r = parseRates(text, false);
+          const { cacheRead: _r, cacheWrite: _w, ...rest } = p ?? { currency, input: 0, output: 0 };
+          await target.writePrice({ ...rest, currency, input: r.input!, output: r.output!, ...(r.cacheRead !== undefined ? { cacheRead: r.cacheRead } : {}), ...(r.cacheWrite !== undefined ? { cacheWrite: r.cacheWrite } : {}) });
+        } catch (err) {
+          report(errorText(err));
+        }
+      } else if (action === "currency" && p) {
+        const currency = await chooseCurrency(p.currency);
+        if (currency && currency !== p.currency) await target.writePrice({ ...p, currency });
+      } else if (action === "add" && p) {
+        const rule = await askRule();
+        if (rule) await target.writePrice({ ...p, rules: [...rules, rule] });
+      } else if (action === "clear" && p) {
+        await target.writePrice(undefined);
+      } else if (action.startsWith("rule:") && p) {
+        const i = Number(action.slice(5));
+        const rule = rules[i];
+        if (!rule) continue;
+        const what = await ui.select(
+          {
+            title: `${formatWhen(rule)}: ${ruleHint(rule, p.currency)}`,
+            options: [
+              { label: "Edit…", value: "edit" },
+              ...(i > 0 ? [{ label: "Move up", value: "up", hint: "rules higher up win" }] : []),
+              { label: "Remove", value: "remove" },
+              { label: "Back", value: "back" },
+            ],
+          },
+          opts.signal,
+        );
+        const next = [...rules];
+        if (what === "edit") {
+          const edited = await askRule(rule);
+          if (!edited) continue;
+          next[i] = edited;
+        } else if (what === "up") next.splice(i - 1, 2, rule, rules[i - 1]!);
+        else if (what === "remove") next.splice(i, 1);
+        else continue;
+        const { rules: _old, ...rest } = p;
+        await target.writePrice(next.length ? { ...rest, rules: next } : rest);
+      }
+    }
+  }
+
+  async function chooseCurrency(current?: Currency): Promise<Currency | undefined> {
+    return ui.select(
+      {
+        title: "Currency of the prices",
+        options: CURRENCIES.map((c) => ({ label: c, value: c, hint: `${symbol(c)}${c === current ? " · current" : ""}` })),
+      },
+      opts.signal,
+    );
   }
 
   /** 把保存过的模型从 models.json 里删掉；服务下没有模型了就连服务（和它的密钥）一起删掉 */
@@ -492,30 +704,58 @@ export function configurator(opts: ConfigureOptions): Configure {
       .map((s) => (serviceId(s.env) === id ? { ...s, models: s.models.filter((m) => m.name !== model.name) } : s))
       .filter((s) => s.models.length > 0);
     await writeSavedServices(modelsFile, rest);
-    report(`Removed ${model.name} (${describeService(service)}).`);
+    report(`Removed ${model.name} (${groupOf(service)}).`);
+  }
+
+  /** 给服务起名字（/model 里按它分组）；空的回到默认的类型和主机名 */
+  async function renameService(service: SavedService): Promise<void> {
+    const text = await ui.input({ title: `Name for this service, e.g. DeepSeek (empty for ${describeService(service)})`, initial: service.name ?? "" }, opts.signal);
+    if (text === undefined) return;
+    const name = text.trim();
+    if (await editSaved(service, ({ name: _old, ...s }) => (name ? { name, ...s } : s))) report(name ? `Renamed ${describeService(service)} to ${name}.` : `${describeService(service)} has no name now.`);
+  }
+
+  /** 主菜单和管理菜单里一个模型的选项：分组是它的服务 */
+  function entryOption(e: Entry, value: string, env: Env) {
+    const settings = e.current ? pick(env, MODEL_SETTINGS) : e.model.settings;
+    const kind = providerKind(e.service.env);
+    const parts = [e.current ? "current" : "", settingsSummary(settings, kind, contextWindow(e.model.name, settings)), e.model.price ? priceSummary(e.model.price) : ""];
+    return { label: e.model.name, value, hint: parts.filter(Boolean).join(" · "), group: groupOf(e.service) };
+  }
+
+  /** 全部模型（当前的那个的设置以 .env 为准） */
+  async function entries(): Promise<Entry[]> {
+    const env = opts.env();
+    const kind = providerKind(env);
+    const info = providerInfo(env);
+    return allModels(await savedServices(), serviceId(env), info.model, () => ({
+      service: { env: isBuiltinKind(kind) ? { ...pick(env, serviceKeys(kind)), JADE_PROVIDER: kind } : { JADE_PROVIDER: kind }, models: [] },
+      model: { name: info.model, settings: pick(env, MODEL_SETTINGS) },
+      current: true,
+    }));
   }
 
   /**
-   * 选中主菜单里一个模型后：切换、配置它（不用先切到它）、把它删掉或返回主菜单。
-   * 当前的模型只能配置（切换没意义；删掉了下次进 /model 又会被记回来）。从设置里出来回到这个菜单；
-   * 切换、删除、Back 或 Esc 回到主菜单
+   * 管理菜单里选中一个模型后：设置（含单价）、服务的名字、删掉它。当前的模型不能删（删掉了下次进 /model 又会被记回来）。
+   * 从设置里出来回到这个菜单；删除、Back 或 Esc 回到管理菜单
    */
-  async function pickModelAction(o: { service: SavedService; model: SavedModel }, isCurrent: boolean): Promise<void> {
-    const kind = providerKind(o.service.env);
+  async function pickModelAction(e: Entry): Promise<void> {
+    const kind = providerKind(e.service.env);
     // 当前的模型改 .env 就好——applyConfig 里的 remember 会把改完的 .env 写回 models.json；
-    // 其他保存过的模型只改 models.json 里的那一个
-    const read = isCurrent ? async () => pick(opts.env(), MODEL_SETTINGS) : () => savedSettings(o.service, o.model);
+    // 其他保存过的模型只改 models.json 里的那一个。单价都只在 models.json 里
+    const read = e.current ? async () => pick(opts.env(), MODEL_SETTINGS) : async () => (await savedModel(e.service, e.model)).settings;
+    const saved = serviceId(e.service.env) !== undefined && e.service.models.length > 0;
     while (true) {
       const settings = await read();
+      const model = await savedModel(e.service, e.model);
+      const service = (await savedServices()).find((s) => serviceId(s.env) === serviceId(e.service.env)) ?? e.service;
       const action = await ui.select(
         {
-          title: o.model.name,
+          title: `${e.model.name} (${groupOf(service)})`,
           options: [
-            ...(isCurrent
-              ? []
-              : [{ label: "Switch to it", value: "switch", hint: serviceId(o.service.env) === serviceId(opts.env()) ? "this service" : describeService(o.service) }]),
-            { label: "Settings…", value: "settings", hint: settingsSummary(settings, kind, contextWindow(o.model.name, settings)) },
-            ...(isCurrent ? [] : [{ label: "Remove", value: "forget" }]),
+            { label: "Settings…", value: "settings", hint: [settingsSummary(settings, kind, contextWindow(e.model.name, settings)), model.price ? priceSummary(model.price) : ""].filter(Boolean).join(" · ") },
+            ...(saved ? [{ label: "Service name…", value: "rename", hint: service.name ?? `not set (${describeService(service)})` }] : []),
+            ...(e.current ? [] : [{ label: "Remove", value: "forget" }]),
             { label: "Back", value: "back" },
           ],
         },
@@ -523,27 +763,39 @@ export function configurator(opts: ConfigureOptions): Configure {
       );
       if (action === "settings") {
         await configureSettings({
-          title: o.model.name,
+          title: e.model.name,
           kind,
-          model: o.model.name,
-          baseURL: providerInfo(o.service.env).baseURL,
+          model: e.model.name,
+          baseURL: providerInfo(e.service.env).baseURL,
           read,
-          update: (updates) => (isCurrent ? applyConfig(updates) : writeSavedModel(o.service, o.model, updates)),
+          update: (updates) => (e.current ? applyConfig(updates) : writeSavedModel(e.service, e.model, updates)),
+          readPrice: async () => (saved ? (await savedModel(e.service, e.model)).price : undefined),
+          writePrice: (price) => (saved ? writePrice(e.service, e.model, price) : (report(`${e.model.name} is not saved in ${modelsFile}, so it cannot have a price.`), Promise.resolve(false))),
         });
         continue;
       }
-      // 用刚读到的设置切换：在这个菜单里改过的也带上
-      if (action === "switch") await useSaved(o.service, { ...o.model, settings });
-      else if (action === "forget") await forgetModel(o.service, o.model);
+      if (action === "rename") {
+        await renameService(service);
+        continue;
+      }
+      if (action === "forget") await forgetModel(e.service, e.model);
       return;
     }
   }
 
-  /** 保存过的模型在 models.json 里现在的设置；找不到时用 fallback 那份 */
-  async function savedSettings(service: SavedService, fallback: SavedModel): Promise<Record<string, string>> {
-    const id = serviceId(service.env);
-    const mine = id === undefined ? undefined : (await readSavedServices(modelsFile)).find((s) => serviceId(s.env) === id);
-    return mine?.models.find((m) => m.name === fallback.name)?.settings ?? fallback.settings;
+  /** 管理菜单：和主菜单一样分组列出全部模型，选中一个改它的设置、单价、服务的名字或删掉它。Back 或 Esc 回到主菜单 */
+  async function manageModels(): Promise<void> {
+    while (true) {
+      const env = opts.env();
+      const list = await entries();
+      const action = await ui.select(
+        { title: "Manage models", options: [...list.map((e, i) => entryOption(e, `model:${i}`, env)), { label: "Back", value: "back" }] },
+        opts.signal,
+      );
+      const e = action?.startsWith("model:") ? list[Number(action.slice(6))] : undefined;
+      if (!e) return;
+      await pickModelAction(e);
+    }
   }
 
   async function configureModel(arg: string | undefined) {
@@ -554,67 +806,34 @@ export function configurator(opts: ConfigureOptions): Configure {
     await remember().catch(() => {});
     if (arg) {
       // 保存过的模型按名字切换（当前服务的优先），否则换当前服务的模型
-      const saved = otherModels(await savedServices(), serviceId(env), providerInfo(env).model).find((o) => o.model.name === arg);
+      const list = (await entries()).filter((e) => !e.current && e.model.name === arg);
+      const saved = list.find((e) => serviceId(e.service.env) === serviceId(env)) ?? list[0];
       return void (await (saved ? useSaved(saved.service, saved.model) : switchModel(arg)));
     }
-    // 主菜单循环：保存过的模型全部直接列出（当前的在最前，然后是同一服务的），选中出一个子菜单
-    // （切换 / 设置 / 删除 / 返回）；配置某个模型、把它删掉都不用先切到它，做完回到主菜单再选。
-    // 每一轮都重读当前配置：切换、配置之后模型和它的设置可能都变了
+    // 主菜单：保存过的模型按服务分组全部列出，回车就切换到它（选当前的什么都不做），然后结束 /model。
+    // 加模型、管理模型做完回到这里；每一轮都重读：配置之后模型和它的设置可能都变了
     while (true) {
       const env = opts.env();
-      const id = serviceId(env);
-      const kind = providerKind(env);
-      const kindKnown = isBuiltinKind(kind);
-      const info = providerInfo(env);
-      const here = describeService({ env: kindKnown ? pick(env, serviceKeys(kind as ProviderKind)) : {}, models: [] });
-      const services = await savedServices();
-      const multi = services.length > 1;
-      const others = otherModels(services, id, info.model);
+      const list = await entries();
       const action = await ui.select(
         {
           title: "Switch model",
           options: [
-            {
-              label: info.model,
-              value: "current",
-              hint: `${multi ? `${here} · ` : ""}current · ${settingsSummary(env, info.kind, contextWindow(info.model, env))}`,
-            },
-            ...others.map((o, i) => ({
-              label: o.model.name,
-              value: `saved:${i}`,
-              hint: `${multi ? `${describeService(o.service)} · ` : ""}${settingsSummary(o.model.settings, providerKind(o.service.env), contextWindow(o.model.name, o.model.settings))}`,
-            })),
-            { label: "Add a model…", value: "add", hint: "from this service or another one" },
+            ...list.map((e, i) => entryOption(e, `model:${i}`, env)),
+            { label: "Add a model…", value: "add", hint: "from a saved service or a new one" },
+            { label: "Manage models…", value: "manage", hint: "settings, prices, service names, remove" },
           ],
         },
         opts.signal,
       );
       if (action === undefined) return; // Esc：整个 /model 结束
-      if (action === "current") {
-        const service = { env: kindKnown ? { ...pick(env, serviceKeys(kind as ProviderKind)), JADE_PROVIDER: kind } : { JADE_PROVIDER: kind }, models: [] };
-        await pickModelAction({ service, model: { name: info.model, settings: pick(env, MODEL_SETTINGS) } }, true);
-      } else if (action.startsWith("saved:")) {
-        const o = others[Number(action.slice(6))];
-        if (o) await pickModelAction(o, false);
-      } else if (action === "add") {
-        const where = await ui.select(
-          {
-            title: "Add a model from",
-            options: [
-              { label: "This service", value: "model", hint: here },
-              { label: "Another service…", value: "provider", hint: "or change this one's base URL / API key" },
-              { label: "Back", value: "back" },
-            ],
-          },
-          opts.signal,
-        );
-        // 做完、Back、Esc 或没填完，都回到主菜单
-        if (where === "model") {
-          const saved = services.find((s) => serviceId(s.env) === id)?.models.map((m) => m.name);
-          const model = await chooseModel(env, info.model, saved);
-          if (model && model !== info.model) await switchModel(model);
-        } else if (where === "provider") await configureProvider();
+      if (action.startsWith("model:")) {
+        const e = list[Number(action.slice(6))];
+        if (e && !e.current) await useSaved(e.service, e.model);
+        return;
       }
+      if (action === "add" && (await addModel())) return;
+      if (action === "manage") await manageModels();
     }
   }
 

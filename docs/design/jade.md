@@ -310,7 +310,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 | `jade/keys` | `keys@1`：`register`、`get`、`list`；`shift+tab` 也可以注册 | — | 快捷键 |
 | `jade/completions` | `completions@1`：`register`、`list`。输入框补全的注册表：触发字符、占位提示里的说明、候选菜单下的说明、候选（像路径一样用 / 分层）。前端只管列、排序、插入 | — | 原来写死在 jade/tui 里的 `@` 补全（2026-11-12 拆出） |
 | `jade/renderers` | `renderers@1`：`tool`、`event`、`forTool`、`forEvent` | — | `ToolRenderer`、`EventRenderer`。`jade/fs`、`jade/shell` 为自己的工具登记，`jade/approval` 用工具的 `preview` 作审批对话框的内容 |
-| `jade/models` | `provider@1`、`models@1`（`current`、`complete`（可选 `model`：用 `/model` 保存过的某个模型和它的设置，或者当前服务上的另一个模型（用服务的默认设置），不切换当前模型）、`list`、`saved`（`/model` 保存过的模型名）、`subscribe`）；`/model`：列出全部模型，选中一个出子菜单（切换到它、配置它的设置、删掉它；当前的模型只能配置；openai-compat 模型的设置里还有它自己的额外请求参数 `OPENAI_COMPAT_EXTRA_BODY`），不用先切到它；加一个模型；用过的模型记在 `$JADE_HOME/models.json` | 可选 `ui@1`、`commands@1` | `provider.ts`、`configure.ts` |
+| `jade/models` | `provider@1`、`models@1`（`current`、`complete`（可选 `model`：用 `/model` 保存过的某个模型和它的设置，或者当前服务上的另一个模型（用服务的默认设置），不切换当前模型）、`list`、`saved`（`/model` 保存过的模型名）、`subscribe`、`price`（`/model` 里给模型填的单价在某一刻是多少，同名的模型当前服务上的优先））；`/model`：按服务分组（服务可以起名字，组和组里的模型都按名字排）列出全部模型，回车切换到它；Manage models 里配置任一模型的设置和单价（货币、基础价、按时间的规则：星期、时段、日期、时区，第一条符合的算数）、给服务起名字、删掉模型（当前的不能删），不用先切到它；openai-compat 模型的设置里还有它自己的额外请求参数 `OPENAI_COMPAT_EXTRA_BODY`；加一个模型（保存过的服务或新的服务），新的模型一律从默认设置开始，只问输出上限；用过的模型、它们的单价和服务的名字记在 `$JADE_HOME/models.json` | 可选 `ui@1`、`commands@1` | `provider.ts`、`configure.ts` |
 | `jade/approval` | `approval@1`（`mode`、`setMode`、`allowRead`：登记不用问就能读的目录；`allowWrite`：登记和工作目录同样对待的目录；`addApprover`：登记审批渠道（例如聊天机器人），要问时问题同时交给终端和渠道，先回答的算数、其余的经 signal 中止，渠道不回答或出错不算拒绝，有渠道时 `-p` 也会问；这三项项目层插件都不能用）、gate；auto 模式下判断不了的调用先由模型审查（`review.ts`） | `ui@1`、`models@1`（都可选：没有 `ui@1` 时，要问的调用一律拒绝；没有 `models@1` 或 `review: false` 时不审查） | `plugins/policy.ts`、`plugins/review.ts` |
 | `jade/modes` | `modes@1`（`current`、`set`、`cycle`、`subscribe`），Shift+Tab、`/mode`；计划模式：往系统提示词里加"先给计划"的段落，`propose_plan` 工具（只在计划模式、能问用户时发给模型）问"执行这个计划？"，批准了就换模式，工具结果让模型开始做 | `approval@1`；可选 `keys@1`、`commands@1`、`prompts@1`、`ui@1` | Shift+Tab、`/mode`、计划模式的批准流程（`test/modes.test.ts`） |
 | `jade/plugins` | `/plugins [id]`：每个插件的状态和原因、每个服务的提供者（来自核心的 `jade@1`） | `commands@1`、`jade@1` | — |
@@ -337,7 +337,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 | `jade/hooks` | 配置 `hooks` 里的 shell 命令：`before`（`tool.gate`，退出码非 0 时拒绝，输出作理由）、`after`（`tool.after`，失败时经 `prompts@1.note` 告诉模型）、`turn`（一轮结束后）。配置键没有标 `project`，仓库设不了 | `shell@1`；可选 `ui@1`、`prompts@1` | 新功能（`test/hooks.test.ts`） |
 | `jade/steer` | `steer@1`（`push`、`pending`、`take`、`subscribe`）：一轮中途对模型说话。内核只在空闲时接受用户消息，所以不走输入：`push` 的话在下一次请求模型时由 `context.project` 附在最后一条消息（刚执行完的工具的结果）后面，写进 `derived`（之后的投影、恢复的会话里位置不变），另记一条 `jade/steer/said` 事件给前端显示。这一轮没有再请求模型就结束时话还留着，调用方用 `take` 取回当普通消息发。`jade/tui` 在模型工作时提交的消息走它（前面已经有东西在排队、或者是命令时照旧排队）；停用它就回到"排队等这一轮结束"。项目层插件不能用 | 可选 `renderers@1` | 新功能（`test/steer.test.ts`） |
 | `jade/editor` | Ctrl+G（配置 `key` 可换；键被别的插件占了时提示一次，插件照常激活）把输入框里的文字交给编辑器（配置 `editor`，否则 `$VISUAL`、`$EDITOR`），存盘退出后换回输入框；终端编辑器经 `ui@1.suspend` 独占终端 | `keys@1`；可选 `ui@1` | 新功能（`test/tui-frontend.test.ts`） |
-| `jade/cost` | 按配置的单价（每百万 token，按模型名前缀）把日志里的用量换算成钱：状态栏一段（`ctx.status`，合计每轮记进 `derived`）、`/cost` | 可选 `commands@1`、`models@1` | 新功能（`test/cost.test.ts`） |
+| `jade/cost` | 按单价把日志里的用量换算成钱：先用 `models@1.price`（`/model` 里给模型填的），再用配置的（每百万 token，按模型名前缀）；每个回复按它的时间（事件的 `at`）取单价，所以分时段的价格按请求发生的时段算，不同货币分开合计。状态栏一段（`ctx.status`，合计每轮记进 `derived`）、`/cost` | 可选 `commands@1`、`models@1` | 新功能（`test/cost.test.ts`） |
 
 2026-11-10 之后的补充（都在插件里，核心没有改）：
 

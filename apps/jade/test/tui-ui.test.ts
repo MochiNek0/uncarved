@@ -664,6 +664,30 @@ describe("terminal UI", () => {
     expect(await picked).toBe(10);
   });
 
+  test("grouped choices show each group's title above its first choice; titles take rows from the list", async () => {
+    const { screen, type, output, clear } = setup();
+    const picked = screen.select("Switch model", [
+      ...Array.from({ length: 6 }, (_, i) => ({ label: `a-${i}`, value: `a${i}`, group: "Alpha" })),
+      ...Array.from({ length: 6 }, (_, i) => ({ label: `b-${i}`, value: `b${i}`, group: "Beta" })),
+      { label: "Add a model…", value: "add" },
+    ]);
+    await sleep(80);
+    expect(output()).toContain(" Alpha");
+    expect(output()).toContain(" Beta");
+    // 两个标题各占一行：一屏十行里只放得下 8 项
+    expect(output()).toContain("b-1");
+    expect(output()).not.toContain("b-2");
+    expect(output()).toContain("↓ 5 more");
+    clear();
+    await type("\x1b[6~");
+    expect(output()).toContain("❯ b-4");
+    // 打字筛选也看组名（选项的名字里没有 beta）
+    await type("beta");
+    await until(output, "filter› beta");
+    await type("\r");
+    expect(await picked).toBe("b0");
+  });
+
   test("esc interrupts while busy; ctrl+c twice exits while idle", async () => {
     const { screen, calls, type } = setup();
     screen.busy("Thinking");

@@ -8,7 +8,7 @@
   "config": {
     "prices": {
       "default": {},
-      "description": "prices in $ per million tokens, by model name or name prefix: { \"<model>\": { \"input\": 3, \"output\": 15, \"cacheRead\": 0.3, \"cacheWrite\": 3.75 } }; models without a price are counted in tokens only"
+      "description": "prices per million tokens, by model name or name prefix: { \"<model>\": { \"input\": 3, \"output\": 15, \"cacheRead\": 0.3, \"cacheWrite\": 3.75, \"currency\": \"USD\" } } (currency defaults to USD). A price set for a model in /model (which can change by time of day) takes precedence; models without a price are counted in tokens only"
     }
   }
 }
