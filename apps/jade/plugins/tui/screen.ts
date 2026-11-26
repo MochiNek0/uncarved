@@ -26,8 +26,11 @@ export interface StatusInfo {
   context?: { used: number; limit: number };
   /** 本会话累计的用量（含子 Agent 和压缩） */
   spent?: { input: number; output: number };
-  /** 上一次请求的输入中命中缓存的比例（0–1）；服务不报告缓存用量时为 undefined */
-  cache?: number;
+  /**
+   * 缓存命中率（0–1）：last 是上一次请求的输入中命中缓存的比例，avg 是当前模型在本会话所有请求里累计的比例；
+   * 服务不报告缓存用量时为 undefined
+   */
+  cache?: { last: number; avg: number };
   /** 输出速度（token/秒）：live 为 true 时是正在输出的这次回复按字数估的，否则是上一次回复按服务端报的用量算的 */
   speed?: { tps: number; live?: boolean };
 }

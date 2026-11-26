@@ -1479,6 +1479,10 @@ function statusSegments(status: StatusInfo, jobs: JobInfo[], width: number): Seg
   const ctx = status.context;
   const pct = ctx ? Math.round((ctx.used / ctx.limit) * 100) : 0;
   const nearFull = pct >= 80;
+  const cache = status.cache;
+  const percent = (r: number) => `${Math.round(r * 1000) / 10}%`;
+  // 这一次命中不到一半、又比平均低（第一次请求没有缓存可命中，不算）：缓存多半断了或过期了
+  const cacheLow = cache !== undefined && cache.last < 0.5 && cache.last < cache.avg;
   const speed = status.speed;
   // 插件的段落：要一直留着的（keep，例如 jade/modes 的当前模式）放在最前，窄的时候换成短写法；其余的比提示晚、比缓存早去掉
   const plugin = (p: { text: string | StatusSegment }, keep: boolean): Segment => {
@@ -1492,7 +1496,7 @@ function statusSegments(status: StatusInfo, jobs: JobInfo[], width: number): Seg
   };
   const kept = (status.plugins ?? []).filter((p) => typeof p.text !== "string" && p.text.keep);
   const others = (status.plugins ?? []).filter((p) => !kept.includes(p));
-  // 窄的时候依次：提示变短、去掉提示、用量变短、去掉缓存、模式变短、去掉用量、上下文变短、去掉速度
+  // 窄的时候依次：提示变短、去掉提示、用量变短、缓存去掉平均值、去掉缓存、模式变短、去掉用量、上下文变短、去掉速度
   const running = runningJobs(jobs);
   const segments: Segment[] = [
     ...kept.map((p) => plugin(p, true)),
@@ -1516,8 +1520,17 @@ function statusSegments(status: StatusInfo, jobs: JobInfo[], width: number): Seg
           },
         ]
       : []),
-    ...(status.cache !== undefined
-      ? [{ text: `cache ${Math.round(status.cache * 1000) / 10}%`, dropAt: 7, dim: true }]
+    ...(cache
+      ? [
+          {
+            text: `cache ${percent(cache.last)} (avg ${percent(cache.avg)})`,
+            short: `cache ${percent(cache.last)}`,
+            shortAt: 7.8,
+            dropAt: 7,
+            color: cacheLow ? "yellow" : undefined,
+            dim: !cacheLow,
+          },
+        ]
       : []),
     ...(status.spent
       ? [

@@ -61,7 +61,7 @@ test("a reply with no deltas at all does not update the speed", async () => {
 });
 
 test("cache hit rate: a missing field after a report means 0%, but a different model has to report on its own", () => {
-  const caches: (number | undefined)[] = [];
+  const caches: ({ last: number; avg: number } | undefined)[] = [];
   const noop = () => {};
   const screen = { busy: noop, stream: noop, endStream: noop, status: (s: Partial<StatusInfo>) => "cache" in s && caches.push(s.cache) } as unknown as Screen;
   const t = transcript({ screen, cwd: "/", contextWindow: () => 100_000, canRetry: () => false });
@@ -70,7 +70,27 @@ test("cache hit rate: a missing field after a report means 0%, but a different m
   reply("a", { inputTokens: 100, cacheReadTokens: 80 });
   reply("a", { inputTokens: 100 });
   reply("b", { inputTokens: 100 });
-  expect(caches).toEqual([0.8, 0, undefined]);
+  expect(caches).toEqual([{ last: 0.8, avg: 0.8 }, { last: 0, avg: 0.4 }, undefined]);
+});
+
+test("cache hit rate: the average covers this session's requests to the model, and starts over on another model", () => {
+  const caches: ({ last: number; avg: number } | undefined)[] = [];
+  const noop = () => {};
+  const screen = { busy: noop, stream: noop, endStream: noop, status: (s: Partial<StatusInfo>) => "cache" in s && caches.push(s.cache) } as unknown as Screen;
+  const t = transcript({ screen, cwd: "/", contextWindow: () => 100_000, canRetry: () => false });
+  const reply = (model: string, usage: object) =>
+    t.onNotice({ type: "event", event: { type: "model.responded", data: { content: [], usage }, origin: { by: "model", provider: "p", model } } as unknown as LogEvent });
+  reply("a", { inputTokens: 100, cacheReadTokens: 0 });
+  reply("a", { inputTokens: 300, cacheReadTokens: 300 });
+  reply("b", { inputTokens: 200, cacheReadTokens: 100 });
+  t.reset();
+  reply("b", { inputTokens: 100, cacheReadTokens: 90 });
+  expect(caches).toEqual([
+    { last: 0, avg: 0 },
+    { last: 1, avg: 0.75 },
+    { last: 0.5, avg: 0.5 },
+    { last: 0.9, avg: 0.9 },
+  ]);
 });
 
 /** 像 jade/shell 的 bash：摘要是命令的第一行（截断），完整的命令在 details 里 */

@@ -588,12 +588,10 @@ describe("terminal UI", () => {
     await until(output, "CI passing");
   });
 
-  test("the cache hit rate shows at most one decimal", async () => {
+  test("the cache hit rate shows this request's and the average, at most one decimal", async () => {
     const { screen, output } = setup();
-    screen.status({ cache: 0.98765 });
-    await until(output, "cache 98.8%");
-    screen.status({ cache: 0.5 });
-    await until(output, "cache 50%");
+    screen.status({ cache: { last: 0.98765, avg: 0.5 } });
+    await until(output, "cache 98.8% (avg 50%)");
   });
 
   test("plugins' panels are shown above the input", async () => {

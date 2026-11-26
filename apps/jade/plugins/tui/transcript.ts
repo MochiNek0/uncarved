@@ -91,16 +91,24 @@ export function transcript(opts: TranscriptOptions): Transcript {
    * 换了服务或模型要重新看，否则从报缓存的服务换到不报的，会一直显示 0%
    */
   let reportsCache: string | undefined;
+  /** reportsCache 那个模型在本会话里累计的输入和其中命中缓存的 token 数，算平均命中率；换模型时清零 */
+  const cached = { input: 0, read: 0 };
   /** 上下文用量：最近一次回复的输入加输出，就是下一次请求的大致起点；以及这次输入的缓存命中率 */
   function showContext(e: LogEvent<"model.responded">) {
     const u = e.data.usage;
     if (u?.inputTokens === undefined) return;
     const by = e.origin.by === "model" ? `${e.origin.provider}/${e.origin.model}` : "";
-    if (u.cacheReadTokens !== undefined) reportsCache = by;
-    screen.status({
-      context: { used: u.inputTokens + (u.outputTokens ?? 0), limit: opts.contextWindow() },
-      cache: reportsCache === by && u.inputTokens > 0 ? (u.cacheReadTokens ?? 0) / u.inputTokens : undefined,
-    });
+    if (u.cacheReadTokens !== undefined && reportsCache !== by) {
+      reportsCache = by;
+      cached.input = cached.read = 0;
+    }
+    let cache: { last: number; avg: number } | undefined;
+    if (reportsCache === by && u.inputTokens > 0) {
+      cached.input += u.inputTokens;
+      cached.read += u.cacheReadTokens ?? 0;
+      cache = { last: (u.cacheReadTokens ?? 0) / u.inputTokens, avg: cached.read / cached.input };
+    }
+    screen.status({ context: { used: u.inputTokens + (u.outputTokens ?? 0), limit: opts.contextWindow() }, cache });
   }
 
   /**
@@ -226,6 +234,7 @@ export function transcript(opts: TranscriptOptions): Transcript {
     reset() {
       for (const k of Object.keys(usage) as (keyof Usage)[]) usage[k] = 0;
       reportsCache = undefined;
+      cached.input = cached.read = 0;
       toolNames.clear();
       for (const id of running) screen.progress(id, undefined);
       running.clear();
