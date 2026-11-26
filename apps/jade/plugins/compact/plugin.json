@@ -10,6 +10,9 @@
     "thresholdTokens": {
       "description": "compact when the history reaches this many tokens (a number or e.g. \"120k\"); default: 80% of the model's context window, leaving room for the reply"
     },
+    "trimTokens": {
+      "description": "when the history passes this many tokens (well before compacting), clear old large tool output and keep only the recent part; default \"100k\", false turns it off"
+    },
     "keepTokens": {
       "description": "after compacting, keep about this many tokens of the most recent messages verbatim; default 30% of the threshold"
     }

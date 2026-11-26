@@ -36,7 +36,7 @@ const HOW: Line[] = [
     tools: ["ask_user"],
   },
   { text: "- Read before you change: use glob/grep/read_file to understand the code, then edit. Never guess file contents.", tools: ["read_file"] },
-  { text: "- When you need several independent reads or searches, issue them in the same response: they run in parallel." },
+  { text: "- When you need several independent reads or searches, issue them in the same response: they run in parallel. Every response resends the whole conversation, so one call per response when you already know the next few is slow and costly." },
   {
     text: "- Change existing files with edit_file (multi_edit for several changes to one file); use write_file only for new files or when most of the file changes.",
     tools: ["edit_file"],
@@ -54,6 +54,10 @@ const HOW: Line[] = [
   },
   { text: "- If the user says not to test or check the result, do not: no tests, builds, screenshots or other checks of any kind. Finish the work and reply." },
   { text: "- Use the task tool for broad searches so that only conclusions come back into this conversation.", tools: ["task"] },
+  {
+    text: "- A task report is finished work with evidence: build on it, do not redo it. Check only the claims that are both uncertain and important to your answer, and issue those checks together in one response (or hand them to sub-agents in parallel) rather than one per response.",
+    tools: ["task"],
+  },
   {
     text: "- Do not guess about things outside the repository that may have changed (library APIs, versions, error messages): look them up with the web tools.",
     tools: ["web_fetch", "web_search"],

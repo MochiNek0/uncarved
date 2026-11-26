@@ -4,8 +4,30 @@ import { describe, expect, test } from "bun:test";
 import type { State } from "uncarved";
 import { stepsThisTurn, WRAP_UP_NOTE } from "../plugins/budget/index.ts";
 import { msg, say, scripted, turn, use } from "./scripted-host.ts";
+import * as ui from "./scripted-ui.ts";
 
 describe("jade/budget", () => {
+  test("when jade can ask, the limit asks whether to keep going; continuing adds maxSteps without a summary", async () => {
+    const { host, shared, send } = await ui.scriptedHost({ config: { "jade/budget": { maxSteps: 2 } } });
+    try {
+      const todo = (n: number) => ui.use(`u${n}`, "todo_write", { todos: [{ content: `step ${n}`, status: "pending" }] });
+      shared.script.push(todo(1), todo(2), todo(3), todo(4), ui.say("summary"));
+      shared.answers.push("more", "stop");
+      const s = await host.sessions.open();
+      await send(s, "go");
+      // 2 次后问一次（继续），再 2 次后又问（停下），之后才收尾
+      expect(shared.asked).toEqual(["Jade has made 2 model responses in this turn. Keep going?", "Jade has made 4 model responses in this turn. Keep going?"]);
+      expect(shared.requests).toHaveLength(5);
+      expect(JSON.stringify(shared.requests[3]!.messages)).not.toContain(WRAP_UP_NOTE);
+      expect(JSON.stringify(shared.requests[4]!.messages.at(-1))).toContain(WRAP_UP_NOTE);
+      const notice = (await s.history()).find((e) => e.type === "jade/budget/notice");
+      expect((notice!.data as { text: string }).text).toContain("stopped after 4 model responses");
+    } finally {
+      await ui.cleanup();
+    }
+  });
+
+
   test("counts the model's replies since the last user input", () => {
     const text = (role: "user" | "assistant", kind = "text") => ({ role, content: [kind === "text" ? { kind: "text", text: "x" } : { kind: "tool_result" }] });
     const s = { messages: [text("assistant"), text("user"), text("assistant"), text("user", "tool_result"), text("assistant")] } as unknown as State;

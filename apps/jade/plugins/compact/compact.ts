@@ -3,6 +3,10 @@
 // 1. 清理：把较早的大段工具输出换成一句占位说明。便宜，不调用模型
 // 2. 总结：清理不够时，用模型把较早的消息总结成一段摘要
 //
+// 清理还有一个更早的触发点 trimAt，和上下文窗口无关：窗口很大（1M）时离压缩阈值很远，
+// 但每一步都要把整段历史重发一遍，几十步以前的工具输出一直在花 token。超过 trimAt 就清理，
+// 只保留最近一段的工具输出；一次至少省下 trimAt 的一定比例才清理，免得每一步都清理一点、每一步都让提示缓存失效。
+//
 // 两种决定都先用 ctx.record 写进日志（derived.recorded）再使用（I-5），之后每次投影都从 derived 里取，
 // 投影在下一次压缩之前保持不变，不会每次请求都让提示缓存失效；恢复会话时也不会重新总结。
 //
@@ -31,6 +35,8 @@ export interface CompactorOptions {
   threshold(): number;
   /** 压缩后保留最近大约这么多 token 的原始消息，默认阈值的 30% */
   keepTokens?: number;
+  /** 投影超过这个 token 数（还没到 threshold）就提前清理旧的工具输出；不给或 0 时不提前清理 */
+  trimAt?(): number;
   id?: string;
   /** 写文件的工具把路径放在输入的哪个字段（工具的 meta.writes）；摘要后面列出改过的文件用 */
   writes(tool: string): string | undefined;
@@ -61,6 +67,10 @@ const TRIM_MIN_CHARS = 2000;
 export const TRIMMED = "[This tool output was cleared to save context. Run the tool again if you need it.]";
 /** 清理后要降到阈值的这个比例以下才算够，否则直接总结，免得很快又要压缩 */
 const TRIM_TARGET = 0.6;
+/** 提前清理时保留最近大约 trimAt 这个比例的原始消息 */
+const EARLY_TRIM_KEEP = 0.4;
+/** 提前清理至少要省下 trimAt 的这个比例，否则先不清理 */
+const EARLY_TRIM_MIN_SAVE = 0.25;
 
 /** 中日韩文字和全角符号：大约一个字一个 token，不能按 4 个字符一个算 */
 const WIDE = /[　-鿿가-힯豈-﫿＀-￯]/g;
@@ -180,21 +190,34 @@ export function compactor(opts: CompactorOptions): Compactor {
     };
     const current = view(messages, prev);
     const tokens = measure(messages, current, JSON.stringify(prev ?? null));
-    if (!forced && tokens <= threshold) return done(current);
-
     const from = prev?.upTo ?? 0;
-    const cut = cutPoint(messages, from, keep);
-    if (cut === undefined) return done(current);
-
-    if (!forced && cut > (prev?.trimUpTo ?? 0)) {
+    /** 清理到 cut 为止的大段工具输出；enough(省下的 token) 不成立时不清理，返回 undefined */
+    const tryTrim = async (cut: number | undefined, enough: (saved: number) => boolean) => {
+      if (cut === undefined || cut <= (prev?.trimUpTo ?? 0)) return undefined;
       const next: CompactState = { upTo: from, summary: prev?.summary ?? "", trimUpTo: cut };
       const trimmed = view(messages, next);
       const saved = estimateTokens(current) - estimateTokens(trimmed);
-      if (tokens - saved <= threshold * TRIM_TARGET) {
-        await ctx.record(DERIVED_KEY, next);
-        await ctx.emit("trimmed", { upTo: cut, before: tokens, saved });
-        return done(trimmed, next);
+      if (!enough(saved)) return undefined;
+      await ctx.record(DERIVED_KEY, next);
+      await ctx.emit("trimmed", { upTo: cut, before: tokens, saved });
+      return done(trimmed, next);
+    };
+
+    if (!forced && tokens <= threshold) {
+      const trimAt = opts.trimAt?.() ?? 0;
+      if (trimAt > 0 && tokens > trimAt) {
+        const early = await tryTrim(cutPoint(messages, from, Math.floor(trimAt * EARLY_TRIM_KEEP)), (saved) => saved >= trimAt * EARLY_TRIM_MIN_SAVE);
+        if (early) return early;
       }
+      return done(current);
+    }
+
+    const cut = cutPoint(messages, from, keep);
+    if (cut === undefined) return done(current);
+
+    if (!forced) {
+      const trimmed = await tryTrim(cut, (saved) => tokens - saved <= threshold * TRIM_TARGET);
+      if (trimmed) return trimmed;
     }
     forced = false;
     const asked = focus;

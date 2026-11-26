@@ -13,6 +13,14 @@ const FALLBACK_THRESHOLD = 120_000;
 const ANTHROPIC_REPLY_TOKENS = 64_000;
 /** 总结要调用模型，比 hook 默认的 30 秒长 */
 const SUMMARY_TIMEOUT_MS = 300_000;
+/** 提前清理旧工具输出的默认点，和窗口大小无关 */
+const DEFAULT_TRIM_TOKENS = 100_000;
+
+/** 配置的 trimTokens：false 关掉提前清理（0），不设时用默认值 */
+function trimAtFor(config: Record<string, unknown>): () => number {
+  const n = config.trimTokens === false ? 0 : (parseTokens(config.trimTokens) ?? DEFAULT_TRIM_TOKENS);
+  return () => n;
+}
 
 /** 自动压缩的阈值：配置的 thresholdTokens，否则按当前模型的上下文窗口算 */
 function thresholdFor(config: Record<string, unknown>, models: Models): () => number {
@@ -58,13 +66,21 @@ export default definePlugin({
   },
 
   session(ctx) {
-    // 子会话（子 Agent）不压缩：它活不长，上下文由开它的插件管（jade/task 接近窗口时让它写报告、只放最近的工具输出）
-    if (ctx.session.parent) return;
+    const trimAt = trimAtFor(ctx.config);
+    // 子会话（子 Agent）不总结：它活不长，接近窗口时由开它的插件管（jade/task 让它写报告、只放最近的工具输出）。
+    // 但它同样每一步重发整段历史，所以照样提前清理旧的工具输出
+    if (ctx.session.parent) {
+      if (!trimAt()) return;
+      const c = compactor({ complete: () => Promise.reject(new Error("sub-agents are not summarized")), threshold: () => Infinity, trimAt, id: ctx.plugin, writes: () => undefined });
+      ctx.kernel.hook({ kind: "transform", point: "context.project", order: 100, fn: (messages, hook) => c.project(messages, hook) });
+      ctx.kernel.hook({ kind: "observe", point: "event", fn: (e: LogEvent) => c.observe(e) });
+      return;
+    }
     const models = ctx.require<Models>("models@1");
     const configured = parseTokens(ctx.config.thresholdTokens);
     const keepTokens = parseTokens(ctx.config.keepTokens);
     const threshold = thresholdFor(ctx.config, models);
-    const c = compactor({ complete: (req, o) => models.complete(req, o), threshold, keepTokens, id: ctx.plugin, writes: (t) => ctx.session.tool(t)?.meta?.writes });
+    const c = compactor({ complete: (req, o) => models.complete(req, o), threshold, keepTokens, trimAt, id: ctx.plugin, writes: (t) => ctx.session.tool(t)?.meta?.writes });
     const id = ctx.session.id;
     /** 状态栏上的一段：多少 token 时自动压缩，投影离它不远（85%）时变黄 */
     const show = (projected?: number) => {

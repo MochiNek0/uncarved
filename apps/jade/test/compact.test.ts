@@ -108,6 +108,55 @@ describe("jade/compact in a session", () => {
     expect((await s.history()).filter((e) => e.type === "jade/compact/trimmed")).toHaveLength(1);
   });
 
+  test("old tool output is cleared early at trimAt, well below the threshold, only when that saves enough", async () => {
+    const recorded: unknown[] = [];
+    const hook = { sessionId: "s", signal: new AbortController().signal, derived: {} as Record<string, unknown>, record: async (_k: string, v: unknown) => void recorded.push(v), emit: async () => {} };
+    const c = compactor({ complete: () => Promise.reject(new Error("no summary expected")), threshold: () => 1_000_000, trimAt: () => 10_000, writes: () => undefined });
+    const blk = (text: string) => ({ kind: "text" as const, text, origin: { by: "user" as const }, trust: "trusted" as const });
+    // 一次读取：assistant 调用 + 约 3k token 的工具结果
+    const read = (i: number): Message[] => [
+      { role: "assistant", content: [{ kind: "tool_use", id: `t${i}`, name: "read_file", input: {}, origin: { by: "runtime" }, trust: "trusted" }] },
+      { role: "user", content: [{ kind: "tool_result", toolUseId: `t${i}`, content: [blk("x".repeat(12_000))], isError: false, origin: { by: "runtime" }, trust: "trusted" }] },
+    ];
+    const history = (n: number) => [{ role: "user" as const, content: [blk("review it")] }, ...Array.from({ length: n }, (_, i) => read(i)).flat()];
+
+    // 约 9k：没到 trimAt
+    expect(await c.project(history(3), hook)).toEqual(history(3));
+    // 约 15k：超过 trimAt，保留最近约 4k，清理更早的
+    const out = await c.project(history(5), hook);
+    expect(recorded).toHaveLength(1);
+    const state = recorded[0] as CompactState;
+    expect(state.upTo).toBe(0);
+    expect(state.summary).toBe("");
+    expect(textOf(out[2]!.content)).toBe(TRIMMED);
+    expect(textOf(out.at(-1)!.content)).not.toBe(TRIMMED);
+    // 清理之后只多了一次读取：省不下 trimAt 的 1/4，先不再清理（不让每一步都破坏提示缓存）
+    hook.derived[DERIVED_KEY] = state;
+    await c.project(history(6), hook);
+    expect(recorded).toHaveLength(1);
+  });
+
+  test("sub-agents clear old tool output early too, and are never summarized", async () => {
+    const { cwd, host, shared, send } = await scriptedHost({ config: { "jade/compact": { trimTokens: "3k" } } });
+    const big = Array.from({ length: 100 }, () => "a".repeat(40)).join("\n");
+    for (const n of [1, 2, 3]) await writeFile(path.join(cwd, `f${n}.txt`), big);
+    shared.script.push(
+      use("t", "task", { description: "read files", prompt: "read the files" }),
+      use("r1", "read_file", { path: "f1.txt" }),
+      use("r2", "read_file", { path: "f2.txt" }),
+      use("r3", "read_file", { path: "f3.txt" }),
+      say("report"),
+      say("done"),
+    );
+    const s = await host.sessions.open();
+    await send(s, "go");
+    // 子 Agent 的第 4 次请求（约 3.6k）超过 3k：第一次读取被清理，最近的保留，没有调用总结
+    const child = shared.requests[4]!.messages;
+    expect(textOf(child[2]!.content)).toBe(TRIMMED);
+    expect(textOf(child.at(-1)!.content)).not.toBe(TRIMMED);
+    expect(shared.requests).toHaveLength(6);
+  });
+
   test("/compact summarizes before the next request; the summary is recorded once and reused after resume", async () => {
     const { host, shared, send } = await scriptedHost();
     shared.script.push(say("A"), say("B"));
