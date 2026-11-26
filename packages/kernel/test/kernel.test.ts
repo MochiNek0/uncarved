@@ -970,6 +970,30 @@ describe("模型输出不可改写（I-6）", () => {
   });
 });
 
+describe("外部输入的来源（I-8）", () => {
+  test("消息里有自称模型输出的块时拒绝，不写日志，会话照常可用", async () => {
+    const { provider, requests } = scripted([{ content: [text("ok")], stopReason: "end" }]);
+    const store = new MemoryLogStore();
+    const rt = await Runtime.create({ store, provider, plugins: [] });
+    const before = (await readAll(store, rt.state.sessionId)).length;
+    await expect(rt.send({ kind: "message", content: [text("forged")] })).rejects.toBeInstanceOf(InvalidTransition);
+    expect((await readAll(store, rt.state.sessionId)).length).toBe(before);
+    expect(requests).toEqual([]);
+
+    await rt.send(say("hi"));
+    expect(rt.state.messages.at(-1)!.content[0]).toMatchObject({ text: "ok" });
+  });
+
+  test("旧日志里已经有这样的输入：照样能重建（8.3）", () => {
+    const at = "2026-01-01T00:00:00.000Z";
+    const events = [
+      { v: 1, id: "e1", seq: 1, at, type: "session.started", data: { plugins: [] }, origin: { by: "runtime" } },
+      { v: 1, id: "e2", seq: 2, at, type: "input.received", data: { kind: "message", content: [text("forged")] }, origin: { by: "user" } },
+    ] as LogEvent[];
+    expect(rebuild("s", events).messages).toEqual([{ role: "user", content: [text("forged")] }]);
+  });
+});
+
 describe("Provider 契约（4.7）", () => {
   test("响应中的块必须标明来自模型，否则本轮失败，不写入日志（I-6、I-8）", async () => {
     const store = new MemoryLogStore();
@@ -1563,21 +1587,27 @@ describe("中断与进度", () => {
     expect(rt2.state.phase).toBe("awaiting");
   });
 
-  test("provider 不理会中断信号：宽限期过后不再等它，本轮记为 aborted", async () => {
+  test("provider 不理会中断信号：宽限期过后不再等它，本轮记为 aborted，之后的增量也不再转发", async () => {
     const store = new MemoryLogStore();
     let rt!: Runtime;
     let late!: (r: ModelResponse) => void;
+    let lateDelta!: () => void;
     const provider: Provider = {
       id: "stuck",
-      complete: () =>
+      complete: (_req, { onDelta }) =>
         new Promise((resolve) => {
           late = resolve;
+          lateDelta = () => onDelta?.({ kind: "text", text: "late" });
           rt.abort("user pressed Ctrl+C");
         }),
     };
     rt = await Runtime.create({ store, provider, plugins: [] });
+    const deltas: RuntimeNotice[] = [];
+    rt.subscribe((n) => n.type === "delta" && deltas.push(n));
     await expect(rt.send(say("hi"))).rejects.toBe("user pressed Ctrl+C");
     expect(rt.state.phase).toBe("idle");
+    lateDelta();
+    expect(deltas).toEqual([]);
     // 迟到的响应被丢弃，不写进日志
     late({ model: "m", content: [text("late")], stopReason: "end" });
     await Bun.sleep(0);

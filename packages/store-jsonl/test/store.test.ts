@@ -256,3 +256,11 @@ test("信任记录损坏时报出文件和行号", async () => {
   await writeFile(file, `{broken\n`);
   await expect(new JsonlTrustStore(file).has("h1")).rejects.toThrow(`trust store ${file}: corrupt record at line 1`);
 });
+
+test("一批里的 seq 不连续时整批拒绝，什么都不写", async () => {
+  const store = new JsonlLogStore(dir);
+  await expect(store.append("s1", [ev(1), ev(3)])).rejects.toThrow("consecutive");
+  expect(await readAll(store, "s1")).toEqual([]);
+  await store.append("s1", [ev(1), ev(2)]);
+  expect((await readAll(store, "s1")).map((e) => e.seq)).toEqual([1, 2]);
+});

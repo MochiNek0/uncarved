@@ -42,7 +42,7 @@
     "access": "public"
   },
   "scripts": {
-    "build": "node scripts/clean-dist.mjs && tsc -p tsconfig.build.json && bun scripts/build-plugins.ts",
+    "build": "node ../../scripts/clean-dist.mjs && tsc -p tsconfig.build.json && bun scripts/build-plugins.ts",
     "prepublishOnly": "node ../../scripts/require-bun-publish.mjs && bun run build"
   },
   "dependencies": {

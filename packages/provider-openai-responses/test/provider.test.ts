@@ -530,3 +530,16 @@ test("api.openai.com 上每个 provider 实例用固定的 prompt_cache_key；�
   expect(await run("https://proxy.example.com/v1", "k")).toEqual(["k", "k"]);
   expect(await run("https://api.openai.com/v1", null)).toEqual([undefined, undefined]);
 });
+
+test("只收到部分 output_item.done 时，缺的 item 从最终响应的 output 里按位置补上", async () => {
+  const { fetchFn } = fakeServer([
+    [
+      itemDone(0, reasoning),
+      { type: "response.completed", response: { model: "fake-1", status: "completed", output: [reasoning, message("m1", "answer")] } },
+    ],
+  ]);
+  const provider = openaiResponsesProvider({ baseURL: "https://example.test/v1", model: "m", fetch: fetchFn });
+  const res = await provider.complete({ system: [], tools: [], messages: [] }, { signal: new AbortController().signal });
+  expect(res.content.map((b) => b.kind)).toEqual(["thinking", "text"]);
+  expect(res.content[1]).toMatchObject({ kind: "text", text: "answer" });
+});

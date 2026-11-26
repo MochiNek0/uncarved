@@ -359,6 +359,23 @@ describe("jade plugins add: npm", () => {
 });
 
 describe("jade plugins update: the recorded source", () => {
+  test("a record whose directory points outside the plugins directory is refused, not replaced", async () => {
+    const { home, opts, plugin } = await world();
+    const from = await plugin("escape", { id: "test/escape" });
+    await pluginsCommand(["add", from], opts);
+    const root = path.join(home, "plugins");
+    const victim = path.join(home, "victim");
+    await mkdir(victim);
+    await writeFile(path.join(victim, "keep.txt"), "keep");
+    const records = JSON.parse(await readFile(path.join(root, ".installed.json"), "utf8"));
+    records.plugins["test/escape"].dir = "../victim";
+    await writeFile(path.join(root, ".installed.json"), JSON.stringify(records));
+
+    const [result] = await updatePlugins(["test/escape"], { root, cwd: home, force: true });
+    expect(result).toMatchObject({ status: "failed" });
+    expect(await readFile(path.join(victim, "keep.txt"), "utf8")).toBe("keep");
+  });
+
   test("a git record is not turned into a local directory that happens to share its name", async () => {
     const { home, plugin } = await world();
     const root = path.join(home, "plugins");

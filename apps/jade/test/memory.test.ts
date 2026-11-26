@@ -47,6 +47,15 @@ describe("jade/memory", () => {
     expect(await new Memory(home, cwd).list("project")).toEqual(["Tests run with bun test"]);
   });
 
+  test("concurrent changes from different sessions are all kept", async () => {
+    const { home, cwd } = await dirs();
+    const a = new Memory(home, cwd, () => "2026-11-25");
+    const b = new Memory(home, cwd, () => "2026-11-25");
+    const texts = Array.from({ length: 10 }, (_, i) => `entry ${i}`);
+    await Promise.all(texts.map((t, i) => (i % 2 ? a : b).add("user", t)));
+    expect((await a.list("user")).sort()).toEqual(texts.sort());
+  });
+
   test("entries keep their dates; undated lines written by hand still count, and the prompt shows the dates", async () => {
     const { home, cwd } = await dirs();
     let day = "2026-11-01";

@@ -74,6 +74,9 @@ export class JsonlLogStore implements LogStore {
     if (events[0]!.seq !== tail.seq + 1) {
       throw new ConcurrentWrite(sessionId, `log ends at seq ${tail.seq}, appending seq ${events[0]!.seq}`);
     }
+    // 批内也要连续：留下缺口的日志再也无法重建
+    const gap = events.findIndex((e, i) => i > 0 && e.seq !== events[i - 1]!.seq + 1);
+    if (gap > 0) throw new Error(`session ${sessionId}: events in a batch must have consecutive seq, got ${events[gap - 1]!.seq} then ${events[gap]!.seq}`);
     const fh = await open(file, "a");
     try {
       // 文件大小和本实例最后一次写入后不同，说明别人写过

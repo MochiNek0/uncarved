@@ -43,6 +43,15 @@ test("output speed counts from the first delta, including tool input, not from t
   expect(streamed).toEqual([]);
 });
 
+test("after switching sessions, a reply that was not streamed is still shown even if the old turn stopped mid-stream", () => {
+  const { t, event, streamed } = setup();
+  // 上一个会话流式输出到一半被中断：没有 model.responded
+  t.onNotice({ type: "delta", delta: { kind: "text", text: "partial" } });
+  t.reset();
+  event("model.responded", { content: [{ kind: "text", text: "answer", origin: { by: "model" }, trust: "trusted" }] });
+  expect(streamed).toEqual(["partial", "answer"]);
+});
+
 test("a reply with no deltas at all does not update the speed", async () => {
   const { event, speeds } = setup();
   event("model.requested", {});

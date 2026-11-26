@@ -197,6 +197,11 @@ export async function updatePlugins(names: readonly string[], opts: UpdateOption
 
 async function updateOne(root: string, rec: InstallRecord, opts: UpdateOptions): Promise<UpdateResult> {
   const dir = path.join(root, rec.dir || path.basename(installDir(root, rec.id)));
+  // 记录文件坏了（或被改过）时，目录可能指到插件目录外面：更新会整个替换它，和 removePlugin 一样先确认
+  const rel = path.relative(root, dir);
+  if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) {
+    return { id: rec.id, dir, status: "failed", error: `refusing to update ${dir}: it is not inside ${root}` };
+  }
   if (rec.kind === "link") return { id: rec.id, dir, status: "linked" };
 
   const exists = await lstat(dir).catch(() => undefined);

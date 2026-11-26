@@ -233,6 +233,8 @@ export function transcript(opts: TranscriptOptions): Transcript {
       befores.clear();
       inputs.clear();
       asks.clear();
+      // 上一个会话可能流式输出到一半被中断，没有 model.responded 把它复位
+      streamed = false;
       self.lastEnd = undefined;
     },
   };

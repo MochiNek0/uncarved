@@ -6,9 +6,9 @@
 // 模型用 memory 工具增删改，用户用 /memory 查看和管理。从旧 jade 的 memory.ts 移植，文件位置不变。
 // 每条前面是保存它的日期（"- [2026-11-25] 内容"），由代码写，模型据此判断旧不旧；没有日期的旧条目照常读。
 
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Tool } from "uncarved";
 
@@ -33,6 +33,20 @@ const localDate = () => {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 };
 const size = (entries: MemoryEntry[]) => entries.reduce((n, e) => n + e.text.length, 0);
+/**
+ * 每个记忆文件上正在进行的改动。同一进程里的几个会话（各有一个 Memory）同时改同一个文件时依次进行，
+ * 否则后读的会覆盖先写的
+ */
+const pending = new Map<string, Promise<unknown>>();
+function serialized<T>(file: string, fn: () => Promise<T>): Promise<T> {
+  const p = (pending.get(file) ?? Promise.resolve()).then(fn, fn);
+  const tail = p.catch(() => {});
+  pending.set(file, tail);
+  void tail.then(() => {
+    if (pending.get(file) === tail) pending.delete(file);
+  });
+  return p;
+}
 const render = (entries: MemoryEntry[]) => entries.map((e) => (e.date ? `- [${e.date}] ${e.text}` : `- ${e.text}`)).join("\n");
 
 export class Memory {
@@ -68,37 +82,43 @@ export class Memory {
   }
 
   /** 加一条；已经有同样的一条时不重复。返回是否加入 */
-  async add(scope: MemoryScope, text: string): Promise<boolean> {
-    const entry = this.#check(text);
-    const all = await this.entries(scope);
-    if (all.some((e) => e.text === entry)) return false;
-    const after = [...all, { text: entry, date: this.#today() }];
-    this.#fits(scope, all, after);
-    await this.#write(scope, after);
-    return true;
+  add(scope: MemoryScope, text: string): Promise<boolean> {
+    return serialized(this.files[scope], async () => {
+      const entry = this.#check(text);
+      const all = await this.entries(scope);
+      if (all.some((e) => e.text === entry)) return false;
+      const after = [...all, { text: entry, date: this.#today() }];
+      this.#fits(scope, all, after);
+      await this.#write(scope, after);
+      return true;
+    });
   }
 
   /** 删掉内容完全相同的一条，或者唯一包含 text 的那一条。返回删掉的那条 */
-  async remove(scope: MemoryScope, text: string): Promise<string | undefined> {
-    const all = await this.entries(scope);
-    const i = this.#find(scope, all, text);
-    if (i < 0) return undefined;
-    const [removed] = all.splice(i, 1);
-    await this.#write(scope, all);
-    return removed!.text;
+  remove(scope: MemoryScope, text: string): Promise<string | undefined> {
+    return serialized(this.files[scope], async () => {
+      const all = await this.entries(scope);
+      const i = this.#find(scope, all, text);
+      if (i < 0) return undefined;
+      const [removed] = all.splice(i, 1);
+      await this.#write(scope, all);
+      return removed!.text;
+    });
   }
 
   /** 把 old 指的那条（找法同 remove）原地换成 text，日期更新。返回被换掉的那条；找不到时返回 undefined */
-  async replace(scope: MemoryScope, old: string, text: string): Promise<string | undefined> {
-    const entry = this.#check(text);
-    const all = await this.entries(scope);
-    const i = this.#find(scope, all, old);
-    if (i < 0) return undefined;
-    if (all.some((e, j) => j !== i && e.text === entry)) throw new Error(`the ${scope} memory already has "${entry}"; remove the old one instead`);
-    const after = all.with(i, { text: entry, date: this.#today() });
-    this.#fits(scope, all, after);
-    await this.#write(scope, after);
-    return all[i]!.text;
+  replace(scope: MemoryScope, old: string, text: string): Promise<string | undefined> {
+    return serialized(this.files[scope], async () => {
+      const entry = this.#check(text);
+      const all = await this.entries(scope);
+      const i = this.#find(scope, all, old);
+      if (i < 0) return undefined;
+      if (all.some((e, j) => j !== i && e.text === entry)) throw new Error(`the ${scope} memory already has "${entry}"; remove the old one instead`);
+      const after = all.with(i, { text: entry, date: this.#today() });
+      this.#fits(scope, all, after);
+      await this.#write(scope, after);
+      return all[i]!.text;
+    });
   }
 
   /** 系统提示词里的一段；没有记忆时返回 undefined */
@@ -147,7 +167,10 @@ export class Memory {
   async #write(scope: MemoryScope, entries: MemoryEntry[]) {
     const file = this.files[scope];
     await mkdir(path.dirname(file), { recursive: true });
-    await writeFile(file, entries.length ? render(entries) + "\n" : "");
+    // 先写临时文件再改名：别的进程（另一个 jade）读到的不会是写了一半的文件
+    const tmp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+    await writeFile(tmp, entries.length ? render(entries) + "\n" : "");
+    await rename(tmp, file);
   }
 }
 

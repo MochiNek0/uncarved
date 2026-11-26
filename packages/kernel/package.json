@@ -24,7 +24,7 @@
     "node": ">=22.18"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "node ../../scripts/clean-dist.mjs && tsc -p tsconfig.build.json",
     "prepublishOnly": "node ../../scripts/require-bun-publish.mjs && bun run build"
   }
 }

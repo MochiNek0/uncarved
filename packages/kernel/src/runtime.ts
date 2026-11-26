@@ -13,7 +13,7 @@ import {
 } from "./hooks.ts";
 import { checkCompat, PluginIncompatible, resumePolicy, type Plugin } from "./plugin.ts";
 import { ProviderError } from "./provider.ts";
-import { initialState, rebuild, step } from "./step.ts";
+import { initialState, InvalidTransition, rebuild, step } from "./step.ts";
 import { isConfirmed, UntrustedPlugin } from "./trust.ts";
 import { readAll, type LogStore } from "./store.ts";
 import type {
@@ -238,6 +238,11 @@ export class Runtime {
   async send(input: UserInput): Promise<void> {
     this.#enter(input.kind === "plugins");
     try {
+      // 外部输入不能自称模型输出：写进日志后 I-6 的检查会把它当成被改过的模型块，会话再也无法继续（I-8）。
+      // 只在这里拦新的输入，不放进 step()：旧日志里已经有的照样能重建（8.3）
+      if (input.kind === "message" && input.content.some((b) => b.origin.by === "model")) {
+        throw new InvalidTransition("input.received", this.#state.phase, "input blocks must not be attributed to the model");
+      }
       await this.#commit("input.received", input, { by: "user" });
       // 插件变化的批准只记录结果，接下来做什么一律由 recover() 根据状态决定，与 resume() 一致（4.6）
       if (input.kind === "plugins") this.#queue.length = 0;
@@ -471,13 +476,19 @@ export class Runtime {
 
     // 不理会 signal 的 provider 不能让中断一直等下去（I-9）：模型调用没有副作用，宽限期过后直接放弃，迟到的结果丢弃。
     // 工具不这样处理：工具可能还在改动外部状态，提前结束会让下一轮和它同时运行
+    // 放弃之后 provider 可能还在推增量，不再转发给订阅者
+    let live = true;
     const res = await abortable(
       this.#provider.complete(request, {
         signal,
-        onDelta: (delta) => this.#notify({ type: "delta", delta }),
+        onDelta: (delta) => {
+          if (live) this.#notify({ type: "delta", delta });
+        },
       }),
       signal,
-    );
+    ).finally(() => {
+      live = false;
+    });
     // I-6 的检查靠 origin 认出模型块，来源不对的块写进日志后就再也认不出来了（I-8）
     if (res.content.some((b) => b.origin?.by !== "model")) {
       throw new ProviderError(`provider ${res.provider ?? this.#provider.id} returned a block not attributed to the model`, {

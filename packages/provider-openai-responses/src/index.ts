@@ -179,9 +179,11 @@ export function openaiResponsesProvider(opts: OpenAIResponsesOptions): Provider 
         if (!final) throw new ProviderError(`${PROVIDER_ID} stream ended without a final response`, { retryable: true });
         if (final.model) model = final.model;
 
-        const items = done.filter(Boolean);
+        // 以流里的 done item 为准；有的没收到 done（或服务端根本不发），按位置用最终响应里的补上
+        const output = final.output ?? [];
+        const items = Array.from({ length: Math.max(done.length, output.length) }, (_, i) => done[i] ?? output[i]).filter(Boolean) as Item[];
         const origin: Origin = { by: "model", provider: PROVIDER_ID, model };
-        const content = (items.length > 0 ? items : (final.output ?? [])).flatMap((item) => toBlocks(item, origin));
+        const content = items.flatMap((item) => toBlocks(item, origin));
         const u = final.usage;
         const usage: Usage | undefined = u
           ? { inputTokens: u.input_tokens, outputTokens: u.output_tokens, cacheReadTokens: u.input_tokens_details?.cached_tokens }
