@@ -15,9 +15,8 @@ import type { Approval, Commands, Keys, Modes, Prompts } from "@uncarved/jade-ap
 
 export const DESCRIPTIONS: Record<string, string> = {
   ask: "ask before edits and commands",
-  auto: "edits in this directory and harmless commands run without asking; others still ask",
+  auto: "never asks: edits in this directory and harmless commands run; a model reviews the rest and blocks risky ones",
   plan: "change nothing: research read-only and propose a plan",
-  readonly: "change nothing",
   yolo: "never ask",
 };
 const CYCLE = ["ask", "auto", "plan"];
@@ -81,9 +80,9 @@ const listeners = new Set<(mode: string) => void>();
 
 /**
  * 用户选的模式记在 $JADE_HOME/mode.json，下次启动接着用（比配置里的 mode 优先）。
- * plan 是一次任务里的，yolo 不该悄悄带到下一次启动：这两个不记
+ * plan 是一次任务里的，yolo 不该悄悄带到下一次启动：这两个不记。readonly 给子 Agent 用，/mode 里没有
  */
-const REMEMBERED = new Set(["ask", "auto", "readonly"]);
+const REMEMBERED = new Set(["ask", "auto"]);
 let modeFile: string | undefined;
 /** 记下的模式只在第一个可交互的会话里恢复一次：jade -p 这类不能问用户的运行一直用配置的模式 */
 let restored = false;

@@ -1,7 +1,8 @@
 // jade/approval：审批。tool.before 把路径统一成绝对路径，tool.gate 按模式和规则决定：允许、拒绝，或者要问用户（ask）。
 // 关卡不等用户：所有关卡合并的结果是 ask 时（日志里的 tool.decided），内核停下来等人工审批，这里才经 ui@1 问用户，
 // 把回答作为 approval 输入交给会话。别的插件的关卡要问时也由这里问。谁回答的、选了什么记成 jade/approval/answered 事件。
-// auto 模式下规则判断不了、本来要问的调用先让模型审一次（review.ts）：它只能放行或转给用户，不能替用户拒绝。
+// auto 模式下规则判断不了、本来要问的调用让模型审一次（review.ts）：放行或拦下，拦下时模型用 ask_user 问用户；
+// 连续拦下几次、或者没有审查时（review: false）才由这里问。
 //
 // 没有这个插件（停用、坏掉、被隔离）时，核心的兜底关卡拒绝所有非只读工具（第 7 节），所以这里出错不会放行。
 // 用户选的"总是允许"记进日志（derived），恢复会话后仍然有效；选"在这个目录里总是允许"的记在
@@ -13,7 +14,7 @@ import type { EventDataMap, GatedToolCall, Message } from "uncarved";
 import { definePlugin, type Caller, type SelectRequest, type Text, type UI } from "@uncarved/jade-api";
 import type { Answer, Approval, Approver, Models, Renderers } from "@uncarved/jade-api/services";
 import { describeRule, MODES, policy, type AllowRule, type Mode } from "./policy.ts";
-import { reviewer, type Review } from "./review.ts";
+import { ASK_USER, reviewer, type Review } from "./review.ts";
 
 const ANSWERS: readonly string[] = ["once", "always", "forever", "deny"] satisfies Answer[];
 /** 只有终端里有的一项：拒绝，并写一句话告诉模型该怎么做 */
@@ -28,6 +29,9 @@ const MAX_ASK_TIMEOUT_MINUTES = 7 * 24 * 60;
 /** 关卡的时限：auto 模式的审查最长一分钟（review.ts），比 hook 默认的 30 秒长 */
 const GATE_TIMEOUT_MS = 2 * 60_000;
 const MAX_DETAIL_CHARS = 2000;
+/** auto 模式的审查连续拦下几次、一个会话里累计拦下几次后，转回问用户一次（同 Claude Code 的 auto 模式） */
+const BLOCKS_IN_A_ROW = 3;
+const BLOCKS_TOTAL = 20;
 /** 等工具的审批预览的时限，过了就用默认的 detail */
 const PREVIEW_TIMEOUT_MS = 5000;
 
@@ -57,6 +61,8 @@ const approvers = new Map<Approver, string>();
 const sessionChecks = new Map<string, (call: GatedToolCall) => boolean>();
 /** 打开着的会话：会话 id → 它现在的"总是允许"规则。子会话（子 Agent）照父会话的规则办：主会话里选过"总是允许"的，子 Agent 不再问 */
 const sessionRules = new Map<string, () => AllowRule[]>();
+/** 会话 id → 用户的请求在哪些消息里：主会话是它自己的，子会话沿用父会话的（一直到主会话），auto 模式的审查用 */
+const sessionUserMessages = new Map<string, () => readonly Message[]>();
 
 export default definePlugin({
   process(ctx) {
@@ -115,9 +121,28 @@ export default definePlugin({
         },
       });
     }
-    const review = reviewing ? reviewer({ models: models!, cwd: ctx.cwd, writeRoots: () => writeRoots, messages: () => recent.messages, meta: (t) => ctx.session.tool(t)?.meta }) : undefined;
+    // 子 Agent 的会话里没有用户的消息：审查从主会话取用户的请求和 ask_user 回答
+    const parentId = ctx.session.parent?.sessionId;
+    const userMessages = parentId === undefined ? () => recent.messages : () => sessionUserMessages.get(parentId)?.() ?? [];
+    sessionUserMessages.set(ctx.session.id, userMessages);
+    await ctx.effect(() => () => {
+      if (sessionUserMessages.get(ctx.session.id) === userMessages) sessionUserMessages.delete(ctx.session.id);
+    });
+    const review = reviewing
+      ? reviewer({
+          models: models!,
+          cwd: ctx.cwd,
+          writeRoots: () => writeRoots,
+          messages: () => recent.messages,
+          ...(parentId !== undefined ? { userMessages } : {}),
+          meta: (t) => ctx.session.tool(t)?.meta,
+        })
+      : undefined;
     /** 本会话里审查过一次、放行了的调用 */
     const reviewedCalls = new Set<string>();
+    /** auto 模式里审查连续拦下、累计拦下的次数（审查失败不算）；到了上限这一次转回问用户，免得模型不问、一直被拦在原地 */
+    let blocksInARow = 0;
+    let blocksTotal = 0;
     let warned = false;
     /** 本进程里刚选的"总是允许"：记进日志之前（要等看到那条 approval 输入）就要生效 */
     const added: AllowRule[] = [];
@@ -170,7 +195,9 @@ export default definePlugin({
         seen.set(call.toolUseId, { call });
         const result = rules.decide(call, { mode, rules: saved() });
         if (result.decision !== "ask") return result;
-        // auto 模式：规则判断不了、本来要问的调用先让模型审一次。审查只能放行或转给用户，不会替用户拒绝
+        // auto 模式：规则判断不了、本来要问的调用让模型审一次，审查的结论就是决定，不问用户。
+        // 拦下时把理由告诉模型：要做就先用 ask_user 问用户，用户同意后重试，审查看到回答会放行。
+        // 连续拦下 BLOCKS_IN_A_ROW 次或累计 BLOCKS_TOTAL 次时，这一次转回问用户
         let why: string | undefined;
         if (review && mode === "auto") {
           const key = reviewedKey(call);
@@ -179,10 +206,18 @@ export default definePlugin({
           // 审查调用不经过 model.responded，用量只能记在这里，界面据此计入会话用量
           if (verdict.usage) await hook.emit("reviewed", { toolUseId: call.toolUseId, usage: verdict.usage });
           if (verdict.decision === "allow") {
+            blocksInARow = 0;
             if (key !== undefined) reviewedCalls.add(key);
             return { decision: "allow", reason: verdict.reason };
           }
-          why = verdict.reason;
+          if (verdict.failed) return { decision: "deny", reason: blocked(call.name, verdict, "reply") };
+          blocksInARow++;
+          blocksTotal++;
+          if (!canAsk() || (blocksInARow < BLOCKS_IN_A_ROW && blocksTotal < BLOCKS_TOTAL))
+            return { decision: "deny", reason: blocked(call.name, verdict, parentId !== undefined ? "report" : ctx.session.tool(ASK_USER) !== undefined ? "ask_user" : "reply") };
+          blocksInARow = 0;
+          blocksTotal = 0;
+          why = `Auto mode has blocked several actions, so it asks you this time. The review's reason: ${verdict.reason ?? "none given"}`;
         }
         if (!canAsk()) {
           if (!warned) {
@@ -222,7 +257,7 @@ export default definePlugin({
           ui,
           {
             title: `Allow ${call.name}?`,
-            // 审查转给用户的：先说为什么
+            // auto 模式拦了几次转回来问的：先说为什么
             detail: asked.why ? [asked.why, "\n\n", shown] : shown,
             options: [
               { label: "Allow once", value: "once" },
@@ -336,12 +371,30 @@ export default definePlugin({
   },
 });
 
-/** 一个要问的调用。没有 mine 的是别的插件的关卡要问的，或者恢复会话时还在等的；why：auto 模式的审查转给用户时的理由 */
+/** 一个要问的调用。没有 mine 的是别的插件的关卡要问的，或者恢复会话时还在等的；why：auto 模式拦了几次转回来问时的理由 */
 interface Asked {
   call: AskedCall;
   /** 这里的规则要问的：关卡看到的完整调用，问之前按它重新判断一次 */
   mine?: GatedToolCall;
   why?: string;
+}
+
+/**
+ * auto 模式的审查拦下调用时告诉模型的话：审查没做成时可以再试；判断有风险时先问用户：
+ * ask_user：用它问（这一轮里接着做）；reply：没有 ask_user，在回复里问、结束这一轮；
+ * report：子 Agent 问不了用户，停下来在报告里说明，由主 Agent 问
+ */
+function blocked(tool: string, verdict: Review, how: "ask_user" | "reply" | "report"): string {
+  const why = verdict.reason ?? "no reason given";
+  if (verdict.failed) return `${why} So this ${tool} call did not run. You may try it once more; if the review fails again, tell the user what you wanted to do.`;
+  const next = {
+    ask_user: `ask the user with ${ASK_USER}: say exactly what you want to run and why it was blocked, with options to allow it or not. If they allow it, make the same call again.`,
+    reply: "tell the user exactly what you want to run and why, and end your turn; once they confirm, try the call again.",
+    report:
+      "stop and say in your report exactly which call was blocked and why, so the main agent can ask the user. Do not retry it yourself; " +
+      "once the user agrees, the main agent can run it or give the task again.",
+  }[how];
+  return `The automatic safety review in auto mode blocked this ${tool} call: ${why} Do not work around it with another call that has the same effect. If this step is needed, ${next}`;
 }
 
 /** 要问的调用里给用户看的部分；恢复的会话里只有这些 */
