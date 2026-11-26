@@ -51,6 +51,9 @@ export interface RetryRecord {
  */
 export type RetriedResponse = ModelResponse & { retries?: RetryRecord[] };
 
+/** models@1 的 complete 多出来的、经 provider 传到这里的回调（见 jade-api 的 Models.complete） */
+type CallHooks = { onWait?: () => void; onSend?: () => void };
+
 export function withRetry(inner: Provider, opts: RetryOptions = {}): Provider {
   const delays = opts.delaysMs ?? RETRY_DELAYS_MS;
   const retries = opts.retries ?? delays.length;
@@ -59,10 +62,14 @@ export function withRetry(inner: Provider, opts: RetryOptions = {}): Provider {
   return {
     id: `retry(${inner.id})`,
     async complete(request, options): Promise<RetriedResponse> {
+      const hooks = options as CallHooks;
       const failures: RetryRecord[] = [];
       for (let attempt = 1; ; attempt++) {
         let streamed = false;
+        // 排队的时间不算请求的耗时：调用方（例如审查的超时）据此暂停、重新计时
+        if (opts.gate) hooks.onWait?.();
         const done = await opts.gate?.acquire(options.signal, opts.onWait && ((delayMs) => opts.onWait!({ delayMs, request })));
+        hooks.onSend?.();
         opts.onRequest?.(attempt);
         try {
           const res = await inner
@@ -101,6 +108,7 @@ export function withRetry(inner: Provider, opts: RetryOptions = {}): Provider {
           if (streamed) options.onDelta?.({ kind: "reset" });
           failures.push({ attempt, delayMs, error: err.message, ...(err.status !== undefined ? { status: err.status } : {}), ...(streamed ? { discarded: true as const } : {}) });
           opts.onRetry?.({ attempt, retries, delayMs, error: err, request });
+          hooks.onWait?.();
           await sleep(delayMs, options.signal);
         }
       }

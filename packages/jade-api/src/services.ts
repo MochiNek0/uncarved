@@ -176,7 +176,18 @@ export interface Models {
    * model 是 /model 保存过的模型名（$JADE_HOME/models.json），用它和它自己的设置；
    * 没保存过时当作当前服务上的模型名（list() 里的那些），用这个服务的默认设置
    */
-  complete(request: ModelRequest, options: { signal: AbortSignal; onDelta?: (delta: import("uncarved").Delta) => void; model?: string }): Promise<ModelResponse>;
+  complete(
+    request: ModelRequest,
+    options: {
+      signal: AbortSignal;
+      onDelta?: (delta: import("uncarved").Delta) => void;
+      model?: string;
+      /** 请求开始等待时调用：在限速里排队、等前面的请求结束，或者失败后等着重试。可能马上就接着 onSend */
+      onWait?: () => void;
+      /** 请求真正发出时调用（每次重试都调一次）：调用方的超时可以从这里算起，不算排队和等重试的时间 */
+      onSend?: () => void;
+    },
+  ): Promise<ModelResponse>;
   /** 服务提供的模型列表；不支持或出错时为空 */
   list(): Promise<string[]>;
   /** 给这个名字的模型填过的单价在 at 这一刻是多少（当前服务上的优先）；没填时 undefined */

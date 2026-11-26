@@ -249,7 +249,7 @@ plugin.run()
 | `JADE_UPDATE_CHECK` | shell | 设为 `off` 不检查更新 |
 | `HTTPS_PROXY` / `HTTP_PROXY` | shell | 模型和 web 请求走代理（Node.js 版本太旧、不支持时启动时会提示；Bun 都支持） |
 
-权限模式和压缩阈值是插件配置，写在 `$JADE_HOME/config.json`，例如 `{"jade/approval": {"mode": "auto"}, "jade/compact": {"thresholdTokens": "120k"}}`。会话里用 Shift+Tab 或 `/mode` 选的模式记在 `mode.json`，比配置优先（见上文"权限"）。历史超过 100k token 时（远在压缩阈值之前）会先清理较早的大段工具输出，只留最近的一段；清理会让提示缓存失效，所以只在大约 10 次请求内能回本时清理：缓存价按 `jade/cost` 的单价（`/model` 里填的或配置里的）算，没有时按原价的 1/20。100k 这个起点可用 `{"jade/compact": {"trimTokens": "200k"}}` 调整，`false` 关掉。等审批回答的时限默认 24 小时，过了按拒绝处理，可用 `{"jade/approval": {"askTimeoutMinutes": 30}}` 改短（最长一周）。
+权限模式和压缩阈值是插件配置，写在 `$JADE_HOME/config.json`，例如 `{"jade/approval": {"mode": "auto"}, "jade/compact": {"thresholdTokens": "120k"}}`。会话里用 Shift+Tab 或 `/mode` 选的模式记在 `mode.json`，比配置优先（见上文"权限"）。历史超过 100k token 时（远在压缩阈值之前）会先清理较早的大段工具输出，只留最近的一段；清理会让提示缓存失效，所以只在大约 10 次请求内能回本时清理：缓存价按 `jade/cost` 的单价（`/model` 里填的或配置里的）算，没有时按原价的 1/20。100k 这个起点可用 `{"jade/compact": {"trimTokens": "200k"}}` 调整，`false` 关掉。等审批回答的时限默认 24 小时，过了按拒绝处理，可用 `{"jade/approval": {"askTimeoutMinutes": 30}}` 改短（最长一周）。auto 模式的审查默认用当前的模型，可用 `{"jade/approval": {"reviewModel": "<模型名>"}}` 换成 `/model` 保存过的另一个模型（更快更便宜的更好，它的限速也和会话分开）；审查的 60 秒时限从请求发出时算起，排队等限流的时间不算，连等待在内最多 4 分钟。
 
 其他插件配置（都写在 `$JADE_HOME/config.json`）：
 

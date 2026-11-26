@@ -49,6 +49,22 @@ describe("withRetry", () => {
     expect(res.provider).toBe("inner");
   });
 
+  test("tells the caller when the request waits (queue, retry) and when it is actually sent", async () => {
+    let calls = 0;
+    const seen: string[] = [];
+    const inner: Provider = {
+      id: "inner",
+      async complete() {
+        seen.push("inner");
+        if (++calls === 1) throw new ProviderError("HTTP 429", { retryable: true, status: 429 });
+        return { model: "m", content: [], stopReason: "end" };
+      },
+    };
+    const options = { signal: new AbortController().signal, onWait: () => seen.push("wait"), onSend: () => seen.push("send") };
+    await withRetry(inner, { delaysMs: [1], gate: new RateGate() }).complete(request, options);
+    expect(seen).toEqual(["wait", "send", "inner", "wait", "wait", "send", "inner"]);
+  });
+
   test("a response after retries carries the failed attempts; a first-try response carries none", async () => {
     let calls = 0;
     const inner: Provider = {

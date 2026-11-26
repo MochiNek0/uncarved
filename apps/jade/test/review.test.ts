@@ -5,7 +5,9 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, realpathSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { parseVerdict } from "../plugins/approval/review.ts";
+import type { GatedToolCall, ModelResponse } from "uncarved";
+import type { Models } from "@uncarved/jade-api/services";
+import { parseVerdict, reviewer } from "../plugins/approval/review.ts";
 import { scratchDir } from "../plugins/scratch/index.ts";
 import { cleanup, say, scriptedHost, use } from "./scripted-ui.ts";
 
@@ -21,6 +23,70 @@ describe("parseVerdict", () => {
     expect(parseVerdict('{"decision": "ask"}')).toBeUndefined();
     expect(parseVerdict("I think it is fine")).toBeUndefined();
     expect(parseVerdict(`{"decision": "block", "reason": "${"x".repeat(400)}"}`)!.reason!.length).toBeLessThan(400);
+  });
+});
+
+describe("review timing", () => {
+  const call = { toolUseId: "t", name: "write_file", input: { path: "/x" }, tool: { effect: "write" } } as unknown as GatedToolCall;
+  const allow: ModelResponse = { model: "m", content: [{ kind: "text", text: '{"decision": "allow"}', origin: { by: "model" }, trust: "trusted" }], stopReason: "end" } as ModelResponse;
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+  /** 假的 models@1：按 run 的步骤调回调、等待 */
+  type Opts = { signal: AbortSignal; onWait?: () => void; onSend?: () => void; onDelta?: () => void; model?: string };
+  const fake = (run: (o: Opts) => Promise<ModelResponse>) =>
+    ({
+      complete: (_req: unknown, o: Opts) =>
+        Promise.race([run(o), new Promise<never>((_, reject) => o.signal.addEventListener("abort", () => reject(o.signal.reason), { once: true }))]),
+    }) as unknown as Models;
+  const review = (models: Models, extra: Record<string, unknown> = {}) =>
+    reviewer({ models, cwd: process.cwd(), messages: () => [], meta: () => undefined, timeoutMs: 100, startTimeoutMs: 1000, ...extra })(call, new AbortController().signal);
+
+  test("time spent waiting for the rate limit does not count against the timeout", async () => {
+    const verdict = await review(
+      fake(async (o) => {
+        o.onWait?.();
+        await sleep(250);
+        o.onSend?.();
+        await sleep(20);
+        return allow;
+      }),
+    );
+    expect(verdict.decision).toBe("allow");
+  });
+
+  test("a service that does not report waiting is timed from the start", async () => {
+    const verdict = await review(
+      fake(async () => {
+        await sleep(250);
+        return allow;
+      }),
+    );
+    expect(verdict).toMatchObject({ decision: "deny", failed: true });
+    expect(verdict.reason).toContain("did not start answering within 0s");
+  });
+
+  test("waiting is capped in all", async () => {
+    const verdict = await review(
+      fake(async (o) => {
+        o.onWait?.();
+        await sleep(400);
+        return allow;
+      }),
+      { maxWaitMs: 150 },
+    );
+    expect(verdict).toMatchObject({ decision: "deny", failed: true });
+    expect(verdict.reason).toContain("mostly for the model service's rate limit");
+  });
+
+  test("reviewModel picks the model the review uses", async () => {
+    let used: string | undefined;
+    await review(
+      fake(async (o) => {
+        used = o.model;
+        return allow;
+      }),
+      { model: () => "fast-model" },
+    );
+    expect(used).toBe("fast-model");
   });
 });
 

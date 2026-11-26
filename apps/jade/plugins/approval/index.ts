@@ -28,8 +28,8 @@ const RULES_KEY = "jade/approval/rules";
 const ASK_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 /** askTimeoutMinutes 的上限：定时器最长约 24.8 天 */
 const MAX_ASK_TIMEOUT_MINUTES = 7 * 24 * 60;
-/** 关卡的时限：auto 模式的审查最长一分钟（review.ts），比 hook 默认的 30 秒长 */
-const GATE_TIMEOUT_MS = 2 * 60_000;
+/** 关卡的时限：auto 模式的审查连排队、等限流最长 4 分钟（review.ts），比 hook 默认的 30 秒长 */
+const GATE_TIMEOUT_MS = 5 * 60_000;
 const MAX_DETAIL_CHARS = 2000;
 /** auto 模式的审查连续拦下几次、一个会话里累计拦下几次后，转回问用户一次（同 Claude Code 的 auto 模式） */
 const BLOCKS_IN_A_ROW = 3;
@@ -151,7 +151,15 @@ export default definePlugin({
       messages: () => recent.messages,
       meta: (t: string) => ctx.session.tool(t)?.meta,
     };
-    const review = reviewing ? reviewer({ ...reviewOptions, models: models!, ...(parentId !== undefined ? { userMessages } : {}), answers }) : undefined;
+    // reviewModel：审查用 /model 保存过的另一个模型（更快、更便宜，限速也和会话分开）
+    const reviewModel = ctx.config.reviewModel;
+    if (reviewModel !== undefined && (typeof reviewModel !== "string" || !reviewModel.trim())) {
+      ui?.notify(`jade/approval: reviewModel must be the name of a model saved with /model, got ${JSON.stringify(reviewModel)}; using the current model`, "warning");
+    }
+    const model = typeof reviewModel === "string" && reviewModel.trim() ? reviewModel.trim() : undefined;
+    const review = reviewing
+      ? reviewer({ ...reviewOptions, models: models!, ...(parentId !== undefined ? { userMessages } : {}), answers, ...(model ? { model: () => model } : {}) })
+      : undefined;
     /** 本会话里审查过一次、放行了的调用 */
     const reviewedCalls = new Set<string>();
     /**

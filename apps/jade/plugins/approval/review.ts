@@ -35,10 +35,14 @@ export interface ReviewOptions {
   answers?: () => ReadonlyMap<string, readonly string[]>;
   /** 工具的 meta（ctx.session.tool）：哪些调用写了文件、命令在哪个字段 */
   meta: (tool: string) => ToolMeta | undefined;
-  /** 审查最多等多久，默认 60 秒；超时后拦下 */
+  /** 请求发出之后最多等多久，默认 60 秒；超时后算审查失败 */
   timeoutMs?: number;
   /** 第一次请求多久还没有任何输出就放弃、重发一次，默认 20 秒 */
   startTimeoutMs?: number;
+  /** 连排队、等重试在内总共最多等多久，默认 4 分钟；timeoutMs 只算请求发出之后的时间 */
+  maxWaitMs?: number;
+  /** 审查用的模型（/model 保存过的模型名，配置 reviewModel）；不设时用当前的模型，每次审查时取 */
+  model?: () => string | undefined;
 }
 
 const SYSTEM =
@@ -260,28 +264,50 @@ export function reviewer(
       tools: [],
     };
     const totalMs = opts.timeoutMs ?? 60_000;
+    const maxWaitMs = opts.maxWaitMs ?? 4 * 60_000;
     // 不用 AbortSignal.timeout：它的定时器不让进程保持运行，没有别的事在跑时（例如测试里）就永远等不到它
     const expired = new AbortController();
-    const deadline = setTimeout(() => expired.abort(new Error("timed out")), totalMs);
     const total = AbortSignal.any([signal, expired.signal]);
     // 共享的模型服务有时让请求排很久的队才开始处理（实测同一个请求 3 秒到 90 多秒），一旦开始几秒内就答完。
-    // 所以第一次请求 startTimeoutMs 内还没有任何输出就放弃，重发一次；重发的那次只受总时限约束
+    // 所以第一次请求 startTimeoutMs 内还没有任何输出就放弃，重发一次；重发的那次只受时限约束
     let started = false;
     let retried = false;
+    /** 超过的是总的等待上限（大多是一直在等限流），不是请求本身的时限 */
+    let capped = false;
     const waiting = new AbortController();
-    const timer = setTimeout(() => waiting.abort(), opts.startTimeoutMs ?? 20_000);
+    // 时限从请求真正发出时算起：在限速里排队、等重试的时间不算（models@1 调 onWait 暂停、onSend 重新计时）。
+    // 不报告这两件事的模型服务从一开始就计时。maxWaitMs 管总的等待，免得一直排队
+    let sendTimer: ReturnType<typeof setTimeout> | undefined;
+    let startTimer: ReturnType<typeof setTimeout> | undefined;
+    const pause = () => {
+      clearTimeout(sendTimer);
+      clearTimeout(startTimer);
+    };
+    const arm = () => {
+      pause();
+      sendTimer = setTimeout(() => expired.abort(new Error("timed out")), totalMs);
+      if (!started && !retried) startTimer = setTimeout(() => waiting.abort(), opts.startTimeoutMs ?? 20_000);
+    };
+    const cap = setTimeout(() => {
+      capped = true;
+      expired.abort(new Error("timed out"));
+    }, maxWaitMs);
+    arm();
     const onDelta = () => {
       started = true;
-      clearTimeout(timer);
+      clearTimeout(startTimer);
     };
+    const model = opts.model?.();
+    const callOptions = { onDelta, onWait: pause, onSend: arm, ...(model ? { model } : {}) };
     try {
       let res;
       try {
-        res = await opts.models.complete(request, { signal: AbortSignal.any([total, waiting.signal]), onDelta });
+        res = await opts.models.complete(request, { ...callOptions, signal: AbortSignal.any([total, waiting.signal]) });
       } catch (err) {
         if (!waiting.signal.aborted || total.aborted) throw err;
         retried = true;
-        res = await opts.models.complete(request, { signal: total, onDelta });
+        arm();
+        res = await opts.models.complete(request, { ...callOptions, signal: total });
       }
       const text = res.content.flatMap((b) => (b.kind === "text" ? [b.text] : [])).join("\n");
       return { ...(parseVerdict(text) ?? { decision: "deny", reason: "The automatic review gave no clear answer.", failed: true }), usage: res.usage };
@@ -290,6 +316,12 @@ export function reviewer(
       if (signal.aborted) throw err;
       if (total.aborted) {
         const s = Math.round(totalMs / 1000);
+        if (capped)
+          return {
+            decision: "deny",
+            failed: true,
+            reason: `The automatic review timed out: it waited ${Math.round(maxWaitMs / 1000)}s in all, mostly for the model service's rate limit.`,
+          };
         return {
           decision: "deny",
           failed: true,
@@ -300,8 +332,8 @@ export function reviewer(
       }
       return { decision: "deny", failed: true, reason: `The automatic review failed: ${reasonOf(err)}` };
     } finally {
-      clearTimeout(timer);
-      clearTimeout(deadline);
+      pause();
+      clearTimeout(cap);
     }
   };
 }
