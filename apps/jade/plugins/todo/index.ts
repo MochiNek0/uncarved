@@ -2,8 +2,12 @@
 //
 // 清单本身就是工具调用的参数，已经在日志里，不另外保存：前端从调用的参数显示，
 // 压缩插件可以从历史里找最后一份清单（latestTodos）写进摘要。从旧 jade 的 tools/todo.ts 移植。
+//
+// 模型常常写好清单就不再更新，做完才一次全标完成，用户在中途看不到进度。清单还有没做完的项、
+// 连续 STALE_AFTER 次回复都没再调用 todo_write 时，在那次回复的一个工具结果后面提醒一句（todoReminder）。
+// 提醒在 tool.after 里加，随工具结果写进日志（I-5）；接在上下文最后，不破坏前缀缓存。
 
-import type { Message, Tool } from "uncarved";
+import type { Block, LocalHookSpec, LogEvent, Message, Tool } from "uncarved";
 import { definePlugin, type Span, type Text } from "@uncarved/jade-api";
 import type { Renderers, ToolRenderer } from "@uncarved/jade-api/services";
 
@@ -83,6 +87,62 @@ export function latestTodos(messages: Message[]): Todo[] | undefined {
   return undefined;
 }
 
+/** 清单有没做完的项时，连续这么多次回复没更新就提醒 */
+export const STALE_AFTER = 10;
+
+/** 提醒模型更新清单的 hook：model.before 数回复次数，tool.after 加提醒，用户发新消息时清单作废（清单只管这一轮） */
+export function todoReminder(id = "jade/todo", after = STALE_AFTER): LocalHookSpec[] {
+  /** 模型调用的次数，每次调用模型前加一 */
+  let calls = 0;
+  /** 这一轮最后一份清单；undefined：这一轮还没写过 */
+  let todos: Todo[] | undefined;
+  /** 最近一次写清单或提醒时的 calls：从这里开始数 */
+  let since = 0;
+  const note = (n: number): Block => ({
+    kind: "text",
+    text:
+      `[Note from jade] Your todo list has not changed in the last ${n} responses. ` +
+      "If you finished an item, mark it completed and the next one in_progress now, in this response together with your other calls; if the plan changed, rewrite the list. Keep it current as you go, not only at the end.",
+    origin: { by: "plugin", id },
+    trust: "trusted",
+  });
+  return [
+    {
+      kind: "transform",
+      point: "model.before",
+      fn: () => {
+        calls++;
+      },
+    },
+    {
+      kind: "transform",
+      point: "tool.after",
+      fn: (outcome) => {
+        if (outcome.call.name === "todo_write") {
+          const list = (outcome.call.input as { todos?: unknown } | null)?.todos;
+          if (!outcome.isError && Array.isArray(list)) {
+            todos = list as Todo[];
+            since = calls;
+          }
+          return;
+        }
+        if (!todos || todos.every((t) => t?.status === "completed") || calls - since < after) return;
+        // 同一次回复里只提醒一次：下一次从这次回复开始数
+        const n = calls - since;
+        since = calls;
+        return { ...outcome, content: [...outcome.content, note(n)] };
+      },
+    },
+    {
+      kind: "observe",
+      point: "event",
+      fn: (e: LogEvent) => {
+        if (e.type === "input.received" && (e as LogEvent<"input.received">).data.kind === "message") todos = undefined;
+      },
+    },
+  ];
+}
+
 // 带语义样式的文字（jade-api 的 Text）：怎么画由前端决定
 const bold = (text: string): Span => ({ text, style: "bold" });
 const args = (input: unknown) => (input !== null && typeof input === "object" ? input : {}) as Record<string, unknown>;
@@ -112,6 +172,7 @@ export default definePlugin({
   },
   session(ctx) {
     ctx.kernel.tool(todoTool((todos) => ctx.panel?.(todoPanel(todos))));
+    for (const h of todoReminder(ctx.plugin)) ctx.kernel.hook(h);
     // 清单只在这一轮跑的时候显示：模型做完常常不再把最后一项标完成，留着就一直挡在输入框上方。
     // 一轮结束就收起，完整清单在对话里那一行展开看
     if (ctx.panel) ctx.session.afterTurn(() => ctx.panel?.(undefined));

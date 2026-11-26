@@ -2,7 +2,7 @@
 
 import { describe, expect, test } from "bun:test";
 import type { Message, ToolContext } from "uncarved";
-import { latestTodos, renderTodos, todoPanel, todoRenderer, todoTool } from "../plugins/todo/index.ts";
+import { latestTodos, renderTodos, STALE_AFTER, todoPanel, todoRenderer, todoTool } from "../plugins/todo/index.ts";
 import { msg, resultText, say, scripted, turn, use } from "./scripted-host.ts";
 
 const ctx: ToolContext = { sessionId: "s", toolUseId: "t", signal: new AbortController().signal, parent: { sessionId: "s", eventId: "e" }, progress: () => {} };
@@ -67,5 +67,61 @@ describe("todo_write", () => {
     } finally {
       await host.close();
     }
+  });
+
+  describe("reminds the model when the list goes stale", () => {
+    const read = (i: number) => use([`r${i}`, "read_file", { path: `missing-${i}.txt` }]);
+    const reads = (from: number, n: number) => Array.from({ length: n }, (_, k) => read(from + k));
+    const noted = (m: Message | undefined) => (m?.content ?? []).some((b) => resultText(b).includes("Your todo list has not changed"));
+
+    test("after STALE_AFTER responses without todo_write, once, then counting again", async () => {
+      const todos = [{ content: "one", status: "in_progress" }, { content: "two", status: "pending" }];
+      // 第 1 次回复写清单，之后都是读文件
+      const { host, requests } = await scripted([use(["u1", "todo_write", { todos }]), ...reads(2, STALE_AFTER * 2), say("done")]);
+      try {
+        const s = await host.sessions.open();
+        await turn(s, msg("plan it"));
+        const hits = requests.map((r, i) => (noted(r.messages.at(-1)) ? i : -1)).filter((i) => i >= 0);
+        // 第 1+STALE_AFTER 次回复的结果里提醒，再过 STALE_AFTER 次回复再提醒一次
+        expect(hits).toEqual([STALE_AFTER + 1, STALE_AFTER * 2 + 1]);
+      } finally {
+        await host.close();
+      }
+    });
+
+    test("not when everything is done, and updating the list starts the count over", async () => {
+      const done = [{ content: "one", status: "completed" }];
+      const open = [{ content: "one", status: "in_progress" }];
+      const half = STALE_AFTER / 2;
+      const { host, requests } = await scripted([
+        use(["u1", "todo_write", { todos: done }]),
+        ...reads(2, STALE_AFTER + 1),
+        use(["u2", "todo_write", { todos: open }]),
+        ...reads(100, half),
+        use(["u3", "todo_write", { todos: open }]),
+        ...reads(200, STALE_AFTER - 1),
+        say("done"),
+      ]);
+      try {
+        const s = await host.sessions.open();
+        await turn(s, msg("plan it"));
+        expect(requests.some((r) => noted(r.messages.at(-1)))).toBe(false);
+      } finally {
+        await host.close();
+      }
+    });
+
+    test("a list from an earlier turn does not count", async () => {
+      const todos = [{ content: "one", status: "in_progress" }];
+      const { host, requests } = await scripted([use(["u1", "todo_write", { todos }]), say("stopping"), ...reads(2, STALE_AFTER + 1), say("done")]);
+      try {
+        const s = await host.sessions.open();
+        await turn(s, msg("plan it"));
+        await turn(s, msg("something else"));
+        expect(requests.some((r) => noted(r.messages.at(-1)))).toBe(false);
+      } finally {
+        await host.close();
+      }
+    });
   });
 });
