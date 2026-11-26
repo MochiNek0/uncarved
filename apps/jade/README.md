@@ -130,7 +130,7 @@ jade 自带的功能全是 `apps/jade/plugins/` 下的普通插件，和第三�
 | `jade/models` | 模型路由、`/model`（按服务分组列出模型，回车切换；设置、单价、服务名在 Manage models 里）、`provider@1` |
 | `jade/approval` | 权限审批、模式、审查 |
 | `jade/modes` | 模式切换、计划模式 |
-| `jade/compact` | 上下文压缩、溢出后自动重试 |
+| `jade/compact` | 上下文压缩（总结沿用主对话的提示缓存）、溢出后自动重试 |
 | `jade/task` | 子 Agent（核心开的子会话） |
 | `jade/mcp` | MCP 服务工具 |
 | `jade/skills`、`jade/memory` | 技能目录、长期记忆 |
@@ -138,7 +138,7 @@ jade 自带的功能全是 `apps/jade/plugins/` 下的普通插件，和第三�
 | `jade/screenshot` | 无头浏览器截图交给模型看 |
 | `jade/custom-commands` | 把 Markdown 文件变成斜杠命令 |
 | `jade/hooks` | 在配置里写 shell 命令，工具调用前后、一轮结束时运行 |
-| `jade/cost` | 按单价把 token 用量换算成钱（`/model` 里给模型填的，可以分时段、美元或人民币；或者配置里的），`/cost` |
+| `jade/cost` | 按单价把 token 用量换算成钱（`/model` 里给模型填的，可以分时段、美元或人民币；或者配置里的），`/cost`；`/cost` 还列出提示缓存的命中率、Jade 改变请求前缀的次数（压缩、系统提示词……）和前缀没变却没命中的次数 |
 | `jade/steer` | agent 工作时说的话在下一次请求模型时就交给它 |
 | `jade/editor` | Ctrl+G 用 `$EDITOR` 编辑输入 |
 

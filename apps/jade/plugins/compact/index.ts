@@ -119,6 +119,16 @@ export default definePlugin({
       },
     });
 
+    // 记下最终发出的请求（排在其他改请求的插件之后）：总结时沿用它的系统提示词和工具，读主对话的缓存
+    ctx.kernel.hook({
+      kind: "transform",
+      point: "model.before",
+      order: 1000,
+      fn: (req) => {
+        c.sent(req);
+      },
+    });
+
     // 上下文溢出后压缩重试，每次用户输入只重试一次
     let retried = false;
     ctx.kernel.hook({
@@ -131,7 +141,7 @@ export default definePlugin({
         const d = (e as LogEvent<"turn.ended">).data;
         if (d.reason !== "error" || retried || !isContextOverflow(d.error)) return;
         retried = true;
-        c.request();
+        c.request(undefined, true);
         const ui = ctx.service<UI>("ui@1");
         const window = models.current()?.contextWindow;
         ui?.notify(

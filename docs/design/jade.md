@@ -322,7 +322,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 | `jade/todo`、`jade/ask` | 工具 | `ask` 需要 `ui@1`，不能提问时不注册工具 | `tools/todo.ts`、`tools/ask.ts` |
 | `jade/tools` | `tools@1`：给嵌套 Agent 用的工具的注册表。**不推荐再用**（2026-11-19）：子 Agent 改用核心开的子会话（`ctx.session.spawn`），内置插件不再往这里登记；保留一个版本给第三方插件，之后删掉 | — | 2026-11-11 从 `jade/task` 的 `task@1` 拆出来（见 jade-log"架构挡了路"） |
 | `jade/task` | `task` 工具：子 Agent 是核心开的子会话（`ctx.session.spawn`），日志存盘、父会话的工具结果带着它的引用。默认只留只读的工具和只放行只读命令的 bash，配置 `write: true` 时全部保留、写操作经过同一套审批，`/undo` 算作打开它的那一轮。步数上限、接近上下文窗口时写报告由本插件在子会话里的那份管；`instructions: false` 去掉指令文件；`model` 换模型 | `models@1`；可选 `approval@1`、`prompts@1`、`renderers@1`、`ui@1` | `tools/task.ts`。设计见 [live-tools-and-child-sessions.md](./live-tools-and-child-sessions.md) |
-| `jade/compact` | `context.project` 里清理旧输出、总结；`/compact`；上下文溢出后压缩并经 `afterTurn` 重试 | `models@1` | `plugins/compact.ts` |
+| `jade/compact` | `context.project` 里清理旧输出、总结（沿用 `model.before` 记下的上一次请求的系统提示词和工具，在投影后面追加要求，读主对话的缓存；溢出后、刚恢复时用单独的总结请求）；`/compact`；上下文溢出后压缩并经 `afterTurn` 重试 | `models@1` | `plugins/compact.ts` |
 | `jade/mcp` | MCP 服务的工具、`/mcp`；`/mcp add\|remove` 和 `jade mcp add\|remove` 改配置文件；项目层服务启动前确认（记在 `trust@1`） | `trust@1`；可选 `ui@1`、`commands@1`、`prompts@1`、`tools@1`、`cli@1` | `mcp.ts`。插件自带的 MCP 配置（旧的 PluginBundle）没有了 |
 | `jade/skills` | `skill` 工具、`/skills`、`/<skill 名>`；`/skills add\|update\|remove` 和 `jade skills …` 从 git、npm 或本地目录安装（下载经核心的 `sources@1`）；每次调用模型前重新查找 skill，会话中途装的马上能用（`skill` 工具因此总是注册、名字不写成 enum，列表变了才改提示词）；工具说明告诉模型用 `jade skills add` 装到 `.jade`；skill 目录经 `approval@1.allowRead` 可直接读 | 可选 | `skills.ts` |
 | `jade/scratch` | 每个会话一个临时目录（系统临时目录下的 `jade-scratch/<会话 id>`，恢复会话时还是同一个，不主动删除），经 `prompts@1` 告诉模型临时文件放这里，经 `approval@1.allowWrite` 和工作目录同样对待 | 可选 `approval@1`、`prompts@1` | 新功能，参考 Claude Code 的 scratchpad（`test/scratch.test.ts`） |
@@ -337,7 +337,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 | `jade/hooks` | 配置 `hooks` 里的 shell 命令：`before`（`tool.gate`，退出码非 0 时拒绝，输出作理由）、`after`（`tool.after`，失败时经 `prompts@1.note` 告诉模型）、`turn`（一轮结束后）。配置键没有标 `project`，仓库设不了 | `shell@1`；可选 `ui@1`、`prompts@1` | 新功能（`test/hooks.test.ts`） |
 | `jade/steer` | `steer@1`（`push`、`pending`、`take`、`subscribe`）：一轮中途对模型说话。内核只在空闲时接受用户消息，所以不走输入：`push` 的话在下一次请求模型时由 `context.project` 附在最后一条消息（刚执行完的工具的结果）后面，写进 `derived`（之后的投影、恢复的会话里位置不变），另记一条 `jade/steer/said` 事件给前端显示。这一轮没有再请求模型就结束时话还留着，调用方用 `take` 取回当普通消息发。`jade/tui` 在模型工作时提交的消息走它（前面已经有东西在排队、或者是命令时照旧排队）；停用它就回到"排队等这一轮结束"。项目层插件不能用 | 可选 `renderers@1` | 新功能（`test/steer.test.ts`） |
 | `jade/editor` | Ctrl+G（配置 `key` 可换；键被别的插件占了时提示一次，插件照常激活）把输入框里的文字交给编辑器（配置 `editor`，否则 `$VISUAL`、`$EDITOR`），存盘退出后换回输入框；终端编辑器经 `ui@1.suspend` 独占终端 | `keys@1`；可选 `ui@1` | 新功能（`test/tui-frontend.test.ts`） |
-| `jade/cost` | 按单价把日志里的用量换算成钱：先用 `models@1.price`（`/model` 里给模型填的），再用配置的（每百万 token，按模型名前缀）；每个回复按它的时间（事件的 `at`）取单价，所以分时段的价格按请求发生的时段算，不同货币分开合计。状态栏一段（`ctx.status`，合计每轮记进 `derived`）、`/cost` | 可选 `commands@1`、`models@1` | 新功能（`test/cost.test.ts`） |
+| `jade/cost` | 按单价把日志里的用量换算成钱：先用 `models@1.price`（`/model` 里给模型填的），再用配置的（每百万 token，按模型名前缀）；每个回复按它的时间（事件的 `at`）取单价，所以分时段的价格按请求发生的时段算，不同货币分开合计。状态栏一段（`ctx.status`，合计每轮记进 `derived`）、`/cost`；`model.before` 里比较每次请求和上一次的前缀，没沿用时记 `jade/cost/prefix` 事件，`/cost` 据此列出缓存命中率和没命中的原因 | 可选 `commands@1`、`models@1` | 新功能（`test/cost.test.ts`） |
 
 2026-11-10 之后的补充（都在插件里，核心没有改）：
 

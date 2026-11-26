@@ -206,11 +206,19 @@ describe("jade/compact in a session", () => {
     shared.script.push(say("SUMMARY"), say("C"));
     await send(s, "third");
 
+    // 总结沿用上一次请求的系统提示词、工具和消息（读主对话的缓存），只在最后一条 user 消息后面追加要求
     const summarizer = shared.requests[2]!;
-    expect(summarizer.tools).toEqual([]);
+    const before = shared.requests[1]!;
+    expect(summarizer.system).toEqual(before.system);
+    expect(summarizer.tools).toEqual(before.tools);
+    expect(summarizer.tools.length).toBeGreaterThan(0);
+    expect(summarizer.messages.slice(0, before.messages.length)).toEqual(before.messages);
+    const asking = summarizer.messages.at(-1)!;
+    expect(asking.role).toBe("user");
+    expect(textOf(asking.content)).toStartWith("third");
+    expect(textOf(asking.content)).toContain("Do not call any tools");
     // 命令后面写的话交给总结
-    expect(textOf(summarizer.messages[0]!.content)).toContain("pay particular attention to: keep the API decisions");
-    expect(textOf(summarizer.messages[0]!.content)).toContain("<transcript>");
+    expect(textOf(asking.content)).toContain("pay particular attention to: keep the API decisions");
     const main = shared.requests[3]!;
     expect(textOf(main.messages[0]!.content)).toContain("SUMMARY");
     expect(main.messages.length).toBeLessThan(s.state.messages.length);
@@ -230,6 +238,22 @@ describe("jade/compact in a session", () => {
     await send(resumed, "fourth");
     expect(shared.requests).toHaveLength(5);
     expect(textOf(shared.requests[4]!.messages[0]!.content)).toContain("SUMMARY");
+  });
+
+  test("when the model answers the in-place summary request without text, a separate summary request is made", async () => {
+    const { host, shared, send } = await scriptedHost();
+    shared.script.push(say("A"));
+    const s = await host.sessions.open();
+    await send(s, "first");
+    const c: CommandContext = { signal: new AbortController().signal, ui: host.service<UI>("ui@1")!, sessions: host.sessions, print: () => {} };
+    await host.service<Commands>("commands@1")!.get("compact")!.command.run("", c);
+    shared.script.push(use("x", "read_file", { path: "a.txt" }), say("SUMMARY"), say("B"));
+    await send(s, "second");
+    // 沿用缓存的那次、单独的那次、主会话
+    expect(shared.requests).toHaveLength(4);
+    expect(shared.requests[2]!.tools).toEqual([]);
+    expect(textOf(shared.requests[2]!.messages[0]!.content)).toContain("<transcript>");
+    expect((s.state.derived[DERIVED_KEY] as CompactState).summary).toStartWith("SUMMARY");
   });
 
   test("a request that overflows the context window is compacted and retried once per input", async () => {

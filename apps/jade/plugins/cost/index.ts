@@ -15,6 +15,7 @@
 import type { LogEvent, Usage } from "uncarved";
 import { definePlugin } from "@uncarved/jade-api";
 import type { Commands, Cost, Models, Price } from "@uncarved/jade-api/services";
+import { cacheReport, prefixWatcher } from "./cache.ts";
 
 export type { Price };
 type Totals = Record<string, Required<Usage>>;
@@ -123,7 +124,8 @@ export default definePlugin({
         if (!s) return "No session is open.";
         const totals: Totals = {};
         const spent: Record<string, Money> = {};
-        for (const e of await s.history()) {
+        const history = await s.history();
+        for (const e of history) {
           const u = usageIn(e);
           if (!u) continue;
           add(totals, u.model, u.usage);
@@ -140,12 +142,24 @@ export default definePlugin({
         const priced = Object.keys(sum).length > 0;
         const hint = `No price is set for ${priced ? "some of these models" : "these models"}: set one in /model (Manage models… → the model → Settings… → Price), or add {"jade/cost": {"prices": {"<model name or prefix>": {"input": <per million tokens>, "output": <…>, "currency": "USD"}}}} to ${ctx.home}/config.json`;
         const unpriced = Object.keys(totals).some((m) => !spent[m]);
-        return [...rows, ...(priced ? [`Total: ${money(sum)}`] : []), ...(unpriced ? [hint] : [])].join("\n");
+        return [...rows, ...(priced ? [`Total: ${money(sum)}`] : []), ...cacheReport(history, `${ctx.plugin}/prefix`), ...(unpriced ? [hint] : [])].join("\n");
       },
     });
   },
 
   session(ctx) {
+    // 最后一个改请求的 hook 之后看前缀有没有沿用上一次的（见 cache.ts）；子 Agent 也记，事后查日志用
+    const watch = prefixWatcher();
+    ctx.kernel.hook({
+      kind: "transform",
+      point: "model.before",
+      order: 1000,
+      optional: true,
+      fn: async (req, hook) => {
+        const change = watch(req);
+        if (change) await hook.emit("prefix", change);
+      },
+    });
     // 前端没有状态栏：不用算
     if (!ctx.status) return;
     const { forLogged } = pricer(ctx.config, () => ctx.service<Models>("models@1"));

@@ -3,8 +3,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { UI } from "../src/index.ts";
 import type { CommandContext, Commands } from "@uncarved/jade-api/services";
+import { writeFile } from "node:fs/promises";
+import path from "node:path";
+import type { Block, LogEvent, Message, ModelRequest } from "uncarved";
+import { cacheReport, prefixWatcher } from "../plugins/cost/cache.ts";
 import { costOf, money, parsePrices, priceOf } from "../plugins/cost/index.ts";
-import { cleanup, say, scriptedHost } from "./scripted-ui.ts";
+import { cleanup, say, scriptedHost, use } from "./scripted-ui.ts";
 
 afterEach(cleanup);
 
@@ -69,5 +73,70 @@ describe("jade/cost", () => {
     await send(s, "first");
     const out = String(await host.service<Commands>("commands@1")!.get("cost")!.command.run("", c));
     expect(out).toStartWith("s1: 1.5k in, 10 out\nNo price is set for these models: set one in /model");
+  });
+});
+
+describe("jade/cost prompt cache", () => {
+  const blk = (text: string, trust: "trusted" | "untrusted" = "trusted"): Block => ({ kind: "text", text, origin: { by: "user" }, trust });
+  const req = (system: string, messages: Message[], tools: ModelRequest["tools"] = []): ModelRequest => ({
+    system: [{ text: system, stability: "stable", origin: { by: "plugin", id: "t" }, trust: "trusted" }],
+    messages,
+    tools,
+  });
+
+  test("a request that only appends to the previous one keeps the prefix; any earlier change is reported where it starts", () => {
+    const watch = prefixWatcher();
+    const a: Message = { role: "user", content: [blk("a")] };
+    const b: Message = { role: "assistant", content: [blk("b")] };
+    expect(watch(req("s", [a]))).toBeUndefined();
+    expect(watch(req("s", [a, b, { role: "user", content: [blk("c")] }]))).toBeUndefined();
+    // 往最后一条消息里追加块、只改了不发给模型的 trust：都算沿用
+    expect(watch(req("s", [a, b, { role: "user", content: [blk("c"), blk("d")] }]))).toBeUndefined();
+    expect(watch(req("s", [{ role: "user", content: [blk("a", "untrusted")] }, b, { role: "user", content: [blk("c"), blk("d")] }]))).toBeUndefined();
+    expect(watch(req("s", [a, { role: "assistant", content: [blk("B")] }]))).toEqual({ part: "messages", message: 1 });
+    expect(watch(req("s2", [a]))).toEqual({ part: "system" });
+    expect(watch(req("s2", [a], [{ name: "x", description: "", inputSchema: {} }]))).toEqual({ part: "tools" });
+  });
+
+  test("/cost tells cache misses jade caused from those where the prefix did not change", () => {
+    const at = (min: number) => new Date(Date.UTC(2026, 10, 26, 0, min)).toISOString();
+    const responded = (min: number, input: number, read: number) =>
+      ({ type: "model.responded", at: at(min), origin: { by: "model", provider: "p", model: "m" }, data: { content: [], usage: { inputTokens: input, cacheReadTokens: read } } }) as unknown as LogEvent;
+    const ev = (type: string, data: unknown = {}) => ({ type, at: at(0), origin: { by: "runtime" }, data }) as unknown as LogEvent;
+    const history = [
+      responded(0, 10_000, 0),
+      responded(1, 20_000, 10_000),
+      // 压缩之后整段重写：算 jade 的
+      ev("jade/compact/trimmed"),
+      ev("jade/cost/prefix", { part: "messages", message: 2 }),
+      ev("model.requested"),
+      responded(2, 15_000, 0),
+      // 前缀没变却没命中
+      responded(3, 25_000, 0),
+      // 隔了 10 分钟
+      responded(13, 30_000, 0),
+      ev("jade/cost/prefix", { part: "system" }),
+      responded(14, 31_000, 0),
+    ];
+    expect(cacheReport(history, "jade/cost/prefix")).toEqual([
+      "Prompt cache: 8% of input read from cache",
+      "Prefix changed by jade: compaction ×1, system prompt ×1",
+      "Cache missed with the prefix unchanged: 2× (~40k tokens, 1 after more than 5 minutes idle)",
+    ]);
+    // 从来没报告过命中的：不显示
+    expect(cacheReport([responded(0, 10_000, 0), responded(1, 20_000, 0)], "jade/cost/prefix")).toEqual([]);
+  });
+
+  test("clearing old tool output shows up in /cost as a prefix change made by compaction", async () => {
+    const { cwd, host, shared, send } = await scriptedHost({ config: { "jade/compact": { thresholdTokens: 12_000 } } });
+    await writeFile(path.join(cwd, "big.txt"), Array.from({ length: 800 }, () => "a".repeat(40)).join("\n"));
+    shared.script.push(use("u1", "read_file", { path: "big.txt" }), say("read", { inputTokens: 15_000, outputTokens: 10, cacheReadTokens: 5000 }), say("ok"));
+    const s = await host.sessions.open();
+    await send(s, "read it");
+    await send(s, "next");
+    const prefix = (await s.history()).filter((e) => e.type === "jade/cost/prefix").map((e) => e.data);
+    expect(prefix).toEqual([{ part: "messages", message: 2 }]);
+    const c: CommandContext = { signal: new AbortController().signal, ui: host.service<UI>("ui@1")!, sessions: host.sessions, print: () => {} };
+    expect(String(await host.service<Commands>("commands@1")!.get("cost")!.command.run("", c))).toContain("Prefix changed by jade: compaction ×1");
   });
 });
