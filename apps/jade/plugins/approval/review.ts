@@ -159,8 +159,14 @@ function reasonOf(err: unknown): string {
   return clip(e instanceof Error ? e.message : String(e), 200);
 }
 
-export function reviewer(opts: ReviewOptions): (call: GatedToolCall, signal: AbortSignal) => Promise<Review> {
-  return async (call, signal) => {
+/** 只读的会话（子 Agent）里审查的额外要求：放在 <action> 前面，系统提示保持不变 */
+const READ_ONLY =
+  "<constraint>\nThis agent is read-only: allow the action only if it cannot change anything — no creating, changing, moving or deleting files " +
+  "(redirecting output into a file counts), no changes to git state, no installs, no starting servers or other long-running processes, " +
+  "no network requests that send data. Reading files, listing, searching, and inline scripts that only read and print are fine.\n</constraint>";
+
+export function reviewer(opts: ReviewOptions): (call: GatedToolCall, signal: AbortSignal, options?: { readOnly?: boolean }) => Promise<Review> {
+  return async (call, signal, options) => {
     const messages = opts.messages();
     const { user, agent } = context(messages, opts.userMessages?.() ?? messages, opts.answers?.() ?? new Map());
     // 子 Agent 的任务：子会话的第一条消息（主 Agent 写的，来源不是用户）
@@ -185,6 +191,7 @@ export function reviewer(opts: ReviewOptions): (call: GatedToolCall, signal: Abo
       "</agent-said>",
       "",
       ...(files.length ? ["<agent-files>", ...files, "</agent-files>", ""] : []),
+      ...(options?.readOnly ? [READ_ONLY, ""] : []),
       "<action>",
       `tool: ${call.name} (effect: ${call.tool.effect})`,
       `input: ${clip(JSON.stringify(call.input, null, 2), 6000)}`,

@@ -2,7 +2,7 @@
 // 审查放行或拦下，不问用户；出错、看不懂、超时也拦下，告诉模型可以再试。模型和界面换成假的。
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { realpathSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { parseVerdict } from "../plugins/approval/review.ts";
@@ -138,6 +138,34 @@ describe("auto-mode review", () => {
     expect(review).toContain("<task>\nread the notes file and summarize it");
     expect(shared.asked).toEqual([]);
     expect(JSON.stringify(shared.requests[3]!.messages.at(-1)!.content)).toContain("so the main agent can ask the user");
+  });
+
+  test("a read-only sub-agent's commands the rules do not recognize go to the review with the read-only constraint", async () => {
+    const { cwd, host, shared, send } = await scriptedHost({ config: AUTO });
+    await writeFile(path.join(cwd, "a.txt"), "hello\n");
+    shared.script.push(
+      use("u1", "task", { description: "look", prompt: "look around" }),
+      // 子 Agent：for 循环规则认不出，审查放行
+      use("c1", "bash", { command: "for f in a.txt; do cat $f; done" }),
+      say('{"decision": "allow", "reason": "only reads"}'),
+      // 会改东西的，审查拦下，不问用户
+      use("c2", "bash", { command: "rm a.txt" }),
+      say('{"decision": "block", "reason": "deletes a file"}'),
+      // 只读规则认得的不审查
+      use("c3", "bash", { command: "cat a.txt" }),
+      say("report"),
+      say("done"),
+    );
+    const s = await host.sessions.open();
+    await send(s, "go");
+
+    const review = (shared.requests[2]!.messages[0]!.content[0] as { text: string }).text;
+    expect(review).toContain("<constraint>\nThis agent is read-only");
+    expect(JSON.stringify(shared.requests[3]!.messages.at(-1)!.content)).toContain("hello");
+    expect(JSON.stringify(shared.requests[5]!.messages.at(-1)!.content)).toContain("deletes a file");
+    expect(existsSync(path.join(cwd, "a.txt"))).toBe(true);
+    expect(JSON.stringify(shared.requests[6]!.messages.at(-1)!.content)).toContain("hello");
+    expect(shared.asked).toEqual([]);
   });
 
   test("after three blocks in a row, auto mode asks the user this time, saying why", async () => {

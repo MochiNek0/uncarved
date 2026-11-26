@@ -66,16 +66,10 @@ export default definePlugin({
   },
 
   session(ctx) {
+    // 子会话（子 Agent）不总结，也不提前清理：它活不长，接近窗口时由开它的插件管（jade/task 让它写报告、只放最近的工具输出）。
+    // 提前清理在子 Agent 里不划算：它读得快，清理后很快又涨回来，每次清理都让整段提示缓存失效，被清掉的文件还要重读
+    if (ctx.session.parent) return;
     const trimAt = trimAtFor(ctx.config);
-    // 子会话（子 Agent）不总结：它活不长，接近窗口时由开它的插件管（jade/task 让它写报告、只放最近的工具输出）。
-    // 但它同样每一步重发整段历史，所以照样提前清理旧的工具输出
-    if (ctx.session.parent) {
-      if (!trimAt()) return;
-      const c = compactor({ complete: () => Promise.reject(new Error("sub-agents are not summarized")), threshold: () => Infinity, trimAt, id: ctx.plugin, writes: () => undefined });
-      ctx.kernel.hook({ kind: "transform", point: "context.project", order: 100, fn: (messages, hook) => c.project(messages, hook) });
-      ctx.kernel.hook({ kind: "observe", point: "event", fn: (e: LogEvent) => c.observe(e) });
-      return;
-    }
     const models = ctx.require<Models>("models@1");
     const configured = parseTokens(ctx.config.thresholdTokens);
     const keepTokens = parseTokens(ctx.config.keepTokens);

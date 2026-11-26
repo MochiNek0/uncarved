@@ -212,6 +212,11 @@ export interface Approval {
    * yolo 模式和"总是允许"的规则都不放宽。会话不存在时为 false
    */
   allows(session: string, call: GatedToolCall): boolean;
+  /**
+   * 会话 session（例如只读的子 Agent）只能做不改东西的事：allows 不放行的非只读调用，auto 模式下由审查按"只读"的标准判断，
+   * 其他模式和审查关掉时拒绝。返回撤销函数
+   */
+  readOnly(session: string): () => void;
 }
 
 /** 审批的回答：允许一次、本会话里总是允许、在这个工作目录里以后都允许、拒绝 */

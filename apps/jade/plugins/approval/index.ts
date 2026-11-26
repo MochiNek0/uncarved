@@ -67,6 +67,8 @@ const sessionRules = new Map<string, () => AllowRule[]>();
 const sessionUserMessages = new Map<string, () => readonly Message[]>();
 /** 会话 id → jade/ask 记下的用户回答（ask_user 的 toolUseId → 回答）：子会话沿用父会话的，同 sessionUserMessages */
 const sessionAnswers = new Map<string, () => ReadonlyMap<string, readonly string[]>>();
+/** 经 readOnly 登记、只能做不改东西的事的会话（只读的子 Agent） */
+const readOnlySessions = new Set<string>();
 
 export default definePlugin({
   process(ctx) {
@@ -95,6 +97,10 @@ export default definePlugin({
         return remove;
       },
       allows: (session: string, call: GatedToolCall) => call.tool !== undefined && (sessionChecks.get(session)?.(call) ?? false),
+      readOnly(session: string) {
+        readOnlySessions.add(session);
+        return () => void readOnlySessions.delete(session);
+      },
     }));
   },
 
@@ -203,6 +209,21 @@ export default definePlugin({
       timeoutMs: GATE_TIMEOUT_MS,
       fn: async (call, hook) => {
         seen.set(call.toolUseId, { call });
+        // 只读的会话：只读规则放行的照常放行；其余的 auto 模式下由审查按只读的标准判断，被拦下不转回问用户，
+        // 其他模式、没有审查时拒绝（静态规则认不出的命令，例如 for 循环、python -c，常常其实只读）
+        if (readOnlySessions.has(id) && call.tool.effect !== "read") {
+          if (check(call)) return { decision: "allow" };
+          if (!review || mode !== "auto") return { decision: "deny", reason: READ_ONLY(call.name) };
+          const key = reviewedKey(call);
+          if (key !== undefined && reviewedCalls.has(key)) return { decision: "allow", reason: "This exact call was already approved in this session." };
+          const verdict: Review = await review(call, hook.signal, { readOnly: true });
+          if (verdict.usage) await hook.emit("reviewed", { toolUseId: call.toolUseId, usage: verdict.usage });
+          if (verdict.decision === "allow") {
+            if (key !== undefined) reviewedCalls.add(key);
+            return { decision: "allow", reason: verdict.reason };
+          }
+          return { decision: "deny", reason: blocked(call.name, verdict, "report") };
+        }
         const result = rules.decide(call, { mode, rules: saved() });
         if (result.decision !== "ask") return result;
         // auto 模式：规则判断不了、本来要问的调用让模型审一次，审查的结论就是决定，不问用户。
@@ -398,6 +419,10 @@ interface Asked {
  * ask_user：用它问（这一轮里接着做）；reply：没有 ask_user，在回复里问、结束这一轮；
  * report：子 Agent 问不了用户，停下来在报告里说明，由主 Agent 问
  */
+/** 只读的会话里，规则认不出是只读、又没有审查可以判断的调用 */
+const READ_ONLY = (tool: string) =>
+  `${tool}: sub-agents can only run read-only commands inside the working directory (for example git log, git diff, ls, rg). Describe anything else in your report instead.`;
+
 function blocked(tool: string, verdict: Review, how: "ask_user" | "reply" | "report"): string {
   const why = verdict.reason ?? "no reason given";
   if (verdict.failed) return `${why} So this ${tool} call did not run. You may try it once more; if the review fails again, tell the user what you wanted to do.`;

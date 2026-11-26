@@ -136,7 +136,7 @@ describe("jade/compact in a session", () => {
     expect(recorded).toHaveLength(1);
   });
 
-  test("sub-agents clear old tool output early too, and are never summarized", async () => {
+  test("sub-agents neither clear old tool output early nor get summarized: each clearing would invalidate the whole prompt cache", async () => {
     const { cwd, host, shared, send } = await scriptedHost({ config: { "jade/compact": { trimTokens: "3k" } } });
     const big = Array.from({ length: 100 }, () => "a".repeat(40)).join("\n");
     for (const n of [1, 2, 3]) await writeFile(path.join(cwd, `f${n}.txt`), big);
@@ -150,9 +150,9 @@ describe("jade/compact in a session", () => {
     );
     const s = await host.sessions.open();
     await send(s, "go");
-    // 子 Agent 的第 4 次请求（约 3.6k）超过 3k：第一次读取被清理，最近的保留，没有调用总结
+    // 子 Agent 的第 4 次请求（约 3.6k）超过 3k：照样不清理，也没有调用总结
     const child = shared.requests[4]!.messages;
-    expect(textOf(child[2]!.content)).toBe(TRIMMED);
+    expect(textOf(child[2]!.content)).not.toBe(TRIMMED);
     expect(textOf(child.at(-1)!.content)).not.toBe(TRIMMED);
     expect(shared.requests).toHaveLength(6);
   });

@@ -140,6 +140,59 @@ function gitKind(args: string[]): CommandKind | undefined {
 
 type CommandKind = "read" | "edit";
 
+/** 第一个位置参数（或 -e 的值）是模式的搜索命令 */
+const GREPS = new Set(["grep", "egrep", "fgrep", "rg"]);
+
+/**
+ * 不是路径、不用检查在不在工作目录里的参数（下标）：echo、printf 的参数，grep、rg、git grep 的模式。
+ * 不然 Windows 上以反斜杠开头的参数（printf '\n--- x ---\n'、grep '\['）会被当成盘符根目录下的路径。
+ * 只认得出的形式：-e 模式、-e模式、--regexp=模式，没有 -e、-f 时第一个位置参数；认不准时不跳过（只会多问，不会少问）
+ */
+export function notPaths(words: string[]): Set<number> {
+  const skip = new Set<number>();
+  const name = words[0]?.replace(/^\/(usr\/)?bin\/(?=[^/]+$)/, "");
+  if (name === "echo" || name === "printf") {
+    for (let i = 1; i < words.length; i++) skip.add(i);
+    return skip;
+  }
+  let i = 1;
+  if (name === "git") {
+    while (words[i] === "--no-pager") i++;
+    if (words[i] !== "grep") return skip;
+    i++;
+  } else if (name === undefined || !GREPS.has(name)) return skip;
+  /** 用 -e 或 -f（文件里的模式）给了模式：位置参数都是路径 */
+  let explicit = false;
+  let first: number | undefined;
+  for (; i < words.length; i++) {
+    const w = words[i]!;
+    if (w === "--") {
+      first ??= i + 1;
+      break;
+    }
+    if (w === "--regexp") {
+      skip.add(i + 1);
+      explicit = true;
+      i++;
+    } else if (w.startsWith("--regexp=")) {
+      skip.add(i);
+      explicit = true;
+    } else if (w === "--files" || w === "--file" || w.startsWith("--file=")) explicit = true;
+    else if (/^-[^-]/.test(w)) {
+      // 短选项可以连写（-rne 模式、-e模式）：第一个带值的选项后面都是它的值
+      const at = w.slice(1).search(/[efmABCdDgtTjM]/);
+      const flag = at < 0 ? undefined : w[at + 1];
+      if (flag === "e") {
+        skip.add(at + 2 < w.length ? i : i + 1);
+        if (at + 2 >= w.length) i++;
+        explicit = true;
+      } else if (flag === "f") explicit = true;
+    } else if (!w.startsWith("-")) first ??= i;
+  }
+  if (!explicit && first !== undefined) skip.add(first);
+  return skip;
+}
+
 /**
  * 一条简单命令（已分好词）的性质：read 只读；edit 只在工作目录里建目录、碰文件，auto 模式下和改文件一样不问；
  * undefined 表示不认识或可能有副作用
@@ -467,14 +520,17 @@ export function policy(opts: PolicyOptions): Policy {
   /**
    * 命令参数里有指向工作目录之外的路径。选项也要看：--opt=path 的值，以及粘在短选项后面的值（-f/etc/x）
    */
-  const argsOutside = (base: string, words: Word[]) =>
-    words.slice(1).some((w) => {
+  const argsOutside = (base: string, words: Word[]) => {
+    const skip = notPaths(words.map((w) => w.value));
+    return words.slice(1).some((w, i) => {
+      if (skip.has(i + 1)) return false;
       const v = w.value;
       const candidates = !v.startsWith("-")
         ? [v]
         : [v.includes("=") ? v.slice(v.indexOf("=") + 1) : "", !v.startsWith("--") && v.length > 2 ? v.slice(2) : ""];
       return candidates.some((c) => c !== "" && pathOutside(base, c, w.glob));
     });
+  };
   /**
    * 判断一条 bash 命令能不能不问就执行。复合命令（&& || | ;）要求每条简单命令都满足：
    * 只读命令；edits 时还可以是建目录、碰文件的命令；ruled 时还可以是"总是允许"的规则覆盖的命令。

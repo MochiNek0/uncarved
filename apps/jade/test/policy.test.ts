@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import type { ToolInfo } from "uncarved";
 import type { ToolMeta } from "@uncarved/jade-api";
-import { bashRules, isSafeCommand, nativePath, policy, shellWords, type Mode } from "../plugins/approval/policy.ts";
+import { bashRules, isSafeCommand, nativePath, notPaths, policy, shellWords, type Mode } from "../plugins/approval/policy.ts";
 import { validate } from "../plugins/approval/schema.ts";
 import { fsTools } from "../plugins/fs/fs.ts";
 import { shellTool } from "../plugins/shell/shell.ts";
@@ -402,6 +402,34 @@ describe("policy", () => {
     expect(decide("ask", "glob", { pattern: "src/**/*.ts" })).toBe("allow");
     // 名为 "..foo" 的目录仍在工作目录里
     expect(decide("ask", "read_file", { path: path.join(cwd, "..foo", "a.ts") })).toBe("allow");
+  });
+
+  test("echo/printf arguments and grep patterns are not paths, so a leading backslash is not a drive root on Windows", () => {
+    for (const c of [
+      "git status && printf '\\n--- HEAD ---\\n' && git rev-parse HEAD",
+      "git diff origin/main...HEAD | grep '^+' | grep '\\[' | nl -ba",
+      "grep -rn '\\(normal\\)' src",
+      "rg -e '\\d+' src",
+      "git grep -n '\\bfoo' -- src",
+      "echo '\\x'",
+    ]) {
+      expect(decide("readonly", "bash", { command: c })).toBe("allow");
+    }
+    // 真正的路径照样检查：-e、-f 给了模式时第一个位置参数是路径，rg --files 的参数都是路径
+    for (const c of ["grep -e x /etc/passwd", "grep -rf /etc/pats .", "rg --files /etc", "grep x /etc/passwd", "git grep -e x -- ../other"]) {
+      expect(decide("readonly", "bash", { command: c })).toBe("ask");
+    }
+  });
+
+  test("notPaths picks out the pattern argument", () => {
+    expect([...notPaths(["grep", "-rn", "pat", "src"])]).toEqual([2]);
+    expect([...notPaths(["grep", "-e", "pat", "src"])]).toEqual([2]);
+    expect([...notPaths(["grep", "-rnepat", "src"])]).toEqual([1]);
+    expect([...notPaths(["rg", "--regexp=pat", "src"])]).toEqual([1]);
+    expect([...notPaths(["git", "--no-pager", "grep", "pat"])]).toEqual([3]);
+    expect([...notPaths(["grep", "-f", "pats", "src"])]).toEqual([]);
+    expect([...notPaths(["git", "log", "x"])]).toEqual([]);
+    expect([...notPaths(["printf", "a", "b"])]).toEqual([1, 2]);
   });
 
   test("schema validation", () => {

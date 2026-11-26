@@ -96,7 +96,12 @@ export default definePlugin({
           }),
         register: (child, control) => {
           controls.set(child, control);
-          return () => void controls.delete(child);
+          // 只读的子 Agent：jade/approval 判断它的非只读调用（auto 模式下交给审查按只读的标准判断），见 childHooks
+          const release = write ? undefined : ctx.service<Approval>("approval@1")?.readOnly(child);
+          return () => {
+            controls.delete(child);
+            release?.();
+          };
         },
         usage: (toolUseId, u) => void usage.set(toolUseId, u),
         job: (description, stop) => ctx.service<UI>("ui@1")?.job?.({ session: ctx.session.id, kind: "agent", title: description, stop }),
@@ -138,14 +143,15 @@ function childHooks(ctx: SessionContext, control: () => Control | undefined, win
     point: "context.project",
     fn: (messages) => (control()?.wrapUp ? fitToolResults(messages, window() * REPORT_TOOL_SHARE * CHARS_PER_TOKEN, ctx.plugin) : messages),
   });
-  // 只读的子 Agent：不是只读的工具（bash）只放行主会话的审批规则认定为只读的调用（git log、ls、rg……），其余的不问用户，直接拒绝
+  // 只读的子 Agent：不是只读的工具（bash）由 jade/approval 判断（登记见 register）：审批规则认定为只读的（git log、ls、rg……）放行，
+  // 其余的 auto 模式下交给审查按只读的标准判断，其他模式直接拒绝。没有 jade/approval 时这里直接拒绝
   ctx.kernel.hook({
     kind: "gate",
     point: "tool.gate",
     fn: (call) => {
       const c = control();
       if (!c || c.write || call.tool.effect === "read") return { decision: "abstain" };
-      if (ctx.service<Approval>("approval@1")?.allows(ctx.session.id, call)) return { decision: "abstain" };
+      if (ctx.service<Approval>("approval@1")) return { decision: "abstain" };
       return { decision: "deny", reason: READ_ONLY_REASON(call.name) };
     },
   });
