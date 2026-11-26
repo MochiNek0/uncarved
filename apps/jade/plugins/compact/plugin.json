@@ -5,7 +5,7 @@
   "entry": "./index.ts",
   "provides": ["compact@1"],
   "requires": ["models@1"],
-  "optional": ["commands@1", "renderers@1", "ui@1"],
+  "optional": ["commands@1", "renderers@1", "ui@1", "cost@1"],
   "config": {
     "thresholdTokens": {
       "description": "compact when the history reaches this many tokens (a number or e.g. \"120k\"); default: 80% of the model's context window, leaving room for the reply"

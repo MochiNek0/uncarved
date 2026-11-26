@@ -7,7 +7,11 @@
   "optional": ["ui@1", "renderers@1", "approval@1", "prompts@1"],
   "config": {
     "maxSteps": {
-      "description": "how many responses a sub-agent may make before it is asked for its report; default: no limit (it is still asked for its report near the context window)"
+      "description": "how many responses a sub-agent may make before it is asked for its report; default: no limit (it is still asked for its report at wrapUpTokens or near the context window)"
+    },
+    "wrapUpTokens": {
+      "default": 150000,
+      "description": "ask a sub-agent for its report once its history reaches this many tokens (or 70% of the context window, if that is smaller): each step resends the whole history, so one long sub-agent costs far more than two short ones"
     },
     "instructions": {
       "default": true,

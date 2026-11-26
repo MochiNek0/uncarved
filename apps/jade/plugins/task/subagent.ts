@@ -21,6 +21,8 @@ export interface Control {
   wrapUp: boolean;
   /** 最近一次模型调用的输入加输出 token，即下一次请求至少有多大 */
   lastTokens?: number;
+  /** 历史到了上限（wrapUpTokens 或接近窗口）被停下的 */
+  hitContextLimit?: boolean;
   /** 子 Agent 一次最多回复几次 */
   maxSteps: number;
   /** 子 Agent 能不能改东西（配置 write）；不能时只有只读的工具和只读的命令 */
@@ -48,6 +50,11 @@ export interface TaskOptions {
 
 /** 历史到了上下文窗口的这个比例就停下来写报告：子 Agent 没有压缩，再读几个大文件就会超出窗口 */
 export const WRAP_UP_AT = 0.7;
+/**
+ * 窗口很大时更早停下：子 Agent 每一步重发整段历史，花费随步数平方增长，滚到几十万 token 的一个子 Agent
+ * 比两个各自从头开始的贵得多。没查完的写进报告，主 Agent 可以再开一个接着查
+ */
+export const DEFAULT_WRAP_UP_TOKENS = 150_000;
 /** 写报告时工具输出最多占窗口的这个比例，更早的不放进去，保证报告这次请求放得下 */
 export const REPORT_TOOL_SHARE = 0.5;
 /** 不知道窗口时按这个算 */
@@ -61,6 +68,10 @@ export const OMITTED = "[Output omitted to fit the context window. Use what you 
 export const WRAP_UP =
   "You have reached your step limit. Do not call any more tools: write your report now from what you have found so far, " +
   "and say what you could not check.";
+
+/** 因为历史到了上限才写的报告，前面加这句：没查完的交给新的子 Agent，它从很小的上下文开始，比主 Agent 自己查便宜 */
+export const CONTEXT_LIMIT_NOTE =
+  "(The sub-agent stopped at its context limit. If the report lists things it could not check, start another task for them rather than checking them yourself.)";
 
 /** 只读的子 Agent 想执行会改东西的命令时给它的理由 */
 export const READ_ONLY_REASON = (name: string) =>
@@ -127,7 +138,8 @@ export function taskTool(opts: TaskOptions): Tool {
       `Delegate a self-contained ${opts.write ? "" : "research "}task to a sub-agent${opts.write ? "" : " with read-only tools (such as read_file, list_dir, glob, grep, read-only shell commands, and web tools when available)"}. ` +
       "Use it for broad searches across many files, or web research across several pages, so that only the conclusion comes back. " +
       "The sub-agent sees nothing of this conversation: the prompt must contain everything it needs. " +
-      "Several task calls in one response run in parallel.",
+      "Several task calls in one response run in parallel. " +
+      "Do not also investigate a delegated question yourself, in the same response or after: work from the report, and only check what it says it could not.",
     inputSchema: {
       type: "object",
       properties: {
@@ -248,6 +260,7 @@ export function taskTool(opts: TaskOptions): Tool {
         return { content: `Sub-agent failed: ${msg}${text ? `\nLast output:\n${text}` : ""}`, isError: true, ...linked };
       }
       if (recovered && text) return { content: `(The sub-agent stopped on an error: ${recovered}. This report was written afterwards from what it had found.)\n\n${text}`, ...linked };
+      if (control.hitContextLimit && text) return { content: `${CONTEXT_LIMIT_NOTE}\n\n${text}`, ...linked };
       return { content: text || "(sub-agent returned no text)", isError: !text, ...linked };
     },
   };

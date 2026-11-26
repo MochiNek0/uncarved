@@ -7,7 +7,7 @@ import path from "node:path";
 import type { Block, Message } from "uncarved";
 import type { UI } from "../src/index.ts";
 import type { CommandContext, Commands, Renderers } from "@uncarved/jade-api/services";
-import { compactor, compactThreshold, DERIVED_KEY, estimateTokens, isContextOverflow, parseTokens, TRIMMED, type CompactState } from "../plugins/compact/compact.ts";
+import { compactor, compactThreshold, DEFAULT_CACHE, DERIVED_KEY, estimateTokens, isContextOverflow, parseTokens, TRIMMED, trimPaysOff, type CompactState } from "../plugins/compact/compact.ts";
 import { say, cleanup, scriptedHost, textOf, use } from "./scripted-ui.ts";
 import { plain as plainText } from "../plugins/tui/screen.ts";
 import type { Text } from "@uncarved/jade-api";
@@ -130,10 +130,46 @@ describe("jade/compact in a session", () => {
     expect(state.summary).toBe("");
     expect(textOf(out[2]!.content)).toBe(TRIMMED);
     expect(textOf(out.at(-1)!.content)).not.toBe(TRIMMED);
-    // 清理之后只多了一次读取：省不下 trimAt 的 1/4，先不再清理（不让每一步都破坏提示缓存）
+    // 清理之后只多了一次读取：省不下一半，先不再清理（不让每一步都破坏提示缓存）
     hook.derived[DERIVED_KEY] = state;
     await c.project(history(6), hook);
     expect(recorded).toHaveLength(1);
+
+    // 历史大多不是工具输出（约 10k 的用户消息加两次读取）：能清理的不到一半，重写缓存不划算，不清理
+    const wordy = [{ role: "user" as const, content: [blk("y".repeat(40_000))] }, ...read(0), ...read(1)];
+    hook.derived = {};
+    expect(await c.project(wordy, hook)).toEqual(wordy);
+    expect(recorded).toHaveLength(1);
+  });
+
+  test("early clearing pays off within about ten requests: the cheaper cached input is, the more it has to save", () => {
+    const at = (read: number, write = 1) => ({ read, write });
+    // 那次实际的会话：100k 时只能省 35.6k
+    expect(trimPaysOff(100_000, 35_600, DEFAULT_CACHE)).toBe(false);
+    expect(trimPaysOff(100_000, 35_600, at(1 / 5))).toBe(true);
+    // 省下七成：缓存价 1/20 时划算，1/50 时不划算；Anthropic 写入加价 25% 时也不划算
+    expect(trimPaysOff(100_000, 70_000, at(1 / 20))).toBe(true);
+    expect(trimPaysOff(100_000, 70_000, at(1 / 50))).toBe(false);
+    expect(trimPaysOff(100_000, 70_000, at(1 / 20, 1.25))).toBe(false);
+    // 缓存不打折：清理没有代价
+    expect(trimPaysOff(100_000, 1_000, at(1))).toBe(true);
+    expect(trimPaysOff(100_000, 0, at(1))).toBe(false);
+  });
+
+  test("early clearing uses the cache price configured in jade/cost for the current model", async () => {
+    const run = async (prices?: object) => {
+      const { cwd, host, shared, send } = await scriptedHost({ config: { "jade/compact": { trimTokens: "3k" }, ...(prices ? { "jade/cost": { prices } } : {}) } });
+      const big = Array.from({ length: 100 }, () => "a".repeat(40)).join("\n");
+      for (const n of [1, 2, 3]) await writeFile(path.join(cwd, `f${n}.txt`), big);
+      shared.script.push(use("r1", "read_file", { path: "f1.txt" }), use("r2", "read_file", { path: "f2.txt" }), use("r3", "read_file", { path: "f3.txt" }), say("done"));
+      await send(await host.sessions.open(), "go");
+      // 第 4 次请求（约 3.6k）超过 3k，清理最早的两次读取能省一半多一点
+      return textOf(shared.requests[3]!.messages[2]!.content);
+    };
+    // 不知道单价：按 1/20 算，省一半回本要十几次请求，不清理
+    expect(await run()).not.toBe(TRIMMED);
+    // 缓存价是原价的 1/4：几次请求就回本，清理
+    expect(await run({ s1: { input: 1, output: 4, cacheRead: 0.25 } })).toBe(TRIMMED);
   });
 
   test("sub-agents neither clear old tool output early nor get summarized: each clearing would invalidate the whole prompt cache", async () => {

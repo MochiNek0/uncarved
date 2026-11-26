@@ -280,6 +280,22 @@ export interface Compact {
   threshold(): number;
 }
 
+// ---------- cost@1（jade/cost） ----------
+
+/** 每百万 token 的单价；cacheRead、cacheWrite 没有时按 input 算 */
+export interface Price {
+  input: number;
+  output: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+}
+
+/** cost@1 */
+export interface Cost {
+  /** 配置里这个模型的单价（名字完全相同的，否则最长的前缀）；没有配置时 undefined */
+  price(model: string): Price | undefined;
+}
+
 // ---------- sessions@1（jade/sessions） ----------
 
 export interface SessionSummary {

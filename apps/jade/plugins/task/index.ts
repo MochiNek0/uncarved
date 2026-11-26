@@ -6,7 +6,7 @@
 import type { Usage } from "uncarved";
 import { definePlugin, type SessionContext, type UI } from "@uncarved/jade-api";
 import type { Approval, Models, Renderers } from "@uncarved/jade-api/services";
-import { CHARS_PER_TOKEN, FALLBACK_WINDOW, fitToolResults, READ_ONLY_REASON, REPORT_TOOL_SHARE, stepsThisTurn, subagentPrompt, taskTool, WRAP_UP_AT, type Control, type TaskProgress } from "./subagent.ts";
+import { CHARS_PER_TOKEN, DEFAULT_WRAP_UP_TOKENS, FALLBACK_WINDOW, fitToolResults, READ_ONLY_REASON, REPORT_TOOL_SHARE, stepsThisTurn, subagentPrompt, taskTool, WRAP_UP_AT, type Control, type TaskProgress } from "./subagent.ts";
 import { clip, dim, error, lines as joinLines } from "./style.ts";
 
 const MAX_DETAIL_LINES = 40;
@@ -67,9 +67,13 @@ export default definePlugin({
     const maxSteps = typeof configured === "number" && Number.isInteger(configured) && configured > 0 ? configured : Infinity;
     const write = ctx.config.write === true;
     const window = () => models.current()?.contextWindow ?? FALLBACK_WINDOW;
+    const wrapUpConfig = ctx.config.wrapUpTokens;
+    const wrapUpTokens = typeof wrapUpConfig === "number" && Number.isInteger(wrapUpConfig) && wrapUpConfig > 0 ? wrapUpConfig : DEFAULT_WRAP_UP_TOKENS;
+    /** 历史到了这么多 token 就停下来写报告 */
+    const wrapUpAt = () => Math.min(window() * WRAP_UP_AT, wrapUpTokens);
 
     // 本插件在子会话里的那份：task 开的子会话的步数上限、写报告、只读的限制。别的插件开的子会话（controls 里没有）不管
-    if (ctx.session.parent) childHooks(ctx, () => controls.get(ctx.session.id), window);
+    if (ctx.session.parent) childHooks(ctx, () => controls.get(ctx.session.id), window, wrapUpAt);
 
     // 层数到了上限的会话（默认子 Agent 不能再开子 Agent）不给 task 工具
     if (!ctx.session.canSpawn) return;
@@ -126,15 +130,18 @@ export default definePlugin({
 });
 
 /** task 开的子会话里，本插件加的 hook。control 在子会话开好之后才登记，hook 执行时再取 */
-function childHooks(ctx: SessionContext, control: () => Control | undefined, window: () => number): void {
-  // 步数上限；wrapUp 时只再要一次回复（报告）。历史接近上下文窗口时也停下，之后要报告
+function childHooks(ctx: SessionContext, control: () => Control | undefined, window: () => number, wrapUpAt: () => number): void {
+  // 步数上限；wrapUp 时只再要一次回复（报告）。历史到了 wrapUpAt（接近上下文窗口或 wrapUpTokens）时也停下，之后要报告
   ctx.kernel.hook({
     kind: "gate",
     point: "turn.continue",
     fn: (s) => {
       const c = control();
       if (!c) return { decision: "abstain" };
-      return stepsThisTurn(s) >= (c.wrapUp ? 1 : c.maxSteps) || (c.lastTokens ?? 0) >= window() * WRAP_UP_AT ? { decision: "deny" } : { decision: "abstain" };
+      if (stepsThisTurn(s) >= (c.wrapUp ? 1 : c.maxSteps)) return { decision: "deny" };
+      if ((c.lastTokens ?? 0) < wrapUpAt()) return { decision: "abstain" };
+      c.hitContextLimit = true;
+      return { decision: "deny" };
     },
   });
   // 要报告时工具输出可能已经很多（上面停下时、或者已经超出窗口）：只放进最近的一部分

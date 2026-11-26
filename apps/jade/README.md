@@ -249,14 +249,15 @@ plugin.run()
 | `JADE_UPDATE_CHECK` | shell | 设为 `off` 不检查更新 |
 | `HTTPS_PROXY` / `HTTP_PROXY` | shell | 模型和 web 请求走代理（Node.js 版本太旧、不支持时启动时会提示；Bun 都支持） |
 
-权限模式和压缩阈值是插件配置，写在 `$JADE_HOME/config.json`，例如 `{"jade/approval": {"mode": "auto"}, "jade/compact": {"thresholdTokens": "120k"}}`。会话里用 Shift+Tab 或 `/mode` 选的模式记在 `mode.json`，比配置优先（见上文"权限"）。历史超过 100k token 时（远在压缩阈值之前，子 Agent 也一样）会先清理较早的大段工具输出，只留最近的一段，可用 `{"jade/compact": {"trimTokens": "200k"}}` 调整，`false` 关掉。等审批回答的时限默认 24 小时，过了按拒绝处理，可用 `{"jade/approval": {"askTimeoutMinutes": 30}}` 改短（最长一周）。
+权限模式和压缩阈值是插件配置，写在 `$JADE_HOME/config.json`，例如 `{"jade/approval": {"mode": "auto"}, "jade/compact": {"thresholdTokens": "120k"}}`。会话里用 Shift+Tab 或 `/mode` 选的模式记在 `mode.json`，比配置优先（见上文"权限"）。历史超过 100k token 时（远在压缩阈值之前）会先清理较早的大段工具输出，只留最近的一段；清理会让提示缓存失效，所以只在大约 10 次请求内能回本时清理：缓存价按 `jade/cost` 配置的单价算，没配时按原价的 1/20。100k 这个起点可用 `{"jade/compact": {"trimTokens": "200k"}}` 调整，`false` 关掉。等审批回答的时限默认 24 小时，过了按拒绝处理，可用 `{"jade/approval": {"askTimeoutMinutes": 30}}` 改短（最长一周）。
 
 其他插件配置（都写在 `$JADE_HOME/config.json`）：
 
 ```jsonc
 {
   // 子 Agent 用另一个（更便宜、更快的）模型：/model 保存过的名字，或当前服务上的模型名
-  "jade/task": { "model": "claude-haiku-5-5" },
+  // 子 Agent 历史到了多少 token 就写报告（默认 150000，窗口的 70% 更小时按窗口算）
+  "jade/task": { "model": "claude-haiku-5-5", "wrapUpTokens": 150000 },
   // 单价，每百万 token（这里的数字只是示例，按你用的服务填）；键是模型名或它的前缀。配了之后状态栏显示会话花了多少钱
   "jade/cost": { "prices": { "claude-opus": { "input": 15, "output": 75, "cacheRead": 1.5, "cacheWrite": 18.75 } } },
   // hook：before 的命令退出码不是 0 时拒绝这次调用；after 失败时告诉 agent；turn 在一轮结束时运行。

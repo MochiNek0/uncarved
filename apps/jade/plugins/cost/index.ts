@@ -10,14 +10,9 @@
 
 import type { LogEvent, Usage } from "uncarved";
 import { definePlugin } from "@uncarved/jade-api";
-import type { Commands, Models } from "@uncarved/jade-api/services";
+import type { Commands, Cost, Models, Price } from "@uncarved/jade-api/services";
 
-export interface Price {
-  input: number;
-  output: number;
-  cacheRead?: number;
-  cacheWrite?: number;
-}
+export type { Price };
 type Totals = Record<string, Required<Usage>>;
 
 const KEY = "jade/cost/usage";
@@ -86,6 +81,8 @@ const tokens = (n: number) => (n >= 1_000_000 ? `${(n / 1_000_000).toFixed(2)}M`
 export default definePlugin({
   process(ctx) {
     const prices = parsePrices(ctx.config.prices);
+    // jade/compact 按缓存价和原价的比例判断提前清理划不划算
+    ctx.provide("cost@1", { price: (model) => priceOf(prices, model) } satisfies Cost);
     ctx.service<Commands>("commands@1")?.register({
       name: "cost",
       description: "show this session's token usage per model, and what it cost at the configured prices",

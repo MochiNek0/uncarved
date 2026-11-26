@@ -14,7 +14,7 @@ import { say, cleanup, scriptedHost, textOf, use } from "./scripted-ui.ts";
 afterEach(cleanup);
 // 每个子 Agent 都是一个完整的会话（所有插件都加入）：全量测试的负载下可能超过默认的 5 秒
 setDefaultTimeout(30_000);
-import { OMITTED, subagentPrompt, taskTool, WRAP_UP } from "../plugins/task/subagent.ts";
+import { CONTEXT_LIMIT_NOTE, OMITTED, subagentPrompt, taskTool, WRAP_UP } from "../plugins/task/subagent.ts";
 import { SEARCH_PROVIDERS } from "../plugins/web/web.ts";
 
 const SEARCH_KEYS = SEARCH_PROVIDERS.map((p) => p.env);
@@ -267,7 +267,35 @@ describe("jade/task", () => {
     await send(s, "go");
     expect(shared.requests).toHaveLength(4);
     expect(textOf(shared.requests[2]!.messages.at(-1)!.content)).toBe(WRAP_UP);
-    expect(textOf([shared.requests[3]!.messages.at(-1)!.content[0]!])).toBe("report: a.txt is x");
+    expect(textOf([shared.requests[3]!.messages.at(-1)!.content[0]!])).toBe(`${CONTEXT_LIMIT_NOTE}
+
+report: a.txt is x`);
+  });
+
+  test("with a large context window the sub-agent stops at wrapUpTokens, long before the window", async () => {
+    const { cwd, host, shared, send } = await scriptedHost({ config: { "jade/task": { wrapUpTokens: 500 } } });
+    shared.current = { ...shared.current!, contextWindow: 1_000_000 };
+    await writeFile(path.join(cwd, "a.txt"), "x");
+    shared.script.push(
+      use("u1", "task", { description: "read", prompt: "read a.txt" }),
+      // 510 个 token：远没到窗口，到了 wrapUpTokens
+      { ...use("c1", "read_file", { path: "a.txt" }), usage: { inputTokens: 500, outputTokens: 10 } },
+      say("report: a.txt is x"),
+      say("done"),
+    );
+    const s = await host.sessions.open();
+    await send(s, "go");
+    expect(shared.requests).toHaveLength(4);
+    expect(textOf(shared.requests[2]!.messages.at(-1)!.content)).toBe(WRAP_UP);
+    // 主 Agent 知道它是到了上限才停的：没查完的再开一个子 Agent
+    expect(JSON.stringify(shared.requests[3]!.messages.at(-1)!.content)).toContain(CONTEXT_LIMIT_NOTE.slice(1, 40));
+  });
+
+  test("a sub-agent that finishes on its own has no context-limit note", async () => {
+    const { host, shared, send } = await scriptedHost();
+    shared.script.push(use("u1", "task", { description: "look", prompt: "look" }), say("report: nothing"), say("done"));
+    await send(await host.sessions.open(), "go");
+    expect(JSON.stringify(shared.requests[2]!.messages.at(-1)!.content)).not.toContain(CONTEXT_LIMIT_NOTE.slice(1, 40));
   });
 
   test("the sub-agent gets web_fetch, and web_search only while a search service is configured", async () => {

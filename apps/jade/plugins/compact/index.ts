@@ -3,8 +3,8 @@
 
 import type { LogEvent } from "uncarved";
 import { definePlugin, type UI } from "@uncarved/jade-api";
-import type { Commands, Compact, Models, Renderers } from "@uncarved/jade-api/services";
-import { compactor, compactThreshold, isContextOverflow, parseTokens } from "./compact.ts";
+import type { Commands, Compact, Cost, Models, Renderers } from "@uncarved/jade-api/services";
+import { compactor, compactThreshold, DEFAULT_CACHE, isContextOverflow, parseTokens, type CachePrice } from "./compact.ts";
 import { dim } from "./style.ts";
 
 /** 认不出窗口时的阈值 */
@@ -31,6 +31,20 @@ function thresholdFor(config: Record<string, unknown>, models: Models): () => nu
     // 别的模型插件可能不给窗口（或给错）
     if (!m || !(typeof m.contextWindow === "number" && m.contextWindow > 0)) return FALLBACK_THRESHOLD;
     return compactThreshold(m.contextWindow, m.kind === "anthropic" ? ANTHROPIC_REPLY_TOKENS : 0);
+  };
+}
+
+/**
+ * 当前模型的缓存读、写单价是原价的几分之几：jade/cost 配了单价时按单价算，没配的那一项按 DEFAULT_CACHE。
+ * 只配了 input、output 时不当成缓存没打折：多半只是没写缓存价
+ */
+function cachePriceOf(cost: Cost | undefined, models: Models): CachePrice {
+  const model = models.current()?.model;
+  const p = model ? cost?.price(model) : undefined;
+  if (!p || !(p.input > 0)) return DEFAULT_CACHE;
+  return {
+    read: p.cacheRead !== undefined ? p.cacheRead / p.input : DEFAULT_CACHE.read,
+    write: p.cacheWrite !== undefined ? p.cacheWrite / p.input : DEFAULT_CACHE.write,
   };
 }
 
@@ -74,7 +88,7 @@ export default definePlugin({
     const configured = parseTokens(ctx.config.thresholdTokens);
     const keepTokens = parseTokens(ctx.config.keepTokens);
     const threshold = thresholdFor(ctx.config, models);
-    const c = compactor({ complete: (req, o) => models.complete(req, o), threshold, keepTokens, trimAt, id: ctx.plugin, writes: (t) => ctx.session.tool(t)?.meta?.writes });
+    const c = compactor({ complete: (req, o) => models.complete(req, o), threshold, keepTokens, trimAt, cachePrice: () => cachePriceOf(ctx.service<Cost>("cost@1"), models), id: ctx.plugin, writes: (t) => ctx.session.tool(t)?.meta?.writes });
     const id = ctx.session.id;
     /** 状态栏上的一段：多少 token 时自动压缩，投影离它不远（85%）时变黄 */
     const show = (projected?: number) => {

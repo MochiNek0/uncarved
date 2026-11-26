@@ -5,7 +5,9 @@
 //
 // 清理还有一个更早的触发点 trimAt，和上下文窗口无关：窗口很大（1M）时离压缩阈值很远，
 // 但每一步都要把整段历史重发一遍，几十步以前的工具输出一直在花 token。超过 trimAt 就清理，
-// 只保留最近一段的工具输出；一次至少省下 trimAt 的一定比例才清理，免得每一步都清理一点、每一步都让提示缓存失效。
+// 只保留最近一段的工具输出。清理让清理处之后的提示缓存全部失效，剩下的 R 要按写入价重写一次，之后每次请求省下的 S 却只是缓存价；
+// 所以只在大约 EARLY_TRIM_PAYBACK 次请求内能回本时清理：S × 缓存价 × 次数 ≥ R × (写入价 − 缓存价)。
+// 缓存价、写入价按 jade/cost 配置的单价算，没有配置时按 DEFAULT_CACHE。
 //
 // 两种决定都先用 ctx.record 写进日志（derived.recorded）再使用（I-5），之后每次投影都从 derived 里取，
 // 投影在下一次压缩之前保持不变，不会每次请求都让提示缓存失效；恢复会话时也不会重新总结。
@@ -37,6 +39,8 @@ export interface CompactorOptions {
   keepTokens?: number;
   /** 投影超过这个 token 数（还没到 threshold）就提前清理旧的工具输出；不给或 0 时不提前清理 */
   trimAt?(): number;
+  /** 当前模型的缓存读、缓存写单价是原价的几分之几（判断提前清理划不划算）；不给时按 DEFAULT_CACHE */
+  cachePrice?(): CachePrice;
   id?: string;
   /** 写文件的工具把路径放在输入的哪个字段（工具的 meta.writes）；摘要后面列出改过的文件用 */
   writes(tool: string): string | undefined;
@@ -69,8 +73,27 @@ export const TRIMMED = "[This tool output was cleared to save context. Run the t
 const TRIM_TARGET = 0.6;
 /** 提前清理时保留最近大约 trimAt 这个比例的原始消息 */
 const EARLY_TRIM_KEEP = 0.4;
-/** 提前清理至少要省下 trimAt 的这个比例，否则先不清理 */
-const EARLY_TRIM_MIN_SAVE = 0.25;
+/** 提前清理要在大约这么多次请求内回本，否则先不清理 */
+const EARLY_TRIM_PAYBACK = 10;
+
+/** 缓存读、缓存写的单价是原价的几分之几 */
+export interface CachePrice {
+  read: number;
+  write: number;
+}
+/**
+ * 不知道单价时按主流的比例算：2026 年 11 月 Anthropic、OpenAI、Google 的当前模型缓存读都是原价的 1/20；
+ * 各家从 1/4（Grok、GLM、MiniMax）到 1/50（DeepSeek Flash、MiMo）不等。写入不加价（Anthropic 加 25%，配了单价才算得到）
+ */
+export const DEFAULT_CACHE: CachePrice = { read: 1 / 20, write: 1 };
+
+/** 清理前 tokens、省下 saved 时，这次清理能不能在 EARLY_TRIM_PAYBACK 次请求内回本 */
+export function trimPaysOff(tokens: number, saved: number, price: CachePrice): boolean {
+  if (saved <= 0) return false;
+  // 缓存不便宜（没打折）时清理没有代价
+  if (price.read >= price.write) return true;
+  return saved * price.read * EARLY_TRIM_PAYBACK >= (tokens - saved) * (price.write - price.read);
+}
 
 /** 中日韩文字和全角符号：大约一个字一个 token，不能按 4 个字符一个算 */
 const WIDE = /[　-鿿가-힯豈-﫿＀-￯]/g;
@@ -206,7 +229,7 @@ export function compactor(opts: CompactorOptions): Compactor {
     if (!forced && tokens <= threshold) {
       const trimAt = opts.trimAt?.() ?? 0;
       if (trimAt > 0 && tokens > trimAt) {
-        const early = await tryTrim(cutPoint(messages, from, Math.floor(trimAt * EARLY_TRIM_KEEP)), (saved) => saved >= trimAt * EARLY_TRIM_MIN_SAVE);
+        const early = await tryTrim(cutPoint(messages, from, Math.floor(trimAt * EARLY_TRIM_KEEP)), (saved) => trimPaysOff(tokens, saved, opts.cachePrice?.() ?? DEFAULT_CACHE));
         if (early) return early;
       }
       return done(current);
