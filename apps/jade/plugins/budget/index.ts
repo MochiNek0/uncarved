@@ -1,6 +1,9 @@
 // jade/budget：一轮里模型回复的次数达到上限就停下（turn.continue 关卡拒绝，这一轮以 stopped 结束）。
 // 从旧 jade 的 plugins/budget.ts 移植；上限来自配置 maxSteps。
 //
+// 没有配置 maxSteps 时，交互式前端的主会话和子 Agent 不限步数（同 Claude Code：用户随时能中断，
+// 子 Agent 由 jade/task 管）；只有不能提问的前端（例如 -p）用默认上限。
+//
 // 停下时最后一条回复通常只有工具调用，用户什么都没收到。所以停下之后再发一条 [Note from jade]，
 // 要模型不调用工具、总结做了什么和还剩什么（同 jade/continue，在 session.afterTurn 里 send）。
 // 收尾这一轮拒绝所有工具调用；模型仍然调用了工具时还能再回复一次，之后一定停下。
@@ -36,9 +39,9 @@ export function stepsThisTurn(s: State): number {
 export default definePlugin({
   session(ctx) {
     const raw = ctx.config.maxSteps;
-    let max = DEFAULT_STEPS;
-    if (typeof raw === "number" && Number.isInteger(raw) && raw > 0) max = raw;
-    else if (raw !== undefined) ctx.service<UI>("ui@1")?.notify(`jade/budget: maxSteps must be a positive integer, got ${JSON.stringify(raw)}; using ${DEFAULT_STEPS}`, "warning");
+    const configured = typeof raw === "number" && Number.isInteger(raw) && raw > 0;
+    const max = configured ? raw : DEFAULT_STEPS;
+    if (!configured && raw !== undefined) ctx.service<UI>("ui@1")?.notify(`jade/budget: maxSteps must be a positive integer, got ${JSON.stringify(raw)}; using ${DEFAULT_STEPS}`, "warning");
 
     /** 本轮的上限：用户选了继续就加 max，有新的用户消息时回到 max */
     let limit = max;
@@ -55,6 +58,8 @@ export default definePlugin({
       // 可能要等用户回答，比我们自己的等待时限再长一点
       timeoutMs: ASK_TIMEOUT_MS + 60_000,
       fn: async (s, hook) => {
+        // 前端能不能提问可能在会话中途变化（例如远程前端连上、断开），每次判断
+        if (!configured && (ctx.session.parent || ctx.service<UI>("ui@1")?.interactive)) return { decision: "abstain" };
         const steps = stepsThisTurn(s);
         if (steps < (wrappingUp ? WRAP_UP_STEPS : limit)) return { decision: "abstain" };
         if (!wrappingUp) {

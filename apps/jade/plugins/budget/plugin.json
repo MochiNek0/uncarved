@@ -6,8 +6,7 @@
   "optional": ["ui@1"],
   "config": {
     "maxSteps": {
-      "default": 200,
-      "description": "the most model responses in one turn (after one user message); when it is reached you are asked whether to continue for as many more, and otherwise (or when jade cannot ask) the turn stops and the model is asked, with tools disabled, to summarize for the user"
+      "description": "the most model responses in one turn (after one user message); when it is reached you are asked whether to continue for as many more, and otherwise (or when jade cannot ask) the turn stops and the model is asked, with tools disabled, to summarize for the user. Default: no limit in the interactive app and in sub-agents, 200 when jade cannot ask (for example -p)"
     }
   }
 }

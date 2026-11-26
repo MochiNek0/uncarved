@@ -14,7 +14,7 @@ import { say, cleanup, scriptedHost, textOf, use } from "./scripted-ui.ts";
 afterEach(cleanup);
 // 每个子 Agent 都是一个完整的会话（所有插件都加入）：全量测试的负载下可能超过默认的 5 秒
 setDefaultTimeout(30_000);
-import { OMITTED, taskTool, WRAP_UP } from "../plugins/task/subagent.ts";
+import { OMITTED, subagentPrompt, taskTool, WRAP_UP } from "../plugins/task/subagent.ts";
 import { SEARCH_PROVIDERS } from "../plugins/web/web.ts";
 
 const SEARCH_KEYS = SEARCH_PROVIDERS.map((p) => p.env);
@@ -22,6 +22,12 @@ const SEARCH_KEYS = SEARCH_PROVIDERS.map((p) => p.env);
 const ASK = { "jade/approval": { mode: "ask" } };
 
 describe("jade/task", () => {
+  test("the sub-agent prompt mentions a step budget only when one is configured", () => {
+    expect(subagentPrompt(40, false)).toContain("You have about 40 responses");
+    expect(subagentPrompt(Infinity, false)).not.toContain("responses (each");
+    expect(subagentPrompt(Infinity, false)).toContain("write your report as soon as you can answer");
+  });
+
   test("runs a read-only sub-agent in a child session and returns its report; progress shows its tool calls", async () => {
     const { home, host, shared, send } = await scriptedHost();
     shared.script.push(

@@ -7,6 +7,21 @@ import { msg, say, scripted, turn, use } from "./scripted-host.ts";
 import * as ui from "./scripted-ui.ts";
 
 describe("jade/budget", () => {
+  test("without maxSteps the interactive app has no step limit", async () => {
+    const { host, shared, send } = await ui.scriptedHost();
+    try {
+      for (let n = 1; n <= 201; n++) shared.script.push(ui.use(`u${n}`, "todo_write", { todos: [{ content: `step ${n}`, status: "pending" }] }));
+      shared.script.push(ui.say("done"));
+      const s = await host.sessions.open();
+      await send(s, "go");
+      expect(shared.asked).toEqual([]);
+      expect(shared.requests).toHaveLength(202);
+      expect((await s.history()).filter((e) => e.type === "jade/budget/notice")).toEqual([]);
+    } finally {
+      await ui.cleanup();
+    }
+  });
+
   test("when jade can ask, the limit asks whether to keep going; continuing adds maxSteps without a summary", async () => {
     const { host, shared, send } = await ui.scriptedHost({ config: { "jade/budget": { maxSteps: 2 } } });
     try {

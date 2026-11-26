@@ -9,7 +9,6 @@ import type { Approval, Models, Renderers } from "@uncarved/jade-api/services";
 import { CHARS_PER_TOKEN, FALLBACK_WINDOW, fitToolResults, READ_ONLY_REASON, REPORT_TOOL_SHARE, stepsThisTurn, subagentPrompt, taskTool, WRAP_UP_AT, type Control, type TaskProgress } from "./subagent.ts";
 import { clip, dim, error, lines as joinLines } from "./style.ts";
 
-const DEFAULT_MAX_STEPS = 40;
 const MAX_DETAIL_LINES = 40;
 
 /** task 开的、还在跑的子会话 → 它的运行状态（子会话里本插件的 hook 用） */
@@ -64,7 +63,8 @@ export default definePlugin({
   session(ctx) {
     const models = ctx.require<Models>("models@1");
     const configured = ctx.config.maxSteps;
-    const maxSteps = typeof configured === "number" && Number.isInteger(configured) && configured > 0 ? configured : DEFAULT_MAX_STEPS;
+    // 不配置时不限步数：子 Agent 做完就报告，接近上下文窗口时也会被要求报告
+    const maxSteps = typeof configured === "number" && Number.isInteger(configured) && configured > 0 ? configured : Infinity;
     const write = ctx.config.write === true;
     const window = () => models.current()?.contextWindow ?? FALLBACK_WINDOW;
 
