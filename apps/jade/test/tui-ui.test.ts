@@ -6,7 +6,7 @@ import { PassThrough, Writable } from "node:stream";
 import { InputHistory } from "../plugins/tui/history.ts";
 import { edit, layout, moveRow, offsetAt } from "../plugins/tui/editor.ts";
 import type { Screen } from "../plugins/tui/screen.ts";
-import { fitSegments, Store, tail, tuiScreen, type TuiHandlers } from "../plugins/tui/tui.ts";
+import { fitSegments, statusSegments, Store, tail, tuiScreen, type TuiHandlers } from "../plugins/tui/tui.ts";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** 等到输出里出现 text（或匹配正则），最多 ms 毫秒：界面按定时器刷新，机器忙时固定等一小段时间不一定够 */
@@ -493,7 +493,8 @@ describe("terminal UI", () => {
       { id: 2, kind: "shell", title: "bg1 npm run dev", status: "running", done: false, output: "ready on :3000\n", stop: () => void stopped.push(2) },
       { id: 3, kind: "shell", title: "bg2 make", status: "exited with code 0", done: true, output: "" },
     ]);
-    await until(output, "1 agent · 1 shell · click or ctrl+t to view");
+    await until(output, "1 agent · 1 shell");
+    expect(output()).not.toContain("click or ctrl+t to view");
     await type("\x14"); // ctrl+t
     await until(output, "Background tasks");
     expect(output()).toContain("agent · find the parser · read_file(src/a.ts)");
@@ -518,19 +519,63 @@ describe("terminal UI", () => {
     expect(calls.submit).toEqual(["hi"]);
   });
 
-  test("clicking the background jobs in the status bar opens the list, for terminals that take ctrl+t", async () => {
-    const { screen, type, output } = setup();
+  test("clicking the background jobs in the status bar opens the list, for terminals that take ctrl+t; hovering shows how", async () => {
+    const { screen, type, output, clear } = setup();
     screen.jobs!([{ id: 1, kind: "shell", title: "bg1 npm run dev", status: "running", done: false, output: "" }]);
-    await until(output, "1 shell · click or ctrl+t to view");
-    // 状态栏是最后一行（终端 40 行，界面占 39 行）；点在这一段外面不打开
+    await until(output, "ask (shift+tab) · 1 shell");
+    // 状态栏是最后一行（终端 40 行，界面占 39 行），"1 shell" 在第 20–26 列；鼠标停在上面、移开都不改文字（反色见下一条）
+    clear();
+    await type("\x1b[<35;22;39M");
+    await type("\x1b[<35;60;30M");
+    await sleep(50);
+    expect(output()).not.toContain("click");
+    // 点在这一段外面不打开
     await type("\x1b[<0;60;39M\x1b[<0;60;39m");
     await sleep(50);
     expect(output()).not.toContain("Background tasks");
-    await type("\x1b[<0;30;39M\x1b[<0;30;39m");
+    await type("\x1b[<0;22;39M\x1b[<0;22;39m");
     await until(output, "Background tasks");
     await type("\x1b");
     screen.showJobs!();
     await until(output, "bg1 npm run dev");
+  });
+
+  test("background jobs: the wheel scrolls the output, not the conversation; clicking a ▸ line shows what it carries", async () => {
+    const { screen, type, output, clear } = setup();
+    const lines = Array.from({ length: 60 }, (_, i) => `out ${i}`);
+    lines[58] = "  ⎿ first (+2 lines)";
+    screen.jobs!([
+      { id: 1, kind: "agent", title: "look", status: "thinking", done: false, output: `${lines.join("\n")}\n`, details: [{ line: 58, text: "first\nsecond detail\nthird detail" }] },
+    ]);
+    await type("\x14");
+    await until(output, "Background tasks");
+    // 列表里点那一项就打开它的输出
+    clear();
+    for (let y = 38; y >= 1 && !output().includes("out 59"); y--) {
+      await type(`\x1b[<0;10;${y}M\x1b[<0;10;${y}m`);
+      await sleep(20);
+    }
+    await until(output, "out 59");
+    expect(output()).toContain("click ▸ to expand");
+    // 滚轮往上翻输出
+    clear();
+    await type("\x1b[<64;10;20M");
+    await until(output, "↓ 3 more lines");
+    await type("\x1b[<65;10;20M");
+    await sleep(50);
+    // 点带 ▸ 的那一行展开，再点收起；点别的行没反应
+    clear();
+    let at = 0;
+    for (let y = 38; y >= 1 && !output().includes("second detail"); y--) {
+      at = y;
+      await type(`\x1b[<0;10;${y}M\x1b[<0;10;${y}m`);
+      await sleep(20);
+    }
+    await until(output, "third detail");
+    expect(output()).toContain("▾");
+    clear();
+    await type(`\x1b[<0;10;${at}M\x1b[<0;10;${at}m`);
+    await until(output, "▸");
   });
 
   test("ctrl+j starts a new line; enter sends", async () => {
@@ -708,6 +753,16 @@ describe("terminal UI", () => {
     expect(fitSegments(all, 20).map((s) => s.text)).toEqual(["ask", "ctx 25%"]);
     expect(tail("abcdefghij", 5)).toBe("…ghij");
     expect(tail("中文中文", 5)).toBe("…中文");
+  });
+
+  test("hovering the background jobs in the status bar only inverts them: same text, nothing else moves", () => {
+    const status = { cwd: "/p", model: "m", context: { used: 50_000, limit: 200_000 } };
+    const jobs = [{ id: 1, kind: "agent", title: "look", status: "", done: false, output: "" }];
+    const plain = statusSegments(status, jobs, 100);
+    const hovered = statusSegments(status, jobs, 100, true);
+    expect(hovered.map((s) => s.text)).toEqual(plain.map((s) => s.text));
+    expect(plain.find((s) => s.jobs)).toMatchObject({ text: "1 agent", inverse: false });
+    expect(hovered.find((s) => s.jobs)).toMatchObject({ text: "1 agent", inverse: true });
   });
 
   test("a short terminal keeps the input box and status bar on screen while the command menu is open", async () => {

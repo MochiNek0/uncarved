@@ -235,4 +235,29 @@ describe("ScreenBridge status segments", () => {
     a.status("late");
     expect(shown.at(-1)).toEqual([]);
   });
+
+  test("a job's output line can carry a detail; when old output is dropped, the line numbers follow", async () => {
+    const { screen } = fakeScreen();
+    const shown: JobInfo[][] = [];
+    screen.jobs = (jobs) => void shown.push(jobs);
+    const bridge = new ScreenBridge();
+    bridge.attach(screen);
+    bridge.show("s1");
+    const job = bridge.ui.job!({ session: "s1", kind: "agent", title: "look" });
+    job.append("● read_file(a.ts)\n");
+    job.append("  ⎿ line 1 (+2 lines)\n", "line 1\nline 2\nline 3");
+    job.append("said\n\n");
+    job.append("  ⎿ two\nrows\n", { text: "full", style: "dim" });
+    await Bun.sleep(150);
+    const details = shown.at(-1)![0]!.details!;
+    expect(details.map((d) => d.line)).toEqual([1, 5]);
+    expect(details[0]!.text).toBe("line 1\nline 2\nline 3");
+    expect(details[1]!.text).toContain("full");
+    // 输出超出上限，开头的行去掉了：行号跟着往前挪，挂在去掉的行上的不要了
+    job.append(`${"x".repeat(100_000 - 20)}\n`);
+    await Bun.sleep(150);
+    const after = shown.at(-1)![0]!;
+    const lines = after.output.split("\n");
+    expect(after.details!.map((d) => d.line)).toEqual([lines.indexOf("rows")]);
+  });
 });

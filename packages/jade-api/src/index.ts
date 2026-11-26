@@ -505,8 +505,11 @@ export interface JobRequest {
 
 /** UI.job 登记的一件事 */
 export interface Job {
-  /** 追加输出；前端只留末尾一段 */
-  append(text: Text): void;
+  /**
+   * 追加输出；前端只留末尾一段。detail 是挂在这段最后一行上的完整内容（例如工具的全部输出），
+   * 前端默认收起，用户点那一行展开
+   */
+  append(text: Text, detail?: Text): void;
   /** 一行状态，例如正在做什么、退出码；done 为 true 时不再算作在运行（仍在列表里，直到 dispose） */
   status(text: string, done?: boolean): void;
   /** 从列表里去掉 */

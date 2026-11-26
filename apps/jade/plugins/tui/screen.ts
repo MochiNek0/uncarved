@@ -62,6 +62,8 @@ export interface JobInfo {
   done: boolean;
   /** 输出的末尾一段，可以带 ANSI 颜色 */
   output: string;
+  /** 挂在 output 某一行（从 0 数）上的完整内容，默认收起 */
+  details?: { line: number; text: string }[];
   /** 用户停掉它；没有时不能停 */
   stop?(): void;
 }
@@ -202,7 +204,7 @@ export function safeScreen(screen: Screen): Screen {
     log: (text, o) => screen.log(s(text), o && { ...o, details: opt(o.details) }),
     amend: (id, text, o) => screen.amend(id, s(text), o && { ...o, details: opt(o.details) }),
     ...(screen.note ? { note: (id: string, text: string) => screen.note!(id, s(text)) } : {}),
-    ...(screen.jobs ? { jobs: (jobs: JobInfo[]) => screen.jobs!(jobs.map((j) => ({ ...j, title: s(j.title), status: s(j.status), output: s(j.output) }))) } : {}),
+    ...(screen.jobs ? { jobs: (jobs: JobInfo[]) => screen.jobs!(jobs.map((j) => ({ ...j, title: s(j.title), status: s(j.status), output: s(j.output), ...(j.details ? { details: j.details.map((d) => ({ line: d.line, text: s(d.text) })) } : {}) }))) } : {}),
     ...(screen.showJobs ? { showJobs: () => screen.showJobs!() } : {}),
     progress: (id, line, o) => screen.progress(id, opt(line), o),
     stream: (kind, text) => {

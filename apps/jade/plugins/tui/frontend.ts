@@ -254,7 +254,22 @@ export class ScreenBridge {
       else this.#applyJobs();
     };
     return {
-      append: (text) => update({ output: (entry.output + ansi(text)).slice(-MAX_JOB_OUTPUT) }, true),
+      append: (text, detail) => {
+        const added = ansi(text);
+        let details = entry.details ?? [];
+        // detail 挂在这段的最后一行（末尾的换行不算）
+        if (detail !== undefined) {
+          const full = ansi(detail);
+          const clipped = full.length > MAX_JOB_DETAIL ? `${full.slice(0, MAX_JOB_DETAIL)}\n…` : full;
+          details = [...details, { line: lineCount(entry.output) + lineCount(added.replace(/\n+$/, "")), text: clipped }];
+        }
+        const joined = entry.output + added;
+        const output = joined.slice(-MAX_JOB_OUTPUT);
+        // 开头去掉了几行，行号跟着往前挪；挂在去掉的行上的不要了
+        const dropped = lineCount(joined.slice(0, joined.length - output.length));
+        if (dropped) details = details.flatMap((d) => (d.line >= dropped ? [{ ...d, line: d.line - dropped }] : []));
+        update({ output, ...(details.length || entry.details ? { details } : {}) }, true);
+      },
       status: (text, done) => update({ status: String(text), done: done === true }),
       dispose: () => {
         const before = this.#jobs.length;
@@ -322,6 +337,10 @@ export class ScreenBridge {
 
 /** 每件后台的事最多留这么多个字符的输出 */
 const MAX_JOB_OUTPUT = 100_000;
+/** 每段展开的内容最多留这么多个字符 */
+const MAX_JOB_DETAIL = 20_000;
+/** 文字里有几个换行 */
+const lineCount = (s: string) => s.split("\n").length - 1;
 /** 后台的事的输出攒这么久交给界面一次 */
 const JOB_REDRAW_MS = 100;
 

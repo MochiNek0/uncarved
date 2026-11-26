@@ -63,7 +63,7 @@ export interface Shared {
   /** 插件经 ctx.status 设置过的状态栏段落，按先后 */
   statuses: { plugin: string; segment: unknown }[];
   /** 经 ui@1.job 登记的后台的事：追加的输出（纯文字）、状态，去掉了没有 */
-  jobs: { session: string; kind: string; title: string; output: string; statuses: string[]; disposed: boolean }[];
+  jobs: { session: string; kind: string; title: string; output: string; details: string[]; statuses: string[]; disposed: boolean }[];
   /** 为 true 时，后台的事第一次有输出就当作用户按了停；"at-end" 时在它从列表里去掉的那一刻按停（已经跑完了） */
   stopJobs: boolean | "at-end";
 }
@@ -103,12 +103,13 @@ export default { process(ctx) {
       dispose: () => {},
     }),
     job: (r) => {
-      const j = { session: r.session, kind: r.kind, title: r.title, output: "", statuses: [], disposed: false };
+      const j = { session: r.session, kind: r.kind, title: r.title, output: "", details: [], statuses: [], disposed: false };
       g().jobs.push(j);
       let stopped = false;
       return {
-        append: (t) => {
+        append: (t, detail) => {
           j.output += plain(t);
+          if (detail !== undefined) j.details.push(plain(detail));
           if (g().stopJobs === true && !stopped && r.stop) { stopped = true; r.stop(); }
         },
         status: (s, done) => void j.statuses.push(done ? s + " (done)" : s),

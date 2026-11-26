@@ -533,11 +533,11 @@ export interface TuiOptions {
 }
 
 /**
- * 开关鼠标事件上报（SGR 格式），用来接收滚轮、点击和按住左键拖动（1002）。
+ * 开关鼠标事件上报（SGR 格式），用来接收滚轮、点击、按住左键拖动（1002）和不按键的移动（1003，悬停提示用）。
  * 开着时终端自己不再处理点击，所以对话区的文字由 jade 自己选中和复制（见 Selection）
  */
-const MOUSE_ON = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
-const MOUSE_OFF = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+const MOUSE_ON = "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h";
+const MOUSE_OFF = "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
 /**
  * 光标样式：闪烁的竖线（DECSCUSR 5，再加上 ATT610 的"开始闪烁"给只认它的终端），一眼能看出输入框有焦点；
  * 退出时还原成终端自己的默认样式。光标什么时候显示仍由 Ink 管（只有输入框或输入对话框有焦点时才显示）
@@ -923,6 +923,8 @@ const WHEEL_LINES = 3;
 
 /** 按住左键拖动时的按钮号（左键 0 加上移动位 32） */
 const DRAG = 32;
+/** 不按键移动鼠标时的按钮号（"没有按键" 3 加上移动位 32） */
+const MOVE = 35;
 /** "已复制"的提示显示多久 */
 const COPIED_MS = 2000;
 
@@ -1169,6 +1171,9 @@ function App({
   useEffect(() => () => clearTimeout(copiedTimer.current), []);
   /** 输入框文字在屏幕上的位置（Prompt 里的 EditableText 每次渲染时写入） */
   const inputPlace = useRef<Placement>(undefined);
+  // 鼠标停在状态栏里后台的事那一段上：那一段反色，看得出能点
+  const [hover, setHover] = useState(false);
+  const hovering = useRef(false);
   const copySelection = (s: Selection) => copyText(selectedText(s, (i) => rowAt(i + front)));
   const copyText = (text: string) => {
     copy(text);
@@ -1191,11 +1196,15 @@ function App({
     if (key.ctrl && input === "t") return store.openJobs();
     const mouse = mouseEvent(input);
     if (mouse) {
-      // 点状态栏（界面的最后一行，比终端少一行）里后台的事那一段也能打开列表：终端自己占用了 ctrl+t 时用
-      if (mouse.button === 0 && mouse.press && mouse.y === rows - 2) {
-        const cols = jobsColumns(statusSegments(state.status, state.jobs, statusWidth));
-        if (cols && mouse.x >= cols[0] && mouse.x <= cols[1]) return store.openJobs();
+      // 状态栏（界面的最后一行，比终端少一行）里后台的事那一段：悬停时反色，点它打开列表（终端自己占用了 ctrl+t 时用）
+      const cols = mouse.y === rows - 2 ? jobsColumns(statusSegments(state.status, state.jobs, statusWidth)) : undefined;
+      const overJobs = cols !== undefined && mouse.x >= cols[0] && mouse.x <= cols[1];
+      if (overJobs !== hovering.current) {
+        hovering.current = overJobs;
+        setHover(overJobs);
       }
+      if (mouse.button === MOVE) return;
+      if (mouse.button === 0 && mouse.press && overJobs) return store.openJobs();
       // 对话区里的位置；clamp 时拖出对话区停在第一行或最后一行，否则在对话区外返回 undefined
       const at = (clamp: boolean): Point | undefined => {
         const i = mouse.y - top;
@@ -1205,7 +1214,8 @@ function App({
       // 滚轮在放不下全部文字的输入框上（含上下边框）时由输入框自己翻
       const input = inputPlace.current;
       const overInput = input && input.total > input.rows && mouse.y >= input.y - 1 && mouse.y <= input.y + input.rows;
-      if ((mouse.button === 64 || mouse.button === 65) && overInput) return;
+      // 后台的事的列表开着时滚轮由它自己翻
+      if ((mouse.button === 64 || mouse.button === 65) && (overInput || dialog?.kind === "jobs")) return;
       if (mouse.button === 64) store.scrollBy(WHEEL_LINES, max);
       else if (mouse.button === 65) store.scrollBy(-WHEEL_LINES, max);
       else if (mouse.button === 0 && mouse.press) {
@@ -1336,7 +1346,7 @@ function App({
             place: inputPlace,
             onCopy: copyText,
           }),
-          h(StatusBar, { status: state.status, jobs: state.jobs, width: statusWidth }),
+          h(StatusBar, { status: state.status, jobs: state.jobs, width: statusWidth, hover }),
         ),
       ),
     ),
@@ -1446,6 +1456,8 @@ interface Segment {
   dropAt?: number;
   color?: string;
   dim?: boolean;
+  /** 反色显示（鼠标停在能点的段上） */
+  inverse?: boolean;
   /** 后台的事的那一段：点一下打开列表 */
   jobs?: boolean;
 }
@@ -1475,7 +1487,7 @@ export function fitSegments(segments: Segment[], width: number): Segment[] {
 }
 
 /** 状态栏的内容，已经按宽度缩短 */
-function statusSegments(status: StatusInfo, jobs: JobInfo[], width: number): Segment[] {
+export function statusSegments(status: StatusInfo, jobs: JobInfo[], width: number, hover = false): Segment[] {
   const ctx = status.context;
   const pct = ctx ? Math.round((ctx.used / ctx.limit) * 100) : 0;
   const nearFull = pct >= 80;
@@ -1496,12 +1508,12 @@ function statusSegments(status: StatusInfo, jobs: JobInfo[], width: number): Seg
   };
   const kept = (status.plugins ?? []).filter((p) => typeof p.text !== "string" && p.text.keep);
   const others = (status.plugins ?? []).filter((p) => !kept.includes(p));
-  // 窄的时候依次：提示变短、去掉提示、用量变短、缓存去掉平均值、去掉缓存、模式变短、去掉用量、上下文变短、去掉速度
+  // 窄的时候依次：用量变短、缓存去掉平均值、去掉缓存、模式变短、去掉用量、上下文变短、去掉速度
   const running = runningJobs(jobs);
   const segments: Segment[] = [
     ...kept.map((p) => plugin(p, true)),
-    // 在后台运行的事：一直留着，窄的时候去掉按键说明
-    ...(running ? [{ text: `${running} · click or ctrl+t to view`, short: running, shortAt: 6.5, color: "cyan", jobs: true }] : []),
+    // 在后台运行的事：一直留着；鼠标停在上面时反色，像个按钮，宽度不变，旁边的段不会跟着挪
+    ...(running ? [{ text: running, color: "cyan", inverse: hover, jobs: true }] : []),
     ctx
       ? {
           text: `ctx ${tokens(ctx.used)}/${tokens(ctx.limit)} (${pct}%)`,
@@ -1544,13 +1556,6 @@ function statusSegments(status: StatusInfo, jobs: JobInfo[], width: number): Seg
         ]
       : []),
     ...others.map((p) => plugin(p, false)),
-    {
-      text: "PgUp/PgDn scroll · click ▸ or ctrl+o to expand · drag to select and copy",
-      short: "ctrl+o to expand",
-      shortAt: 10,
-      dropAt: 9,
-      dim: true,
-    },
   ];
   return fitSegments(segments, width);
 }
@@ -1571,8 +1576,8 @@ function jobsColumns(segments: Segment[]): [number, number] | undefined {
   return undefined;
 }
 
-function StatusBar({ status, jobs, width }: { status: StatusInfo; jobs: JobInfo[]; width: number }) {
-  const shown = statusSegments(status, jobs, width);
+function StatusBar({ status, jobs, width, hover }: { status: StatusInfo; jobs: JobInfo[]; width: number; hover: boolean }) {
+  const shown = statusSegments(status, jobs, width, hover);
   return h(
     Box,
     { paddingX: 1 },
@@ -1580,7 +1585,7 @@ function StatusBar({ status, jobs, width }: { status: StatusInfo; jobs: JobInfo[
       Text,
       { wrap: "truncate-end" },
       shown.map((s, i) =>
-        h(Text, { key: i }, i ? h(Text, { dimColor: true }, " · ") : null, h(Text, { color: s.color, dimColor: s.dim }, s.text)),
+        h(Text, { key: i }, i ? h(Text, { dimColor: true }, " · ") : null, h(Text, { color: s.color, dimColor: s.dim, inverse: s.inverse }, s.text)),
       ),
     ),
   );
@@ -2515,9 +2520,43 @@ export function runningJobs(jobs: readonly JobInfo[]): string {
 /** 查看一件后台的事时，输出只折最后这么多行 */
 const JOB_TAIL_LINES = 2000;
 
+/** 后台的事的输出折好的一行；line 是它属于输出的哪一行，那一行挂着可以展开的内容时才有 */
+type JobRow = { text: string; line?: number };
+
+/** 把后台的事的输出折成行：挂着内容（JobInfo.details）的行末尾画 ▸，展开的（open）在它下面接着画内容 */
+export function jobRows(job: JobInfo, width: number, open: ReadonlySet<number>): JobRow[] {
+  const output = job.output.replace(/\n+$/, "");
+  if (!output) return [];
+  const all = output.split("\n");
+  const from = Math.max(0, all.length - JOB_TAIL_LINES);
+  const rows = (text: string, line?: number) => wrap(text, width).map((r) => (line === undefined ? { text: visibleRow(r) } : { text: visibleRow(r), line }));
+  const details = new Map((job.details ?? []).map((d) => [d.line, d.text]));
+  if (details.size === 0) return rows(all.slice(from).join("\n"));
+  // 没挂内容的相邻几行一起折：颜色可能跨行
+  const out: JobRow[] = [];
+  let plain: string[] = [];
+  const flush = () => {
+    if (plain.length) out.push(...rows(plain.join("\n")));
+    plain = [];
+  };
+  for (let i = from; i < all.length; i++) {
+    const detail = details.get(i);
+    if (detail === undefined) {
+      plain.push(all[i]!);
+      continue;
+    }
+    flush();
+    const on = open.has(i);
+    out.push(...rows(`${all[i]}${dim(on ? " ▾" : " ▸")}`, i));
+    if (on) out.push(...rows(detail.replace(/\s+$/, "").replace(/^/gm, "      "), i));
+  }
+  flush();
+  return out;
+}
+
 /**
- * 后台的事（ctrl+t）：列表里选一件，enter 看它的输出（跟着最新的，PgUp/PgDn 翻看），x 停掉，esc 返回、关掉。
- * 正在看的那件被去掉了（子 Agent 交了报告）时回到列表
+ * 后台的事（ctrl+t）：列表里选一件（或点它），enter 看它的输出（跟着最新的，PgUp/PgDn、滚轮翻看），
+ * 点带 ▸ 的行展开它挂着的内容，x 停掉，esc 返回、关掉。正在看的那件被去掉了（子 Agent 交了报告）时回到列表
  */
 function JobsDialog({ dialog, jobs }: { dialog: Extract<Dialog, { kind: "jobs" }>; jobs: JobInfo[] }) {
   const selection = useContext(SelectionContext);
@@ -2525,24 +2564,69 @@ function JobsDialog({ dialog, jobs }: { dialog: Extract<Dialog, { kind: "jobs" }
   const [getViewing, setViewing] = useLive<number | undefined>(undefined);
   /** 看输出时离底部翻上去了多少行 */
   const [getBack, setBack] = useLive(0);
+  /** 看输出时展开了的行（输出的第几行） */
+  const [getOpen, setOpen] = useLive<ReadonlySet<number>>(new Set());
   const { rows, columns } = useScreenSize();
   const width = Math.max(10, columns - 4);
   const viewing = jobs.find((j) => j.id === getViewing());
   const selected = Math.min(getSelected(), Math.max(0, jobs.length - 1));
   const room = Math.max(3, rows - 14);
   // 输出折好行，只显示末尾 room 行（往上翻了 back 行）
-  const lines = viewing ? wrap(viewing.output.replace(/\n+$/, "").split("\n").slice(-JOB_TAIL_LINES).join("\n"), width).map(visibleRow) : [];
+  const lines = viewing ? jobRows(viewing, width, getOpen()) : [];
   const maxBack = Math.max(0, lines.length - room);
   const back = Math.min(getBack(), maxBack);
-  const scrolling = useRef({ maxBack, room });
-  scrolling.current = { maxBack, room };
+  const shown = lines.slice(lines.length - room - back, lines.length - back);
+  const visible = roomFor(rows, VISIBLE);
+  const start = around(selected, jobs.length, visible);
+  // 点击时按这一帧画出来的样子换算是哪一行
+  const box = useRef<DOMElement>(null);
+  const drawn = useRef({ maxBack, room, lines, shown, width, start, visible });
+  drawn.current = { maxBack, room, lines, shown, width, start, visible };
+  const view = (id: number) => {
+    setBack(0);
+    setOpen(new Set());
+    setViewing(id);
+  };
   useInput((input, key) => {
     if (key.ctrl && input === "c" && selection.active()) return selection.clear();
     const current = jobs.find((j) => j.id === getViewing());
+    const mouse = mouseEvent(input);
+    if (mouse) {
+      const wheel = mouse.button === 64 ? 1 : mouse.button === 65 ? -1 : 0;
+      const click = mouse.button === 0 && mouse.press;
+      if (!wheel && !click) return;
+      const d = drawn.current;
+      // 框的上边框下面一行是标题，内容从再下一行开始
+      const row = box.current ? mouse.y - origin(box.current).y - 2 : -1;
+      if (current) {
+        if (wheel) return setBack(Math.max(0, Math.min(d.maxBack, Math.min(getBack(), d.maxBack) + wheel * WHEEL_LINES)));
+        const above = d.lines.length > d.room + Math.min(getBack(), d.maxBack) ? 1 : 0;
+        const line = d.shown[row - above]?.line;
+        if (line === undefined) return;
+        const open = new Set(getOpen());
+        if (!open.delete(line)) open.add(line);
+        // 点的那一行尽量留在原地：它下面多出（少了）几行，离底部就多（少）几行。
+        // 展开时下面放不下的话往上挪，让展开的内容露出来，但那一行不挪出顶上
+        const added = jobRows(current, d.width, open).length - d.lines.length;
+        const first = d.shown.findIndex((r) => r.line === line);
+        const below = d.shown.length - 1 - d.shown.findLastIndex((r) => r.line === line);
+        const up = added > 0 ? Math.min(first, Math.max(0, added - below)) : 0;
+        setOpen(open);
+        return setBack(Math.max(0, Math.min(getBack(), d.maxBack) + added - up));
+      }
+      const n = jobs.length;
+      if (wheel) return n && setSelected(Math.max(0, Math.min(n - 1, Math.min(getSelected(), n - 1) - wheel)));
+      const i = d.start + row - (d.start > 0 ? 1 : 0);
+      if (i >= d.start && i < Math.min(n, d.start + d.visible)) {
+        setSelected(i);
+        return view(jobs[i]!.id);
+      }
+      return;
+    }
     const target = current ?? jobs[Math.min(getSelected(), jobs.length - 1)];
     if (input === "x" && target && !target.done && target.stop) return target.stop();
     if (current) {
-      const { maxBack, room } = scrolling.current;
+      const { maxBack, room } = drawn.current;
       const by = (n: number) => setBack(Math.max(0, Math.min(maxBack, Math.min(getBack(), maxBack) + n)));
       if (key.pageUp) return by(room - 1);
       if (key.pageDown) return by(-(room - 1));
@@ -2557,33 +2641,31 @@ function JobsDialog({ dialog, jobs }: { dialog: Extract<Dialog, { kind: "jobs" }
     const n = jobs.length;
     if (key.upArrow || input === "k") return n && setSelected((Math.min(getSelected(), n - 1) - 1 + n) % n);
     if (key.downArrow || input === "j") return n && setSelected((Math.min(getSelected(), n - 1) + 1) % n);
-    if ((key.return || key.rightArrow) && target) {
-      setBack(0);
-      return setViewing(target.id);
-    }
+    if ((key.return || key.rightArrow) && target) return view(target.id);
     if (key.escape || (key.ctrl && input === "c")) return dialog.resolve(undefined);
   });
   const mark = (j: JobInfo) => (j.done ? h(Text, { dimColor: true }, "○ ") : h(Text, { color: "green" }, "● "));
   const canStop = (j: JobInfo | undefined) => j !== undefined && !j.done && j.stop !== undefined;
-  const frame = { flexDirection: "column", borderStyle: "round", borderColor: "cyan", paddingX: 1, marginTop: 1 } as const;
+  const frame = { ref: box, flexDirection: "column", borderStyle: "round", borderColor: "cyan", paddingX: 1, marginTop: 1 } as const;
   if (viewing) {
-    const shown = lines.slice(lines.length - room - back, lines.length - back);
+    const expandable = lines.some((l) => l.line !== undefined);
     return h(
       Box,
       frame,
       h(Text, { wrap: "truncate-end" }, mark(viewing), h(Text, { bold: true }, `${viewing.kind} · ${viewing.title}`), viewing.status ? h(Text, { dimColor: true }, ` · ${viewing.status}`) : null),
       lines.length > room + back ? h(Text, { dimColor: true }, ` ↑ ${lines.length - room - back} more lines`) : null,
       lines.length === 0 ? h(Text, { dimColor: true }, " (no output yet)") : null,
-      shown.map((l, i) => h(Text, { key: i, wrap: "truncate-end" }, l || " ")),
+      shown.map((l, i) => h(Text, { key: i, wrap: "truncate-end" }, l.text || " ")),
       back > 0 ? h(Text, { dimColor: true }, ` ↓ ${back} more lines`) : null,
       h(Hint, {
         width,
-        variants: [`PgUp/PgDn ↑↓ scroll${canStop(viewing) ? " · x stop" : ""} · esc back`, `↑↓${canStop(viewing) ? " · x" : ""} · esc`],
+        variants: [
+          `wheel PgUp/PgDn ↑↓ scroll${expandable ? " · click ▸ to expand" : ""}${canStop(viewing) ? " · x stop" : ""} · esc back`,
+          `↑↓${expandable ? " · click ▸" : ""}${canStop(viewing) ? " · x" : ""} · esc`,
+        ],
       }),
     );
   }
-  const visible = roomFor(rows, VISIBLE);
-  const start = around(selected, jobs.length, visible);
   return h(
     Box,
     frame,
@@ -2605,7 +2687,7 @@ function JobsDialog({ dialog, jobs }: { dialog: Extract<Dialog, { kind: "jobs" }
     h(Hint, {
       width,
       variants: jobs.length
-        ? [`↑↓ select · enter view output${canStop(jobs[selected]) ? " · x stop" : ""} · esc close`, `↑↓ · enter${canStop(jobs[selected]) ? " · x" : ""} · esc`]
+        ? [`↑↓ select · enter or click view output${canStop(jobs[selected]) ? " · x stop" : ""} · esc close`, `↑↓ · enter${canStop(jobs[selected]) ? " · x" : ""} · esc`]
         : ["esc close"],
     }),
   );

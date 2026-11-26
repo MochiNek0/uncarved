@@ -190,9 +190,13 @@ export function taskTool(opts: TaskOptions): Tool {
           }
         } else if (n.event.type === "tool.completed" && job) {
           const d = n.event.data as EventDataMap["tool.completed"];
-          const out = d.content.flatMap((b) => (b.kind === "text" ? [b.text] : [])).join("\n").trim().split("\n");
+          const full = d.content.flatMap((b) => (b.kind === "text" ? [b.text] : [])).join("\n").trim();
+          const out = full.split("\n");
           const more = out.length > 1 ? ` (+${out.length - 1} lines)` : "";
-          job.append([{ text: `  ⎿ ${clipText(out[0] ?? "", JOB_RESULT_CHARS)}${more}`, style: d.isError ? "error" : "dim" }, "\n"]);
+          const first = clipText(out[0] ?? "", JOB_RESULT_CHARS);
+          // 一行放不下的完整输出挂在这一行上，后台列表里点开看
+          const detail = first !== full ? { text: full, style: d.isError ? "error" : "dim" } as const : undefined;
+          job.append([{ text: `  ⎿ ${first}${more}`, style: d.isError ? "error" : "dim" }, "\n"], detail);
         }
       });
       const forward = () => child.abort(String(ctx.signal.reason ?? "aborted"));

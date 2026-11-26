@@ -76,15 +76,28 @@ describe("jade/task", () => {
   });
 
   test("a running sub-agent is listed in the frontend's background jobs with what it does, and removed when it reports", async () => {
-    const { shared, host, send } = await scriptedHost();
-    shared.script.push(use("u1", "task", { description: "look", prompt: "list the root" }), use("c1", "list_dir", { path: "." }), say("report: empty"), say("done"));
+    const { shared, host, send, cwd } = await scriptedHost();
+    await writeFile(path.join(cwd, "a.txt"), "a");
+    await writeFile(path.join(cwd, "b.txt"), "b");
+    shared.script.push(
+      use("u1", "task", { description: "look", prompt: "list the root" }),
+      use("c1", "list_dir", { path: "." }),
+      use("c2", "list_dir", { path: "missing-dir-x" }),
+      say("report: two files"),
+      say("done"),
+    );
     const s = await host.sessions.open();
     await send(s, "go");
     expect(shared.jobs).toHaveLength(1);
     const job = shared.jobs[0]!;
     expect(job).toMatchObject({ session: s.id, kind: "agent", title: "look", disposed: true });
     expect(job.output).toContain("● list_dir(");
-    expect(job.output).toContain("report: empty");
+    expect(job.output).toContain("report: two files");
+    // 工具结果只显示第一行；多出来的完整输出挂在那一行上，后台列表里点开看。一行就放得下的不挂
+    expect(job.output).toMatch(/⎿ .*\(\+1 lines\)/);
+    expect(job.details).toHaveLength(1);
+    expect(job.details[0]).toContain("a.txt");
+    expect(job.details[0]).toContain("b.txt");
     expect(job.statuses).toContain("thinking");
     expect(job.statuses.some((t) => t.startsWith("list_dir("))).toBe(true);
   });
