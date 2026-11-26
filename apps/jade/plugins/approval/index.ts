@@ -2,19 +2,21 @@
 // 关卡不等用户：所有关卡合并的结果是 ask 时（日志里的 tool.decided），内核停下来等人工审批，这里才经 ui@1 问用户，
 // 把回答作为 approval 输入交给会话。别的插件的关卡要问时也由这里问。谁回答的、选了什么记成 jade/approval/answered 事件。
 // auto 模式下规则判断不了、本来要问的调用让模型审一次（review.ts）：放行或拦下，拦下时模型用 ask_user 问用户；
+// 审查没做成（超时、出错）时直接问用户；放行过的 shell 命令按命令和它跑的脚本内容缓存，没变就不再审查。
 // 连续拦下几次、或者没有审查时（review: false）才由这里问。
 //
 // 没有这个插件（停用、坏掉、被隔离）时，核心的兜底关卡拒绝所有非只读工具（第 7 节），所以这里出错不会放行。
 // 用户选的"总是允许"记进日志（derived），恢复会话后仍然有效；选"在这个目录里总是允许"的记在
 // $JADE_HOME/state/approvals.json（按工作目录），以后在这个目录里开的会话都有效。模式是进程级的，来自配置，可以经 approval@1 改。
 
+import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { EventDataMap, GatedToolCall, Message } from "uncarved";
 import { definePlugin, type Caller, type SelectRequest, type Text, type UI } from "@uncarved/jade-api";
 import type { Answer, Approval, Approver, Models, Renderers } from "@uncarved/jade-api/services";
 import { describeRule, MODES, policy, type AllowRule, type Mode } from "./policy.ts";
-import { ASK_USER, reviewer, type Review } from "./review.ts";
+import { ASK_USER, commandFiles, commandOf, reviewer, type Review } from "./review.ts";
 
 const ANSWERS: readonly string[] = ["once", "always", "forever", "deny"] satisfies Answer[];
 /** 只有终端里有的一项：拒绝，并写一句话告诉模型该怎么做 */
@@ -105,7 +107,7 @@ export default definePlugin({
   },
 
   async session(ctx) {
-    const rules = policy({ cwd: ctx.cwd, readRoots, writeRoots, shell: (t) => ctx.session.tool(t)?.meta?.shell });
+    const rules = policy({ cwd: ctx.cwd, readRoots, writeRoots, secretRoots: [ctx.home], shell: (t) => ctx.session.tool(t)?.meta?.shell });
     const ui = ctx.service<UI>("ui@1");
     if (badMode !== undefined) {
       ui?.notify(`jade/approval: mode must be one of ${MODES.join(", ")}, got ${badMode}; using ask`, "warning");
@@ -143,19 +145,28 @@ export default definePlugin({
       if (sessionUserMessages.get(ctx.session.id) === userMessages) sessionUserMessages.delete(ctx.session.id);
       if (sessionAnswers.get(ctx.session.id) === answers) sessionAnswers.delete(ctx.session.id);
     });
-    const review = reviewing
-      ? reviewer({
-          models: models!,
-          cwd: ctx.cwd,
-          writeRoots: () => writeRoots,
-          messages: () => recent.messages,
-          ...(parentId !== undefined ? { userMessages } : {}),
-          answers,
-          meta: (t) => ctx.session.tool(t)?.meta,
-        })
-      : undefined;
+    const reviewOptions = {
+      cwd: ctx.cwd,
+      writeRoots: () => writeRoots,
+      messages: () => recent.messages,
+      meta: (t: string) => ctx.session.tool(t)?.meta,
+    };
+    const review = reviewing ? reviewer({ ...reviewOptions, models: models!, ...(parentId !== undefined ? { userMessages } : {}), answers }) : undefined;
     /** 本会话里审查过一次、放行了的调用 */
     const reviewedCalls = new Set<string>();
+    /**
+     * 审查要看的文件（shell 命令）和放行后的缓存键。带 URL 的只读调用按完整的输入记；
+     * shell 命令按完整的输入加上它跑的脚本的内容记：同一条 pnpm run build、没改过的临时脚本不再审查，脚本改了就重审
+     */
+    const reviewKey = async (call: GatedToolCall): Promise<{ key?: string; files?: string[] }> => {
+      const url = reviewedKey(call);
+      if (url !== undefined) return { key: url };
+      const command = commandOf(call, reviewOptions.meta);
+      if (command === undefined) return {};
+      const files = await commandFiles(reviewOptions, command);
+      const digest = createHash("sha256").update(files.join("\0")).digest("hex");
+      return { key: `${call.name} ${JSON.stringify(call.input)} ${digest}`, files };
+    };
     /** auto 模式里审查连续拦下、累计拦下的次数（审查失败不算）；到了上限这一次转回问用户，免得模型不问、一直被拦在原地 */
     let blocksInARow = 0;
     let blocksTotal = 0;
@@ -214,9 +225,9 @@ export default definePlugin({
         if (readOnlySessions.has(id) && call.tool.effect !== "read") {
           if (check(call)) return { decision: "allow" };
           if (!review || mode !== "auto") return { decision: "deny", reason: READ_ONLY(call.name) };
-          const key = reviewedKey(call);
+          const { key, files } = await reviewKey(call);
           if (key !== undefined && reviewedCalls.has(key)) return { decision: "allow", reason: "This exact call was already approved in this session." };
-          const verdict: Review = await review(call, hook.signal, { readOnly: true });
+          const verdict: Review = await review(call, hook.signal, { readOnly: true, ...(files ? { files } : {}) });
           if (verdict.usage) await hook.emit("reviewed", { toolUseId: call.toolUseId, usage: verdict.usage });
           if (verdict.decision === "allow") {
             if (key !== undefined) reviewedCalls.add(key);
@@ -231,9 +242,9 @@ export default definePlugin({
         // 连续拦下 BLOCKS_IN_A_ROW 次或累计 BLOCKS_TOTAL 次时，这一次转回问用户
         let why: string | undefined;
         if (review && mode === "auto") {
-          const key = reviewedKey(call);
+          const { key, files } = await reviewKey(call);
           if (key !== undefined && reviewedCalls.has(key)) return { decision: "allow", reason: "This exact call was already approved in this session." };
-          const verdict: Review = await review(call, hook.signal);
+          const verdict: Review = await review(call, hook.signal, files ? { files } : undefined);
           // 审查调用不经过 model.responded，用量只能记在这里，界面据此计入会话用量
           if (verdict.usage) await hook.emit("reviewed", { toolUseId: call.toolUseId, usage: verdict.usage });
           if (verdict.decision === "allow") {
@@ -241,14 +252,19 @@ export default definePlugin({
             if (key !== undefined) reviewedCalls.add(key);
             return { decision: "allow", reason: verdict.reason };
           }
-          if (verdict.failed) return { decision: "deny", reason: blocked(call.name, verdict, "reply") };
-          blocksInARow++;
-          blocksTotal++;
-          if (!canAsk() || (blocksInARow < BLOCKS_IN_A_ROW && blocksTotal < BLOCKS_TOTAL))
-            return { decision: "deny", reason: blocked(call.name, verdict, parentId !== undefined ? "report" : ctx.session.tool(ASK_USER) !== undefined ? "ask_user" : "reply") };
-          blocksInARow = 0;
-          blocksTotal = 0;
-          why = `Auto mode has blocked several actions, so it asks you this time. The review's reason: ${verdict.reason ?? "none given"}`;
+          if (verdict.failed) {
+            // 审查没做成（超时、出错、答非所问）不是判断有风险：能问就直接问用户，免得模型重试、再等一轮审查
+            if (!canAsk()) return { decision: "deny", reason: blocked(call.name, verdict, "reply") };
+            why = `${verdict.reason ?? "The automatic review failed."} So auto mode asks you this time.`;
+          } else {
+            blocksInARow++;
+            blocksTotal++;
+            if (!canAsk() || (blocksInARow < BLOCKS_IN_A_ROW && blocksTotal < BLOCKS_TOTAL))
+              return { decision: "deny", reason: blocked(call.name, verdict, parentId !== undefined ? "report" : ctx.session.tool(ASK_USER) !== undefined ? "ask_user" : "reply") };
+            blocksInARow = 0;
+            blocksTotal = 0;
+            why = `Auto mode has blocked several actions, so it asks you this time. The review's reason: ${verdict.reason ?? "none given"}`;
+          }
         }
         if (!canAsk()) {
           if (!warned) {

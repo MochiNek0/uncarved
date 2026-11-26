@@ -214,8 +214,22 @@ describe("auto-mode review", () => {
     expect(await readFile(outside, "utf8")).toBe("hi");
   });
 
-  test("a failed review blocks the call and tells the model it may retry", async () => {
+  test("a failed review asks the user right away, saying why", async () => {
     const { home, host, shared, send } = await scriptedHost({ config: AUTO });
+    const outside = path.join(home, "outside.txt");
+    shared.script.push(use("u1", "write_file", { path: outside, content: "hi" }), { error: "boom" }, say("done"));
+    shared.answers.push("once");
+    const s = await host.sessions.open();
+    await send(s, "write it");
+
+    expect(shared.asked).toEqual(["Allow write_file?"]);
+    expect(shared.dialogs[0]!.detail).toContain("The automatic review failed: boom");
+    expect(await readFile(outside, "utf8")).toBe("hi");
+  });
+
+  test("a failed review blocks the call and tells the model it may retry when nobody can be asked", async () => {
+    const { home, host, shared, send } = await scriptedHost({ config: AUTO });
+    shared.interactive = false;
     const outside = path.join(home, "outside.txt");
     shared.script.push(use("u1", "write_file", { path: outside, content: "hi" }), { error: "boom" }, say("done"));
     const s = await host.sessions.open();
@@ -226,6 +240,34 @@ describe("auto-mode review", () => {
     const result = JSON.stringify(shared.requests[2]!.messages.at(-1)!.content);
     expect(result).toContain("The automatic review failed: boom");
     expect(result).toContain("You may try it once more");
+  });
+
+  test("an allowed command is not reviewed again until the script it runs changes; the review sees project scripts and package.json scripts", async () => {
+    const { cwd, host, shared, send } = await scriptedHost({ config: AUTO });
+    await writeFile(path.join(cwd, "package.json"), JSON.stringify({ scripts: { build: "node wrap.cjs" } }));
+    await writeFile(path.join(cwd, "wrap.cjs"), "console.log('wrapped v1')\n");
+    const allow = say('{"decision": "allow", "reason": "the project build"}');
+    shared.script.push(
+      use("u1", "bash", { command: "pnpm run build" }),
+      allow,
+      use("u2", "bash", { command: "pnpm run build" }),
+      // 第二次没有审查：直接是下一个模型回复。改了脚本之后再跑要重审
+      use("r3", "read_file", { path: path.join(cwd, "wrap.cjs") }),
+      use("u3", "write_file", { path: path.join(cwd, "wrap.cjs"), content: "console.log('wrapped v2')\n" }),
+      use("u4", "bash", { command: "pnpm run build" }),
+      allow,
+      say("done"),
+    );
+    const s = await host.sessions.open();
+    await send(s, "build it");
+
+    const reviews = shared.requests.filter((r) => r.system[0]!.text.includes("You review actions"));
+    expect(reviews.length).toBe(2);
+    const first = (reviews[0]!.messages[0]!.content[0] as { text: string }).text;
+    expect(first).toContain('"build": "node wrap.cjs"');
+    expect(first).toContain("wrapped v1");
+    expect((reviews[1]!.messages[0]!.content[0] as { text: string }).text).toContain("wrapped v2");
+    expect(shared.asked).toEqual([]);
   });
 
   test("review: false in the config skips the model and asks directly", async () => {

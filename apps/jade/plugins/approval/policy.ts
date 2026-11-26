@@ -5,6 +5,7 @@
 // 指向本机的 URL（localhost 上的开发服务器，截图最常见的用途）不问：数据不会离开这台机器。
 
 import { realpathSync, statSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import type { GatedToolCall, GateResult } from "uncarved";
 import type { ApprovalMode } from "@uncarved/jade-api/services";
@@ -52,7 +53,30 @@ export interface PolicyOptions {
   writeRoots?: string[];
   /** 执行 shell 命令的工具把命令放在输入的哪个字段（工具的 meta.shell，例如 bash 的 command）；别的工具返回 undefined */
   shell(tool: string): string | undefined;
+  /** auto 模式下读工作目录之外时也要审查的目录（例如 $JADE_HOME：里面有 .env 和会话日志） */
+  secretRoots?: readonly string[];
+  /** 用户的主目录，默认 os.homedir()；测试用 */
+  homeDir?: string;
 }
+
+/** 放着凭据、密钥的目录名：路径里有这一段就算敏感 */
+const SECRET_SEGMENTS = new Set([".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker", ".password-store", ".claude", ".codex", ".gemini", ".jade"]);
+/** 路径里有这一截就算敏感（小写、正斜杠）：gh / gcloud 的登录信息、浏览器的配置目录、系统的凭据库 */
+const SECRET_PARTS = [
+  "/.config/gh/",
+  "/.config/gcloud/",
+  "/user data/",
+  "/firefox/profiles/",
+  "/microsoft/credentials/",
+  "/microsoft/protect/",
+  "/library/keychains/",
+  "/library/cookies/",
+];
+/** 文件名像凭据、密钥的 */
+const SECRET_NAME =
+  /^\.env(\..*)?$|^\.(npmrc|pypirc|netrc|git-credentials|pgpass|htpasswd|yarnrc\.yml)$|^auth\.json$|\.(pem|key|p12|pfx|jks|keystore|kdbx|ovpn|tfstate)$|^id_[a-z0-9]+(\.pub)?$|(^|[._-])(secrets?|credentials?|tokens?|passwords?|cookies)([._-]|$)|^login data$/i;
+/** 主目录下这些目录整个读（grep -r、ls -R）会扫到浏览器配置、凭据库：目录本身算敏感，里面具体的路径照常判断 */
+const BROAD_HOME_DIRS = ["AppData", "AppData/Local", "AppData/Roaming", "Library", "Library/Application Support", ".config"];
 
 export interface Policy {
   /** 给"总是允许"一个默认规则：bash 取命令的前两个词，工作目录之外的路径取所在目录，URL 取主机，其他取工具名 */
@@ -510,6 +534,35 @@ export function policy(opts: PolicyOptions): Policy {
     const target = real(path.resolve(opts.cwd, p));
     return contains(realBase(opts.cwd), target) || (opts.writeRoots ?? []).some((r) => contains(realBase(r), target));
   };
+  const homeDir = opts.homeDir ?? os.homedir();
+  /**
+   * auto 模式下读工作目录之外仍要审查的路径：凭据、密钥、浏览器数据、$JADE_HOME，以及包含整个主目录的目录
+   * （在它上面 grep -r 会扫到上面这些）。其余只读不问：读装好的依赖、别的项目的源码是排查问题的常事，
+   * 每次都审查又慢又占模型的限流额度
+   */
+  const secret = (p: string) => {
+    const target = real(path.resolve(opts.cwd, p));
+    const home = realBase(homeDir);
+    if (contains(target, home)) return true;
+    if (BROAD_HOME_DIRS.some((d) => path.relative(realBase(path.join(homeDir, d)), target) === "")) return true;
+    if ((opts.secretRoots ?? []).some((r) => contains(realBase(r), target))) return true;
+    const norm = `${target.replace(/\\/g, "/").toLowerCase()}/`;
+    if (norm.split("/").some((seg) => SECRET_SEGMENTS.has(seg))) return true;
+    if (SECRET_PARTS.some((part) => norm.includes(part))) return true;
+    return SECRET_NAME.test(path.basename(target));
+  };
+  /** 命令参数里的路径（相对 base），~ 开头的按主目录展开；~user 这类说不清的返回 undefined */
+  const argPath = (base: string, v: string): string | undefined => {
+    if (v === "~" || v.startsWith("~/")) return path.join(homeDir, v.slice(1));
+    if (v.startsWith("~")) return undefined;
+    return path.resolve(base, nativePath(v));
+  };
+  /** auto 模式下只读命令可以不问就读的外部路径：不是通配、不敏感 */
+  const readableOutside = (base: string, v: string, glob: boolean) => {
+    if (glob) return false;
+    const p = argPath(base, v);
+    return p !== undefined && !secret(p);
+  };
   /** glob 的 pattern 是绝对路径或含 ".." 段时，匹配范围会超出 path */
   const globEscapes = (pattern: string) => path.isAbsolute(pattern) || pattern.split(/[\\/]/).includes("..");
   /** 以 "." 或 "[" 开头的通配段可能匹配到 ".."（取决于 bash 版本和选项），按越界处理 */
@@ -520,7 +573,7 @@ export function policy(opts: PolicyOptions): Policy {
   /**
    * 命令参数里有指向工作目录之外的路径。选项也要看：--opt=path 的值，以及粘在短选项后面的值（-f/etc/x）
    */
-  const argsOutside = (base: string, words: Word[]) => {
+  const argsOutside = (base: string, words: Word[], readable?: (base: string, v: string, glob: boolean) => boolean) => {
     const skip = notPaths(words.map((w) => w.value));
     return words.slice(1).some((w, i) => {
       if (skip.has(i + 1)) return false;
@@ -528,18 +581,19 @@ export function policy(opts: PolicyOptions): Policy {
       const candidates = !v.startsWith("-")
         ? [v]
         : [v.includes("=") ? v.slice(v.indexOf("=") + 1) : "", !v.startsWith("--") && v.length > 2 ? v.slice(2) : ""];
-      return candidates.some((c) => c !== "" && pathOutside(base, c, w.glob));
+      return candidates.some((c) => c !== "" && pathOutside(base, c, w.glob) && !readable?.(base, c, w.glob));
     });
   };
   /**
    * 判断一条 bash 命令能不能不问就执行。复合命令（&& || | ;）要求每条简单命令都满足：
    * 只读命令；edits 时还可以是建目录、碰文件的命令；ruled 时还可以是"总是允许"的规则覆盖的命令。
+   * reads 时只读命令读工作目录之外不敏感的路径（见 secret）也算在里面。
    * 输出重定向只能是 /dev/null。cd 到工作目录里的目录后，后面的相对路径按新目录算。
    * 返回 inside（可以放行）、outside（认识，但碰到了工作目录之外的路径，先问）、undefined（不认识）
    */
   const classifyBash = (
     command: string,
-    { edits, ruled }: { edits: boolean; ruled?: (words: Word[]) => boolean },
+    { edits, reads, ruled }: { edits: boolean; reads?: boolean; ruled?: (words: Word[]) => boolean },
   ): "inside" | "outside" | undefined => {
     const cmds = shellCommands(command);
     if (!cmds) return undefined;
@@ -547,7 +601,8 @@ export function policy(opts: PolicyOptions): Policy {
     let outside = false;
     for (const c of cmds) {
       if (!quietOutputs(c) || c.words[0]!.glob) return undefined;
-      if (c.inputs.some((w) => w.value !== "/dev/null" && pathOutside(base, w.value, w.glob))) outside = true;
+      // 输入重定向只读
+      if (c.inputs.some((w) => w.value !== "/dev/null" && pathOutside(base, w.value, w.glob) && !(reads && readableOutside(base, w.value, w.glob)))) outside = true;
       if (c.words[0]!.value === "cd") {
         const target = c.words[1];
         // 不带参数的 cd 回到 home；cd 到外面以后，后面的相对路径都说不清了
@@ -559,7 +614,7 @@ export function policy(opts: PolicyOptions): Policy {
       if (ruled?.(c.words)) continue;
       const kind = commandKind(c.words.map((w) => w.value));
       if (!kind || (kind === "edit" && !edits)) return undefined;
-      if (argsOutside(base, c.words)) outside = true;
+      if (argsOutside(base, c.words, reads && kind === "read" ? readableOutside : undefined)) outside = true;
     }
     return outside ? "outside" : "inside";
   };
@@ -631,6 +686,15 @@ export function policy(opts: PolicyOptions): Policy {
           !outside ||
           (typeof input.path === "string" && call.name !== "glob" && (opts.readRoots ?? []).some((r) => within(r, input.path!)));
         if (mode === "yolo" || ruled || (readable && !network)) return { decision: "allow" };
+        // auto：读工作目录之外也不问；网络请求、敏感路径、越界的 glob 仍交给审查
+        if (
+          mode === "auto" &&
+          !network &&
+          typeof input.path === "string" &&
+          !(call.name === "glob" && globEscapes(input.pattern ?? "")) &&
+          !secret(input.path)
+        )
+          return { decision: "allow" };
         return { decision: "ask" };
       }
       // plan：和 readonly 一样不改任何东西，只是拒绝的理由告诉模型先给出计划
@@ -649,7 +713,7 @@ export function policy(opts: PolicyOptions): Policy {
       if (mode === "yolo" || ruled) return { decision: "allow" };
       if (tool.effect === "write") return { decision: mode === "auto" && !outside ? "allow" : "ask" };
       // external
-      const gate = isShell ? bashGate(classifyBash(command, { edits: mode === "auto", ruled: ruledWords })) : undefined;
+      const gate = isShell ? bashGate(classifyBash(command, { edits: mode === "auto", reads: mode === "auto", ruled: ruledWords })) : undefined;
       return gate ?? { decision: "ask" };
     },
   };

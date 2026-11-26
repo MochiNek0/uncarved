@@ -83,6 +83,41 @@ describe("policy", () => {
     expect(d("auto", "write_file", { path: path.join(root, "notes.md"), content: "" })).toBe("ask");
   });
 
+  test("auto mode reads outside the working directory without asking, except secrets, the home directory itself and escaping globs", () => {
+    const home = path.resolve("/home/me");
+    const jadeHome = path.resolve("/jadehome");
+    const p = policy({ shell, cwd, homeDir: home, secretRoots: [jadeHome] });
+    const d = (mode: Mode, name: string, input: unknown) => p.decide(gated(name, input), { mode, rules: [] }).decision;
+    const dep = path.resolve("/opt/node/node_modules/@scope/pkg/src/index.ts");
+    expect(d("auto", "read_file", { path: dep })).toBe("allow");
+    expect(d("ask", "read_file", { path: dep })).toBe("ask");
+    expect(d("auto", "grep", { pattern: "x", path: path.dirname(dep) })).toBe("allow");
+    expect(d("auto", "read_file", { path: path.join(home, "other-project", "src", "tokenizer.ts") })).toBe("allow");
+    // 凭据、密钥、浏览器数据、$JADE_HOME、主目录本身
+    for (const secret of [
+      path.join(home, ".ssh", "config"),
+      path.join(home, "proj", ".env.local"),
+      path.join(home, ".npmrc"),
+      path.join(home, "certs", "server.pem"),
+      path.join(home, "AppData", "Local", "Google", "Chrome", "User Data", "Default", "Bookmarks"),
+      path.join(home, "app", "credentials.json"),
+      path.join(jadeHome, "sessions", "x.jsonl"),
+      home,
+      path.join(home, "AppData"),
+      path.resolve("/"),
+    ])
+      expect([secret, d("auto", "read_file", { path: secret })]).toEqual([secret, "ask"]);
+    expect(d("auto", "glob", { path: cwd, pattern: "../**/*" })).toBe("ask");
+    // 只读命令同样；改东西的、碰到敏感路径的、通配的仍然问
+    expect(d("auto", "bash", { command: `cat "${dep}" | head -20` })).toBe("allow");
+    expect(d("auto", "bash", { command: `ls -la "${path.dirname(dep)}" && grep -n foo "${dep}"` })).toBe("allow");
+    expect(d("auto", "bash", { command: `cat "${path.join(home, ".ssh", "id_ed25519")}"` })).toBe("ask");
+    expect(d("auto", "bash", { command: "cat ~/.aws/credentials" })).toBe("ask");
+    expect(d("auto", "bash", { command: `ls "${path.dirname(dep)}"/*` })).toBe("ask");
+    expect(d("auto", "bash", { command: `touch "${dep}"` })).toBe("ask");
+    expect(d("readonly", "bash", { command: `cat "${dep}"` })).toBe("ask");
+  });
+
   // 会话的临时目录（jade/scratch 经 allowWrite 传入）：和工作目录同样对待
   test("files under a write root are treated like the working directory", () => {
     const root = path.resolve("/scratch/s1");
