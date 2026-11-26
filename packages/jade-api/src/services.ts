@@ -216,9 +216,10 @@ export interface Approval {
   allows(session: string, call: GatedToolCall): boolean;
   /**
    * 会话 session（例如只读的子 Agent）只能做不改东西的事：allows 不放行的非只读调用，auto 模式下由审查按"只读"的标准判断，
-   * 其他模式和审查关掉时拒绝。返回撤销函数
+   * 其他模式和审查关掉时拒绝。返回撤销函数。
+   * 可选：approval@1 的提供者没有实现它时，调用方自己守只读（例如 jade/task 只放行 allows 认定为只读的调用）
    */
-  readOnly(session: string): () => void;
+  readOnly?(session: string): () => void;
 }
 
 /** 审批的回答：允许一次、本会话里总是允许、在这个工作目录里以后都允许、拒绝 */

@@ -13,6 +13,8 @@ const MAX_DETAIL_LINES = 40;
 
 /** task 开的、还在跑的子会话 → 它的运行状态（子会话里本插件的 hook 用） */
 const controls = new Map<string, Control>();
+/** 只读的子会话里，经 approval@1.readOnly 交给审批插件判断非只读调用的那些；不在这里的由本插件的关卡守 */
+const delegated = new Set<string>();
 
 export default definePlugin({
   process(ctx) {
@@ -94,16 +96,20 @@ export default definePlugin({
             label: description,
             system,
             ...(provider ? { provider } : {}),
-            // 只读时：只读的工具，加上 bash 这类按命令判断的（只放行审批规则认定为只读的命令，见 childHooks）。
+            // 只读时：只读的工具，加上 bash 这类按命令判断的（只放行只读的调用，由谁判断见 register、childHooks）。
             // 子 Agent 不能问用户问题（ask_user）：它的过程用户看不到，问了也没有上下文
             tools: (t) => t.name !== "ask_user" && (write || t.effect === "read" || t.meta?.shell !== undefined),
           }),
         register: (child, control) => {
           controls.set(child, control);
-          // 只读的子 Agent：jade/approval 判断它的非只读调用（auto 模式下交给审查按只读的标准判断），见 childHooks
-          const release = write ? undefined : ctx.service<Approval>("approval@1")?.readOnly(child);
+          // 只读的子 Agent：审批插件实现了 readOnly 时由它判断非只读调用（jade/approval 在 auto 模式下交给审查按只读的标准判断），
+          // 没实现时由 childHooks 的关卡只放行 allows 认定为只读的调用
+          const approval = write ? undefined : ctx.service<Approval>("approval@1");
+          const release = approval?.readOnly?.(child);
+          if (release) delegated.add(child);
           return () => {
             controls.delete(child);
+            delegated.delete(child);
             release?.();
           };
         },
@@ -150,15 +156,17 @@ function childHooks(ctx: SessionContext, control: () => Control | undefined, win
     point: "context.project",
     fn: (messages) => (control()?.wrapUp ? fitToolResults(messages, window() * REPORT_TOOL_SHARE * CHARS_PER_TOKEN, ctx.plugin) : messages),
   });
-  // 只读的子 Agent：不是只读的工具（bash）由 jade/approval 判断（登记见 register）：审批规则认定为只读的（git log、ls、rg……）放行，
-  // 其余的 auto 模式下交给审查按只读的标准判断，其他模式直接拒绝。没有 jade/approval 时这里直接拒绝
+  // 只读的子 Agent：不是只读的工具（bash）经 approval@1.readOnly 登记过的（见 register）由审批插件判断：
+  // jade/approval 放行规则认定为只读的（git log、ls、rg……），其余的 auto 模式下交给审查按只读的标准判断，其他模式拒绝。
+  // 审批插件没实现 readOnly 时这里只放行 allows 认定为只读的调用；没有审批插件时直接拒绝
   ctx.kernel.hook({
     kind: "gate",
     point: "tool.gate",
     fn: (call) => {
       const c = control();
       if (!c || c.write || call.tool.effect === "read") return { decision: "abstain" };
-      if (ctx.service<Approval>("approval@1")) return { decision: "abstain" };
+      if (delegated.has(ctx.session.id)) return { decision: "abstain" };
+      if (ctx.service<Approval>("approval@1")?.allows(ctx.session.id, call)) return { decision: "abstain" };
       return { decision: "deny", reason: READ_ONLY_REASON(call.name) };
     },
   });

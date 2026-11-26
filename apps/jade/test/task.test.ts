@@ -397,6 +397,39 @@ report: a.txt is x`);
     expect(existsSync(path.join(cwd, "a.txt"))).toBe(true);
   }, 30_000);
 
+  test("with an approval plugin that has no readOnly, the sub-agent still runs only what allows calls read-only", async () => {
+    // 代替 jade/approval 的审批插件：只有 allows（只认 cat），没有 readOnly；它的关卡什么都放行
+    const approval = `export default {
+  process(ctx) {
+    ctx.provide("approval@1", {
+      mode: () => "yolo", setMode() {}, allowRead: () => () => {}, allowWrite: () => () => {}, addApprover: () => () => {},
+      allows: (_s, call) => typeof call.input?.command === "string" && call.input.command.startsWith("cat "),
+    });
+  },
+  session(ctx) { ctx.kernel.hook({ kind: "gate", point: "tool.gate", fn: () => ({ decision: "allow" }) }); },
+};`;
+    const { cwd, host, shared, send } = await scriptedHost({
+      files: {
+        "plugins/lite-approval/plugin.json": JSON.stringify({ id: "test/lite-approval", version: "1.0.0", api: "^1", entry: "index.mjs", provides: ["approval@1"], replaces: ["jade/approval"] }),
+        "plugins/lite-approval/index.mjs": approval,
+      },
+    });
+    await writeFile(path.join(cwd, "a.txt"), "hello\n");
+    shared.script.push(
+      use("u1", "task", { description: "look", prompt: "look around" }),
+      use("c1", "bash", { command: "cat a.txt" }),
+      use("c2", "bash", { command: "rm a.txt" }),
+      say("report"),
+      say("done"),
+    );
+    const s = await host.sessions.open();
+    await send(s, "go");
+    expect(textOf(shared.requests[2]!.messages.at(-1)!.content)).toContain("hello");
+    expect(textOf(shared.requests[3]!.messages.at(-1)!.content)).toContain("sub-agents can only run read-only commands");
+    expect(existsSync(path.join(cwd, "a.txt"))).toBe(true);
+    expect(textOf(shared.requests[4]!.messages.at(-1)!.content)).toBe("report");
+  }, 30_000);
+
   test("with write: true the sub-agent gets every tool, and its changes go through approval", async () => {
     const { cwd, host, shared, send } = await scriptedHost({ config: { ...ASK, "jade/task": { write: true } } });
     shared.script.push(
