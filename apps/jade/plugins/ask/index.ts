@@ -154,6 +154,34 @@ export default definePlugin({
   },
   session(ctx) {
     const ui = ctx.require<UI>("ui@1");
-    if (ui.interactive) ctx.kernel.tool(askUserTool(askVia(ui)));
+    if (!ui.interactive) return;
+    // 用户的回答另外记成 jade/ask/answered 事件（来源是本插件，模型伪造不了），
+    // 别的插件（auto 模式的审查）要认用户的回答时读它，不去解析工具结果里模型写的问题和回答混在一起的文本。
+    // 工具执行时拿不到 emit，先按 toolUseId 存着，在 tool.after 里写（tool.completed 之前）
+    // ask_user 是 exclusive 的，一个会话里不会同时有两个在问，所以记下最近一次的回答就够了
+    const answers = new Map<string, string[]>();
+    const viaUi = askVia(ui);
+    let last: string[] | undefined;
+    const tool = askUserTool(async (questions, signal) => (last = await viaUi(questions, signal)));
+    ctx.kernel.tool({
+      ...tool,
+      async execute(input, tctx) {
+        last = undefined;
+        const r = await tool.execute(input, tctx);
+        if (last && !r.isError) answers.set(tctx.toolUseId, last);
+        return r;
+      },
+    });
+    ctx.kernel.hook({
+      kind: "transform",
+      point: "tool.after",
+      fn: async (out, hook) => {
+        const got = answers.get(out.call.toolUseId);
+        if (got === undefined) return out;
+        answers.delete(out.call.toolUseId);
+        await hook.emit("answered", { toolUseId: out.call.toolUseId, answers: got });
+        return out;
+      },
+    });
   },
 });

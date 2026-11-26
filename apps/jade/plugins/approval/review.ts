@@ -29,6 +29,8 @@ export interface ReviewOptions {
    * 只有主 Agent 写的任务（当前会话的第一条消息，作为 <task> 给审查参考）
    */
   userMessages?: () => readonly Message[];
+  /** jade/ask 记下的用户回答：ask_user 的 toolUseId → 每个问题的回答（子 Agent 用主会话的） */
+  answers?: () => ReadonlyMap<string, readonly string[]>;
   /** 工具的 meta（ctx.session.tool）：哪些调用写了文件、命令在哪个字段 */
   meta: (tool: string) => ToolMeta | undefined;
   /** 审查最多等多久，默认 60 秒；超时后拦下 */
@@ -73,22 +75,37 @@ function textOf(m: Message, by: "user" | "model"): string {
 /** jade/ask 的工具：拦下的操作由模型用它问用户，用户的回答算用户的话 */
 export const ASK_USER = "ask_user";
 
-/** 消息里 ask_user 的回答（"Q: … A: …"，问题是模型写的，回答是用户选的或输入的） */
-function answersIn(m: Message, asks: ReadonlySet<string>): string {
+/**
+ * 消息里 ask_user 的问答。回答只取 jade/ask 记下的 answered 事件（answers），不取工具结果的文本：
+ * 那段 "Q: … A: …" 里的问题是模型写的，可以在问题里伪造一段回答。问题仍是模型写的，每条用 JSON 写出，
+ * 问题里的换行、引号伪造不出另一条回答
+ */
+function answersIn(m: Message, asked: ReadonlyMap<string, readonly string[]>, answers: ReadonlyMap<string, readonly string[]>): string {
   return m.content
-    .flatMap((b) => (b.kind === "tool_result" && !b.isError && asks.has(b.toolUseId) ? b.content.flatMap((c) => (c.kind === "text" ? [c.text.trim()] : [])) : []))
-    .filter(Boolean)
+    .flatMap((b) => {
+      if (b.kind !== "tool_result" || b.isError) return [];
+      const qs = asked.get(b.toolUseId);
+      const as = answers.get(b.toolUseId);
+      if (!qs || !as) return [];
+      return as.map((a, i) => JSON.stringify({ agent_asked: qs[i] ?? "", user_answered: a }));
+    })
     .join("\n");
 }
 
+/** ask_user 调用里的问题（模型写的） */
+function questionsOf(input: unknown): string[] {
+  const qs = (input as { questions?: unknown } | null)?.questions;
+  return Array.isArray(qs) ? qs.map((q) => String((q as { question?: unknown } | null)?.question ?? "")) : [];
+}
+
 /** 审查看到的上下文：用户最近的请求和对 ask_user 的回答（可信）、模型调用之前说了什么（不可信，只作参考） */
-function context(messages: readonly Message[], userMessages: readonly Message[]): { user: string[]; agent: string } {
-  const asks = new Set(userMessages.flatMap((m) => m.content.flatMap((b) => (b.kind === "tool_use" && b.name === ASK_USER ? [b.id] : []))));
+function context(messages: readonly Message[], userMessages: readonly Message[], answered: ReadonlyMap<string, readonly string[]>): { user: string[]; agent: string } {
+  const asked = new Map(userMessages.flatMap((m) => m.content.flatMap((b) => (b.kind === "tool_use" && b.name === ASK_USER ? [[b.id, questionsOf(b.input)] as const] : []))));
   const user: string[] = [];
   for (let i = userMessages.length - 1; i >= 0 && user.length < USER_MESSAGES; i--) {
     const m = userMessages[i]!;
     if (m.role !== "user") continue;
-    const answers = answersIn(m, asks);
+    const answers = answersIn(m, asked, answered);
     const text = [textOf(m, "user"), answers && `The user answered the agent's question (ask_user):\n${answers}`].filter(Boolean).join("\n");
     if (text) user.unshift(clip(text, 2000));
   }
@@ -145,7 +162,7 @@ function reasonOf(err: unknown): string {
 export function reviewer(opts: ReviewOptions): (call: GatedToolCall, signal: AbortSignal) => Promise<Review> {
   return async (call, signal) => {
     const messages = opts.messages();
-    const { user, agent } = context(messages, opts.userMessages?.() ?? messages);
+    const { user, agent } = context(messages, opts.userMessages?.() ?? messages, opts.answers?.() ?? new Map());
     // 子 Agent 的任务：子会话的第一条消息（主 Agent 写的，来源不是用户）
     const first = opts.userMessages ? messages.find((m) => m.role === "user") : undefined;
     const task = first ? clip(first.content.flatMap((b) => (b.kind === "text" ? [b.text.trim()] : [])).join("\n"), 2000) : "";

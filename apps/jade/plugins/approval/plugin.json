@@ -16,7 +16,7 @@
     },
     "review": {
       "default": true,
-      "description": "in auto mode, let the model review the calls the rules cannot decide (it can only allow or pass them to you); false turns the review off"
+      "description": "in auto mode, let the model review the calls the rules cannot decide: it allows them or blocks them and tells the agent to ask you first; false turns the review off, and those calls ask you instead"
     }
   }
 }

@@ -32,6 +32,8 @@ const MAX_DETAIL_CHARS = 2000;
 /** auto 模式的审查连续拦下几次、一个会话里累计拦下几次后，转回问用户一次（同 Claude Code 的 auto 模式） */
 const BLOCKS_IN_A_ROW = 3;
 const BLOCKS_TOTAL = 20;
+/** jade/ask 记下用户回答的事件 */
+const ASK_ANSWERED = "jade/ask/answered";
 /** 等工具的审批预览的时限，过了就用默认的 detail */
 const PREVIEW_TIMEOUT_MS = 5000;
 
@@ -63,6 +65,8 @@ const sessionChecks = new Map<string, (call: GatedToolCall) => boolean>();
 const sessionRules = new Map<string, () => AllowRule[]>();
 /** 会话 id → 用户的请求在哪些消息里：主会话是它自己的，子会话沿用父会话的（一直到主会话），auto 模式的审查用 */
 const sessionUserMessages = new Map<string, () => readonly Message[]>();
+/** 会话 id → jade/ask 记下的用户回答（ask_user 的 toolUseId → 回答）：子会话沿用父会话的，同 sessionUserMessages */
+const sessionAnswers = new Map<string, () => ReadonlyMap<string, readonly string[]>>();
 
 export default definePlugin({
   process(ctx) {
@@ -125,8 +129,13 @@ export default definePlugin({
     const parentId = ctx.session.parent?.sessionId;
     const userMessages = parentId === undefined ? () => recent.messages : () => sessionUserMessages.get(parentId)?.() ?? [];
     sessionUserMessages.set(ctx.session.id, userMessages);
+    /** 本会话里 jade/ask 记下的回答（jade/ask/answered 事件，只认来源是 jade/ask 插件的） */
+    const ownAnswers = new Map<string, readonly string[]>();
+    const answers = parentId === undefined ? () => ownAnswers : () => sessionAnswers.get(parentId)?.() ?? new Map();
+    sessionAnswers.set(ctx.session.id, answers);
     await ctx.effect(() => () => {
       if (sessionUserMessages.get(ctx.session.id) === userMessages) sessionUserMessages.delete(ctx.session.id);
+      if (sessionAnswers.get(ctx.session.id) === answers) sessionAnswers.delete(ctx.session.id);
     });
     const review = reviewing
       ? reviewer({
@@ -135,6 +144,7 @@ export default definePlugin({
           writeRoots: () => writeRoots,
           messages: () => recent.messages,
           ...(parentId !== undefined ? { userMessages } : {}),
+          answers,
           meta: (t) => ctx.session.tool(t)?.meta,
         })
       : undefined;
@@ -324,7 +334,11 @@ export default definePlugin({
       kind: "observe",
       point: "event",
       fn: async (e, hook) => {
-        if (e.type === "tool.decided") {
+        if (e.type === ASK_ANSWERED) {
+          const d = e.data as { toolUseId?: unknown; answers?: unknown };
+          if (e.origin.by === "plugin" && e.origin.id === "jade/ask" && typeof d.toolUseId === "string" && Array.isArray(d.answers))
+            ownAnswers.set(d.toolUseId, d.answers.map(String));
+        } else if (e.type === "tool.decided") {
           const d = e.data as EventDataMap["tool.decided"];
           const asked = seen.get(d.toolUseId);
           seen.delete(d.toolUseId);

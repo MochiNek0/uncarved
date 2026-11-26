@@ -19,6 +19,8 @@
 - 2026-11-11 `!npm login` 运行中按 esc → 一直停在 Interrupting，Ctrl+C 也退不出去，只能关终端 → Windows 上 Git Bash 执行脚本形式的命令（`npm` 是个 sh 脚本）时会换一个 Windows 进程，原来按 WINPID 和 `taskkill /T` 都找不到它，没杀掉的进程占着输出管道，读取永远不结束；模型的 bash 工具有同样的问题。同日改：启动时在环境变量里放标记，按标记在 msys 的 `/proc` 里找进程杀；杀掉之后最多再等 2 秒就不等了；运行中连按两次 Ctrl+C 退出，退出最多等 3 秒；中断时吉祥物的汗珠会动。
 - 2026-11-11 对复合命令点"总是允许" → 规则只认整条命令原文（`git add -A && git commit -m '…'`、`bun install && bun test`），提交信息一变又要问，等于没允许 → 同日改：复合命令里每条不是只读的命令各记一条规则（`git add…`、`git commit…`），以后换了提交信息、换了组合都不再问；带输出重定向的仍只认整条原文。范围因此变宽：批准过 `bun install && bun test`，单独的 `bun install` 也不问了。没改的：`mkdir -p a/b`、`git -C <dir> status` 这类第二个词是选项的命令仍只认原文（取一个词当前缀会把 `rm -rf` 也放进来）。
 - 2026-11-11 审批对话框里两个"总是允许"选项看不清 → 规则（整条命令）写在选项中间，区别（本会话 / 这个目录）在句尾，超宽时被截掉，两项看起来一样 → 同日改：规则只在正文里写一次，选项只写范围。
+- 2026-11-26 想让 auto 模式尽量少问用户（同 Claude Code）→ 原来审查只能放行或转给用户，规则判断不了的调用常常还是要问 → 同日改：审查只放行或拦下，拦下时模型用 `ask_user` 问用户，同意后重试放行；连续拦下 3 次（累计 20 次）才转回问一次。用户的回答由 `jade/ask` 记成 `jade/ask/answered` 事件，审查只认这一份（工具结果文本里的问题是模型写的，可以伪造回答）。
+- 2026-11-26 想取消交互模式下的轮次限制 → 原来一轮默认 100 步就停下、让模型总结 → 同日改：不配置 `maxSteps` 时交互式前端和子 Agent 不限步数（随时能 esc 中断），只有 `-p` 这类不能提问的默认 200。
 
 ## 3. 架构证据
 
@@ -43,6 +45,7 @@ C 的证据。"多亏是插件才能这样做"是架构对的证据，"架构挡
   - 2026-11-19 解决，内核没改：jade 核心加了 `ctx.session.spawn`，子会话用内核已有的 `parent`/`child` 引用，所有插件照常加入，审批、`/undo`、用户 hook、兜底关卡都生效，日志存盘。`jade/task` 改用它（配置 `write: true` 让子 Agent 写），内置插件不再往 `tools@1` 登记。第三方插件另起 Agent 也用 `spawn`。~~还没做的：子 Agent 的 shell 命令改的文件 `/undo` 撤销不了~~（2026-11-21 补上：算在根会话的这一轮里，整棵会话树一张快照）。见 [live-tools-and-child-sessions.md](./live-tools-and-child-sessions.md)。
 
 - 2026-11-10 想做"用 `$EDITOR` 编辑输入"和通用的"复制到剪贴板"→ `ui@1` 没有暂停/恢复终端的方法，也没有剪贴板方法，插件做不了终端编辑器；`/copy` 因此只能放在 `jade/tui` 里。没改，等真的需要时给 `ui@1` 加方法。同日补上：`ui@1.copy`、`ui@1.suspend`，`jade/editor` 用后者；`/copy` 还留在 `jade/tui` 里，没有搬。2026-11-18 搬出：单独的 `jade/copy`，回复从 `sessions.current.state` 取，剪贴板经 `ui@1.copy`，`jade/tui` 里只剩 `/help`、`/exit`。
+- 2026-11-26 `jade/budget` 到了步数上限想问用户要不要继续 → `turn.continue` 关卡的 `ask` 在内核里等于停止，没有 `ask → AwaitInput` 这条路，只好在关卡里弹对话框等（最长 24 小时），和 2026-11-10 审批走过的老路一样：等待期间内核以为自己在驱动这一轮，会话不能序列化、宿主写入被拒；用户的回答一开始也没记进日志（违反 I-5）。绕过去了：选"继续"时先记 `jade/budget/continued` 再放行。不绕的做法是先停下（`deny`），在 `afterTurn` 里问、选继续就发一条消息（同 `jade/continue`）。不配置 `maxSteps` 时交互模式不限步数，这条路很少走到，先不改。
 - 2026-11-10 想让会话里的插件读自己会话的日志（`jade/cost` 恢复会话后接着算）→ `ctx.session` 没有 `history()`（命令里的 `sessions.current` 有）→ 绕过去了：合计每轮记进 `derived`。同日 `ctx.session` 加了 `state()` 和 `subscribe()`（和前端的一样）；整份日志（`history()`）仍然只有前端和命令拿得到。
 
 - 2026-11-09 想让用户在终端里一条命令装网上的 skill 和 MCP 服务（`jade skills add`、`jade mcp add`）→ 插件没法加 `jade <子命令>`，直接写进 `main.ts` 又要让核心认识 skill 和 MCP → 给核心加了 `cli@1`（核心只查名字、转交参数），安装逻辑留在 `jade/skills`、`jade/mcp`。见 [jade.md](./jade.md) 3.4。

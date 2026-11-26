@@ -77,6 +77,8 @@ export default definePlugin({
               AbortSignal.any([hook.signal, AbortSignal.timeout(ASK_TIMEOUT_MS)]),
             );
             if (answer === "more") {
+              // 用户的回答是人工输入，先记进日志再用（I-5）
+              await hook.emit("continued", { steps, limit: steps + max });
               limit = steps + max;
               return { decision: "abstain" };
             }

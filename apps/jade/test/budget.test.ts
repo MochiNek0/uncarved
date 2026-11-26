@@ -35,7 +35,10 @@ describe("jade/budget", () => {
       expect(shared.requests).toHaveLength(5);
       expect(JSON.stringify(shared.requests[3]!.messages)).not.toContain(WRAP_UP_NOTE);
       expect(JSON.stringify(shared.requests[4]!.messages.at(-1))).toContain(WRAP_UP_NOTE);
-      const notice = (await s.history()).find((e) => e.type === "jade/budget/notice");
+      const history = await s.history();
+      // 用户选的"继续"是人工输入，记进了日志（I-5）
+      expect(history.filter((e) => e.type === "jade/budget/continued").map((e) => e.data)).toEqual([{ steps: 2, limit: 4 }]);
+      const notice = history.find((e) => e.type === "jade/budget/notice");
       expect((notice!.data as { text: string }).text).toContain("stopped after 4 model responses");
     } finally {
       await ui.cleanup();
