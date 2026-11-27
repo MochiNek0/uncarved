@@ -239,7 +239,7 @@ plugin.run()
 | `JADE_MAX_TOKENS` | `.env` | 每次回复的输出上限，可写 `32000` / `64K` / `1M` |
 | `JADE_EFFORT` | `.env` | 思考力度（Claude：`low`–`max`；OpenAI：`minimal`–`high`） |
 | `JADE_CONTEXT_WINDOW` | `.env` | 模型上下文窗口，不设时按模型名推断 |
-| `JADE_RPM` | `.env` | 每分钟最多发几个模型请求，不设时不主动限速 |
+| `JADE_RPM` | `.env` | 每分钟最多发几个模型请求；被限流时先降下来，再随着请求慢慢回升到它。不设时不主动限速，被限流后自己推一个上限 |
 | `JADE_FALLBACKS` | `.env` | Claude 因安全策略拒绝时由服务端换模型重试；不设时只对官方地址开启，其他 Anthropic 格式的服务默认关闭。可在 `/model` 的模型设置里按模型改 |
 | `JADE_THINKING` | `.env` | Anthropic 格式的请求里带不带 `thinking`（adaptive）和默认的 effort；设成 `off` 给见到这个字段就拒绝请求的服务用（例如基元律动的 egg-alpha-004），模型自己决定思不思考。可在 `/model` 的模型设置里按模型改 |
 | `JADE_SEARCH` | `.env` | 搜索服务顺序，逗号分隔 |

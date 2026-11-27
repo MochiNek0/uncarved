@@ -219,14 +219,14 @@ test("RateGate keeps at most the limit in any minute, counted from when requests
   expect(waits).toEqual([61_000]);
   stopSecond.abort(new Error("second"));
   await expect(second).rejects.toThrow("second");
-  // 设了 JADE_RPM 时不改
+  // 设了 JADE_RPM 时也按请求数降下来
   const fixed = new RateGate({ rpm: 30, now: () => now });
   for (let i = 0; i < 4; i++) {
     (await fixed.acquire(signal))();
     now += 2_000;
   }
   fixed.limited(1);
-  expect(fixed.rpm).toBe(30);
+  expect(fixed.rpm).toBe(3);
   expect(isRateLimit(new ProviderError("stream error: Rate limit exceeded: free-models-per-min", { retryable: true }))).toBe(true);
   expect(isRateLimit(new ProviderError("HTTP 429: slow down", { retryable: true }))).toBe(true);
   expect(isRateLimit(new ProviderError("HTTP 500: oops (id 14290)", { retryable: true, status: 500 }))).toBe(false);
@@ -246,6 +246,50 @@ test("RateGate keeps at most the limit in any minute, counted from when requests
   await expect(paused).rejects.toThrow("done");
   expect(rpmFromEnv({ JADE_RPM: "20" })).toBe(20);
   expect(() => rpmFromEnv({ JADE_RPM: "fast" })).toThrow("JADE_RPM");
+});
+
+test("RateGate raises a lowered limit by one after that many requests fill the window without a 429, up to JADE_RPM", async () => {
+  let now = 0;
+  const signal = new AbortController().signal;
+  // 每个请求立即结束；窗口满了就把时钟拨到最早那个出窗口，不真的等
+  const send = async (gate: RateGate, ends: number[], n: number, gap = 1_000) => {
+    for (let i = 0; i < n; i++) {
+      for (let live = ends.filter((at) => now - at < 61_000); gate.rpm !== undefined && live.length >= gate.rpm; live = ends.filter((at) => now - at < 61_000)) {
+        now = live[0]! + 61_000;
+      }
+      (await gate.acquire(signal))();
+      ends.push(now);
+      now += gap;
+    }
+  };
+  const gate = new RateGate({ now: () => now });
+  const ends: number[] = [];
+  await send(gate, ends, 5);
+  gate.limited(1);
+  expect(gate.rpm).toBe(4);
+  // 每个都把窗口发满：4 个后上限 5，再 5 个后 6
+  await send(gate, ends, 3);
+  expect(gate.rpm).toBe(4);
+  await send(gate, ends, 1);
+  expect(gate.rpm).toBe(5);
+  await send(gate, ends, 5);
+  expect(gate.rpm).toBe(6);
+  // 发得稀（窗口不满）不算，上限不会比实际用量高出去
+  await send(gate, ends, 20, 20_000);
+  expect(gate.rpm).toBe(6);
+  // 再被限流：攒的数清零，按窗口里的请求数重新推
+  now += 120_000;
+  await send(gate, ends, 3);
+  gate.limited(1);
+  expect(gate.rpm).toBe(2);
+  // 设了 JADE_RPM：降下来后最多回到它
+  const capped = new RateGate({ rpm: 4, now: () => now });
+  const cappedEnds: number[] = [];
+  await send(capped, cappedEnds, 4);
+  capped.limited(1);
+  expect(capped.rpm).toBe(3);
+  await send(capped, cappedEnds, 30);
+  expect(capped.rpm).toBe(4);
 });
 
 // ---------- 按环境变量选择服务 ----------

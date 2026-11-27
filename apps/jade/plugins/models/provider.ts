@@ -125,7 +125,7 @@ export function withRetry(inner: Provider, opts: RetryOptions = {}): RetryingPro
 }
 
 export interface RateGateOptions {
-  /** 每分钟最多发几个请求（JADE_RPM）；不设时不主动限速，被限流后按当时的请求数推一个 */
+  /** 每分钟最多发几个请求（JADE_RPM）；被限流后会先降下来，回升时不超过它。不设时不主动限速，被限流后按当时的请求数推一个 */
   rpm?: number;
   now?: () => number;
   /** 要等一段时间才能发下一个请求时通知宿主（显示用） */
@@ -151,12 +151,17 @@ interface Sent {
  *   从请求结束算起：服务端常常在请求结束时才记一次，从发出时算、按 60s / 上限平均间隔的话，
  *   每隔上限个请求就正好卡在窗口边上被拒，每次再白等一个 Retry-After
  * - 收到 429 后，所有请求都等到重试时间之后再发
+ * - 被限流降下来的上限会回升，免得一次限流之后一直慢下去：把窗口发满的请求（发出时窗口里正好到上限）
+ *   每攒够上限那么多个都没被限流，上限加一，最高到 JADE_RPM。只数发满窗口的，上限就不会比实际用量高出去
  */
 export class RateGate {
   #rpm: number | undefined;
-  readonly #explicit: boolean;
+  /** 回升的最高值（JADE_RPM）；undefined 表示不封顶 */
+  readonly #ceiling: number | undefined;
   #sent: Sent[] = [];
   #until = 0;
+  /** 上次限流以后发满窗口的请求数，攒够上限那么多个就把上限加一 */
+  #full = 0;
   #queue: Promise<void> = Promise.resolve();
   readonly #now: () => number;
   readonly #opts: RateGateOptions;
@@ -164,7 +169,7 @@ export class RateGate {
   constructor(opts: RateGateOptions = {}) {
     this.#opts = opts;
     this.#rpm = opts.rpm;
-    this.#explicit = opts.rpm !== undefined;
+    this.#ceiling = opts.rpm;
     this.#now = opts.now ?? Date.now;
   }
 
@@ -190,6 +195,7 @@ export class RateGate {
         onWait?.(wait);
         await sleep(wait, signal);
       }
+      this.#recover();
       let finish!: () => void;
       const sent: Sent = { at: this.#now(), inFlight: true, finished: new Promise((r) => (finish = r)) };
       this.#sent.push(sent);
@@ -219,13 +225,14 @@ export class RateGate {
   }
 
   /**
-   * 被限流了：ms 内不再发请求。没设上限时，按最近一分钟发出的请求数推一个上限（比它少一个）；
+   * 被限流了：ms 内不再发请求。按最近一分钟发出的请求数推一个上限（比它少一个），比当前上限低才换；
    * 一分钟里只发了一两个请求就被限流，多半是服务端繁忙，不是请求太多，不推；learn 为 false（并发数限流）时也不推
    */
   limited(ms: number, { learn = true }: { learn?: boolean } = {}) {
     const now = this.#now();
     this.#until = Math.max(this.#until, now + ms);
-    if (this.#explicit || !learn) return;
+    this.#full = 0;
+    if (!learn) return;
     const recent = this.#recent(now);
     if (recent < 3) return;
     const next = recent - 1;
@@ -233,6 +240,15 @@ export class RateGate {
       this.#rpm = next;
       this.#opts.onLearn?.(next);
     }
+  }
+
+  /** 要发一个请求了：它把窗口发满时记一个，攒够上限那么多个就把上限加一（不超过 JADE_RPM） */
+  #recover() {
+    if (this.#rpm === undefined || this.#rpm === this.#ceiling) return;
+    if (this.#recent(this.#now()) + 1 < this.#rpm) return;
+    if (++this.#full < this.#rpm) return;
+    this.#full = 0;
+    this.#rpm += 1;
   }
 
   /** 还算在窗口里的请求数：没结束的，和最近一分钟里结束的 */
