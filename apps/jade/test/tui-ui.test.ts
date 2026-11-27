@@ -7,6 +7,7 @@ import { InputHistory } from "../plugins/tui/history.ts";
 import { edit, layout, moveRow, offsetAt } from "../plugins/tui/editor.ts";
 import type { Screen } from "../plugins/tui/screen.ts";
 import { fitSegments, statusSegments, Store, tail, tuiScreen, type TuiHandlers } from "../plugins/tui/tui.ts";
+import { visibleWidth } from "../plugins/tui/width.ts";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** 等到输出里出现 text（或匹配正则），最多 ms 毫秒：界面按定时器刷新，机器忙时固定等一小段时间不一定够 */
@@ -664,6 +665,23 @@ describe("terminal UI", () => {
     expect(await picked).toBe(10);
   });
 
+  test("the current choice is marked and selected when the list opens; the wheel moves the selection", async () => {
+    const { screen, type, output, clear } = setup();
+    const picked = screen.select(
+      "Switch model",
+      Array.from({ length: 30 }, (_, i) => ({ label: `model-${i}`, value: i, ...(i === 20 ? { current: true } : {}) })),
+    );
+    await sleep(80);
+    expect(output()).toContain("❯ model-20 ● current");
+    clear();
+    await type("\x1b[<65;10;10M");
+    await type("\x1b[<65;10;10M");
+    await type("\x1b[<64;10;10M");
+    expect(output()).toContain("❯ model-21");
+    await type("\r");
+    expect(await picked).toBe(21);
+  });
+
   test("grouped choices show each group's title above its first choice; titles take rows from the list", async () => {
     const { screen, type, output, clear } = setup();
     const picked = screen.select("Switch model", [
@@ -927,6 +945,30 @@ describe("terminal UI", () => {
     await type("\x1b[<0;5;7m");
     expect(raw()).toContain("hidden-1");
     expect(copied()).toEqual([]);
+  });
+
+  test("clicking the session, model, directory or branch in the header copies it", async () => {
+    const { type, raw, output } = setup();
+    await sleep(80);
+    const copied = () => [...raw().matchAll(/\x1b\]52;c;([A-Za-z0-9+/=]*)\x07/g)].map((m) => Buffer.from(m[1]!, "base64").toString("utf8"));
+    const lines = output().split("\n");
+    // 鼠标的行列从 1 开始：点在字段的第二个字上
+    const click = async (text: string) => {
+      const y = lines.findIndex((l) => l.includes(text));
+      const x = visibleWidth(lines[y]!.slice(0, lines[y]!.indexOf(text))) + 2;
+      await type(`\x1b[<0;${x};${y + 1}M`);
+      await type(`\x1b[<0;${x};${y + 1}m`);
+    };
+    await click("s-123");
+    await click("test-model");
+    await click("~/proj");
+    await click("main)");
+    expect(copied()).toEqual(["s-123", "test-model", "~/proj", "main"]);
+    // 点在字段之间的分隔上不复制
+    const y = lines.findIndex((l) => l.includes("test-model"));
+    const x = visibleWidth(lines[y]!.slice(0, lines[y]!.indexOf(" · ~/proj"))) + 2;
+    await type(`\x1b[<0;${x};${y + 1}M`);
+    expect(copied()).toHaveLength(4);
   });
 
   test("dragging above or below the conversation keeps scrolling and extends the selection until released", async () => {

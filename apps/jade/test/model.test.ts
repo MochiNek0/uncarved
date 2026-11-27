@@ -59,6 +59,8 @@ interface Shared {
   hints: (string | undefined)[][];
   /** 每次选择给出的选项分组（group） */
   groups: (string | undefined)[][];
+  /** 每次选择里标成现在用着的那几项的 value */
+  currents: string[][];
   inputsAsked: string[];
   notes: string[];
   /** 会话状态栏上 jade/models 那一段每次的值（undefined 是去掉） */
@@ -84,6 +86,7 @@ const FAKE_UI = `export default { process(ctx) {
       g().offered.push(r.options.map((o) => o.value));
       g().hints.push(r.options.map((o) => o.hint));
       g().groups.push(r.options.map((o) => o.group));
+      g().currents.push(r.options.filter((o) => o.current).map((o) => o.value));
       const a = g().selects.shift();
       if (a === undefined) return undefined;
       return typeof a === "number" ? r.options[a]?.value : a;
@@ -150,7 +153,7 @@ async function setup(env: string = ENV_A) {
     }
   }
   await writeFile(path.join(home, "plugins.json"), JSON.stringify({ disabled }));
-  const shared: Shared = { selects: [], inputs: [], asked: [], offered: [], hints: [], groups: [], inputsAsked: [], notes: [], statuses: [], notices: [] };
+  const shared: Shared = { selects: [], inputs: [], asked: [], offered: [], hints: [], groups: [], currents: [], inputsAsked: [], notes: [], statuses: [], notices: [] };
   (globalThis as { __jadeModelTest?: Shared }).__jadeModelTest = shared;
   const reports: string[] = [];
   const host = await PluginHost.start({
@@ -393,7 +396,7 @@ describe("/model", () => {
       expect(shared.offered[0]).toEqual(["model:0", "model:1", "add", "manage"]);
       // 每个服务一组，组的标题是服务
       expect(shared.groups[0]).toEqual(["openai-compat · a.example", "openai-compat · b.example", undefined, undefined]);
-      expect(shared.hints[0]![0]).toStartWith("current · ");
+      expect(shared.currents[0]).toEqual(["model:0"]);
       expect(models.current()!.model).toBe("m2");
       expect(await readEnvFile(home)).toContain("OPENAI_COMPAT_MODEL=m2");
     } finally {
@@ -1002,7 +1005,7 @@ describe("prices and service names in /model", () => {
       await command.run("", ctx);
       expect(shared.offered.at(-1)).toEqual(["model:0", "model:1", "add", "manage"]);
       expect(shared.groups.at(-1)).toEqual(["Alpha", "openai-compat · a.example", undefined, undefined]);
-      expect(shared.hints.at(-1)![1]).toStartWith("current · ");
+      expect(shared.currents.at(-1)).toEqual(["model:1"]);
       // 切换、改设置之后名字还在
       await command.run("m2", ctx);
       expect((await readSaved(home)).services.find((s) => s.env.OPENAI_COMPAT_BASE_URL === "https://b.example/v1")!.name).toBe("Alpha");

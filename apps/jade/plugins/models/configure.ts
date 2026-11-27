@@ -289,7 +289,7 @@ export function configurator(opts: ConfigureOptions): Configure {
       const picked = await ui.select(
         {
           title: "Choose a model",
-          options: [...models.map((m) => ({ label: m, value: m, ...(m === current ? { hint: "current" } : saved.includes(m) ? { hint: "saved" } : {}) })), { label: "Enter a name…", value: OTHER }, { label: "Back", value: BACK }],
+          options: [...models.map((m) => ({ label: m, value: m, ...(m === current ? { current: true } : saved.includes(m) ? { hint: "saved" } : {}) })), { label: "Enter a name…", value: OTHER }, { label: "Back", value: BACK }],
         },
         opts.signal,
       );
@@ -306,7 +306,7 @@ export function configurator(opts: ConfigureOptions): Configure {
     const kindName = await ui.select(
       {
         title: "Which service should jade use?",
-        options: PROVIDERS.map((p) => ({ label: p.label, value: p.kind, hint: p.kind === current?.kind ? `${p.hint} · current` : p.hint })),
+        options: PROVIDERS.map((p) => ({ label: p.label, value: p.kind, hint: p.hint, ...(p.kind === current?.kind ? { current: true } : {}) })),
       },
       opts.signal,
     );
@@ -362,7 +362,7 @@ export function configurator(opts: ConfigureOptions): Configure {
       {
         title: "Add a model from",
         options: [
-          ...services.map((s, i) => ({ label: groupOf(s), value: `service:${i}`, hint: `${s.name ? `${describeService(s)} · ` : ""}${serviceId(s.env) === currentId ? "current service" : `${s.models.length} saved`}` })),
+          ...services.map((s, i) => ({ label: groupOf(s), value: `service:${i}`, hint: `${s.name ? `${describeService(s)} · ` : ""}${s.models.length} saved`, ...(serviceId(s.env) === currentId ? { current: true } : {}) })),
           { label: "Another service…", value: "provider", hint: "a new base URL or API key" },
           { label: "Back", value: "back" },
         ],
@@ -433,7 +433,7 @@ export function configurator(opts: ConfigureOptions): Configure {
         const effort = await ui.select(
           {
             title: "Reasoning effort",
-            options: [...efforts.map((e) => ({ label: e, value: e, ...(e === env.JADE_EFFORT ? { hint: "current" } : {}) })), { label: "Default", value: DEFAULT, hint: kind === "anthropic" ? "high" : "service default" }],
+            options: [...efforts.map((e) => ({ label: e, value: e, ...(e === env.JADE_EFFORT ? { current: true } : {}) })), { label: "Default", value: DEFAULT, hint: kind === "anthropic" ? "high" : "service default" }],
           },
           opts.signal,
         );
@@ -690,7 +690,7 @@ export function configurator(opts: ConfigureOptions): Configure {
     return ui.select(
       {
         title: "Currency of the prices",
-        options: CURRENCIES.map((c) => ({ label: c, value: c, hint: `${symbol(c)}${c === current ? " · current" : ""}` })),
+        options: CURRENCIES.map((c) => ({ label: c, value: c, hint: symbol(c), ...(c === current ? { current: true } : {}) })),
       },
       opts.signal,
     );
@@ -719,8 +719,8 @@ export function configurator(opts: ConfigureOptions): Configure {
   function entryOption(e: Entry, value: string, env: Env) {
     const settings = e.current ? pick(env, MODEL_SETTINGS) : e.model.settings;
     const kind = providerKind(e.service.env);
-    const parts = [e.current ? "current" : "", settingsSummary(settings, kind, contextWindow(e.model.name, settings)), e.model.price ? priceSummary(e.model.price) : ""];
-    return { label: e.model.name, value, hint: parts.filter(Boolean).join(" · "), group: groupOf(e.service) };
+    const parts = [settingsSummary(settings, kind, contextWindow(e.model.name, settings)), e.model.price ? priceSummary(e.model.price) : ""];
+    return { label: e.model.name, value, hint: parts.filter(Boolean).join(" · "), group: groupOf(e.service), ...(e.current ? { current: true } : {}) };
   }
 
   /** 全部模型（当前的那个的设置以 .env 为准） */

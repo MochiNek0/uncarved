@@ -552,8 +552,11 @@ export interface SelectRequest<T extends string> {
   title: string;
   /** 选项上方的详细内容，例如要执行的命令、要改的文件 */
   detail?: Text;
-  /** group：分组的标题，相邻的、group 相同的选项显示在同一个标题下；不认识分组的前端忽略它 */
-  options: { label: string; value: T; /** 选项后面的灰色说明 */ hint?: string; group?: string }[];
+  /**
+   * group：分组的标题，相邻的、group 相同的选项显示在同一个标题下；不认识分组的前端忽略它。
+   * current：现在用着的那一项，前端醒目地标出来，打开时选中它
+   */
+  options: { label: string; value: T; /** 选项后面的灰色说明 */ hint?: string; group?: string; current?: boolean }[];
 }
 
 export interface PluginModule {

@@ -13,6 +13,8 @@ export interface Choice<T> {
   hint?: string;
   /** 分组的标题：相邻的、group 相同的选项显示在同一个标题下 */
   group?: string;
+  /** 现在用着的那一项：标出来，打开时选中它 */
+  current?: boolean;
 }
 
 export interface StatusInfo {
@@ -337,7 +339,7 @@ export function plainScreen(opts: { interactive: boolean }): Screen {
       if (o?.body) line(o.body);
       choices.forEach((c, i) => {
         if (c.group !== undefined && c.group !== choices[i - 1]?.group) line(dim(`  ${c.group}`));
-        line(`  ${i + 1}. ${c.label}${c.hint ? dim(`  ${c.hint}`) : ""}`);
+        line(`  ${i + 1}. ${c.label}${c.current ? " (current)" : ""}${c.hint ? dim(`  ${c.hint}`) : ""}`);
       });
       if (o?.signal?.aborted) return undefined;
       const n = Number(await ask(`Choose 1-${choices.length} (empty to cancel): `, o?.signal));

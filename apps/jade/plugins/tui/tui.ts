@@ -1102,6 +1102,8 @@ function App({
   // 对话区占掉标题和底部之外的全部高度，只画能看见的那几行
   const ref = useRef<DOMElement>(null);
   const { height, top } = useBoxMetrics(ref);
+  /** 标题里放文字的 Box：点上面的字段复制它（见 headerFields） */
+  const headerRef = useRef<DOMElement>(null);
   const width = Math.max(10, columns - 2);
   // 往上翻看时要折到能看见的地方；多要一屏给翻页
   const done = store.lines(width, state.scroll + 2 * rows);
@@ -1205,6 +1207,12 @@ function App({
       }
       if (mouse.button === MOVE) return;
       if (mouse.button === 0 && mouse.press && overJobs) return store.openJobs();
+      // 点标题里的 session、模型、目录、分支：复制它（不用按住 Shift 让终端自己选）
+      if (mouse.button === 0 && mouse.press && headerRef.current) {
+        const o = origin(headerRef.current);
+        const hit = headerFields(state.status, version, compact).find((f) => mouse.y - o.y === f.row && mouse.x - o.x >= f.from && mouse.x - o.x < f.to);
+        if (hit) return copyText(hit.text);
+      }
       // 对话区里的位置；clamp 时拖出对话区停在第一行或最后一行，否则在对话区外返回 undefined
       const at = (clamp: boolean): Point | undefined => {
         const i = mouse.y - top;
@@ -1214,8 +1222,8 @@ function App({
       // 滚轮在放不下全部文字的输入框上（含上下边框）时由输入框自己翻
       const input = inputPlace.current;
       const overInput = input && input.total > input.rows && mouse.y >= input.y - 1 && mouse.y <= input.y + input.rows;
-      // 后台的事的列表开着时滚轮由它自己翻
-      if ((mouse.button === 64 || mouse.button === 65) && (overInput || dialog?.kind === "jobs")) return;
+      // 后台的事的列表、选择框开着时滚轮由它们自己处理
+      if ((mouse.button === 64 || mouse.button === 65) && (overInput || dialog?.kind === "jobs" || dialog?.kind === "select")) return;
       if (mouse.button === 64) store.scrollBy(WHEEL_LINES, max);
       else if (mouse.button === 65) store.scrollBy(-WHEEL_LINES, max);
       else if (mouse.button === 0 && mouse.press) {
@@ -1285,7 +1293,7 @@ function App({
       h(
         Box,
         { flexDirection: "column", flexGrow: 1, overflowY: "hidden" },
-        h(Header, { status: state.status, version, compact, bot, completions: handlers.completions?.() ?? [] }),
+        h(Header, { status: state.status, version, compact, bot, textRef: headerRef, completions: handlers.completions?.() ?? [] }),
         h(
           Box,
           {
@@ -1376,9 +1384,12 @@ function Header({
   version,
   compact,
   bot,
+  textRef,
 }: {
   status: StatusInfo;
   version: string;
+  /** 放文字的那个 Box（见 headerFields） */
+  textRef: { current: DOMElement | null };
   /** 吉祥物这一帧的像素（见 mascot.ts）；放不下时 undefined */
   bot?: (string | undefined)[][];
   /** 终端很矮时只占一行，把高度留给对话和输入框 */
@@ -1396,7 +1407,7 @@ function Header({
   if (compact)
     return h(
       Box,
-      { flexShrink: 0, paddingX: 1 },
+      { ref: textRef, flexShrink: 0, paddingX: 1 },
       h(Text, { wrap: "truncate-end" }, name, h(Text, { key: "dot", dimColor: true }, " · "), ...where),
     );
   return h(
@@ -1405,7 +1416,7 @@ function Header({
     bot ? h(Bot, { pixels: bot }) : null,
     h(
       Box,
-      { flexDirection: "column", flexGrow: 1, flexShrink: 1 },
+      { ref: textRef, flexDirection: "column", flexGrow: 1, flexShrink: 1 },
       h(
         Text,
         { wrap: "truncate-end" },
@@ -1417,6 +1428,29 @@ function Header({
       h(Text, { dimColor: true, wrap: "truncate-end" }, ["/help for commands", ...completions.map((c) => `${c.trigger} ${c.label}`)].join(" · ")),
     ),
   );
+}
+
+/**
+ * 标题里点一下就复制的字段（session、模型、目录、分支）：row、from、to 相对 textRef 那个 Box 的左上角，to 不含。
+ * 要和 Header 画的文字对得上
+ */
+export function headerFields(status: StatusInfo, version: string, compact: boolean): { row: number; from: number; to: number; text: string }[] {
+  const out: { row: number; from: number; to: number; text: string }[] = [];
+  const line = (row: number, x: number, parts: [text: string, copy: boolean][]) => {
+    for (const [text, copy] of parts) {
+      const w = visibleWidth(text);
+      if (copy && text) out.push({ row, from: x, to: x + w, text });
+      x += w;
+    }
+  };
+  const where: [string, boolean][] = [[status.model, true], [" · ", false], [status.cwd, true], ...(status.branch ? ([[" (", false], [status.branch, true]] as [string, boolean][]) : [])];
+  // 紧凑的标题只有一行，Box 左边有一格 padding
+  if (compact) line(0, 1, [["jade · ", false], ...where]);
+  else {
+    if (status.session) line(0, 0, [[`jade v${version}  ·  session `, false], [status.session, true]]);
+    line(1, 0, where);
+  }
+  return out;
 }
 
 const dialogIds = new WeakMap<Dialog, number>();
@@ -2386,7 +2420,8 @@ function SelectDialog({
   dialog: Extract<Dialog, { kind: "select" }>;
 }) {
   const selection = useContext(SelectionContext);
-  const [getSelected, setSelected] = useLive(0);
+  // 打开时选中现在用着的那一项
+  const [getSelected, setSelected] = useLive(Math.max(0, dialog.choices.findIndex((c) => c.current)));
   const [getQuery, setQuery] = useLive("");
   /** 预览从第几行开始显示，以及它能翻到哪里、一页几行（放得下时 maxTop 是 0） */
   const [getTop, setTop] = useLive(0);
@@ -2432,6 +2467,15 @@ function SelectDialog({
     const items = filtered();
     const n = items.length;
     const selected = Math.min(getSelected(), Math.max(0, n - 1));
+    // 滚轮：预览放不下时翻预览（同 PgUp/PgDn），否则上下移动选中项
+    const mouse = mouseEvent(input);
+    if (mouse) {
+      const wheel = mouse.button === 64 ? -1 : mouse.button === 65 ? 1 : 0;
+      if (!wheel) return;
+      const { maxTop } = scrolling.current;
+      if (maxTop > 0) return setTop(Math.max(0, Math.min(maxTop, Math.min(getTop(), maxTop) + wheel * WHEEL_LINES)));
+      return n && setSelected(Math.max(0, Math.min(n - 1, selected + wheel)));
+    }
     if (key.upArrow || (!filtering && input === "k"))
       return n && setSelected((selected - 1 + n) % n);
     if (key.downArrow || (!filtering && input === "j"))
@@ -2512,7 +2556,8 @@ function SelectDialog({
         const row = h(
           Text,
           { key: i, wrap: "truncate-end" },
-          h(Text, { color: on ? "cyan" : undefined, bold: on }, on ? "❯ " : "  ", filtering ? "" : `${i + 1}. `, c.label),
+          h(Text, { color: on ? "cyan" : c.current ? "green" : undefined, bold: on || c.current }, on ? "❯ " : "  ", filtering ? "" : `${i + 1}. `, c.label),
+          c.current ? h(Text, { color: "green", bold: true }, " ● current") : null,
           c.hint ? h(Text, { dimColor: true }, ` ${c.hint}`) : null,
         );
         return head === undefined ? [row] : [h(Text, { key: `group-${i}`, bold: true, dimColor: true, wrap: "truncate-end" }, ` ${head}`), row];
