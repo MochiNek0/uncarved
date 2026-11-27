@@ -140,6 +140,7 @@ jade 自带的功能全是 `apps/jade/plugins/` 下的普通插件，和第三�
 | `jade/hooks` | 在配置里写 shell 命令，工具调用前后、一轮结束时运行 |
 | `jade/cost` | 按单价把 token 用量换算成钱（`/model` 里给模型填的，可以分时段、美元或人民币；或者配置里的），`/cost`；`/cost` 还列出提示缓存的命中率、Jade 改变请求前缀的次数（压缩、系统提示词……）和前缀没变却没命中的次数 |
 | `jade/steer` | agent 工作时说的话在下一次请求模型时就交给它 |
+| `jade/withdraw` | 按 esc 时模型还没回复的消息撤回、放回输入框，会话不换 |
 | `jade/editor` | Ctrl+G 用 `$EDITOR` 编辑输入 |
 
 完整清单见 [docs/design/jade.md](../../docs/design/jade.md) 第 9 节。

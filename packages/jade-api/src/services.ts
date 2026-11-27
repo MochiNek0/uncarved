@@ -409,3 +409,14 @@ export interface Steer {
   /** pending 变了（交给了模型、被取回、新加了一句）时调用，返回取消订阅；调用方的作用域关闭时自动取消 */
   subscribe(fn: () => void): () => void;
 }
+
+// ---------- withdraw@1（jade/withdraw） ----------
+
+/** withdraw@1：用户中断一轮时，模型还没有回复的那条消息撤回。项目层插件不能替用户撤回，arm 对它们抛错 */
+export interface Withdraw {
+  /**
+   * 用户要中断这个会话正在跑的一轮（前端在中止之前调用）：这一轮以 aborted 结束、模型还没有回复时，
+   * 撤回这条消息（记进日志，之后不再交给模型），文字放回输入框。会话里没有正在跑的一轮（或没有这个会话）时返回 false
+   */
+  arm(session: string): boolean;
+}

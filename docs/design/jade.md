@@ -303,7 +303,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 
 | 插件 | 提供 | 依赖 | 来自旧 jade |
 |---|---|---|---|
-| `jade/tui` | `frontend@1`（默认）、`ui@1`（含 `session`：状态栏段落、输入框）；启动参数 `--resume <id>`、`-c/--continue`；输入框里的补全（候选来自 `completions@1`）和命令简写（`Command.prefix`）。不认识具体功能：模式、压缩阈值是 jade/modes、jade/compact 自己的状态栏段落，没配模型的提示由 jade/models 给 | `commands@1`、`keys@1`、`renderers@1`；可选 `models@1`、`completions@1`、`sessions@1`、`steer@1` | `ui/*`、`main.ts` 的界面部分（`frontend.ts`）。`tui@1`（local）等第一个要扩展界面的插件出现时再做 |
+| `jade/tui` | `frontend@1`（默认）、`ui@1`（含 `session`：状态栏段落、输入框）；启动参数 `--resume <id>`、`-c/--continue`；输入框里的补全（候选来自 `completions@1`）和命令简写（`Command.prefix`）。不认识具体功能：模式、压缩阈值是 jade/modes、jade/compact 自己的状态栏段落，没配模型的提示由 jade/models 给 | `commands@1`、`keys@1`、`renderers@1`；可选 `models@1`、`completions@1`、`sessions@1`、`steer@1`、`withdraw@1` | `ui/*`、`main.ts` 的界面部分（`frontend.ts`）。`tui@1`（local）等第一个要扩展界面的插件出现时再做 |
 | `jade/print` | `frontend@1`（`-p`）、`ui@1` | — | `-p` 模式 |
 | `jade/serve` | `frontend@1`（`--serve`）、`ui@1`：无头常驻，stdin/stdout 一行一个 JSON，用 `sessions.start` 同时跑多个会话 | — | 新增（2026-11-25） |
 | `jade/commands` | `commands@1`：`register`、`get`、`list`、`byPrefix`。只登记不执行，前端带着 `{ signal, ui, sessions, print }` 调用 `run`。命令可以带一个字符的简写 `prefix`（jade/shell 的 `/sh` 是 `!`）和输入框里的说明 `prefixHint`；简写被占了时命令照常注册、没有简写 | — | 插件命令（`PluginCommand`）。自定义命令（Markdown 文件）以后由单独的插件注册进来 |
@@ -336,6 +336,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 | `jade/custom-commands` | `$JADE_HOME/commands/<名字>.md`、`<工作目录>/.jade/commands/<名字>.md` 变成 `/<名字> [参数]`：文件内容作为用户消息发出去，`$ARGUMENTS` 换成参数；启动时登记，内容每次执行时重新读；名字被占用的不登记 | `commands@1`；可选 `ui@1` | 新功能（`test/custom-commands.test.ts`） |
 | `jade/hooks` | 配置 `hooks` 里的 shell 命令：`before`（`tool.gate`，退出码非 0 时拒绝，输出作理由）、`after`（`tool.after`，失败时经 `prompts@1.note` 告诉模型）、`turn`（一轮结束后）。配置键没有标 `project`，仓库设不了 | `shell@1`；可选 `ui@1`、`prompts@1` | 新功能（`test/hooks.test.ts`） |
 | `jade/steer` | `steer@1`（`push`、`pending`、`take`、`subscribe`）：一轮中途对模型说话。内核只在空闲时接受用户消息，所以不走输入：`push` 的话在下一次请求模型时由 `context.project` 附在最后一条消息（刚执行完的工具的结果）后面，写进 `derived`（之后的投影、恢复的会话里位置不变），另记一条 `jade/steer/said` 事件给前端显示。这一轮没有再请求模型就结束时话还留着，调用方用 `take` 取回当普通消息发。`jade/tui` 在模型工作时提交的消息走它（前面已经有东西在排队、或者是命令时照旧排队）；停用它就回到"排队等这一轮结束"。项目层插件不能用 | 可选 `renderers@1` | 新功能（`test/steer.test.ts`） |
+| `jade/withdraw` | `withdraw@1`（`arm`）：用户按 esc 中断一轮时模型还没有回复，这条消息撤回，文字放回输入框，会话 id 不变。`jade/tui` 在中止之前调用 `arm`；插件、退出中止的一轮不撤回。撤回记进 `derived`（消息在内核状态里的下标），另记一条 `jade/withdraw/withdrawn` 事件给前端显示；`context.project`（order -45）把它从投影里去掉。只撤回最后一条消息，前面的下标不变：排在它之前的 `jade/mentions` 的附件随它去掉，排在它之后的 note、`jade/steer`、压缩按去掉之后的下标记，附在它上面的说明落到下一条消息上。最后一条消息撤回了还要请求模型（`/retry`）时这一轮出错。项目层插件不能用 | 可选 `renderers@1` | 新功能（`test/withdraw.test.ts`） |
 | `jade/editor` | Ctrl+G（配置 `key` 可换；键被别的插件占了时提示一次，插件照常激活）把输入框里的文字交给编辑器（配置 `editor`，否则 `$VISUAL`、`$EDITOR`），存盘退出后换回输入框；终端编辑器经 `ui@1.suspend` 独占终端 | `keys@1`；可选 `ui@1` | 新功能（`test/tui-frontend.test.ts`） |
 | `jade/cost` | 按单价把日志里的用量换算成钱：先用 `models@1.price`（`/model` 里给模型填的），再用配置的（每百万 token，按模型名前缀）；每个回复按它的时间（事件的 `at`）取单价，所以分时段的价格按请求发生的时段算，不同货币分开合计。状态栏一段（`ctx.status`，合计每轮记进 `derived`）、`/cost`；`model.before` 里比较每次请求和上一次的前缀，没沿用时记 `jade/cost/prefix` 事件，`/cost` 据此列出缓存命中率和没命中的原因 | 可选 `commands@1`、`models@1` | 新功能（`test/cost.test.ts`） |
 
@@ -379,6 +380,7 @@ jade 对每一条的回答：5.2–5.4、3.3、3.5、第 6 节。
 | 停在等待人工审批的一轮结束不了 | `abort` 只发信号，等待期间没有操作在跑；发新消息被拒绝，逐个拒绝又会再请求一次模型 | **已解决，内核新增 `Runtime.endTurn`**（宪法 4.4，v0.10）：没有在驱动时写入 `turn.ended`（`aborted`）。jade 的会话和 `jade/approval` 已经用上（第 7 节）。子 Agent（`jade/task`）的关卡还是在关卡里面等回答 |
 | 一批工具调用里有一个不是 `safe` 的，整批都依次执行 | 内核规定（第六章） | **已解决，修宪**（v0.11）：按模型给出的顺序分段，连续的 `safe` 调用并发，`exclusive` 的单独执行。执行工具只有运行时能做，内核之外改不了 |
 | 一轮中途不能再发用户消息 | 内核只在 `idle` 阶段接受消息输入 | **不改内核**：`context.project` 加 `derived` 就能把话附在工具结果后面（`jade/steer`），和 `prompts@1.note` 是同一个办法；内核外能做对，按宪法 1.3 不进内核。代价是日志里这句话是插件记的 `derived` 和 `jade/steer/said`，不是 `input.received` |
+| 撤回模型还没回复的消息 | 日志只追加，内核状态里的消息只增不减 | **不改内核**：撤回记进 `derived`，`context.project` 把它从投影里去掉（I-4 允许投影省略），会话 id 不变（`jade/withdraw`）；内核外能做对，按宪法 1.3 不进内核。代价是内核状态（`state.messages`、`/rewind` 的列表、会话标题）里这条消息还在，只有投影里没有 |
 
 ## 11. 实施顺序
 

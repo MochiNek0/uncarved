@@ -11,7 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import type { Block } from "uncarved";
 import type { Frontend, Job, JobRequest, OpenOptions, Session, SessionManager, SessionUI, StatusSegment, Text, UI } from "@uncarved/jade-api";
-import type { CommandContext, Commands, Completions, EventRenderer, Keys, Models, Renderers, SessionIndex, Steer, ToolRenderer } from "@uncarved/jade-api/services";
+import type { CommandContext, Commands, Completions, EventRenderer, Keys, Models, Renderers, SessionIndex, Steer, ToolRenderer, Withdraw } from "@uncarved/jade-api/services";
 import { InputHistory } from "./history.ts";
 import { ansi, dim, red, safeScreen, yellow, type CommandInfo, type CompletionInfo, type JobInfo, type Screen } from "./screen.ts";
 import { transcript, type Transcript } from "./transcript.ts";
@@ -54,7 +54,7 @@ const KEYS = [
   "  send       enter send · ctrl+j, alt+enter or \\ then enter: new line · tab completes /commands",
   "  input      ↑↓ history · ctrl+r search history · ↑ on the first line edits queued messages · esc twice or ctrl+c clears the input",
   "  editing    ctrl+←/→ or alt+b/f move by words · ctrl+w or alt+backspace delete a word · ctrl+a/e line start/end · ctrl+u/k delete to start/end",
-  "  running    esc interrupt (twice to also move queued messages back to the input) · ctrl+c twice to exit · ctrl+t, /tasks or a click on the status bar lists sub-agents and background commands",
+  "  running    esc interrupt (a message the model has not answered yet goes back to the input; twice to also move queued messages back) · ctrl+c twice to exit · ctrl+t, /tasks or a click on the status bar lists sub-agents and background commands",
   "  transcript pgup/pgdn scroll · ctrl+home/end top/bottom · ctrl+o expands the latest item, a click the one under it · drag to select and copy · ctrl+l redraw",
 ].join("\n");
 
@@ -131,6 +131,8 @@ export interface FrontendServices {
   index?: SessionIndex;
   /** 一轮中途说的话（jade/steer）：有它时，模型工作中提交的消息在下一次请求模型时就交给它，不等这一轮结束 */
   steer?: Steer;
+  /** 中断时模型还没有回复的消息撤回、放回输入框（jade/withdraw） */
+  withdraw?: Withdraw;
 }
 
 /** 状态栏上插件的一段最多显示这么多字符（超出的截断，换行并成空格） */
@@ -404,7 +406,7 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
     return 2;
   }
 
-  const { cwd, home, commands, keys, renderers, models, completions, index, steer } = services;
+  const { cwd, home, commands, keys, renderers, models, completions, index, steer, withdraw } = services;
   const sessions = opts.sessions;
   // --continue：这个目录里最近用过的会话（索引由 jade/sessions 在收到第一条消息时写）
   if (args.cont && !index) {
@@ -646,6 +648,11 @@ async function run(services: FrontendServices, bridge: ScreenBridge, opts: Param
     interruptedAt = Date.now();
     interruptPending = true;
     for (const ac of commandAborts) ac.abort(new Error("interrupted by user"));
+    try {
+      if (current) withdraw?.arm(current.id);
+    } catch {
+      // 撤回不了就只是中断
+    }
     current?.abort(new Error("interrupted by user"));
     screen.busy("Interrupting");
     const n = queue.length + steered.pending().length;
