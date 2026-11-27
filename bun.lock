@@ -17,7 +17,7 @@
     },
     "apps/jade": {
       "name": "@uncarved/jade",
-      "version": "0.5.1",
+      "version": "0.5.2",
       "bin": {
         "jade": "./bin/jade.js",
       },
@@ -42,14 +42,14 @@
     },
     "packages/jade-api": {
       "name": "@uncarved/jade-api",
-      "version": "1.6.0",
+      "version": "1.7.0",
       "peerDependencies": {
         "uncarved": "workspace:^",
       },
     },
     "packages/kernel": {
       "name": "uncarved",
-      "version": "0.1.7",
+      "version": "0.1.8",
     },
     "packages/plugin-stdio": {
       "name": "@uncarved/plugin-stdio",
@@ -77,14 +77,14 @@
     },
     "packages/provider-openai-responses": {
       "name": "@uncarved/provider-openai-responses",
-      "version": "0.1.5",
+      "version": "0.1.6",
       "peerDependencies": {
         "uncarved": "workspace:^",
       },
     },
     "packages/store-jsonl": {
       "name": "@uncarved/store-jsonl",
-      "version": "0.1.1",
+      "version": "0.1.2",
       "peerDependencies": {
         "uncarved": "workspace:^",
       },
