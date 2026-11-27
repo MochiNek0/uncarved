@@ -3,7 +3,7 @@
 
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { existsSync } from "node:fs";
-import { readFile, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { JsonlLogStore } from "@uncarved/store-jsonl";
 import { ProviderError, readAll, type Block, type ChildRef, type RuntimeNotice } from "uncarved";
@@ -79,10 +79,12 @@ describe("jade/task", () => {
     const { shared, host, send, cwd } = await scriptedHost();
     await writeFile(path.join(cwd, "a.txt"), "a");
     await writeFile(path.join(cwd, "b.txt"), "b");
+    // 结果只有一行的那次调用：用空目录，不用会报错的路径（错误信息带着临时目录的绝对路径，macOS 上长到一行放不下）
+    await mkdir(path.join(cwd, "empty"));
     shared.script.push(
       use("u1", "task", { description: "look", prompt: "list the root" }),
       use("c1", "list_dir", { path: "." }),
-      use("c2", "list_dir", { path: "missing-dir-x" }),
+      use("c2", "list_dir", { path: "empty" }),
       say("report: two files"),
       say("done"),
     );
@@ -94,7 +96,7 @@ describe("jade/task", () => {
     expect(job.output).toContain("● list_dir(");
     expect(job.output).toContain("report: two files");
     // 工具结果只显示第一行；多出来的完整输出挂在那一行上，后台列表里点开看。一行就放得下的不挂
-    expect(job.output).toMatch(/⎿ .*\(\+1 lines\)/);
+    expect(job.output).toMatch(/⎿ .*\(\+2 lines\)/);
     expect(job.details).toHaveLength(1);
     expect(job.details[0]).toContain("a.txt");
     expect(job.details[0]).toContain("b.txt");

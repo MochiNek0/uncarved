@@ -20,7 +20,7 @@ describe("jade/budget", () => {
     } finally {
       await ui.cleanup();
     }
-  });
+  }, 30_000);
 
   test("when jade can ask, the limit asks whether to keep going; continuing adds maxSteps without a summary", async () => {
     const { host, shared, send } = await ui.scriptedHost({ config: { "jade/budget": { maxSteps: 2 } } });

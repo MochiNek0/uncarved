@@ -84,7 +84,7 @@ describe("policy", () => {
   });
 
   test("auto mode reads outside the working directory without asking, except secrets, the home directory itself and escaping globs", () => {
-    const home = path.resolve("/home/me");
+    const home = path.resolve("/jade-test-home/me");
     const jadeHome = path.resolve("/jadehome");
     const p = policy({ shell, cwd, homeDir: home, secretRoots: [jadeHome] });
     const d = (mode: Mode, name: string, input: unknown) => p.decide(gated(name, input), { mode, rules: [] }).decision;
